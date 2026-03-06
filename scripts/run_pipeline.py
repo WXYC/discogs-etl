@@ -379,10 +379,10 @@ def main() -> None:
             tmp = Path(tmpdir)
             csv_dir = tmp / "csv"
 
-            # -- enrich_artists: Enrich library_artists.txt (optional)
+            # -- enrich_artists: Generate/enrich library_artists.txt from library.db
             library_artists_path = args.library_artists
-            if args.library_db and library_artists_path:
-                enriched_artists = tmp / "enriched_library_artists.txt"
+            if args.library_db:
+                enriched_artists = tmp / "library_artists.txt"
                 enrich_library_artists(args.library_db, enriched_artists, args.wxyc_db_url)
                 library_artists_path = enriched_artists
 
