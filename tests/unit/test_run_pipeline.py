@@ -18,6 +18,8 @@ _spec = importlib.util.spec_from_file_location(
 run_pipeline = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(run_pipeline)
 
+run_sql_statements_parallel = run_pipeline.run_sql_statements_parallel
+
 
 class TestRunStepStreaming:
     """run_step() streams subprocess output line-by-line."""
@@ -190,6 +192,83 @@ class TestArgParsing:
         """--xml can accept a directory path (for multi-XML input)."""
         args = run_pipeline.parse_args(["--xml", "/tmp/xml_dumps/"])
         assert args.xml == Path("/tmp/xml_dumps/")
+
+    def test_keep_csv_flag_parsed(self) -> None:
+        """--keep-csv is parsed as a Path."""
+        args = run_pipeline.parse_args(
+            ["--xml", "/tmp/releases.xml.gz", "--keep-csv", "/tmp/kept_csvs"]
+        )
+        assert args.keep_csv == Path("/tmp/kept_csvs")
+
+    def test_keep_csv_default_none(self) -> None:
+        """--keep-csv defaults to None."""
+        args = run_pipeline.parse_args(["--xml", "/tmp/releases.xml.gz"])
+        assert args.keep_csv is None
+
+    def test_keep_csv_only_valid_with_xml(self) -> None:
+        """--keep-csv is only meaningful with --xml, not --csv-dir."""
+        # Should still parse (no error), but it's ignored in csv-dir mode
+        args = run_pipeline.parse_args(["--csv-dir", "/tmp/csv", "--keep-csv", "/tmp/kept"])
+        assert args.keep_csv == Path("/tmp/kept")
+
+
+class TestRunSqlStatementsParallel:
+    """Test parallel SQL statement execution."""
+
+    def test_all_statements_executed(self) -> None:
+        """All statements are executed exactly once."""
+        from unittest.mock import MagicMock, patch
+
+        executed: list[str] = []
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
+        mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+
+        def track_execute(stmt):
+            executed.append(stmt)
+
+        mock_cursor.execute.side_effect = track_execute
+
+        stmts = [
+            "CREATE INDEX idx_a ON t(a)",
+            "CREATE INDEX idx_b ON t(b)",
+            "CREATE INDEX idx_c ON t(c)",
+        ]
+
+        with patch.object(run_pipeline.psycopg, "connect", return_value=mock_conn):
+            run_sql_statements_parallel("postgresql:///test", stmts)
+
+        assert set(executed) == set(stmts)
+        assert len(executed) == 3
+
+    def test_empty_statements_is_noop(self) -> None:
+        """Empty list of statements doesn't crash."""
+        from unittest.mock import MagicMock, patch
+
+        with patch.object(run_pipeline.psycopg, "connect", return_value=MagicMock()):
+            run_sql_statements_parallel("postgresql:///test", [])
+
+    def test_description_logged(self, caplog) -> None:
+        """Description is logged when provided."""
+        from unittest.mock import MagicMock, patch
+
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
+        mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+
+        with (
+            patch.object(run_pipeline.psycopg, "connect", return_value=mock_conn),
+            caplog.at_level(logging.INFO, logger=run_pipeline.logger.name),
+        ):
+            run_sql_statements_parallel(
+                "postgresql:///test",
+                ["CREATE INDEX idx_x ON t(x)"],
+                description="test indexes",
+            )
+
+        assert any("test indexes" in r.message for r in caplog.records)
 
 
 class TestXmlModeEnrichment:

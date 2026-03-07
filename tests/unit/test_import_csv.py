@@ -20,6 +20,7 @@ TABLES = _ic.TABLES
 BASE_TABLES = _ic.BASE_TABLES
 TRACK_TABLES = _ic.TRACK_TABLES
 TableConfig = _ic.TableConfig
+_import_tables_parallel = _ic._import_tables_parallel
 
 FIXTURES_DIR = Path(__file__).parent.parent / "fixtures"
 CSV_DIR = FIXTURES_DIR / "csv"
@@ -248,6 +249,63 @@ class TestCountTracksFromCsv:
 # ---------------------------------------------------------------------------
 # BASE_TABLES / TRACK_TABLES split
 # ---------------------------------------------------------------------------
+
+
+class TestParallelImport:
+    """Test parallel CSV import."""
+
+    def test_parent_imports_before_children(self, tmp_path) -> None:
+        """Parent tables (release) must be imported before child tables."""
+        import threading
+        from unittest.mock import MagicMock, patch
+
+        # Track import order via thread-safe list
+        import_order: list[str] = []
+        lock = threading.Lock()
+
+        def mock_import_csv(conn, csv_path, table, *args, **kwargs):
+            with lock:
+                import_order.append(table)
+            return 1
+
+        # Create dummy CSV files
+        for name in ["release.csv", "release_artist.csv", "release_label.csv"]:
+            (tmp_path / name).write_text("id\n1\n")
+
+        with (
+            patch.object(_ic, "import_csv", side_effect=mock_import_csv),
+            patch.object(_ic.psycopg, "connect", return_value=MagicMock()),
+        ):
+            _import_tables_parallel(
+                "postgresql:///test", tmp_path, BASE_TABLES[:1], BASE_TABLES[1:]
+            )
+
+        # release must come before release_artist and release_label
+        assert import_order[0] == "release"
+
+    def test_child_tables_imported(self, tmp_path) -> None:
+        """All child tables are imported."""
+        from unittest.mock import MagicMock, patch
+
+        imported_tables: list[str] = []
+
+        def mock_import_csv(conn, csv_path, table, *args, **kwargs):
+            imported_tables.append(table)
+            return 1
+
+        for name in ["release.csv", "release_artist.csv", "release_label.csv"]:
+            (tmp_path / name).write_text("id\n1\n")
+
+        with (
+            patch.object(_ic, "import_csv", side_effect=mock_import_csv),
+            patch.object(_ic.psycopg, "connect", return_value=MagicMock()),
+        ):
+            _import_tables_parallel(
+                "postgresql:///test", tmp_path, BASE_TABLES[:1], BASE_TABLES[1:]
+            )
+
+        assert "release_artist" in imported_tables
+        assert "release_label" in imported_tables
 
 
 class TestTableSplit:

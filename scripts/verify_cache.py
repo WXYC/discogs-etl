@@ -35,11 +35,13 @@ import asyncio
 import enum
 import json
 import logging
+import os
 import re
 import sqlite3
 import sys
 import time
 import unicodedata
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -650,6 +652,180 @@ async def prune_releases(conn: asyncpg.Connection, release_ids: set[int]) -> dic
     return {"release": count}
 
 
+def prune_releases_copy_swap(
+    db_url: str,
+    keep_ids: set[int],
+    review_ids: set[int],
+) -> None:
+    """Prune releases using copy-and-swap (faster than DELETE for large prune sets).
+
+    Instead of deleting ~86% of rows with CASCADE, copies only the ~14%
+    we want to keep into fresh tables, then swaps them in. Reuses the
+    pattern from dedup_releases.py.
+
+    Args:
+        db_url: PostgreSQL connection URL.
+        keep_ids: Release IDs classified as KEEP.
+        review_ids: Release IDs classified as REVIEW (also kept).
+    """
+    all_ids = keep_ids | review_ids
+    if not all_ids:
+        logger.warning("No releases to keep — skipping copy-swap prune")
+        return
+
+    logger.info(
+        "Pruning via copy-and-swap (%s KEEP + %s REVIEW = %s total)",
+        f"{len(keep_ids):,}",
+        f"{len(review_ids):,}",
+        f"{len(all_ids):,}",
+    )
+
+    conn = psycopg.connect(db_url, autocommit=True)
+    start = time.time()
+
+    try:
+        with conn.cursor() as cur:
+            # Load keep IDs into a temp table for efficient joins
+            cur.execute("DROP TABLE IF EXISTS _keep_ids")
+            cur.execute("CREATE UNLOGGED TABLE _keep_ids (release_id integer PRIMARY KEY)")
+            with cur.copy("COPY _keep_ids (release_id) FROM STDIN") as copy:
+                for rid in all_ids:
+                    copy.write_row((rid,))
+
+        # Tables to copy-swap: (old_table, new_table, columns, id_column)
+        tables = [
+            ("release", "new_release", "id, title, release_year, country, artwork_url", "id"),
+            (
+                "release_artist",
+                "new_release_artist",
+                "release_id, artist_id, artist_name, extra",
+                "release_id",
+            ),
+            ("release_label", "new_release_label", "release_id, label_name", "release_id"),
+            (
+                "release_track",
+                "new_release_track",
+                "release_id, sequence, position, title, duration",
+                "release_id",
+            ),
+            (
+                "release_track_artist",
+                "new_release_track_artist",
+                "release_id, track_sequence, artist_name",
+                "release_id",
+            ),
+            (
+                "cache_metadata",
+                "new_cache_metadata",
+                "release_id, cached_at, source, last_validated",
+                "release_id",
+            ),
+        ]
+
+        # Copy keeper rows into new tables
+        for old_table, new_table, columns, id_col in tables:
+            with conn.cursor() as cur:
+                cur.execute(f"DROP TABLE IF EXISTS {new_table}")
+                cur.execute(f"""
+                    CREATE TABLE {new_table} AS
+                    SELECT {columns} FROM {old_table} t
+                    WHERE EXISTS (
+                        SELECT 1 FROM _keep_ids k WHERE k.release_id = t.{id_col}
+                    )
+                """)
+                cur.execute(f"SELECT count(*) FROM {new_table}")
+                count = cur.fetchone()[0]
+            logger.info(f"  Copied {old_table} -> {new_table}: {count:,} rows")
+
+        # Drop FK constraints before swap
+        with conn.cursor() as cur:
+            for stmt in [
+                "ALTER TABLE release_artist DROP CONSTRAINT IF EXISTS fk_release_artist_release",
+                "ALTER TABLE release_label DROP CONSTRAINT IF EXISTS fk_release_label_release",
+                "ALTER TABLE release_track DROP CONSTRAINT IF EXISTS fk_release_track_release",
+                "ALTER TABLE release_track_artist DROP CONSTRAINT IF EXISTS fk_release_track_artist_release",
+                "ALTER TABLE cache_metadata DROP CONSTRAINT IF EXISTS fk_cache_metadata_release",
+            ]:
+                cur.execute(stmt)
+
+        # Swap tables
+        for old_table, new_table, _, _ in tables:
+            bak = f"{old_table}_old"
+            with conn.cursor() as cur:
+                cur.execute(f"ALTER TABLE {old_table} RENAME TO {bak}")
+                cur.execute(f"ALTER TABLE {new_table} RENAME TO {old_table}")
+                cur.execute(f"DROP TABLE {bak} CASCADE")
+            logger.info(f"  Swapped {new_table} -> {old_table}")
+
+        # Re-add constraints and indexes
+        with conn.cursor() as cur:
+            # PK on release
+            cur.execute("ALTER TABLE release ADD PRIMARY KEY (id)")
+
+            # FK constraints
+            cur.execute(
+                "ALTER TABLE release_artist ADD CONSTRAINT fk_release_artist_release "
+                "FOREIGN KEY (release_id) REFERENCES release(id) ON DELETE CASCADE"
+            )
+            cur.execute(
+                "ALTER TABLE release_label ADD CONSTRAINT fk_release_label_release "
+                "FOREIGN KEY (release_id) REFERENCES release(id) ON DELETE CASCADE"
+            )
+            cur.execute(
+                "ALTER TABLE release_track ADD CONSTRAINT fk_release_track_release "
+                "FOREIGN KEY (release_id) REFERENCES release(id) ON DELETE CASCADE"
+            )
+            cur.execute(
+                "ALTER TABLE release_track_artist ADD CONSTRAINT fk_release_track_artist_release "
+                "FOREIGN KEY (release_id) REFERENCES release(id) ON DELETE CASCADE"
+            )
+            cur.execute(
+                "ALTER TABLE cache_metadata ADD CONSTRAINT fk_cache_metadata_release "
+                "FOREIGN KEY (release_id) REFERENCES release(id) ON DELETE CASCADE"
+            )
+            cur.execute("ALTER TABLE cache_metadata ADD PRIMARY KEY (release_id)")
+
+            # FK indexes
+            cur.execute("CREATE INDEX idx_release_artist_release_id ON release_artist(release_id)")
+            cur.execute("CREATE INDEX idx_release_label_release_id ON release_label(release_id)")
+            cur.execute("CREATE INDEX idx_release_track_release_id ON release_track(release_id)")
+            cur.execute(
+                "CREATE INDEX idx_release_track_artist_release_id "
+                "ON release_track_artist(release_id)"
+            )
+
+            # Trigram indexes
+            cur.execute(
+                "CREATE INDEX idx_release_artist_name_trgm ON release_artist "
+                "USING gin (lower(f_unaccent(artist_name)) gin_trgm_ops)"
+            )
+            cur.execute(
+                "CREATE INDEX idx_release_title_trgm ON release "
+                "USING gin (lower(f_unaccent(title)) gin_trgm_ops)"
+            )
+            cur.execute(
+                "CREATE INDEX idx_release_track_title_trgm ON release_track "
+                "USING gin (lower(f_unaccent(title)) gin_trgm_ops)"
+            )
+            cur.execute(
+                "CREATE INDEX idx_release_track_artist_name_trgm ON release_track_artist "
+                "USING gin (lower(f_unaccent(artist_name)) gin_trgm_ops)"
+            )
+
+            # Cache metadata indexes
+            cur.execute("CREATE INDEX idx_cache_metadata_cached_at ON cache_metadata(cached_at)")
+            cur.execute("CREATE INDEX idx_cache_metadata_source ON cache_metadata(source)")
+
+            # Cleanup
+            cur.execute("DROP TABLE IF EXISTS _keep_ids")
+
+        elapsed = time.time() - start
+        logger.info(f"Copy-and-swap prune completed in {elapsed:.1f}s")
+
+    finally:
+        conn.close()
+
+
 # ---------------------------------------------------------------------------
 # Copy to target database
 # ---------------------------------------------------------------------------
@@ -1009,6 +1185,117 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def classify_artist_fuzzy(
+    norm_artist: str,
+    artist_releases: list[tuple[int, str, str]],
+    index: LibraryIndex,
+    matcher: MultiIndexMatcher,
+    artist_match_threshold: int = 60,
+) -> tuple[set[int], set[int], set[int], dict[str, list[tuple[int, str, MatchResult]]]]:
+    """Classify all releases for a single artist using fuzzy matching.
+
+    Pure function: reads index and matcher but does not mutate shared state.
+    Returns (keep_ids, prune_ids, review_ids, review_by_artist).
+    """
+    keep_ids: set[int] = set()
+    prune_ids: set[int] = set()
+    review_ids: set[int] = set()
+    review_by_artist: dict[str, list[tuple[int, str, MatchResult]]] = {}
+
+    raw_artist = artist_releases[0][1]
+
+    if is_compilation_artist(raw_artist):
+        for release_id, _, raw_title in artist_releases:
+            norm_title = normalize_title(raw_title)
+            decision = classify_compilation(norm_title, index)
+            if decision == Decision.KEEP:
+                keep_ids.add(release_id)
+            else:
+                prune_ids.add(release_id)
+        return keep_ids, prune_ids, review_ids, review_by_artist
+
+    # Single artist-level fuzzy match
+    artist_result = process.extractOne(
+        norm_artist,
+        index.all_artists,
+        scorer=fuzz.token_set_ratio,
+        score_cutoff=artist_match_threshold,
+    )
+
+    if artist_result is None:
+        for release_id, _, _ in artist_releases:
+            prune_ids.add(release_id)
+        return keep_ids, prune_ids, review_ids, review_by_artist
+
+    matched_lib_artist, artist_score, _ = artist_result
+    matched_titles_list = index.artist_to_titles_list.get(matched_lib_artist)
+
+    for release_id, _, raw_title in artist_releases:
+        norm_title = normalize_title(raw_title)
+
+        # Exact pair check (using matched library artist)
+        if (matched_lib_artist, norm_title) in index.exact_pairs:
+            keep_ids.add(release_id)
+            continue
+
+        if not matched_titles_list:
+            prune_ids.add(release_id)
+            continue
+
+        title_result = process.extractOne(
+            norm_title,
+            matched_titles_list,
+            scorer=fuzz.token_set_ratio,
+        )
+
+        if title_result is None:
+            prune_ids.add(release_id)
+            continue
+
+        title_score = float(title_result[1])
+        combined = float((float(artist_score) * title_score) ** 0.5) / 100.0
+
+        if combined >= matcher.keep_threshold:
+            keep_ids.add(release_id)
+        elif combined >= matcher.review_threshold:
+            review_ids.add(release_id)
+            result = MatchResult(Decision.REVIEW, 0.0, 0.0, 0.0, combined)
+            review_by_artist.setdefault(norm_artist, []).append((release_id, raw_title, result))
+        else:
+            prune_ids.add(release_id)
+
+    return keep_ids, prune_ids, review_ids, review_by_artist
+
+
+def classify_fuzzy_batch(
+    artists: list[str],
+    by_artist: dict[str, list[tuple[int, str, str]]],
+    index: LibraryIndex,
+    matcher: MultiIndexMatcher,
+    artist_match_threshold: int = 60,
+) -> tuple[set[int], set[int], set[int], dict[str, list[tuple[int, str, MatchResult]]]]:
+    """Classify a batch of artists, aggregating results.
+
+    Returns (keep_ids, prune_ids, review_ids, review_by_artist).
+    """
+    keep_ids: set[int] = set()
+    prune_ids: set[int] = set()
+    review_ids: set[int] = set()
+    review_by_artist: dict[str, list[tuple[int, str, MatchResult]]] = {}
+
+    for norm_artist in artists:
+        a_keep, a_prune, a_review, a_review_by = classify_artist_fuzzy(
+            norm_artist, by_artist[norm_artist], index, matcher, artist_match_threshold
+        )
+        keep_ids |= a_keep
+        prune_ids |= a_prune
+        review_ids |= a_review
+        for k, v in a_review_by.items():
+            review_by_artist.setdefault(k, []).extend(v)
+
+    return keep_ids, prune_ids, review_ids, review_by_artist
+
+
 def classify_all_releases(
     releases: list[tuple[int, str, str]],
     index: LibraryIndex,
@@ -1038,7 +1325,6 @@ def classify_all_releases(
     artists_exact_matched = 0
     artists_fuzzy_matched = 0
     start_time = time.monotonic()
-    last_log_time = start_time
 
     # Build a set of library artist names for O(1) exact lookup
     library_artist_set = set(index.all_artists)
@@ -1142,103 +1428,48 @@ def classify_all_releases(
     # Match each artist ONCE against library artists, then classify their
     # releases by title only against the matched library artist's albums.
     # This avoids the O(releases * all_library_pairs) cost of full scoring.
+    #
+    # Parallelized via ThreadPoolExecutor. Rapidfuzz's C extension releases
+    # the GIL during extractOne, so threads achieve real parallelism.
     logger.info(
         "Phase 4: Fuzzy artist matching for %s artists...",
         f"{len(truly_fuzzy):,}",
     )
     phase4_start = time.monotonic()
-    last_log_time = phase4_start
-    artist_match_threshold = 60  # minimum artist similarity to consider
 
-    for i, norm_artist in enumerate(truly_fuzzy, 1):
-        artist_releases = by_artist[norm_artist]
-        raw_artist = artist_releases[0][1]
+    num_workers = min(os.cpu_count() or 4, 8)
+    chunk_size = max(1, len(truly_fuzzy) // (num_workers * 4))
+    chunks = [truly_fuzzy[i : i + chunk_size] for i in range(0, len(truly_fuzzy), chunk_size)]
 
-        if is_compilation_artist(raw_artist):
-            for release_id, _, raw_title in artist_releases:
-                norm_title = normalize_title(raw_title)
-                decision = classify_compilation(norm_title, index)
-                if decision == Decision.KEEP:
-                    keep_ids.add(release_id)
-                else:
-                    prune_ids.add(release_id)
-            releases_processed += len(artist_releases)
-            continue
+    logger.info(f"  Using {num_workers} workers, {len(chunks)} chunks of ~{chunk_size} artists")
 
-        # Single artist-level fuzzy match (one extractOne against 24K artists)
-        artist_result = process.extractOne(
-            norm_artist,
-            index.all_artists,
-            scorer=fuzz.token_set_ratio,
-            score_cutoff=artist_match_threshold,
-        )
+    completed_chunks = 0
+    with ThreadPoolExecutor(max_workers=num_workers) as executor:
+        futures = {
+            executor.submit(classify_fuzzy_batch, chunk, by_artist, index, matcher): chunk
+            for chunk in chunks
+        }
+        for future in as_completed(futures):
+            batch_keep, batch_prune, batch_review, batch_review_by = future.result()
+            keep_ids |= batch_keep
+            prune_ids |= batch_prune
+            review_ids |= batch_review
+            for k, v in batch_review_by.items():
+                review_by_artist.setdefault(k, []).extend(v)
 
-        if artist_result is None:
-            # No plausible artist match — prune all releases
-            for release_id, _, _ in artist_releases:
-                prune_ids.add(release_id)
-            releases_processed += len(artist_releases)
-            artists_fuzzy_matched += 1
-            continue
+            completed_chunks += 1
+            chunk = futures[future]
+            releases_processed += sum(len(by_artist[a]) for a in chunk)
+            artists_fuzzy_matched += len(chunk)
 
-        matched_lib_artist, artist_score, _ = artist_result
-        matched_titles_list = index.artist_to_titles_list.get(matched_lib_artist)
-
-        for release_id, _, raw_title in artist_releases:
-            norm_title = normalize_title(raw_title)
-
-            # Exact pair check (using matched library artist)
-            if (matched_lib_artist, norm_title) in index.exact_pairs:
-                keep_ids.add(release_id)
-                continue
-
-            # Title-level fuzzy match within the matched artist's albums
-            if not matched_titles_list:
-                prune_ids.add(release_id)
-                continue
-
-            title_result = process.extractOne(
-                norm_title,
-                matched_titles_list,
-                scorer=fuzz.token_set_ratio,
-            )
-
-            if title_result is None:
-                prune_ids.add(release_id)
-                continue
-
-            # Combine artist and title scores
-            title_score = float(title_result[1])
-            combined = float((float(artist_score) * title_score) ** 0.5) / 100.0
-
-            if combined >= matcher.keep_threshold:
-                keep_ids.add(release_id)
-            elif combined >= matcher.review_threshold:
-                review_ids.add(release_id)
-                result = MatchResult(Decision.REVIEW, 0.0, 0.0, 0.0, combined)
-                review_by_artist.setdefault(norm_artist, []).append((release_id, raw_title, result))
-            else:
-                prune_ids.add(release_id)
-
-        releases_processed += len(artist_releases)
-        artists_fuzzy_matched += 1
-
-        # Log progress every 10 seconds
-        now = time.monotonic()
-        if now - last_log_time >= 10:
-            fuzzy_elapsed = now - phase4_start
-            fuzzy_rate = artists_fuzzy_matched / fuzzy_elapsed if fuzzy_elapsed > 0 else 0
-            remaining_artists = len(truly_fuzzy) - i
-            remaining_sec = remaining_artists / fuzzy_rate if fuzzy_rate > 0 else 0
+            elapsed = time.monotonic() - phase4_start
             logger.info(
-                f"  {i:,}/{len(truly_fuzzy):,} fuzzy artists "
-                f"({releases_processed:,}/{total_releases:,} total releases) "
-                f"| {fuzzy_rate:,.0f} artists/s "
-                f"| ~{remaining_sec / 60:.1f}m remaining "
+                f"  Chunk {completed_chunks}/{len(chunks)} done "
+                f"({releases_processed:,}/{total_releases:,} releases) "
+                f"| {elapsed:.1f}s elapsed "
                 f"| KEEP={len(keep_ids):,} PRUNE={len(prune_ids):,} "
                 f"REVIEW={len(review_ids):,}"
             )
-            last_log_time = now
 
     elapsed = time.monotonic() - start_time
     logger.info(
@@ -1311,17 +1542,25 @@ async def async_main():
             rows_to_delete = await count_rows_to_delete(conn, report.prune_ids)
             print_report(report, index, table_sizes, rows_to_delete, pruned=False)
         elif args.prune:
-            # Actually delete PRUNE releases (never REVIEW)
+            # Actually prune non-matching releases (never REVIEW)
             logger.info(f"Pruning {len(report.prune_ids):,} releases...")
-            rows_deleted = await prune_releases(conn, report.prune_ids)
-            print_report(report, index, table_sizes, rows_deleted, pruned=True)
+            if len(report.prune_ids) > 10000:
+                # Large prune set: copy-and-swap is faster than CASCADE DELETE
+                await conn.close()
+                conn = None
+                prune_releases_copy_swap(args.database_url, report.keep_ids, report.review_ids)
+            else:
+                await prune_releases(conn, report.prune_ids)
+            print_report(report, index, table_sizes, pruned=True)
+
         else:
             # Dry run: count what would be deleted
             logger.info("Counting rows that would be deleted (dry run)...")
             rows_to_delete = await count_rows_to_delete(conn, report.prune_ids)
             print_report(report, index, table_sizes, rows_to_delete, pruned=False)
     finally:
-        await conn.close()
+        if conn is not None:
+            await conn.close()
 
 
 def main():
