@@ -4,7 +4,7 @@
 
 ETL pipeline for building and maintaining a PostgreSQL cache of Discogs release data, filtered to artists in the WXYC radio library catalog. The cache database is a shared resource consumed by multiple services:
 
-- **request-o-matic** (Python/FastAPI) - `discogs/cache_service.py` queries the cache for album lookups
+- **library-metadata-lookup** (Python/FastAPI) - `discogs/cache_service.py` queries the cache for album lookups
 - **Backend-Service** (TypeScript/Node.js) - future consumer for Discogs data
 
 ## Architecture
@@ -71,16 +71,20 @@ docker compose up db -d     # just the database (for tests)
 - `lib/matching.py` -- Compilation detection utility
 - `lib/pipeline_state.py` -- Pipeline state tracking for resumable runs
 - `lib/db_introspect.py` -- Database introspection for inferring pipeline state on resume
+- `scripts/export_to_sqlite.py` -- Generate `library.db` from WXYC MySQL catalog via SSH
+- `scripts/sync-library.sh` -- Orchestrate library.db generation + upload to library-metadata-lookup
 - `docs/discogs-cache-technical-overview.md` -- Design rationale, benchmarks, and pipeline architecture details
 
 ### External Inputs
 
-Two files are inputs to the ETL but produced by request-o-matic:
+### Library Catalog (library.db)
 
-1. **`library_artists.txt`** -- One artist name per line, used by `discogs-xml-converter --library-artists` for filtering
-2. **`library.db`** -- SQLite database, used by `verify_cache.py` for KEEP/PRUNE classification
+`library.db` is a SQLite export of the WXYC library catalog, generated from the MySQL database on Kattare by `scripts/export_to_sqlite.py`. It is used as input throughout the pipeline:
 
-Both are produced by request-o-matic's library sync (`scripts/sync-library.sh`).
+1. **`library_artists.txt`** -- Generated from `library.db` by `scripts/enrich_library_artists.py`, one artist name per line, used by `discogs-xml-converter --library-artists` for filtering
+2. **KEEP/PRUNE classification** -- `scripts/verify_cache.py` uses `library.db` to match cached releases against the WXYC catalog
+
+`scripts/sync-library.sh` orchestrates the full flow: generate `library.db`, then upload it to library-metadata-lookup staging and production. The pipeline can also generate `library.db` inline via `--generate-library-db`.
 
 ## Development
 

@@ -93,7 +93,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=Path,
         metavar="FILE",
         help="Path to library.db for KEEP/PRUNE classification "
-        "(optional; if omitted, the prune step is skipped).",
+        "(optional; if omitted, the prune step is skipped). "
+        "Use --generate-library-db to generate it from MySQL via SSH.",
+    )
+    parser.add_argument(
+        "--generate-library-db",
+        action="store_true",
+        default=False,
+        help="Generate library.db from the WXYC MySQL catalog via SSH before "
+        "running the pipeline. Requires LIBRARY_SSH_HOST, LIBRARY_SSH_USER, "
+        "LIBRARY_DB_HOST, LIBRARY_DB_USER, LIBRARY_DB_PASSWORD, and "
+        "LIBRARY_DB_NAME environment variables. Conflicts with --library-db.",
     )
     parser.add_argument(
         "--wxyc-db-url",
@@ -162,11 +172,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         if args.resume:
             parser.error("--resume is only valid with --csv-dir, not --xml")
 
-    if args.wxyc_db_url and not args.library_db:
-        parser.error("--library-db is required when using --wxyc-db-url")
+    if args.generate_library_db and args.library_db:
+        parser.error("--generate-library-db and --library-db are mutually exclusive")
 
-    if args.target_db_url and not args.library_db:
-        parser.error("--library-db is required when using --target-db-url")
+    if args.wxyc_db_url and not args.library_db and not args.generate_library_db:
+        parser.error("--library-db or --generate-library-db is required when using --wxyc-db-url")
+
+    if args.target_db_url and not args.library_db and not args.generate_library_db:
+        parser.error(
+            "--library-db or --generate-library-db is required when using --target-db-url"
+        )
 
     return args
 
@@ -355,12 +370,27 @@ def _load_or_create_state(args: argparse.Namespace) -> PipelineState:
     return PipelineState(db_url=args.database_url, csv_dir=csv_dir_str)
 
 
+def generate_library_db(output_path: Path) -> None:
+    """Step 0: Generate library.db from WXYC MySQL catalog via SSH."""
+    run_step(
+        "Generate library.db from MySQL",
+        [sys.executable, str(SCRIPT_DIR / "export_to_sqlite.py")],
+        env={**os.environ, "LIBRARY_DB_OUTPUT_PATH": str(output_path)},
+    )
+
+
 def main() -> None:
     args = parse_args()
 
     python = sys.executable
     db_url = args.database_url
     pipeline_start = time.monotonic()
+
+    # Generate library.db if requested
+    if args.generate_library_db:
+        generated_db = Path(tempfile.mkdtemp(prefix="discogs_library_")) / "library.db"
+        generate_library_db(generated_db)
+        args.library_db = generated_db
 
     # Validate paths
     if args.xml is not None:
