@@ -26,8 +26,7 @@ services:
       - ./data:/data:ro
     command: >
       python scripts/run_pipeline.py
-      --xml /data/releases.xml.gz
-      --library-artists /data/library_artists.txt
+      --xml /data/
       --library-db /data/library.db
 
 volumes:
