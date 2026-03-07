@@ -63,8 +63,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     source.add_argument(
         "--xml",
         type=Path,
-        metavar="FILE",
-        help="Path to Discogs releases XML dump (e.g. releases.xml.gz).",
+        metavar="PATH",
+        help="Path to Discogs XML dump file or directory containing XML dumps "
+        "(e.g. releases.xml.gz or a directory with artists.xml, labels.xml, releases.xml).",
     )
     source.add_argument(
         "--csv-dir",
@@ -128,6 +129,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Path to pre-generated library_labels.csv for label-aware dedup. "
         "If omitted but --wxyc-db-url is provided, labels are extracted "
         "automatically before dedup.",
+    )
+    parser.add_argument(
+        "--label-hierarchy",
+        type=Path,
+        default=None,
+        metavar="FILE",
+        help="Path to label_hierarchy.csv from discogs-xml-converter. "
+        "Enables sublabel resolution during label-aware dedup. "
+        "In --xml mode with directory input, auto-detected from converter output.",
     )
     parser.add_argument(
         "--resume",
@@ -355,7 +365,7 @@ def main() -> None:
     # Validate paths
     if args.xml is not None:
         if not args.xml.exists():
-            logger.error("XML file not found: %s", args.xml)
+            logger.error("XML path not found: %s", args.xml)
             sys.exit(1)
         if args.library_artists and not args.library_artists.exists():
             logger.error("library_artists.txt not found: %s", args.library_artists)
@@ -379,15 +389,23 @@ def main() -> None:
             tmp = Path(tmpdir)
             csv_dir = tmp / "csv"
 
-            # -- enrich_artists: Enrich library_artists.txt (optional)
+            # -- enrich_artists: Generate/enrich library_artists.txt from library.db
             library_artists_path = args.library_artists
-            if args.library_db and library_artists_path:
-                enriched_artists = tmp / "enriched_library_artists.txt"
+            if args.library_db:
+                enriched_artists = tmp / "library_artists.txt"
                 enrich_library_artists(args.library_db, enriched_artists, args.wxyc_db_url)
                 library_artists_path = enriched_artists
 
             # -- convert_and_filter: XML to CSV (with optional artist filtering)
             convert_and_filter(args.xml, csv_dir, args.converter, library_artists_path)
+
+            # Auto-detect label_hierarchy.csv from converter output
+            hierarchy_csv = args.label_hierarchy
+            if hierarchy_csv is None:
+                auto_hierarchy = csv_dir / "label_hierarchy.csv"
+                if auto_hierarchy.exists():
+                    logger.info("Auto-detected label_hierarchy.csv from converter output")
+                    hierarchy_csv = auto_hierarchy
 
             # -- database build (create_schema through vacuum)
             _run_database_build(
@@ -396,6 +414,7 @@ def main() -> None:
                 args.library_db,
                 python,
                 library_labels=args.library_labels,
+                label_hierarchy=hierarchy_csv,
                 wxyc_db_url=args.wxyc_db_url,
             )
     else:
@@ -408,6 +427,7 @@ def main() -> None:
             python,
             target_db_url=args.target_db_url,
             library_labels=args.library_labels,
+            label_hierarchy=args.label_hierarchy,
             wxyc_db_url=args.wxyc_db_url,
             state=state,
             state_file=args.state_file,
@@ -425,6 +445,7 @@ def _run_database_build(
     *,
     target_db_url: str | None = None,
     library_labels: Path | None = None,
+    label_hierarchy: Path | None = None,
     wxyc_db_url: str | None = None,
     state: PipelineState | None = None,
     state_file: Path | None = None,
@@ -502,6 +523,8 @@ def _run_database_build(
         dedup_cmd = [python, str(SCRIPT_DIR / "dedup_releases.py")]
         if labels_csv is not None:
             dedup_cmd.extend(["--library-labels", str(labels_csv)])
+        if label_hierarchy is not None:
+            dedup_cmd.extend(["--label-hierarchy", str(label_hierarchy)])
         dedup_cmd.append(db_url)
 
         run_step("Deduplicate releases", dedup_cmd)

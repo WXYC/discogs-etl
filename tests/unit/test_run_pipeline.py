@@ -6,6 +6,7 @@ import importlib.util
 import logging
 import sys
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -169,3 +170,68 @@ class TestArgParsing:
                     "mysql://user:pass@host/db",
                 ]
             )
+
+    def test_label_hierarchy_parsed(self) -> None:
+        args = run_pipeline.parse_args(
+            [
+                "--csv-dir",
+                "/tmp/csv",
+                "--label-hierarchy",
+                "/tmp/label_hierarchy.csv",
+            ]
+        )
+        assert args.label_hierarchy == Path("/tmp/label_hierarchy.csv")
+
+    def test_label_hierarchy_default_none(self) -> None:
+        args = run_pipeline.parse_args(["--csv-dir", "/tmp/csv"])
+        assert args.label_hierarchy is None
+
+    def test_xml_accepts_directory_path(self) -> None:
+        """--xml can accept a directory path (for multi-XML input)."""
+        args = run_pipeline.parse_args(["--xml", "/tmp/xml_dumps/"])
+        assert args.xml == Path("/tmp/xml_dumps/")
+
+
+class TestXmlModeEnrichment:
+    """In --xml mode, library_artists.txt is generated from library.db when not provided."""
+
+    def test_enrich_called_with_library_db_only(self, tmp_path) -> None:
+        """When --library-db is provided without --library-artists, the pipeline
+        generates library_artists.txt from library.db via enrich_library_artists."""
+        xml_file = tmp_path / "releases.xml.gz"
+        xml_file.touch()
+        library_db = tmp_path / "library.db"
+        library_db.touch()
+
+        args = run_pipeline.parse_args(
+            [
+                "--xml",
+                str(xml_file),
+                "--library-db",
+                str(library_db),
+            ]
+        )
+
+        enrich_calls = []
+        convert_calls = []
+
+        def fake_enrich(lib_db, output, wxyc_url=None):
+            enrich_calls.append((lib_db, output, wxyc_url))
+
+        def fake_convert(xml, output_dir, converter, library_artists=None):
+            convert_calls.append((xml, output_dir, converter, library_artists))
+
+        with (
+            patch.object(run_pipeline, "enrich_library_artists", side_effect=fake_enrich),
+            patch.object(run_pipeline, "convert_and_filter", side_effect=fake_convert),
+            patch.object(run_pipeline, "_run_database_build"),
+            patch.object(run_pipeline, "parse_args", return_value=args),
+        ):
+            run_pipeline.main()
+
+        assert len(enrich_calls) == 1, "enrich_library_artists should be called"
+        assert len(convert_calls) == 1, "convert_and_filter should be called"
+        # The generated artist list path should be passed to the converter
+        assert convert_calls[0][3] is not None, (
+            "library_artists path should be passed to convert_and_filter"
+        )
