@@ -82,8 +82,8 @@ BASE_TABLES: list[TableConfig] = [
     {
         "csv_file": "release_artist.csv",
         "table": "release_artist",
-        "csv_columns": ["release_id", "artist_name", "extra"],
-        "db_columns": ["release_id", "artist_name", "extra"],
+        "csv_columns": ["release_id", "artist_id", "artist_name", "extra"],
+        "db_columns": ["release_id", "artist_id", "artist_name", "extra"],
         "required": ["release_id"],
         "transforms": {},
         "unique_key": ["release_id", "artist_name"],

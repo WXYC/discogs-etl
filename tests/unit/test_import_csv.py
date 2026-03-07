@@ -109,6 +109,12 @@ class TestTablesConfig:
         assert "country" in release_config["csv_columns"]
         assert "country" in release_config["db_columns"]
 
+    def test_release_artist_table_includes_artist_id(self) -> None:
+        """The release_artist table must import artist_id for alias-enhanced filtering."""
+        ra_config = next(t for t in TABLES if t["table"] == "release_artist")
+        assert "artist_id" in ra_config["csv_columns"]
+        assert "artist_id" in ra_config["db_columns"]
+
     def test_release_table_transforms_released_to_year(self) -> None:
         """The released field should be transformed via extract_year."""
         release_config = next(t for t in TABLES if t["table"] == "release")

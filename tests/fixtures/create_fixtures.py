@@ -263,6 +263,29 @@ def create_library_labels_csv() -> None:
     write_csv("library_labels.csv", headers, rows)
 
 
+def create_label_hierarchy_csv() -> None:
+    """Create label_hierarchy.csv with parent-child label relationships.
+
+    Mirrors the output of discogs-xml-converter's label parser.
+    Used to test sublabel resolution during label-aware dedup.
+
+    The existing release_label.csv has:
+      - 1001: Parlophone, Capitol Records
+      - 1002: Capitol Records
+      - 1003: EMI
+    The library_labels.csv says WXYC owns "Parlophone" pressing.
+
+    With this hierarchy, "EMI" (parent) matches releases labeled "Parlophone"
+    or "Capitol Records" (sublabels), and vice versa.
+    """
+    headers = ["label_id", "label_name", "parent_label_id", "parent_label_name"]
+    rows = [
+        [2, "Parlophone", 1, "EMI"],
+        [3, "Capitol Records", 1, "EMI"],
+    ]
+    write_csv("label_hierarchy.csv", headers, rows)
+
+
 def create_library_db() -> None:
     """Create a SQLite library.db with (artist, title) pairs.
 
@@ -355,6 +378,7 @@ def main() -> None:
     create_release_label_csv()
     create_release_image_csv()
     create_library_labels_csv()
+    create_label_hierarchy_csv()
     print()
     print("Library data:")
     create_library_db()
