@@ -1,4 +1,4 @@
-FROM rust:1.77 AS rust-builder
+FROM rust:1.87 AS rust-builder
 WORKDIR /build
 RUN apt-get update && \
     apt-get install -y --no-install-recommends git && \
