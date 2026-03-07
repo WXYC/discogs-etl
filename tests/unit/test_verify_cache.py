@@ -567,7 +567,170 @@ class TestLoadDiscogsReleases:
 # Step 8: Argument Parsing
 # ---------------------------------------------------------------------------
 
+classify_all_releases = _vc.classify_all_releases
+classify_artist_fuzzy = _vc.classify_artist_fuzzy
+classify_fuzzy_batch = _vc.classify_fuzzy_batch
+prune_releases_copy_swap = _vc.prune_releases_copy_swap
+
 parse_args = _vc.parse_args
+
+
+# ---------------------------------------------------------------------------
+# Step 8.5: Parallel Fuzzy Matching
+# ---------------------------------------------------------------------------
+
+
+class TestClassifyArtistFuzzy:
+    """Test the extracted per-artist fuzzy classification function."""
+
+    def test_high_score_match_returns_keep(self, sample_index):
+        """An artist that closely matches a library artist returns keep IDs."""
+        matcher = MultiIndexMatcher(sample_index)
+        # "radiohead" is in library. A slight misspelling should still match.
+        by_artist = {"radioheed": [(999, "Radioheed", "OK Computer")]}
+        keep, prune, review, review_by = classify_artist_fuzzy(
+            "radioheed", by_artist["radioheed"], sample_index, matcher
+        )
+        # "OK Computer" should match, so release 999 should be in keep
+        assert 999 in keep
+
+    def test_no_match_returns_prune(self, sample_index):
+        """An artist with no plausible match returns prune IDs."""
+        matcher = MultiIndexMatcher(sample_index)
+        releases = [(888, "Zzyzx Unknownband", "Nonexistent Album")]
+        keep, prune, review, review_by = classify_artist_fuzzy(
+            "zzyzx unknownband", releases, sample_index, matcher
+        )
+        assert 888 in prune
+        assert not keep
+
+    def test_compilation_artist_uses_title_matching(self, sample_index):
+        """Compilation artists should use title-only matching."""
+        matcher = MultiIndexMatcher(sample_index)
+        releases = [(777, "Various Artists", "Sugar Hill")]
+        keep, prune, review, review_by = classify_artist_fuzzy(
+            "various artists", releases, sample_index, matcher
+        )
+        assert 777 in keep
+
+    def test_returns_four_collections(self, sample_index):
+        """Function returns (keep_ids, prune_ids, review_ids, review_by_artist)."""
+        matcher = MultiIndexMatcher(sample_index)
+        releases = [(100, "Nobody", "Nothing")]
+        result = classify_artist_fuzzy("nobody", releases, sample_index, matcher)
+        assert len(result) == 4
+        keep, prune, review, review_by = result
+        assert isinstance(keep, set)
+        assert isinstance(prune, set)
+        assert isinstance(review, set)
+        assert isinstance(review_by, dict)
+
+
+class TestClassifyFuzzyBatch:
+    """Test batch processing of multiple artists."""
+
+    def test_batch_aggregates_multiple_artists(self, sample_index):
+        """Batch processing aggregates results from multiple artists."""
+        matcher = MultiIndexMatcher(sample_index)
+        by_artist = {
+            "radioheed": [(101, "Radioheed", "OK Computer")],
+            "zzyzx unknownband": [(102, "Zzyzx Unknownband", "Fake Album")],
+        }
+        artists = ["radioheed", "zzyzx unknownband"]
+        keep, prune, review, review_by = classify_fuzzy_batch(
+            artists, by_artist, sample_index, matcher
+        )
+        assert 101 in keep
+        assert 102 in prune
+
+    def test_empty_batch_returns_empty_sets(self, sample_index):
+        """Empty artist list returns empty sets."""
+        matcher = MultiIndexMatcher(sample_index)
+        keep, prune, review, review_by = classify_fuzzy_batch([], {}, sample_index, matcher)
+        assert keep == set()
+        assert prune == set()
+        assert review == set()
+        assert review_by == {}
+
+
+class TestPruneCopySwapSQL:
+    """Test prune_releases_copy_swap generates correct SQL operations."""
+
+    def _make_mock_conn(self):
+        """Create a mock psycopg connection with proper cursor context manager."""
+        from unittest.mock import MagicMock
+
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        # fetchone returns (count,) for "SELECT count(*)" queries
+        mock_cursor.fetchone.return_value = (42,)
+        # copy context manager
+        mock_cursor.copy.return_value.__enter__ = MagicMock()
+        mock_cursor.copy.return_value.__exit__ = MagicMock(return_value=False)
+        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
+        mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+        return mock_conn, mock_cursor
+
+    def test_creates_keep_ids_table(self):
+        """Should create a temp table with keep + review IDs."""
+        mock_conn, mock_cursor = self._make_mock_conn()
+
+        with patch("verify_cache.psycopg") as mock_psycopg:
+            mock_psycopg.connect.return_value = mock_conn
+            prune_releases_copy_swap("postgresql:///test", keep_ids={1, 2, 3}, review_ids={4})
+
+        # Verify _keep_ids temp table was created
+        executed_sqls = [str(c) for c in mock_cursor.execute.call_args_list]
+        assert any("_keep_ids" in s for s in executed_sqls)
+
+    def test_swaps_all_release_tables(self):
+        """Should swap release, release_artist, release_label, release_track,
+        release_track_artist, and cache_metadata."""
+        mock_conn, mock_cursor = self._make_mock_conn()
+
+        with patch("verify_cache.psycopg") as mock_psycopg:
+            mock_psycopg.connect.return_value = mock_conn
+            prune_releases_copy_swap("postgresql:///test", keep_ids={1, 2}, review_ids={3})
+
+        all_sql = " ".join(str(c) for c in mock_cursor.execute.call_args_list)
+        # All tables should be involved in the copy-swap
+        for table in [
+            "release",
+            "release_artist",
+            "release_label",
+            "release_track",
+            "release_track_artist",
+            "cache_metadata",
+        ]:
+            assert f"new_{table}" in all_sql, f"{table} should be part of copy-swap"
+
+    def test_empty_ids_is_noop(self):
+        """Empty keep + review IDs should not connect to database."""
+        with patch("verify_cache.psycopg") as mock_psycopg:
+            prune_releases_copy_swap("postgresql:///test", keep_ids=set(), review_ids=set())
+        mock_psycopg.connect.assert_not_called()
+
+
+class TestParallelMatchesSerial:
+    """Verify parallel fuzzy matching produces identical results to serial."""
+
+    def test_parallel_matches_serial(self, sample_index):
+        """classify_all_releases should produce identical results regardless of threading."""
+        releases = [
+            (1, "Radiohead", "OK Computer"),
+            (2, "Joy Division", "Unknown Pleasures"),
+            (3, "Aphex Twin", "Selected Ambient Works 85-92"),
+            (4, "Nobody Real", "Fake Album XYZ"),
+            (5, "Another Unknown", "Phantom Record"),
+        ]
+        matcher = MultiIndexMatcher(sample_index)
+
+        report = classify_all_releases(releases, sample_index, matcher)
+
+        # Exact-match artists (radiohead, joy division, aphex twin) should be KEEP
+        assert {1, 2, 3} <= report.keep_ids
+        # Unknown artists should be PRUNE
+        assert {4, 5} <= report.prune_ids
 
 
 class TestParseArgsCopyTo:

@@ -380,6 +380,75 @@ def _import_tables(
     return total
 
 
+def _import_tables_parallel(
+    db_url: str,
+    csv_dir: Path,
+    parent_tables: list[TableConfig],
+    child_tables: list[TableConfig],
+    release_id_filter: set[int] | None = None,
+) -> int:
+    """Import parent tables sequentially, then child tables concurrently.
+
+    Each child table import runs on its own connection via ThreadPoolExecutor.
+    Parent tables must be imported first to satisfy FK constraints.
+
+    Returns total row count across all tables.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    total = 0
+
+    # Import parent tables sequentially (on a shared connection)
+    conn = psycopg.connect(db_url)
+    for table_config in parent_tables:
+        csv_path = csv_dir / table_config["csv_file"]
+        if not csv_path.exists():
+            logger.warning(f"Skipping {table_config['csv_file']} (not found)")
+            continue
+        count = import_csv(
+            conn,
+            csv_path,
+            table_config["table"],
+            table_config["csv_columns"],
+            table_config["db_columns"],
+            table_config["required"],
+            table_config["transforms"],
+            unique_key=table_config.get("unique_key"),
+            release_id_filter=release_id_filter,
+        )
+        total += count
+    conn.close()
+
+    # Import child tables concurrently (each on its own connection)
+    def _import_child(table_config: TableConfig) -> int:
+        csv_path = csv_dir / table_config["csv_file"]
+        if not csv_path.exists():
+            logger.warning(f"Skipping {table_config['csv_file']} (not found)")
+            return 0
+        child_conn = psycopg.connect(db_url)
+        count = import_csv(
+            child_conn,
+            csv_path,
+            table_config["table"],
+            table_config["csv_columns"],
+            table_config["db_columns"],
+            table_config["required"],
+            table_config["transforms"],
+            unique_key=table_config.get("unique_key"),
+            release_id_filter=release_id_filter,
+        )
+        child_conn.close()
+        return count
+
+    if child_tables:
+        with ThreadPoolExecutor(max_workers=len(child_tables)) as executor:
+            futures = [executor.submit(_import_child, tc) for tc in child_tables]
+            for future in futures:
+                total += future.result()
+
+    return total
+
+
 def main():
     import argparse
 
@@ -421,10 +490,23 @@ def main():
         with conn.cursor() as cur:
             cur.execute("SELECT id FROM release")
             release_ids = {row[0] for row in cur.fetchall()}
+        conn.close()
         logger.info(f"Filtering tracks to {len(release_ids):,} surviving releases")
-        total = _import_tables(conn, csv_dir, TRACK_TABLES, release_id_filter=release_ids)
+        # release_track and release_track_artist are independent — import in parallel
+        total = _import_tables_parallel(
+            db_url,
+            csv_dir,
+            parent_tables=[],
+            child_tables=TRACK_TABLES,
+            release_id_filter=release_ids,
+        )
     elif args.base_only:
-        total = _import_tables(conn, csv_dir, BASE_TABLES)
+        conn.close()
+        # release is parent; release_artist and release_label are independent children
+        total = _import_tables_parallel(
+            db_url, csv_dir, parent_tables=BASE_TABLES[:1], child_tables=BASE_TABLES[1:]
+        )
+        conn = psycopg.connect(db_url)
         import_artwork(conn, csv_dir)
         logger.info("Populating cache_metadata...")
         with conn.cursor() as cur:
@@ -436,6 +518,7 @@ def main():
             """)
         conn.commit()
         create_track_count_table(conn, csv_dir)
+        conn.close()
     else:
         total = _import_tables(conn, csv_dir, TABLES)
         import_artwork(conn, csv_dir)
@@ -448,9 +531,9 @@ def main():
                 ON CONFLICT (release_id) DO NOTHING
             """)
         conn.commit()
+        conn.close()
 
     logger.info(f"Total: {total:,} rows imported")
-    conn.close()
 
 
 if __name__ == "__main__":

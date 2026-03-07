@@ -351,47 +351,81 @@ def swap_tables(conn, old_table: str, new_table: str) -> None:
     logger.info(f"  Swapped {new_table} -> {old_table}")
 
 
+def _exec_one(db_url: str, stmt: str) -> None:
+    """Execute a single SQL statement on its own connection (autocommit)."""
+    conn = psycopg.connect(db_url, autocommit=True)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(stmt)
+    finally:
+        conn.close()
+
+
 def add_base_constraints_and_indexes(conn) -> None:
     """Add PK, FK constraints and indexes to base tables (no track tables).
 
     Called after dedup copy-swap. Track constraints are added separately
     by create_track_indexes.sql after track import.
+
+    Parallelizes independent index/constraint creation:
+    - Level 1: PK on release (must be first, FK constraints depend on it)
+    - Level 2: FK constraints + FK indexes (parallel, all depend on PK only)
+    - Level 3: GIN trigram indexes + cache metadata indexes (parallel, independent)
     """
     logger.info("Adding base constraints and indexes...")
     start = time.time()
 
-    statements = [
-        # Primary key on release
-        "ALTER TABLE release ADD PRIMARY KEY (id)",
-        # FK constraints with CASCADE (base tables only)
-        "ALTER TABLE release_artist ADD CONSTRAINT fk_release_artist_release "
-        "FOREIGN KEY (release_id) REFERENCES release(id) ON DELETE CASCADE",
-        "ALTER TABLE release_label ADD CONSTRAINT fk_release_label_release "
-        "FOREIGN KEY (release_id) REFERENCES release(id) ON DELETE CASCADE",
-        "ALTER TABLE cache_metadata ADD CONSTRAINT fk_cache_metadata_release "
-        "FOREIGN KEY (release_id) REFERENCES release(id) ON DELETE CASCADE",
-        "ALTER TABLE cache_metadata ADD PRIMARY KEY (release_id)",
-        # FK indexes (base tables only)
-        "CREATE INDEX idx_release_artist_release_id ON release_artist(release_id)",
-        "CREATE INDEX idx_release_label_release_id ON release_label(release_id)",
-        # Base trigram indexes for fuzzy search (accent-insensitive via f_unaccent)
-        "CREATE INDEX idx_release_artist_name_trgm ON release_artist "
-        "USING gin (lower(f_unaccent(artist_name)) gin_trgm_ops)",
-        "CREATE INDEX idx_release_title_trgm ON release "
-        "USING gin (lower(f_unaccent(title)) gin_trgm_ops)",
-        # Cache metadata indexes
-        "CREATE INDEX idx_cache_metadata_cached_at ON cache_metadata(cached_at)",
-        "CREATE INDEX idx_cache_metadata_source ON cache_metadata(source)",
-    ]
+    from concurrent.futures import ThreadPoolExecutor, as_completed
 
+    db_url = conn.info.dsn
+
+    def _exec_parallel(stmts: list[str], label: str) -> None:
+        if not stmts:
+            return
+        logger.info(f"  {label} ({len(stmts)} statements)...")
+        level_start = time.time()
+        with ThreadPoolExecutor(max_workers=min(len(stmts), 4)) as executor:
+            futures = {executor.submit(_exec_one, db_url, s): s for s in stmts}
+            for future in as_completed(futures):
+                future.result()
+        logger.info(f"    done in {time.time() - level_start:.1f}s")
+
+    # Level 1: PK on release (serial, must be first)
+    logger.info("  [Level 1] ALTER TABLE release ADD PRIMARY KEY...")
+    pk_start = time.time()
     with conn.cursor() as cur:
-        for i, stmt in enumerate(statements):
-            label = stmt.split("(")[0].strip() if "(" in stmt else stmt[:60]
-            logger.info(f"  [{i + 1}/{len(statements)}] {label}...")
-            stmt_start = time.time()
-            cur.execute(stmt)
-            conn.commit()
-            logger.info(f"    done in {time.time() - stmt_start:.1f}s")
+        cur.execute("ALTER TABLE release ADD PRIMARY KEY (id)")
+    conn.commit()
+    logger.info(f"    done in {time.time() - pk_start:.1f}s")
+
+    # Level 2: FK constraints + PK on cache_metadata + FK indexes (parallel)
+    _exec_parallel(
+        [
+            "ALTER TABLE release_artist ADD CONSTRAINT fk_release_artist_release "
+            "FOREIGN KEY (release_id) REFERENCES release(id) ON DELETE CASCADE",
+            "ALTER TABLE release_label ADD CONSTRAINT fk_release_label_release "
+            "FOREIGN KEY (release_id) REFERENCES release(id) ON DELETE CASCADE",
+            "ALTER TABLE cache_metadata ADD CONSTRAINT fk_cache_metadata_release "
+            "FOREIGN KEY (release_id) REFERENCES release(id) ON DELETE CASCADE",
+            "ALTER TABLE cache_metadata ADD PRIMARY KEY (release_id)",
+            "CREATE INDEX idx_release_artist_release_id ON release_artist(release_id)",
+            "CREATE INDEX idx_release_label_release_id ON release_label(release_id)",
+        ],
+        "Level 2: FK constraints + FK indexes",
+    )
+
+    # Level 3: GIN trigram indexes + cache metadata indexes (parallel)
+    _exec_parallel(
+        [
+            "CREATE INDEX idx_release_artist_name_trgm ON release_artist "
+            "USING gin (lower(f_unaccent(artist_name)) gin_trgm_ops)",
+            "CREATE INDEX idx_release_title_trgm ON release "
+            "USING gin (lower(f_unaccent(title)) gin_trgm_ops)",
+            "CREATE INDEX idx_cache_metadata_cached_at ON cache_metadata(cached_at)",
+            "CREATE INDEX idx_cache_metadata_source ON cache_metadata(source)",
+        ],
+        "Level 3: GIN trigram + metadata indexes",
+    )
 
     elapsed = time.time() - start
     logger.info(f"Base constraints and indexes added in {elapsed:.1f}s")
@@ -402,34 +436,52 @@ def add_track_constraints_and_indexes(conn) -> None:
 
     Called after track import (post-dedup). Equivalent to running
     create_track_indexes.sql.
+
+    Parallelizes independent statements:
+    - Level 1: FK constraints (parallel, both depend on release PK only)
+    - Level 2: FK indexes + GIN trigram indexes (parallel, independent)
     """
     logger.info("Adding track constraints and indexes...")
     start = time.time()
 
-    statements = [
-        # FK constraints with CASCADE
-        "ALTER TABLE release_track ADD CONSTRAINT fk_release_track_release "
-        "FOREIGN KEY (release_id) REFERENCES release(id) ON DELETE CASCADE",
-        "ALTER TABLE release_track_artist ADD CONSTRAINT fk_release_track_artist_release "
-        "FOREIGN KEY (release_id) REFERENCES release(id) ON DELETE CASCADE",
-        # FK indexes
-        "CREATE INDEX idx_release_track_release_id ON release_track(release_id)",
-        "CREATE INDEX idx_release_track_artist_release_id ON release_track_artist(release_id)",
-        # Track trigram indexes for fuzzy search
-        "CREATE INDEX idx_release_track_title_trgm ON release_track "
-        "USING gin (lower(f_unaccent(title)) gin_trgm_ops)",
-        "CREATE INDEX idx_release_track_artist_name_trgm ON release_track_artist "
-        "USING gin (lower(f_unaccent(artist_name)) gin_trgm_ops)",
-    ]
+    from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    with conn.cursor() as cur:
-        for i, stmt in enumerate(statements):
-            label = stmt.split("(")[0].strip() if "(" in stmt else stmt[:60]
-            logger.info(f"  [{i + 1}/{len(statements)}] {label}...")
-            stmt_start = time.time()
-            cur.execute(stmt)
-            conn.commit()
-            logger.info(f"    done in {time.time() - stmt_start:.1f}s")
+    db_url = conn.info.dsn
+
+    def _exec_parallel(stmts: list[str], label: str) -> None:
+        if not stmts:
+            return
+        logger.info(f"  {label} ({len(stmts)} statements)...")
+        level_start = time.time()
+        with ThreadPoolExecutor(max_workers=min(len(stmts), 4)) as executor:
+            futures = {executor.submit(_exec_one, db_url, s): s for s in stmts}
+            for future in as_completed(futures):
+                future.result()
+        logger.info(f"    done in {time.time() - level_start:.1f}s")
+
+    # Level 1: FK constraints (parallel)
+    _exec_parallel(
+        [
+            "ALTER TABLE release_track ADD CONSTRAINT fk_release_track_release "
+            "FOREIGN KEY (release_id) REFERENCES release(id) ON DELETE CASCADE",
+            "ALTER TABLE release_track_artist ADD CONSTRAINT fk_release_track_artist_release "
+            "FOREIGN KEY (release_id) REFERENCES release(id) ON DELETE CASCADE",
+        ],
+        "Level 1: FK constraints",
+    )
+
+    # Level 2: FK indexes + GIN trigram indexes (parallel)
+    _exec_parallel(
+        [
+            "CREATE INDEX idx_release_track_release_id ON release_track(release_id)",
+            "CREATE INDEX idx_release_track_artist_release_id ON release_track_artist(release_id)",
+            "CREATE INDEX idx_release_track_title_trgm ON release_track "
+            "USING gin (lower(f_unaccent(title)) gin_trgm_ops)",
+            "CREATE INDEX idx_release_track_artist_name_trgm ON release_track_artist "
+            "USING gin (lower(f_unaccent(artist_name)) gin_trgm_ops)",
+        ],
+        "Level 2: FK indexes + GIN trigram indexes",
+    )
 
     elapsed = time.time() - start
     logger.info(f"Track constraints and indexes added in {elapsed:.1f}s")

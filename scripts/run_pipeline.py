@@ -150,6 +150,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "In --xml mode with directory input, auto-detected from converter output.",
     )
     parser.add_argument(
+        "--keep-csv",
+        type=Path,
+        default=None,
+        metavar="DIR",
+        help="Directory to store converted CSVs persistently (--xml mode only). "
+        "When provided, CSVs are kept after the pipeline completes or fails, "
+        "avoiding a full re-conversion on retry. When omitted, CSVs are "
+        "written to a temporary directory that is deleted on exit.",
+    )
+    parser.add_argument(
         "--resume",
         action="store_true",
         default=False,
@@ -228,6 +238,51 @@ def run_sql_file(db_url: str, sql_file: Path, *, strip_concurrently: bool = Fals
         sys.exit(1)
     conn.close()
     logger.info("  done.")
+
+
+def run_sql_statements_parallel(
+    db_url: str,
+    statements: list[str],
+    description: str = "",
+) -> None:
+    """Execute independent SQL statements in parallel.
+
+    Each statement runs on its own connection (autocommit=True) via
+    ThreadPoolExecutor. Useful for creating multiple independent indexes
+    concurrently.
+    """
+    if not statements:
+        return
+
+    if description:
+        logger.info("Running %s (%d statements in parallel)...", description, len(statements))
+
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    def _execute_one(stmt: str) -> str:
+        conn = psycopg.connect(db_url, autocommit=True)
+        try:
+            with conn.cursor() as cur:
+                cur.execute(stmt)
+        finally:
+            conn.close()
+        return stmt
+
+    start = time.monotonic()
+    with ThreadPoolExecutor(max_workers=min(len(statements), 4)) as executor:
+        futures = {executor.submit(_execute_one, s): s for s in statements}
+        for future in as_completed(futures):
+            stmt = futures[future]
+            try:
+                future.result()
+            except psycopg.Error as exc:
+                label = stmt[:60].strip()
+                logger.error("Parallel SQL failed: %s: %s", label, exc)
+                raise
+
+    elapsed = time.monotonic() - start
+    if description:
+        logger.info("  %s done in %.1fs", description, elapsed)
 
 
 def run_step(description: str, cmd: list[str], **kwargs) -> None:
@@ -377,6 +432,66 @@ def generate_library_db(output_path: Path) -> None:
     )
 
 
+def _run_xml_pipeline(
+    args: argparse.Namespace,
+    python: str,
+    db_url: str,
+) -> None:
+    """Run the XML conversion + database build pipeline.
+
+    When --keep-csv is provided, CSVs are written to that directory and
+    persist after the pipeline. Otherwise, a TemporaryDirectory is used.
+    """
+    keep_csv_dir = args.keep_csv
+
+    if keep_csv_dir is not None:
+        keep_csv_dir.mkdir(parents=True, exist_ok=True)
+        tmp = keep_csv_dir
+        csv_dir = keep_csv_dir / "csv"
+        logger.info("Using persistent CSV directory: %s", keep_csv_dir)
+    else:
+        # Create a TemporaryDirectory that auto-cleans on exit
+        tmp = None
+        csv_dir = None
+
+    def _run_with_dirs(tmp_dir: Path, csv_out: Path) -> None:
+        # -- enrich_artists
+        library_artists_path = args.library_artists
+        if args.library_db:
+            enriched_artists = tmp_dir / "library_artists.txt"
+            enrich_library_artists(args.library_db, enriched_artists, args.wxyc_db_url)
+            library_artists_path = enriched_artists
+
+        # -- convert_and_filter
+        convert_and_filter(args.xml, csv_out, args.converter, library_artists_path)
+
+        # Auto-detect label_hierarchy.csv
+        hierarchy_csv = args.label_hierarchy
+        if hierarchy_csv is None:
+            auto_hierarchy = csv_out / "label_hierarchy.csv"
+            if auto_hierarchy.exists():
+                logger.info("Auto-detected label_hierarchy.csv from converter output")
+                hierarchy_csv = auto_hierarchy
+
+        # -- database build
+        _run_database_build(
+            db_url,
+            csv_out,
+            args.library_db,
+            python,
+            library_labels=args.library_labels,
+            label_hierarchy=hierarchy_csv,
+            wxyc_db_url=args.wxyc_db_url,
+        )
+
+    if keep_csv_dir is not None:
+        _run_with_dirs(tmp, csv_dir)
+    else:
+        with tempfile.TemporaryDirectory(prefix="discogs_pipeline_") as tmpdir:
+            tmp_path = Path(tmpdir)
+            _run_with_dirs(tmp_path, tmp_path / "csv")
+
+
 def main() -> None:
     args = parse_args()
 
@@ -413,38 +528,7 @@ def main() -> None:
 
     # Steps 1-3: XML conversion + filtering (only in --xml mode)
     if args.xml is not None:
-        with tempfile.TemporaryDirectory(prefix="discogs_pipeline_") as tmpdir:
-            tmp = Path(tmpdir)
-            csv_dir = tmp / "csv"
-
-            # -- enrich_artists: Generate/enrich library_artists.txt from library.db
-            library_artists_path = args.library_artists
-            if args.library_db:
-                enriched_artists = tmp / "library_artists.txt"
-                enrich_library_artists(args.library_db, enriched_artists, args.wxyc_db_url)
-                library_artists_path = enriched_artists
-
-            # -- convert_and_filter: XML to CSV (with optional artist filtering)
-            convert_and_filter(args.xml, csv_dir, args.converter, library_artists_path)
-
-            # Auto-detect label_hierarchy.csv from converter output
-            hierarchy_csv = args.label_hierarchy
-            if hierarchy_csv is None:
-                auto_hierarchy = csv_dir / "label_hierarchy.csv"
-                if auto_hierarchy.exists():
-                    logger.info("Auto-detected label_hierarchy.csv from converter output")
-                    hierarchy_csv = auto_hierarchy
-
-            # -- database build (create_schema through vacuum)
-            _run_database_build(
-                db_url,
-                csv_dir,
-                args.library_db,
-                python,
-                library_labels=args.library_labels,
-                label_hierarchy=hierarchy_csv,
-                wxyc_db_url=args.wxyc_db_url,
-            )
+        _run_xml_pipeline(args, python, db_url)
     else:
         # Database build only (--csv-dir mode)
         state = _load_or_create_state(args)
@@ -519,11 +603,27 @@ def _run_database_build(
             state.mark_completed("import_csv")
             _save_state()
 
-    # -- create_indexes (base trigram indexes, strip CONCURRENTLY for fresh DB)
+    # -- create_indexes (base trigram indexes, run in parallel)
     if state and state.is_completed("create_indexes"):
         logger.info("Skipping create_indexes (already completed)")
     else:
-        run_sql_file(db_url, SCHEMA_DIR / "create_indexes.sql", strip_concurrently=True)
+        # Ensure pg_trgm extension exists (idempotent, must be serial)
+        run_sql_file(db_url, SCHEMA_DIR / "create_functions.sql")
+        conn = psycopg.connect(db_url, autocommit=True)
+        with conn.cursor() as cur:
+            cur.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm")
+        conn.close()
+
+        run_sql_statements_parallel(
+            db_url,
+            [
+                "CREATE INDEX IF NOT EXISTS idx_release_artist_name_trgm "
+                "ON release_artist USING GIN (lower(f_unaccent(artist_name)) gin_trgm_ops)",
+                "CREATE INDEX IF NOT EXISTS idx_release_title_trgm "
+                "ON release USING GIN (lower(f_unaccent(title)) gin_trgm_ops)",
+            ],
+            description="base trigram indexes",
+        )
         if state:
             state.mark_completed("create_indexes")
             _save_state()
@@ -576,7 +676,36 @@ def _run_database_build(
     if state and state.is_completed("create_track_indexes"):
         logger.info("Skipping create_track_indexes (already completed)")
     else:
-        run_sql_file(db_url, SCHEMA_DIR / "create_track_indexes.sql", strip_concurrently=True)
+        # Level 1: FK constraints (parallel)
+        run_sql_statements_parallel(
+            db_url,
+            [
+                "DO $$ BEGIN "
+                "ALTER TABLE release_track ADD CONSTRAINT fk_release_track_release "
+                "FOREIGN KEY (release_id) REFERENCES release(id) ON DELETE CASCADE; "
+                "EXCEPTION WHEN duplicate_object THEN NULL; END $$",
+                "DO $$ BEGIN "
+                "ALTER TABLE release_track_artist ADD CONSTRAINT fk_release_track_artist_release "
+                "FOREIGN KEY (release_id) REFERENCES release(id) ON DELETE CASCADE; "
+                "EXCEPTION WHEN duplicate_object THEN NULL; END $$",
+            ],
+            description="track FK constraints",
+        )
+        # Level 2: FK indexes + trigram indexes (parallel)
+        run_sql_statements_parallel(
+            db_url,
+            [
+                "CREATE INDEX IF NOT EXISTS idx_release_track_release_id "
+                "ON release_track(release_id)",
+                "CREATE INDEX IF NOT EXISTS idx_release_track_artist_release_id "
+                "ON release_track_artist(release_id)",
+                "CREATE INDEX IF NOT EXISTS idx_release_track_title_trgm "
+                "ON release_track USING GIN (lower(f_unaccent(title)) gin_trgm_ops)",
+                "CREATE INDEX IF NOT EXISTS idx_release_track_artist_name_trgm "
+                "ON release_track_artist USING GIN (lower(f_unaccent(artist_name)) gin_trgm_ops)",
+            ],
+            description="track indexes",
+        )
         if state:
             state.mark_completed("create_track_indexes")
             _save_state()
