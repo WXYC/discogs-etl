@@ -33,6 +33,7 @@ CREATE TABLE IF NOT EXISTS release (
 -- Artists on releases
 CREATE TABLE IF NOT EXISTS release_artist (
     release_id      integer NOT NULL REFERENCES release(id) ON DELETE CASCADE,
+    artist_id       integer,             -- Discogs artist ID (nullable for API-fetched releases)
     artist_name     text NOT NULL,
     extra           integer DEFAULT 0  -- 0 = main artist, 1 = extra credit
 );
