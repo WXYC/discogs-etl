@@ -144,7 +144,7 @@ def _run_dedup(db_url: str) -> None:
 
         for old, new, _, _ in tables:
             swap_tables(conn, old, new)
-        add_base_constraints_and_indexes(conn)
+        add_base_constraints_and_indexes(conn, db_url=db_url)
 
         with conn.cursor() as cur:
             cur.execute("DROP TABLE IF EXISTS dedup_delete_ids")
@@ -455,7 +455,7 @@ def _run_dedup_with_labels(db_url: str, library_labels_csv: Path) -> None:
 
         for old, new, _, _ in tables:
             swap_tables(conn, old, new)
-        add_base_constraints_and_indexes(conn)
+        add_base_constraints_and_indexes(conn, db_url=db_url)
 
         with conn.cursor() as cur:
             cur.execute("DROP TABLE IF EXISTS dedup_delete_ids")
@@ -635,7 +635,7 @@ def _run_dedup_with_labels_and_hierarchy(
 
         for old, new, _, _ in tables:
             swap_tables(conn, old, new)
-        add_base_constraints_and_indexes(conn)
+        add_base_constraints_and_indexes(conn, db_url=db_url)
 
         with conn.cursor() as cur:
             cur.execute("DROP TABLE IF EXISTS dedup_delete_ids")
