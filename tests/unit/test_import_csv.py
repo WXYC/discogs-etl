@@ -16,6 +16,7 @@ _spec.loader.exec_module(_ic)
 
 extract_year = _ic.extract_year
 count_tracks_from_csv = _ic.count_tracks_from_csv
+import_csv = _ic.import_csv
 TABLES = _ic.TABLES
 BASE_TABLES = _ic.BASE_TABLES
 TRACK_TABLES = _ic.TRACK_TABLES
@@ -326,3 +327,57 @@ class TestTableSplit:
         base_names = {t["table"] for t in BASE_TABLES}
         track_names = {t["table"] for t in TRACK_TABLES}
         assert base_names.isdisjoint(track_names)
+
+
+# ---------------------------------------------------------------------------
+# import_csv missing columns
+# ---------------------------------------------------------------------------
+
+
+class TestImportCsvMissingColumns:
+    """import_csv reports clear errors when CSV header is missing expected columns."""
+
+    def test_missing_columns_returns_zero_and_logs_error(self, tmp_path, caplog) -> None:
+        """When the CSV header lacks required columns, import_csv returns 0 and logs them."""
+        csv_path = tmp_path / "release.csv"
+        # Write a CSV missing the 'title' and 'master_id' columns
+        csv_path.write_text("id,country,released\n1001,US,2024\n")
+
+        from unittest.mock import MagicMock
+
+        conn = MagicMock()
+        count = import_csv(
+            conn,
+            csv_path,
+            table="release",
+            csv_columns=["id", "title", "country", "released", "master_id"],
+            db_columns=["id", "title", "country", "release_year", "master_id"],
+            required_columns=["id", "title"],
+            transforms={},
+        )
+
+        assert count == 0
+        assert "Missing columns" in caplog.text
+        assert "master_id" in caplog.text
+        assert "title" in caplog.text
+
+    def test_no_header_returns_zero(self, tmp_path, caplog) -> None:
+        """An empty CSV file returns 0 with a warning."""
+        csv_path = tmp_path / "empty.csv"
+        csv_path.write_text("")
+
+        from unittest.mock import MagicMock
+
+        conn = MagicMock()
+        count = import_csv(
+            conn,
+            csv_path,
+            table="release",
+            csv_columns=["id", "title"],
+            db_columns=["id", "title"],
+            required_columns=["id"],
+            transforms={},
+        )
+
+        assert count == 0
+        assert "No header" in caplog.text

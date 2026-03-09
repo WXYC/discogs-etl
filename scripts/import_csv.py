@@ -159,28 +159,31 @@ def import_csv(
         unique_key_indices = [csv_columns.index(col) for col in unique_key]
 
     with open(csv_path, encoding="utf-8", errors="replace") as f:
-        reader = csv.DictReader(f)
-        header = reader.fieldnames
+        reader = csv.reader(f)
+        header = next(reader, None)
         if not header:
             logger.warning(f"  No header found in {csv_path.name}, skipping")
             return 0
 
         # Verify required CSV columns exist in header
-        missing = [c for c in csv_columns if c not in header]
+        missing = sorted(set(csv_columns) - set(header))
         if missing:
             logger.error(f"  Missing columns in {csv_path.name}: {missing}")
             return 0
+
+        # Build column index mapping for positional access
+        col_idx = {col: header.index(col) for col in csv_columns}
 
         # Find indices of required columns for null checking
         required_set = set(required_columns)
         seen: set[tuple[str | None, ...]] = set()
 
-        # Determine release_id column name for filtering
-        release_id_col: str | None = None
+        # Determine release_id column index for filtering
+        release_id_idx: int | None = None
         if release_id_filter is not None:
             for col_name in ("release_id", "id"):
-                if col_name in csv_columns:
-                    release_id_col = col_name
+                if col_name in col_idx:
+                    release_id_idx = col_idx[col_name]
                     break
 
         with conn.cursor() as cur:
@@ -191,10 +194,10 @@ def import_csv(
                 dupes = 0
                 for row in reader:
                     # Filter by release_id if specified
-                    if release_id_filter is not None and release_id_col is not None:
+                    if release_id_filter is not None and release_id_idx is not None:
                         try:
-                            rid = int(row.get(release_id_col, ""))
-                        except (ValueError, TypeError):
+                            rid = int(row[release_id_idx])
+                        except (ValueError, IndexError):
                             filtered += 1
                             continue
                         if rid not in release_id_filter:
@@ -205,7 +208,7 @@ def import_csv(
                     values: list[str | None] = []
                     skip = False
                     for csv_col in csv_columns:
-                        val = row.get(csv_col, "")
+                        val = row[col_idx[csv_col]]
                         if val == "":
                             val = None
 

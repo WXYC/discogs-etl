@@ -83,22 +83,19 @@ def load_library_labels(conn, csv_path: Path) -> int:
             )
         """)
 
-    rows = []
+    count = 0
     with open(csv_path, newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
-        for row in reader:
-            rows.append((row["artist_name"], row["release_title"], row["label_name"]))
-
-    if rows:
         with conn.cursor() as cur:
-            cur.executemany(
-                "INSERT INTO wxyc_label_pref (artist_name, release_title, label_name) "
-                "VALUES (%s, %s, %s)",
-                rows,
-            )
+            with cur.copy(
+                "COPY wxyc_label_pref (artist_name, release_title, label_name) FROM STDIN"
+            ) as copy:
+                for row in reader:
+                    copy.write_row((row["artist_name"], row["release_title"], row["label_name"]))
+                    count += 1
 
-    logger.info("Loaded %d label preferences", len(rows))
-    return len(rows)
+    logger.info("Loaded %d label preferences", count)
+    return count
 
 
 def load_label_hierarchy(conn, csv_path: Path) -> int:
@@ -128,29 +125,27 @@ def load_label_hierarchy(conn, csv_path: Path) -> int:
             )
         """)
 
-    rows = []
+    count = 0
     with open(csv_path, newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
-        for row in reader:
-            rows.append(
-                (
-                    int(row["label_id"]),
-                    row["label_name"],
-                    int(row["parent_label_id"]),
-                    row["parent_label_name"],
-                )
-            )
-
-    if rows:
         with conn.cursor() as cur:
-            cur.executemany(
-                "INSERT INTO label_hierarchy (label_id, label_name, parent_label_id, "
-                "parent_label_name) VALUES (%s, %s, %s, %s)",
-                rows,
-            )
+            with cur.copy(
+                "COPY label_hierarchy (label_id, label_name, parent_label_id, "
+                "parent_label_name) FROM STDIN"
+            ) as copy:
+                for row in reader:
+                    copy.write_row(
+                        (
+                            int(row["label_id"]),
+                            row["label_name"],
+                            int(row["parent_label_id"]),
+                            row["parent_label_name"],
+                        )
+                    )
+                    count += 1
 
-    logger.info("Loaded %d label hierarchy entries", len(rows))
-    return len(rows)
+    logger.info("Loaded %d label hierarchy entries", count)
+    return count
 
 
 def _label_hierarchy_table_exists(conn) -> bool:
