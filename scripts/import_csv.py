@@ -84,7 +84,7 @@ BASE_TABLES: list[TableConfig] = [
         "table": "release_artist",
         "csv_columns": ["release_id", "artist_id", "artist_name", "extra"],
         "db_columns": ["release_id", "artist_id", "artist_name", "extra"],
-        "required": ["release_id"],
+        "required": ["release_id", "artist_name"],
         "transforms": {},
         "unique_key": ["release_id", "artist_name"],
     },
@@ -232,7 +232,7 @@ def import_csv(
                     count += 1
 
                     if count % 500000 == 0:
-                        logger.info(f"  {count:,} rows...")
+                        logger.info(f"  {table}: {count:,} rows...")
 
     conn.commit()
     parts = [f"Imported {count:,} rows"]
