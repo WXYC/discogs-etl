@@ -81,6 +81,10 @@ CREATE INDEX IF NOT EXISTS idx_release_label_release_id ON release_label(release
 CREATE INDEX IF NOT EXISTS idx_release_track_release_id ON release_track(release_id);
 CREATE INDEX IF NOT EXISTS idx_release_track_artist_release_id ON release_track_artist(release_id);
 
+-- Partial index on master_id for dedup performance.
+-- Transient: dropped automatically by dedup copy-swap (which excludes master_id).
+CREATE INDEX IF NOT EXISTS idx_release_master_id ON release(master_id) WHERE master_id IS NOT NULL;
+
 -- Cache metadata indexes
 CREATE INDEX IF NOT EXISTS idx_cache_metadata_cached_at ON cache_metadata(cached_at);
 CREATE INDEX IF NOT EXISTS idx_cache_metadata_source ON cache_metadata(source);

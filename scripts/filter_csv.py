@@ -69,6 +69,8 @@ def find_matching_release_ids(release_artist_path: Path, library_artists: set[st
     total_rows = 0
     matched_rows = 0
 
+    normalize_cache: dict[str, str] = {}
+
     with open(release_artist_path, encoding="utf-8", errors="replace") as f:
         reader = csv.reader(f)
         header = next(reader)
@@ -77,9 +79,13 @@ def find_matching_release_ids(release_artist_path: Path, library_artists: set[st
         for row in reader:
             total_rows += 1
             try:
-                artist_name = normalize_artist(row[artist_name_idx])
+                raw_name = row[artist_name_idx]
             except IndexError:
                 continue
+            artist_name = normalize_cache.get(raw_name)
+            if artist_name is None:
+                artist_name = normalize_artist(raw_name)
+                normalize_cache[raw_name] = artist_name
             if artist_name in library_artists:
                 release_id = int(row[release_id_idx])
                 matching_ids.add(release_id)
@@ -107,28 +113,37 @@ def get_release_id_column(filename: str) -> str:
 def filter_csv_file(
     input_path: Path, output_path: Path, matching_ids: set[int], id_column: str
 ) -> tuple[int, int]:
-    """Filter a CSV file to only include rows with matching release IDs."""
+    """Filter a CSV file to only include rows with matching release IDs.
+
+    Uses csv.reader with positional indexing instead of csv.DictReader
+    to avoid dict creation overhead on large files.
+    """
     input_count = 0
     output_count = 0
 
     with open(input_path, encoding="utf-8", errors="replace") as infile:
-        reader = csv.DictReader(infile)
-        fieldnames = reader.fieldnames
-        assert fieldnames is not None, f"No header row found in {input_path}"
+        reader = csv.reader(infile)
+        header = next(reader)
+        try:
+            id_idx = header.index(id_column)
+        except ValueError:
+            raise ValueError(
+                f"Column '{id_column}' not found in {input_path}. Available columns: {header}"
+            ) from None
 
         with open(output_path, "w", encoding="utf-8", newline="") as outfile:
-            writer = csv.DictWriter(outfile, fieldnames=fieldnames)
-            writer.writeheader()
+            writer = csv.writer(outfile)
+            writer.writerow(header)
 
             for row in reader:
                 input_count += 1
                 try:
-                    release_id = int(row[id_column])
+                    release_id = int(row[id_idx])
                     if release_id in matching_ids:
                         writer.writerow(row)
                         output_count += 1
-                except (ValueError, KeyError):
-                    # Skip rows with invalid release IDs
+                except (ValueError, IndexError):
+                    # Skip rows with invalid release IDs or short rows
                     pass
 
                 if input_count % 1000000 == 0:

@@ -133,6 +133,33 @@ class TestFindMatchingReleaseIds:
         # "Some Producer" is an extra artist on release 1001
         assert 1001 in ids
 
+    def test_normalize_cache_avoids_redundant_calls(self, tmp_path: Path) -> None:
+        """Duplicate artist names should only be normalized once (via cache)."""
+        csv_path = tmp_path / "release_artist.csv"
+        # Write a CSV with the same artist name repeated many times
+        with open(csv_path, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["release_id", "artist_id", "artist_name", "extra", "anv", "position"])
+            for i in range(1, 101):
+                writer.writerow([i, 1, "Juana Molina", 0, "", 1])
+
+        from unittest.mock import patch
+
+        call_count = 0
+        original_normalize = normalize_artist
+
+        def counting_normalize(name):
+            nonlocal call_count
+            call_count += 1
+            return original_normalize(name)
+
+        with patch.object(_fc, "normalize_artist", side_effect=counting_normalize):
+            find_matching_release_ids(csv_path, {"juana molina"})
+
+        # With caching, normalize should be called once for the unique name,
+        # not 100 times for every row.
+        assert call_count == 1
+
 
 # ---------------------------------------------------------------------------
 # get_release_id_column
@@ -210,3 +237,12 @@ class TestFilterCsvFile:
 
         _, output_count = filter_csv_file(input_path, output_path, matching_ids, "release_id")
         assert output_count == 5  # Release 1001 has 5 tracks
+
+    def test_missing_id_column_raises_clear_error(self, tmp_path: Path) -> None:
+        """When id_column is not in the CSV header, a ValueError is raised
+        with a message listing the available columns."""
+        input_path = FIXTURES_DIR / "csv" / "release.csv"
+        output_path = tmp_path / "out.csv"
+
+        with pytest.raises(ValueError, match="Column 'nonexistent'.*not found"):
+            filter_csv_file(input_path, output_path, {1001}, "nonexistent")

@@ -331,8 +331,12 @@ def run_step(description: str, cmd: list[str], **kwargs) -> None:
 
 
 def run_vacuum(db_url: str) -> None:
-    """Run VACUUM FULL on all pipeline tables."""
-    logger.info("Running VACUUM FULL ...")
+    """Run VACUUM FULL on all pipeline tables in parallel.
+
+    VACUUM FULL on independent tables does not conflict, so we use
+    run_sql_statements_parallel (which opens a separate autocommit
+    connection per statement) to vacuum all tables concurrently.
+    """
     tables = [
         "release",
         "release_artist",
@@ -341,16 +345,8 @@ def run_vacuum(db_url: str) -> None:
         "release_track_artist",
         "cache_metadata",
     ]
-    conn = psycopg.connect(db_url, autocommit=True)
-    for table in tables:
-        logger.info("  VACUUM FULL %s ...", table)
-        try:
-            with conn.cursor() as cur:
-                cur.execute(f"VACUUM FULL {table}")
-        except psycopg.Error as exc:
-            logger.warning("  VACUUM FULL %s failed: %s", table, exc)
-    conn.close()
-    logger.info("  VACUUM complete.")
+    statements = [f"VACUUM FULL {table}" for table in tables]
+    run_sql_statements_parallel(db_url, statements, description="VACUUM FULL")
 
 
 def report_sizes(db_url: str) -> None:

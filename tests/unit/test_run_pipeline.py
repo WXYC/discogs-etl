@@ -271,6 +271,27 @@ class TestRunSqlStatementsParallel:
         assert any("test indexes" in r.message for r in caplog.records)
 
 
+class TestRunVacuum:
+    """run_vacuum() delegates to run_sql_statements_parallel for parallel execution."""
+
+    def test_vacuum_uses_parallel_execution(self) -> None:
+        """run_vacuum should call run_sql_statements_parallel with VACUUM FULL statements."""
+        from unittest.mock import patch
+
+        with patch.object(run_pipeline, "run_sql_statements_parallel") as mock_parallel:
+            run_pipeline.run_vacuum("postgresql:///test")
+
+        mock_parallel.assert_called_once()
+        args, kwargs = mock_parallel.call_args
+        db_url, statements = args[0], args[1]
+        assert db_url == "postgresql:///test"
+        assert len(statements) == 6
+        assert all(s.startswith("VACUUM FULL ") for s in statements)
+        assert "VACUUM FULL release" in statements
+        assert "VACUUM FULL cache_metadata" in statements
+        assert kwargs.get("description") or args[2] if len(args) > 2 else True
+
+
 class TestXmlModeEnrichment:
     """In --xml mode, library_artists.txt is generated from library.db when not provided."""
 
