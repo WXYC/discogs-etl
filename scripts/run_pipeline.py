@@ -28,6 +28,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -316,7 +317,11 @@ def run_step(description: str, cmd: list[str], **kwargs) -> None:
         **kwargs,
     )
     for line in proc.stdout:
-        logger.info("  %s", line.rstrip("\n"))
+        text = line.rstrip("\n")
+        # Strip env_logger timestamps (e.g. "[2026-03-09T14:13:57Z INFO  module]")
+        # to avoid double-dating when wrapped by Python's logger.
+        stripped = re.sub(r"^\[[\dT:Z -]+\s+\w+\s+\S+]\s*", "", text)
+        logger.info("  %s", stripped)
     proc.wait()
     elapsed = time.monotonic() - start
     if proc.returncode != 0:
