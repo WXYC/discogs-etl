@@ -160,6 +160,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "written to a temporary directory that is deleted on exit.",
     )
     parser.add_argument(
+        "--direct-pg",
+        action="store_true",
+        default=False,
+        help="Stream releases directly into PostgreSQL from the converter, "
+        "bypassing CSV import. Requires --xml mode. The converter writes "
+        "releases via COPY, eliminating the CSV round-trip for release data. "
+        "Supplementary CSVs (artist_alias.csv, label_hierarchy.csv) are "
+        "still written to the output directory.",
+    )
+    parser.add_argument(
         "--resume",
         action="store_true",
         default=False,
@@ -181,6 +191,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     if args.xml is not None:
         if args.resume:
             parser.error("--resume is only valid with --csv-dir, not --xml")
+
+    if args.direct_pg and args.xml is None:
+        parser.error("--direct-pg requires --xml mode")
 
     if args.generate_library_db and args.library_db:
         parser.error("--generate-library-db and --library-db are mutually exclusive")
@@ -361,16 +374,27 @@ def convert_and_filter(
     output_dir: Path,
     converter: str,
     library_artists: Path | None = None,
+    database_url: str | None = None,
 ) -> None:
     """Convert Discogs XML to CSV using discogs-xml-converter.
 
     Replaces the old three-step process (xml2db + fix_newlines + filter_csv)
     with a single call to the Rust binary.
+
+    When database_url is provided, releases are streamed directly into
+    PostgreSQL via COPY instead of being written to CSV files. Supplementary
+    CSVs (artist_alias.csv, label_hierarchy.csv) are still written to
+    output_dir.
     """
     cmd = [converter, str(xml_file), "--output-dir", str(output_dir)]
     if library_artists:
         cmd.extend(["--library-artists", str(library_artists)])
-    run_step("Convert and filter XML to CSV", cmd)
+    if database_url:
+        cmd.extend(["--database-url", database_url])
+    description = (
+        "Convert and import XML to PostgreSQL" if database_url else "Convert and filter XML to CSV"
+    )
+    run_step(description, cmd)
 
 
 def enrich_library_artists(
@@ -462,27 +486,64 @@ def _run_xml_pipeline(
             enrich_library_artists(args.library_db, enriched_artists, args.wxyc_db_url)
             library_artists_path = enriched_artists
 
-        # -- convert_and_filter
-        convert_and_filter(args.xml, csv_out, args.converter, library_artists_path)
+        if args.direct_pg:
+            # Direct-to-PG mode: create schema first, then converter writes
+            # releases directly into PostgreSQL via COPY.
+            wait_for_postgres(db_url)
+            run_sql_file(db_url, SCHEMA_DIR / "create_database.sql")
+            run_sql_file(db_url, SCHEMA_DIR / "create_functions.sql")
 
-        # Auto-detect label_hierarchy.csv
-        hierarchy_csv = args.label_hierarchy
-        if hierarchy_csv is None:
-            auto_hierarchy = csv_out / "label_hierarchy.csv"
-            if auto_hierarchy.exists():
-                logger.info("Auto-detected label_hierarchy.csv from converter output")
-                hierarchy_csv = auto_hierarchy
+            # Converter streams releases into PG; supplementary CSVs still
+            # go to csv_out (artist_alias.csv, label_hierarchy.csv).
+            convert_and_filter(
+                args.xml,
+                csv_out,
+                args.converter,
+                library_artists_path,
+                database_url=db_url,
+            )
 
-        # -- database build
-        _run_database_build(
-            db_url,
-            csv_out,
-            args.library_db,
-            python,
-            library_labels=args.library_labels,
-            label_hierarchy=hierarchy_csv,
-            wxyc_db_url=args.wxyc_db_url,
-        )
+            # Auto-detect label_hierarchy.csv
+            hierarchy_csv = args.label_hierarchy
+            if hierarchy_csv is None:
+                auto_hierarchy = csv_out / "label_hierarchy.csv"
+                if auto_hierarchy.exists():
+                    logger.info("Auto-detected label_hierarchy.csv from converter output")
+                    hierarchy_csv = auto_hierarchy
+
+            # Skip import_csv steps (converter already loaded release data).
+            # Continue with indexes, dedup, track indexes, prune, vacuum.
+            _run_database_build_post_import(
+                db_url,
+                csv_out,
+                args.library_db,
+                python,
+                library_labels=args.library_labels,
+                label_hierarchy=hierarchy_csv,
+                wxyc_db_url=args.wxyc_db_url,
+            )
+        else:
+            # Standard CSV mode
+            convert_and_filter(args.xml, csv_out, args.converter, library_artists_path)
+
+            # Auto-detect label_hierarchy.csv
+            hierarchy_csv = args.label_hierarchy
+            if hierarchy_csv is None:
+                auto_hierarchy = csv_out / "label_hierarchy.csv"
+                if auto_hierarchy.exists():
+                    logger.info("Auto-detected label_hierarchy.csv from converter output")
+                    hierarchy_csv = auto_hierarchy
+
+            # -- database build
+            _run_database_build(
+                db_url,
+                csv_out,
+                args.library_db,
+                python,
+                library_labels=args.library_labels,
+                label_hierarchy=hierarchy_csv,
+                wxyc_db_url=args.wxyc_db_url,
+            )
 
     if keep_csv_dir is not None:
         _run_with_dirs(tmp, csv_dir)
@@ -547,6 +608,110 @@ def main() -> None:
 
     total = time.monotonic() - pipeline_start
     logger.info("Pipeline complete in %.1f minutes.", total / 60)
+
+
+def _run_database_build_post_import(
+    db_url: str,
+    csv_dir: Path,
+    library_db: Path | None,
+    python: str,
+    *,
+    library_labels: Path | None = None,
+    label_hierarchy: Path | None = None,
+    wxyc_db_url: str | None = None,
+) -> None:
+    """Post-import database build for --direct-pg mode.
+
+    Skips create_schema (already done), import_csv, and import_tracks
+    (converter loaded all data directly). Runs create_indexes through vacuum.
+    """
+    # -- create_indexes (base trigram indexes, run in parallel)
+    conn = psycopg.connect(db_url, autocommit=True)
+    with conn.cursor() as cur:
+        cur.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm")
+    conn.close()
+
+    run_sql_statements_parallel(
+        db_url,
+        [
+            "CREATE INDEX IF NOT EXISTS idx_release_artist_name_trgm "
+            "ON release_artist USING GIN (lower(f_unaccent(artist_name)) gin_trgm_ops)",
+            "CREATE INDEX IF NOT EXISTS idx_release_title_trgm "
+            "ON release USING GIN (lower(f_unaccent(title)) gin_trgm_ops)",
+        ],
+        description="base trigram indexes",
+    )
+
+    # -- dedup (deduplicate by master_id)
+    labels_csv = library_labels
+    if labels_csv is None and wxyc_db_url is not None:
+        labels_csv = Path(tempfile.mkdtemp(prefix="discogs_labels_")) / "library_labels.csv"
+        run_step(
+            "Extract WXYC library labels",
+            [
+                python,
+                str(SCRIPT_DIR / "extract_library_labels.py"),
+                "--wxyc-db-url",
+                wxyc_db_url,
+                "--output",
+                str(labels_csv),
+            ],
+        )
+
+    dedup_cmd = [python, str(SCRIPT_DIR / "dedup_releases.py")]
+    if labels_csv is not None:
+        dedup_cmd.extend(["--library-labels", str(labels_csv)])
+    if label_hierarchy is not None:
+        dedup_cmd.extend(["--label-hierarchy", str(label_hierarchy)])
+    dedup_cmd.append(db_url)
+
+    run_step("Deduplicate releases", dedup_cmd)
+
+    # -- create_track_indexes (FK constraints, FK indexes, trigram indexes)
+    # Level 1: FK constraints (parallel)
+    run_sql_statements_parallel(
+        db_url,
+        [
+            "DO $$ BEGIN "
+            "ALTER TABLE release_track ADD CONSTRAINT fk_release_track_release "
+            "FOREIGN KEY (release_id) REFERENCES release(id) ON DELETE CASCADE; "
+            "EXCEPTION WHEN duplicate_object THEN NULL; END $$",
+            "DO $$ BEGIN "
+            "ALTER TABLE release_track_artist ADD CONSTRAINT fk_release_track_artist_release "
+            "FOREIGN KEY (release_id) REFERENCES release(id) ON DELETE CASCADE; "
+            "EXCEPTION WHEN duplicate_object THEN NULL; END $$",
+        ],
+        description="track FK constraints",
+    )
+    # Level 2: FK indexes + trigram indexes (parallel)
+    run_sql_statements_parallel(
+        db_url,
+        [
+            "CREATE INDEX IF NOT EXISTS idx_release_track_release_id ON release_track(release_id)",
+            "CREATE INDEX IF NOT EXISTS idx_release_track_artist_release_id "
+            "ON release_track_artist(release_id)",
+            "CREATE INDEX IF NOT EXISTS idx_release_track_title_trgm "
+            "ON release_track USING GIN (lower(f_unaccent(title)) gin_trgm_ops)",
+            "CREATE INDEX IF NOT EXISTS idx_release_track_artist_name_trgm "
+            "ON release_track_artist USING GIN (lower(f_unaccent(artist_name)) gin_trgm_ops)",
+        ],
+        description="track indexes",
+    )
+
+    # -- prune (optional)
+    if library_db:
+        run_step(
+            "Prune to library matches",
+            [python, str(SCRIPT_DIR / "verify_cache.py"), "--prune", str(library_db), db_url],
+        )
+    else:
+        logger.info("Skipping prune step (no library.db provided)")
+
+    # -- vacuum
+    run_vacuum(db_url)
+
+    # -- report
+    report_sizes(db_url)
 
 
 def _run_database_build(
