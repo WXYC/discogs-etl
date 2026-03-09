@@ -248,6 +248,28 @@ def import_csv(
     return count
 
 
+def populate_cache_metadata(conn) -> int:
+    """Populate cache_metadata for all releases via COPY.
+
+    Much faster than INSERT...SELECT with ON CONFLICT for large tables.
+    Assumes cache_metadata is empty (schema freshly created).
+
+    Returns the number of rows inserted.
+    """
+    with conn.cursor() as cur:
+        cur.execute("SELECT id FROM release")
+        release_ids = [row[0] for row in cur.fetchall()]
+
+    count = len(release_ids)
+    with conn.cursor() as cur:
+        with cur.copy("COPY cache_metadata (release_id, source) FROM STDIN") as copy:
+            for rid in release_ids:
+                copy.write_row((rid, "bulk_import"))
+    conn.commit()
+    logger.info(f"  Populated cache_metadata with {count:,} rows")
+    return count
+
+
 def create_track_count_table(conn, csv_dir: Path) -> int:
     """Pre-compute track counts from CSV and store in release_track_count table.
 
@@ -512,15 +534,8 @@ def main():
         logger.info("Populating artwork URLs...")
         import_artwork(conn, csv_dir)
         logger.info("Artwork URLs complete")
-        logger.info("Populating cache_metadata...")
-        with conn.cursor() as cur:
-            cur.execute("""
-                INSERT INTO cache_metadata (release_id, source)
-                SELECT id, 'bulk_import'
-                FROM release
-                ON CONFLICT (release_id) DO NOTHING
-            """)
-        conn.commit()
+        logger.info("Populating cache_metadata via COPY...")
+        populate_cache_metadata(conn)
         logger.info("cache_metadata complete")
         logger.info("Creating track count table...")
         create_track_count_table(conn, csv_dir)
@@ -531,15 +546,8 @@ def main():
         logger.info("Populating artwork URLs...")
         import_artwork(conn, csv_dir)
         logger.info("Artwork URLs complete")
-        logger.info("Populating cache_metadata...")
-        with conn.cursor() as cur:
-            cur.execute("""
-                INSERT INTO cache_metadata (release_id, source)
-                SELECT id, 'bulk_import'
-                FROM release
-                ON CONFLICT (release_id) DO NOTHING
-            """)
-        conn.commit()
+        logger.info("Populating cache_metadata via COPY...")
+        populate_cache_metadata(conn)
         logger.info("cache_metadata complete")
         conn.close()
 
