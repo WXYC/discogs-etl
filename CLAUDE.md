@@ -14,7 +14,7 @@ ETL pipeline for building and maintaining a PostgreSQL cache of Discogs release 
 1. **Download** Discogs monthly data dumps (XML) from https://discogs-data-dumps.s3.us-west-2.amazonaws.com/index.html
 2. **Enrich** `library_artists.txt` with WXYC cross-references (`scripts/enrich_library_artists.py`, optional)
 3. **Convert and filter** XML to CSV using [discogs-xml-converter](https://github.com/WXYC/discogs-xml-converter) (Rust binary), with optional artist filtering via `--library-artists`. Accepts a single XML file or a directory containing releases.xml, artists.xml, and labels.xml. When artists.xml is present, alias-enhanced filtering is enabled automatically. When labels.xml is present, `label_hierarchy.csv` is produced for sublabel-aware dedup.
-4. **Create schema** (`schema/create_database.sql`) and **functions** (`schema/create_functions.sql`)
+4. **Create schema** (`schema/create_database.sql`) and **functions** (`schema/create_functions.sql`), then **SET UNLOGGED** on all tables to skip WAL writes during bulk import
 5. **Import** filtered CSVs into PostgreSQL (`scripts/import_csv.py`)
 6. **Create indexes** including accent-insensitive trigram GIN indexes (`schema/create_indexes.sql`)
 7. **Deduplicate** by master_id (`scripts/dedup_releases.py`) -- prefers label match (with sublabel resolution via `--label-hierarchy`), then US releases, then most tracks, then lowest ID
@@ -22,10 +22,11 @@ ETL pipeline for building and maintaining a PostgreSQL cache of Discogs release 
     - `--prune`: delete non-matching releases in place (~89% data reduction, 3 GB -> 340 MB)
     - `--copy-to`/`--target-db-url`: copy matched releases to a separate database, preserving the full import
 9. **Vacuum** to reclaim disk space (`VACUUM FULL`)
+10. **SET LOGGED** to restore WAL durability for consumers
 
 `scripts/run_pipeline.py` supports two modes:
-- `--xml` mode: runs steps 2-9 (enrich, convert+filter, database build through vacuum). `--xml` accepts a single file or a directory.
-- `--csv-dir` mode: runs steps 4-9 (database build from pre-filtered CSVs)
+- `--xml` mode: runs steps 2-10 (enrich, convert+filter, database build through SET LOGGED). `--xml` accepts a single file or a directory.
+- `--csv-dir` mode: runs steps 4-10 (database build from pre-filtered CSVs)
 
 Both modes support `--target-db-url` to copy matched releases to a separate database instead of pruning in place, and `--resume` (csv-dir only) to skip already-completed steps. `--keep-csv` (xml mode only) writes converted CSVs to a persistent directory instead of a temp dir, so they survive pipeline failures.
 

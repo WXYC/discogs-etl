@@ -292,6 +292,121 @@ class TestRunVacuum:
         assert kwargs.get("description") or args[2] if len(args) > 2 else True
 
 
+class TestPipelineTables:
+    """PIPELINE_TABLES constant is shared between run_vacuum and set_tables_*."""
+
+    def test_pipeline_tables_matches_vacuum_tables(self) -> None:
+        """PIPELINE_TABLES should contain the same tables used by run_vacuum."""
+        expected = {
+            "release",
+            "release_artist",
+            "release_label",
+            "release_track",
+            "release_track_artist",
+            "cache_metadata",
+        }
+        assert set(run_pipeline.PIPELINE_TABLES) == expected
+
+    def test_run_vacuum_uses_pipeline_tables(self) -> None:
+        """run_vacuum should generate VACUUM FULL from PIPELINE_TABLES."""
+        from unittest.mock import patch
+
+        with patch.object(run_pipeline, "run_sql_statements_parallel") as mock_parallel:
+            run_pipeline.run_vacuum("postgresql:///test")
+
+        statements = mock_parallel.call_args[0][1]
+        vacuum_tables = {s.replace("VACUUM FULL ", "") for s in statements}
+        assert vacuum_tables == set(run_pipeline.PIPELINE_TABLES)
+
+
+class TestSetTablesUnlogged:
+    """set_tables_unlogged() generates ALTER TABLE SET UNLOGGED in FK order."""
+
+    def test_children_first_then_parent(self) -> None:
+        """Children are set UNLOGGED before the parent (release) for FK ordering."""
+        from unittest.mock import patch
+
+        with patch.object(run_pipeline, "run_sql_statements_parallel") as mock_parallel:
+            run_pipeline.set_tables_unlogged("postgresql:///test")
+
+        assert mock_parallel.call_count == 2
+        # First call: child tables
+        child_stmts = mock_parallel.call_args_list[0][0][1]
+        assert all("SET UNLOGGED" in s for s in child_stmts)
+        assert not any(
+            "release" == s.split()[-2] for s in child_stmts if s.endswith("SET UNLOGGED")
+        )
+        # Second call: parent table
+        parent_stmts = mock_parallel.call_args_list[1][0][1]
+        assert parent_stmts == ["ALTER TABLE release SET UNLOGGED"]
+
+    def test_all_tables_covered(self) -> None:
+        """All PIPELINE_TABLES are included across both phases."""
+        from unittest.mock import patch
+
+        with patch.object(run_pipeline, "run_sql_statements_parallel") as mock_parallel:
+            run_pipeline.set_tables_unlogged("postgresql:///test")
+
+        all_stmts = []
+        for c in mock_parallel.call_args_list:
+            all_stmts.extend(c[0][1])
+        tables = {s.split()[2] for s in all_stmts}
+        assert tables == set(run_pipeline.PIPELINE_TABLES)
+
+    def test_descriptions_contain_unlogged(self) -> None:
+        from unittest.mock import patch
+
+        with patch.object(run_pipeline, "run_sql_statements_parallel") as mock_parallel:
+            run_pipeline.set_tables_unlogged("postgresql:///test")
+
+        for c in mock_parallel.call_args_list:
+            desc = c[1].get("description", c[0][2] if len(c[0]) > 2 else "")
+            assert "UNLOGGED" in desc
+
+
+class TestSetTablesLogged:
+    """set_tables_logged() generates ALTER TABLE SET LOGGED in FK order."""
+
+    def test_parent_first_then_children(self) -> None:
+        """Parent (release) is set LOGGED before children for FK ordering."""
+        from unittest.mock import patch
+
+        with patch.object(run_pipeline, "run_sql_statements_parallel") as mock_parallel:
+            run_pipeline.set_tables_logged("postgresql:///test")
+
+        assert mock_parallel.call_count == 2
+        # First call: parent table
+        parent_stmts = mock_parallel.call_args_list[0][0][1]
+        assert parent_stmts == ["ALTER TABLE release SET LOGGED"]
+        # Second call: child tables
+        child_stmts = mock_parallel.call_args_list[1][0][1]
+        assert all("SET LOGGED" in s for s in child_stmts)
+        assert len(child_stmts) == len(run_pipeline.PIPELINE_TABLES) - 1
+
+    def test_all_tables_covered(self) -> None:
+        """All PIPELINE_TABLES are included across both phases."""
+        from unittest.mock import patch
+
+        with patch.object(run_pipeline, "run_sql_statements_parallel") as mock_parallel:
+            run_pipeline.set_tables_logged("postgresql:///test")
+
+        all_stmts = []
+        for c in mock_parallel.call_args_list:
+            all_stmts.extend(c[0][1])
+        tables = {s.split()[2] for s in all_stmts}
+        assert tables == set(run_pipeline.PIPELINE_TABLES)
+
+    def test_descriptions_contain_logged(self) -> None:
+        from unittest.mock import patch
+
+        with patch.object(run_pipeline, "run_sql_statements_parallel") as mock_parallel:
+            run_pipeline.set_tables_logged("postgresql:///test")
+
+        for c in mock_parallel.call_args_list:
+            desc = c[1].get("description", c[0][2] if len(c[0]) > 2 else "")
+            assert "LOGGED" in desc
+
+
 class TestXmlModeEnrichment:
     """In --xml mode, library_artists.txt is generated from library.db when not provided."""
 

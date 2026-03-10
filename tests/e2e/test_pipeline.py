@@ -231,6 +231,25 @@ class TestPipeline:
         conn.close()
         assert count == 0
 
+    def test_tables_are_logged(self) -> None:
+        """All tables are LOGGED after pipeline completion (not UNLOGGED)."""
+        conn = self._connect()
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT relname, relpersistence
+                FROM pg_class
+                WHERE relname IN (
+                    'release', 'release_artist', 'release_label',
+                    'release_track', 'release_track_artist', 'cache_metadata'
+                )
+            """)
+            results = cur.fetchall()
+        conn.close()
+        for relname, relpersistence in results:
+            assert relpersistence == "p", (
+                f"Table {relname} should be LOGGED (p) after pipeline, got {relpersistence}"
+            )
+
 
 FIXTURE_LIBRARY_LABELS = CSV_DIR / "library_labels.csv"
 
@@ -574,7 +593,7 @@ class TestPipelineStateFile:
     def test_state_file_has_correct_metadata(self) -> None:
         """State file contains correct database URL and version."""
         data = json.loads(self.__class__._state_file.read_text())
-        assert data["version"] == 2
+        assert data["version"] == 3
         assert data["database_url"] == self.__class__._db_url
 
 
@@ -649,6 +668,7 @@ class TestPipelineResume:
         assert "Skipping create_track_indexes" in stderr
         assert "Skipping prune" in stderr
         assert "Skipping vacuum" in stderr
+        assert "Skipping set_logged" in stderr
 
     def test_resume_completes_successfully(self) -> None:
         """Resume run exits with code 0."""

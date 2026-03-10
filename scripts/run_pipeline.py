@@ -3,7 +3,7 @@
 
 Two modes of operation:
 
-  Full pipeline from XML (steps 1-9):
+  Full pipeline from XML (steps 1-10):
     python scripts/run_pipeline.py \\
       --xml <releases.xml.gz> \\
       --library-artists <library_artists.txt> \\
@@ -12,7 +12,7 @@ Two modes of operation:
       [--wxyc-db-url <mysql://user:pass@host:port/db>] \\
       [--database-url <url>]
 
-  Database build from pre-filtered CSVs (steps 4-9):
+  Database build from pre-filtered CSVs (steps 4-10):
     python scripts/run_pipeline.py \\
       --csv-dir <path/to/filtered/> \\
       [--library-db <library.db>] \\
@@ -51,6 +51,16 @@ SCHEMA_DIR = SCRIPT_DIR.parent / "schema"
 
 # Maximum seconds to wait for Postgres to become ready.
 PG_CONNECT_TIMEOUT = 30
+
+# Tables managed by the pipeline (shared by run_vacuum, set_tables_unlogged, set_tables_logged).
+PIPELINE_TABLES = [
+    "release",
+    "release_artist",
+    "release_label",
+    "release_track",
+    "release_track_artist",
+    "cache_metadata",
+]
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -337,16 +347,38 @@ def run_vacuum(db_url: str) -> None:
     run_sql_statements_parallel (which opens a separate autocommit
     connection per statement) to vacuum all tables concurrently.
     """
-    tables = [
-        "release",
-        "release_artist",
-        "release_label",
-        "release_track",
-        "release_track_artist",
-        "cache_metadata",
-    ]
-    statements = [f"VACUUM FULL {table}" for table in tables]
+    statements = [f"VACUUM FULL {table}" for table in PIPELINE_TABLES]
     run_sql_statements_parallel(db_url, statements, description="VACUUM FULL")
+
+
+def set_tables_unlogged(db_url: str) -> None:
+    """Set all pipeline tables to UNLOGGED to skip WAL writes during bulk import.
+
+    FK ordering: child tables first (parallel), then the parent ``release``
+    table, because PostgreSQL requires all tables in a FK relationship to
+    share the same persistence mode.
+    """
+    child_tables = [t for t in PIPELINE_TABLES if t != "release"]
+    child_stmts = [f"ALTER TABLE {t} SET UNLOGGED" for t in child_tables]
+    run_sql_statements_parallel(db_url, child_stmts, description="SET UNLOGGED (children)")
+    run_sql_statements_parallel(
+        db_url, ["ALTER TABLE release SET UNLOGGED"], description="SET UNLOGGED (release)"
+    )
+
+
+def set_tables_logged(db_url: str) -> None:
+    """Set all pipeline tables back to LOGGED for durable storage after import.
+
+    FK ordering: parent ``release`` table first, then child tables (parallel),
+    because PostgreSQL requires all tables in a FK relationship to share
+    the same persistence mode.
+    """
+    run_sql_statements_parallel(
+        db_url, ["ALTER TABLE release SET LOGGED"], description="SET LOGGED (release)"
+    )
+    child_tables = [t for t in PIPELINE_TABLES if t != "release"]
+    child_stmts = [f"ALTER TABLE {t} SET LOGGED" for t in child_tables]
+    run_sql_statements_parallel(db_url, child_stmts, description="SET LOGGED (children)")
 
 
 def report_sizes(db_url: str) -> None:
@@ -634,6 +666,9 @@ def _run_database_build_post_import(
     Skips create_schema (already done), import_csv, and import_tracks
     (converter loaded all data directly). Runs create_indexes through vacuum.
     """
+    # -- set_tables_unlogged (skip WAL writes during bulk operations)
+    set_tables_unlogged(db_url)
+
     # -- create_indexes (base trigram indexes, run in parallel)
     conn = psycopg.connect(db_url, autocommit=True)
     with conn.cursor() as cur:
@@ -719,6 +754,9 @@ def _run_database_build_post_import(
     # -- vacuum
     run_vacuum(db_url)
 
+    # -- set_tables_logged (restore WAL durability for consumers)
+    set_tables_logged(db_url)
+
     # -- report
     report_sizes(db_url)
 
@@ -764,6 +802,9 @@ def _run_database_build(
         if state:
             state.mark_completed("create_schema")
             _save_state()
+
+    # -- set_tables_unlogged (skip WAL writes during bulk import)
+    set_tables_unlogged(db_url)
 
     # -- import_csv (base tables, artwork, cache_metadata, track counts)
     if state and state.is_completed("import_csv"):
@@ -924,6 +965,15 @@ def _run_database_build(
         run_vacuum(vacuum_db)
         if state:
             state.mark_completed("vacuum")
+            _save_state()
+
+    # -- set_tables_logged (restore WAL durability for consumers)
+    if state and state.is_completed("set_logged"):
+        logger.info("Skipping set_logged (already completed)")
+    else:
+        set_tables_logged(vacuum_db)
+        if state:
+            state.mark_completed("set_logged")
             _save_state()
 
     # -- report
