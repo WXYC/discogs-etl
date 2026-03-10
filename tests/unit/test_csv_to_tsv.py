@@ -15,6 +15,7 @@ _ct = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_ct)
 
 convert = _ct.convert
+main = _ct.main
 
 
 class TestConvert:
@@ -90,3 +91,32 @@ class TestConvert:
         assert count == 0
         lines = tsv_file.read_text().splitlines()
         assert lines == ["h"]
+
+
+class TestMain:
+    """Tests for the main() entry point."""
+
+    def test_wrong_arg_count_exits(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr("sys.argv", ["csv_to_tsv.py"])
+        with pytest.raises(SystemExit) as exc_info:
+            main()
+        assert exc_info.value.code == 1
+
+    def test_too_many_args_exits(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr("sys.argv", ["csv_to_tsv.py", "a", "b", "c"])
+        with pytest.raises(SystemExit) as exc_info:
+            main()
+        assert exc_info.value.code == 1
+
+    def test_happy_path(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        csv_file = tmp_path / "input.csv"
+        tsv_file = tmp_path / "output.tsv"
+        csv_file.write_text("name,value\nalpha,1\nbeta,2\n")
+
+        monkeypatch.setattr("sys.argv", ["csv_to_tsv.py", str(csv_file), str(tsv_file)])
+        main()
+
+        lines = tsv_file.read_text().splitlines()
+        assert lines[0] == "name\tvalue"
+        assert lines[1] == "alpha\t1"
+        assert lines[2] == "beta\t2"

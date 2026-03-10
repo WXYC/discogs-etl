@@ -643,6 +643,11 @@ class TestLoadDiscogsReleases:
 # Step 8: Argument Parsing
 # ---------------------------------------------------------------------------
 
+format_bytes = _vc.format_bytes
+ClassificationReport = _vc.ClassificationReport
+MatchResult = _vc.MatchResult
+print_report = _vc.print_report
+
 classify_all_releases = _vc.classify_all_releases
 classify_artist_fuzzy = _vc.classify_artist_fuzzy
 classify_fuzzy_batch = _vc.classify_fuzzy_batch
@@ -843,3 +848,132 @@ class TestParseArgsCopyTo:
         lib_db.touch()
         args = parse_args([str(lib_db)])
         assert args.copy_to is None
+
+
+# ---------------------------------------------------------------------------
+# format_bytes
+# ---------------------------------------------------------------------------
+
+
+class TestFormatBytes:
+    """Test human-readable byte formatting."""
+
+    @pytest.mark.parametrize(
+        "num_bytes, expected",
+        [
+            (0, "0.0 B"),
+            (1023, "1023.0 B"),
+            (1024, "1.0 KB"),
+            (1048576, "1.0 MB"),
+            (1073741824, "1.0 GB"),
+            (1099511627776, "1.0 TB"),
+        ],
+        ids=["zero", "bytes", "kilobytes", "megabytes", "gigabytes", "terabytes"],
+    )
+    def test_format_bytes(self, num_bytes: int, expected: str) -> None:
+        assert format_bytes(num_bytes) == expected
+
+
+# ---------------------------------------------------------------------------
+# print_report
+# ---------------------------------------------------------------------------
+
+
+class TestPrintReport:
+    """Test the print_report function with mock data."""
+
+    def test_basic_report(self, sample_index, capsys: pytest.CaptureFixture[str]) -> None:
+        report = ClassificationReport(
+            keep_ids={1, 2, 3},
+            prune_ids={4, 5},
+            review_ids=set(),
+            review_by_artist={},
+            artist_originals={},
+            total_releases=5,
+        )
+
+        print_report(report, sample_index)
+
+        captured = capsys.readouterr()
+        assert "VERIFICATION REPORT" in captured.out
+        assert "KEEP:" in captured.out
+        assert "PRUNE:" in captured.out
+        assert "3" in captured.out  # keep count
+        assert "2" in captured.out  # prune count
+
+    def test_report_with_table_sizes(
+        self, sample_index, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        report = ClassificationReport(
+            keep_ids={1, 2},
+            prune_ids={3, 4, 5},
+            review_ids=set(),
+            review_by_artist={},
+            artist_originals={},
+            total_releases=5,
+        )
+        table_sizes = {
+            "release": (100, 1048576),
+            "release_artist": (200, 2097152),
+            "release_label": (150, 524288),
+            "release_track": (500, 4194304),
+            "release_track_artist": (300, 1048576),
+            "cache_metadata": (100, 262144),
+        }
+        rows_to_delete = {
+            "release": 60,
+            "release_artist": 120,
+            "release_label": 90,
+            "release_track": 300,
+            "release_track_artist": 180,
+            "cache_metadata": 60,
+        }
+
+        print_report(report, sample_index, table_sizes=table_sizes, rows_to_delete=rows_to_delete)
+
+        captured = capsys.readouterr()
+        assert "Database size" in captured.out
+        assert "Estimated savings" in captured.out
+        assert "release_track" in captured.out
+
+    def test_pruned_report(self, sample_index, capsys: pytest.CaptureFixture[str]) -> None:
+        report = ClassificationReport(
+            keep_ids={1, 2},
+            prune_ids={3},
+            review_ids=set(),
+            review_by_artist={},
+            artist_originals={},
+            total_releases=3,
+        )
+
+        print_report(report, sample_index, pruned=True)
+
+        captured = capsys.readouterr()
+        assert "PRUNING REPORT" in captured.out
+        assert "Releases kept:" in captured.out
+        assert "Releases pruned:" in captured.out
+
+    def test_report_with_review_artists(
+        self, sample_index, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        match_result = MatchResult(
+            decision=Decision.REVIEW,
+            exact_score=0.0,
+            token_set_score=0.70,
+            token_sort_score=0.65,
+            two_stage_score=0.60,
+        )
+        report = ClassificationReport(
+            keep_ids={1},
+            prune_ids={2},
+            review_ids={3},
+            review_by_artist={"some artist": [(3, "Some Album", match_result)]},
+            artist_originals={"some artist": "Some Artist"},
+            total_releases=3,
+        )
+
+        print_report(report, sample_index)
+
+        captured = capsys.readouterr()
+        assert "REVIEW" in captured.out
+        assert "artist-level decisions needed" in captured.out

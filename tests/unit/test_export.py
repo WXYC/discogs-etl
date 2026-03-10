@@ -13,6 +13,7 @@ assert _spec is not None and _spec.loader is not None
 _mod = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_mod)
 _do_export = _mod._do_export
+format_size = _mod.format_size
 _OUTPUT_PATH_ATTR = "OUTPUT_PATH"
 
 
@@ -168,3 +169,91 @@ class TestDoExport:
         assert len(results) == 2
         assert results[0] == (1, "Plug")
         assert results[1] == (2, None)
+
+    def test_creates_correct_tables_and_row_count(self):
+        """Verify the exported database has the correct tables, FTS index, and row count."""
+        rows = [
+            {
+                "id": "1",
+                "title": "DOGA",
+                "artist": "Juana Molina",
+                "call_letters": "M",
+                "artist_call_number": "42",
+                "release_call_number": "1",
+                "genre": "Rock",
+                "format": "LP",
+                "alternate_artist_name": None,
+            },
+            {
+                "id": "2",
+                "title": "Aluminum Tunes",
+                "artist": "Stereolab",
+                "call_letters": "S",
+                "artist_call_number": "88",
+                "release_call_number": "1",
+                "genre": "Rock",
+                "format": "CD",
+                "alternate_artist_name": None,
+            },
+            {
+                "id": "3",
+                "title": "Moon Pix",
+                "artist": "Cat Power",
+                "call_letters": "C",
+                "artist_call_number": "7",
+                "release_call_number": "1",
+                "genre": "Rock",
+                "format": "LP",
+                "alternate_artist_name": None,
+            },
+        ]
+        _do_export(rows)
+
+        conn = sqlite3.connect(self.output_path)
+
+        # Verify table exists
+        cursor = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='library'"
+        )
+        assert cursor.fetchone() is not None
+
+        # Verify FTS table exists
+        cursor = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='library_fts'"
+        )
+        assert cursor.fetchone() is not None
+
+        # Verify row count
+        cursor = conn.execute("SELECT COUNT(*) FROM library")
+        assert cursor.fetchone()[0] == 3
+
+        # Verify FTS works
+        cursor = conn.execute("""
+            SELECT l.id FROM library l
+            JOIN library_fts fts ON l.id = fts.rowid
+            WHERE library_fts MATCH 'Stereolab'
+        """)
+        results = cursor.fetchall()
+        assert len(results) == 1
+        assert results[0][0] == 2
+
+        conn.close()
+
+
+class TestFormatSize:
+    """Test human-readable size formatting."""
+
+    @pytest.mark.parametrize(
+        "size_bytes, expected",
+        [
+            (0, "0.0 B"),
+            (1023, "1023.0 B"),
+            (1024, "1.0 KB"),
+            (1048576, "1.0 MB"),
+            (1073741824, "1.0 GB"),
+            (1099511627776, "1.0 TB"),
+        ],
+        ids=["zero", "bytes", "kilobytes", "megabytes", "gigabytes", "terabytes"],
+    )
+    def test_format_size(self, size_bytes: int, expected: str) -> None:
+        assert format_size(size_bytes) == expected

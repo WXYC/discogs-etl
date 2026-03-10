@@ -20,6 +20,7 @@ load_library_artists = _fc.load_library_artists
 find_matching_release_ids = _fc.find_matching_release_ids
 filter_csv_file = _fc.filter_csv_file
 get_release_id_column = _fc.get_release_id_column
+main = _fc.main
 
 FIXTURES_DIR = Path(__file__).parent.parent / "fixtures"
 
@@ -246,3 +247,185 @@ class TestFilterCsvFile:
 
         with pytest.raises(ValueError, match="Column 'nonexistent'.*not found"):
             filter_csv_file(input_path, output_path, {1001}, "nonexistent")
+
+    def test_row_with_invalid_release_id_skipped(self, tmp_path: Path) -> None:
+        """Rows where the release_id is not a valid integer are silently skipped."""
+        csv_path = tmp_path / "release.csv"
+        output_path = tmp_path / "out.csv"
+        with open(csv_path, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["id", "title"])
+            writer.writerow(["abc", "Bad ID"])
+            writer.writerow(["1001", "Good ID"])
+
+        input_count, output_count = filter_csv_file(csv_path, output_path, {1001}, "id")
+        assert input_count == 2
+        assert output_count == 1
+
+    def test_short_row_skipped(self, tmp_path: Path) -> None:
+        """Rows shorter than expected (IndexError on id column) are silently skipped."""
+        csv_path = tmp_path / "release.csv"
+        output_path = tmp_path / "out.csv"
+        with open(csv_path, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["id", "title", "country"])
+            # Normal row
+            writer.writerow(["1001", "DOGA", "AR"])
+            # Write a short row manually (fewer columns than header)
+            f.write('"short"\n')
+
+        input_count, output_count = filter_csv_file(csv_path, output_path, {1001}, "id")
+        assert input_count == 2
+        assert output_count == 1
+
+
+class TestFindMatchingReleaseIdsEdgeCases:
+    """Edge cases for find_matching_release_ids."""
+
+    def test_short_row_skipped(self, tmp_path: Path) -> None:
+        """Rows missing the artist_name column are silently skipped."""
+        csv_path = tmp_path / "release_artist.csv"
+        with open(csv_path, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["release_id", "artist_id", "artist_name", "extra", "anv", "position"])
+            writer.writerow(["1001", "101", "Juana Molina", "0", "", "1"])
+            # Short row missing artist_name
+            f.write('"2001","201"\n')
+
+        ids = find_matching_release_ids(csv_path, {"juana molina"})
+        assert ids == {1001}
+
+
+# ---------------------------------------------------------------------------
+# main
+# ---------------------------------------------------------------------------
+
+
+class TestMain:
+    """Tests for the main() entry point."""
+
+    def test_wrong_arg_count_exits(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr("sys.argv", ["filter_csv.py"])
+        with pytest.raises(SystemExit) as exc_info:
+            main()
+        assert exc_info.value.code == 1
+
+    def test_missing_library_artists_exits(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            "sys.argv",
+            [
+                "filter_csv.py",
+                str(tmp_path / "nonexistent.txt"),
+                str(tmp_path),
+                str(tmp_path / "out"),
+            ],
+        )
+        with pytest.raises(SystemExit) as exc_info:
+            main()
+        assert exc_info.value.code == 1
+
+    def test_missing_csv_dir_exits(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        artists_file = tmp_path / "artists.txt"
+        artists_file.write_text("Juana Molina\n")
+        monkeypatch.setattr(
+            "sys.argv",
+            ["filter_csv.py", str(artists_file), str(tmp_path / "nope"), str(tmp_path / "out")],
+        )
+        with pytest.raises(SystemExit) as exc_info:
+            main()
+        assert exc_info.value.code == 1
+
+    def test_missing_release_artist_csv_exits(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        artists_file = tmp_path / "artists.txt"
+        artists_file.write_text("Juana Molina\n")
+        csv_dir = tmp_path / "csv"
+        csv_dir.mkdir()
+        monkeypatch.setattr(
+            "sys.argv",
+            ["filter_csv.py", str(artists_file), str(csv_dir), str(tmp_path / "out")],
+        )
+        with pytest.raises(SystemExit) as exc_info:
+            main()
+        assert exc_info.value.code == 1
+
+    def test_no_matches_exits(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        artists_file = tmp_path / "artists.txt"
+        artists_file.write_text("Nonexistent Artist XYZ\n")
+
+        csv_dir = tmp_path / "csv"
+        csv_dir.mkdir()
+        with open(csv_dir / "release_artist.csv", "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["release_id", "artist_id", "artist_name", "extra", "anv", "position"])
+            writer.writerow(["1001", "101", "Juana Molina", "0", "", "1"])
+
+        monkeypatch.setattr(
+            "sys.argv",
+            ["filter_csv.py", str(artists_file), str(csv_dir), str(tmp_path / "out")],
+        )
+        with pytest.raises(SystemExit) as exc_info:
+            main()
+        assert exc_info.value.code == 1
+
+    def test_happy_path(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        artists_file = tmp_path / "artists.txt"
+        artists_file.write_text("Juana Molina\n")
+
+        csv_dir = tmp_path / "csv"
+        csv_dir.mkdir()
+        out_dir = tmp_path / "out"
+
+        with open(csv_dir / "release_artist.csv", "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["release_id", "artist_id", "artist_name", "extra", "anv", "position"])
+            writer.writerow(["5001", "101", "Juana Molina", "0", "", "1"])
+            writer.writerow(["5002", "102", "Stereolab", "0", "", "1"])
+
+        with open(csv_dir / "release.csv", "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(
+                [
+                    "id",
+                    "status",
+                    "title",
+                    "country",
+                    "released",
+                    "notes",
+                    "data_quality",
+                    "master_id",
+                    "format",
+                ]
+            )
+            writer.writerow(
+                ["5001", "Accepted", "DOGA", "AR", "2024-05-10", "", "Correct", "8001", "LP"]
+            )
+            writer.writerow(
+                [
+                    "5002",
+                    "Accepted",
+                    "Aluminum Tunes",
+                    "UK",
+                    "1998-09-01",
+                    "",
+                    "Correct",
+                    "8002",
+                    "CD",
+                ]
+            )
+
+        monkeypatch.setattr(
+            "sys.argv",
+            ["filter_csv.py", str(artists_file), str(csv_dir), str(out_dir)],
+        )
+        main()
+
+        assert out_dir.exists()
+        with open(out_dir / "release.csv") as f:
+            reader = csv.DictReader(f)
+            rows = list(reader)
+        assert len(rows) == 1
+        assert rows[0]["id"] == "5001"
