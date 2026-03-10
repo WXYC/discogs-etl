@@ -22,6 +22,8 @@ _spec.loader.exec_module(_ic)
 import_csv_func = _ic.import_csv
 import_artwork = _ic.import_artwork
 create_track_count_table = _ic.create_track_count_table
+populate_cache_metadata = _ic.populate_cache_metadata
+_import_tables = _ic._import_tables
 TABLES = _ic.TABLES
 BASE_TABLES = _ic.BASE_TABLES
 TRACK_TABLES = _ic.TRACK_TABLES
@@ -467,3 +469,262 @@ class TestDuplicateReleaseIds:
         conn.close()
         # First occurrence wins
         assert title == "DOGA"
+
+
+class TestPopulateCacheMetadata:
+    """Verify populate_cache_metadata() inserts metadata for all releases via COPY."""
+
+    @pytest.fixture(autouse=True, scope="class")
+    def _set_up_database(self, db_url):
+        self.__class__._db_url = db_url
+        _clean_db(db_url)
+        conn = psycopg.connect(db_url, autocommit=True)
+        with conn.cursor() as cur:
+            cur.execute(SCHEMA_DIR.joinpath("create_database.sql").read_text())
+            cur.execute("INSERT INTO release (id, title) VALUES (5001, 'DOGA')")
+            cur.execute("INSERT INTO release (id, title) VALUES (5002, 'Aluminum Tunes')")
+            cur.execute("INSERT INTO release (id, title) VALUES (5003, 'Moon Pix')")
+        conn.close()
+
+        conn = psycopg.connect(db_url)
+        populate_cache_metadata(conn)
+        conn.close()
+
+    @pytest.fixture(autouse=True)
+    def _store_url(self):
+        self.db_url = self.__class__._db_url
+
+    def _connect(self):
+        return psycopg.connect(self.db_url)
+
+    def test_metadata_row_count(self) -> None:
+        """One cache_metadata row per release."""
+        conn = self._connect()
+        with conn.cursor() as cur:
+            cur.execute("SELECT count(*) FROM cache_metadata")
+            count = cur.fetchone()[0]
+        conn.close()
+        assert count == 3
+
+    def test_metadata_source(self) -> None:
+        """All rows have source='bulk_import'."""
+        conn = self._connect()
+        with conn.cursor() as cur:
+            cur.execute("SELECT DISTINCT source FROM cache_metadata")
+            sources = {row[0] for row in cur.fetchall()}
+        conn.close()
+        assert sources == {"bulk_import"}
+
+    def test_metadata_release_ids(self) -> None:
+        """Metadata release_ids match the inserted releases."""
+        conn = self._connect()
+        with conn.cursor() as cur:
+            cur.execute("SELECT release_id FROM cache_metadata ORDER BY release_id")
+            ids = [row[0] for row in cur.fetchall()]
+        conn.close()
+        assert ids == [5001, 5002, 5003]
+
+    def test_metadata_cached_at_not_null(self) -> None:
+        """cached_at defaults to current timestamp (not null)."""
+        conn = self._connect()
+        with conn.cursor() as cur:
+            cur.execute("SELECT count(*) FROM cache_metadata WHERE cached_at IS NOT NULL")
+            count = cur.fetchone()[0]
+        conn.close()
+        assert count == 3
+
+
+class TestImportArtwork:
+    """Verify import_artwork() populates artwork_url from release_image.csv."""
+
+    @pytest.fixture(autouse=True, scope="class")
+    def _set_up_database(self, db_url):
+        self.__class__._db_url = db_url
+        _clean_db(db_url)
+        conn = psycopg.connect(db_url, autocommit=True)
+        with conn.cursor() as cur:
+            cur.execute(SCHEMA_DIR.joinpath("create_database.sql").read_text())
+            cur.execute("INSERT INTO release (id, title) VALUES (101, 'Album A')")
+            cur.execute("INSERT INTO release (id, title) VALUES (102, 'Album B')")
+            cur.execute("INSERT INTO release (id, title) VALUES (103, 'Album C')")
+        conn.close()
+
+    @pytest.fixture(autouse=True)
+    def _store_url(self):
+        self.db_url = self.__class__._db_url
+
+    def _connect(self):
+        return psycopg.connect(self.db_url)
+
+    def test_primary_image_preferred(self, tmp_path) -> None:
+        """Primary image type is used over secondary."""
+        csv_path = tmp_path / "release_image.csv"
+        csv_path.write_text(
+            "release_id,type,width,height,uri\n"
+            "101,secondary,300,300,https://img.discogs.com/secondary-101.jpg\n"
+            "101,primary,600,600,https://img.discogs.com/primary-101.jpg\n"
+        )
+        conn = psycopg.connect(self.db_url)
+        import_artwork(conn, tmp_path)
+        conn.close()
+
+        conn = self._connect()
+        with conn.cursor() as cur:
+            cur.execute("SELECT artwork_url FROM release WHERE id = 101")
+            url = cur.fetchone()[0]
+        conn.close()
+        assert url == "https://img.discogs.com/primary-101.jpg"
+
+    def test_fallback_when_no_primary(self, tmp_path) -> None:
+        """Secondary image used as fallback when no primary exists."""
+        csv_path = tmp_path / "release_image.csv"
+        csv_path.write_text(
+            "release_id,type,width,height,uri\n"
+            "102,secondary,600,600,https://img.discogs.com/secondary-102.jpg\n"
+        )
+        # Reset artwork_url for release 102
+        conn = psycopg.connect(self.db_url)
+        with conn.cursor() as cur:
+            cur.execute("UPDATE release SET artwork_url = NULL WHERE id = 102")
+        conn.commit()
+        import_artwork(conn, tmp_path)
+        conn.close()
+
+        conn = self._connect()
+        with conn.cursor() as cur:
+            cur.execute("SELECT artwork_url FROM release WHERE id = 102")
+            url = cur.fetchone()[0]
+        conn.close()
+        assert url == "https://img.discogs.com/secondary-102.jpg"
+
+    def test_invalid_release_id_skipped(self, tmp_path) -> None:
+        """Rows with non-integer release_id are silently skipped."""
+        csv_path = tmp_path / "release_image.csv"
+        csv_path.write_text(
+            "release_id,type,width,height,uri\n"
+            "abc,primary,600,600,https://img.discogs.com/bad.jpg\n"
+            "103,primary,600,600,https://img.discogs.com/good-103.jpg\n"
+        )
+        conn = psycopg.connect(self.db_url)
+        with conn.cursor() as cur:
+            cur.execute("UPDATE release SET artwork_url = NULL WHERE id = 103")
+        conn.commit()
+        count = import_artwork(conn, tmp_path)
+        conn.close()
+
+        conn = self._connect()
+        with conn.cursor() as cur:
+            cur.execute("SELECT artwork_url FROM release WHERE id = 103")
+            url = cur.fetchone()[0]
+        conn.close()
+        assert url == "https://img.discogs.com/good-103.jpg"
+        assert count >= 1
+
+    def test_empty_uri_skipped(self, tmp_path) -> None:
+        """Rows with empty URI are skipped."""
+        csv_path = tmp_path / "release_image.csv"
+        csv_path.write_text("release_id,type,width,height,uri\n103,primary,600,600,\n")
+        conn = psycopg.connect(self.db_url)
+        with conn.cursor() as cur:
+            cur.execute("UPDATE release SET artwork_url = NULL WHERE id = 103")
+        conn.commit()
+        count = import_artwork(conn, tmp_path)
+        conn.close()
+
+        conn = self._connect()
+        with conn.cursor() as cur:
+            cur.execute("SELECT artwork_url FROM release WHERE id = 103")
+            url = cur.fetchone()[0]
+        conn.close()
+        assert url is None
+        assert count == 0
+
+
+class TestImportArtworkMissing:
+    """Verify import_artwork() returns 0 when release_image.csv is missing."""
+
+    @pytest.fixture(autouse=True, scope="class")
+    def _set_up_database(self, db_url):
+        self.__class__._db_url = db_url
+        _clean_db(db_url)
+        conn = psycopg.connect(db_url, autocommit=True)
+        with conn.cursor() as cur:
+            cur.execute(SCHEMA_DIR.joinpath("create_database.sql").read_text())
+            cur.execute("INSERT INTO release (id, title) VALUES (1, 'Test')")
+        conn.close()
+
+    @pytest.fixture(autouse=True)
+    def _store_url(self):
+        self.db_url = self.__class__._db_url
+
+    def test_returns_zero(self, tmp_path) -> None:
+        """import_artwork returns 0 when release_image.csv does not exist."""
+        conn = psycopg.connect(self.db_url)
+        result = import_artwork(conn, tmp_path)
+        conn.close()
+        assert result == 0
+
+
+class TestCreateTrackCountTableMissing:
+    """Verify create_track_count_table() returns 0 when release_track.csv is missing."""
+
+    @pytest.fixture(autouse=True, scope="class")
+    def _set_up_database(self, db_url):
+        self.__class__._db_url = db_url
+        _clean_db(db_url)
+        conn = psycopg.connect(db_url, autocommit=True)
+        with conn.cursor() as cur:
+            cur.execute(SCHEMA_DIR.joinpath("create_database.sql").read_text())
+        conn.close()
+
+    @pytest.fixture(autouse=True)
+    def _store_url(self):
+        self.db_url = self.__class__._db_url
+
+    def test_returns_zero(self, tmp_path) -> None:
+        """create_track_count_table returns 0 when release_track.csv does not exist."""
+        conn = psycopg.connect(self.db_url)
+        result = create_track_count_table(conn, tmp_path)
+        conn.close()
+        assert result == 0
+
+
+class TestImportTables:
+    """Verify _import_tables() sequential import of table configs."""
+
+    @pytest.fixture(autouse=True, scope="class")
+    def _set_up_database(self, db_url):
+        self.__class__._db_url = db_url
+        _clean_db(db_url)
+        conn = psycopg.connect(db_url, autocommit=True)
+        with conn.cursor() as cur:
+            cur.execute(SCHEMA_DIR.joinpath("create_database.sql").read_text())
+        conn.close()
+
+    @pytest.fixture(autouse=True)
+    def _store_url(self):
+        self.db_url = self.__class__._db_url
+
+    def test_imports_all_tables(self) -> None:
+        """_import_tables imports all CSVs in the table list and returns total count."""
+        conn = psycopg.connect(self.db_url)
+        total = _import_tables(conn, CSV_DIR, BASE_TABLES)
+        conn.close()
+
+        conn = psycopg.connect(self.db_url)
+        with conn.cursor() as cur:
+            cur.execute("SELECT count(*) FROM release")
+            release_count = cur.fetchone()[0]
+            cur.execute("SELECT count(*) FROM release_artist")
+            artist_count = cur.fetchone()[0]
+        conn.close()
+        assert release_count > 0
+        assert artist_count > 0
+        assert total == release_count + artist_count + 16  # + release_label count
+
+    def test_skips_missing_csv(self, tmp_path) -> None:
+        """_import_tables skips table configs whose CSV file does not exist."""
+        conn = psycopg.connect(self.db_url)
+        total = _import_tables(conn, tmp_path, TRACK_TABLES)
+        conn.close()
+        assert total == 0
