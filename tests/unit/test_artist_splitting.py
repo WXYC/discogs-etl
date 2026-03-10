@@ -4,7 +4,12 @@ from __future__ import annotations
 
 import pytest
 
-from lib.artist_splitting import split_artist_name, split_artist_name_contextual
+from lib.artist_splitting import (
+    _split_trailing_and,
+    _try_ampersand_split,
+    split_artist_name,
+    split_artist_name_contextual,
+)
 
 # ---------------------------------------------------------------------------
 # split_artist_name (context-free)
@@ -159,3 +164,64 @@ class TestSplitArtistNameContextual:
         """Common band name patterns with 'and'/'with' should never be split."""
         known = {"sly", "andy human", "my life", "nurse"}
         assert split_artist_name_contextual(name, known) == []
+
+
+# ---------------------------------------------------------------------------
+# _comma_guard (numeric guard)
+# ---------------------------------------------------------------------------
+
+
+class TestCommaGuardNumeric:
+    """The numeric guard in comma splitting prevents splitting artist names with numbers."""
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "10,000 Maniacs",
+            "808,303",
+            "1,000 Homo DJs",
+        ],
+        ids=["10000-maniacs", "808-303", "1000-homo-djs"],
+    )
+    def test_numeric_components_block_split(self, name: str) -> None:
+        assert split_artist_name(name) == []
+
+
+# ---------------------------------------------------------------------------
+# _split_trailing_and (single-component input)
+# ---------------------------------------------------------------------------
+
+
+class TestSplitTrailingAnd:
+    """Direct tests for _split_trailing_and edge cases."""
+
+    def test_single_component_returns_as_is(self) -> None:
+        assert _split_trailing_and(["Autechre"]) == ["Autechre"]
+
+    def test_empty_list_returns_as_is(self) -> None:
+        assert _split_trailing_and([]) == []
+
+    def test_two_components_with_trailing_and(self) -> None:
+        assert _split_trailing_and(["Emerson", "and Palmer"]) == ["Emerson", "Palmer"]
+
+    def test_two_components_without_trailing_and(self) -> None:
+        assert _split_trailing_and(["Emerson", "Palmer"]) == ["Emerson", "Palmer"]
+
+
+# ---------------------------------------------------------------------------
+# _try_ampersand_split (edge cases)
+# ---------------------------------------------------------------------------
+
+
+class TestTryAmpersandSplit:
+    """Direct tests for _try_ampersand_split edge cases."""
+
+    def test_no_ampersand_returns_none(self) -> None:
+        assert _try_ampersand_split("Autechre", {"autechre"}) is None
+
+    def test_no_known_artist_returns_none(self) -> None:
+        assert _try_ampersand_split("Simon & Garfunkel", set()) is None
+
+    def test_single_char_components_rejected(self) -> None:
+        """When all components after filtering are too short, returns None."""
+        assert _try_ampersand_split("A & B", {"a"}) is None

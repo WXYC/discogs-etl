@@ -16,6 +16,8 @@ _fn = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_fn)
 
 fix_csv = _fn.fix_csv
+fix_csv_dir = _fn.fix_csv_dir
+main = _fn.main
 
 
 class TestFixCsv:
@@ -101,3 +103,81 @@ class TestFixCsv:
 
         rows = self._read_csv(output_path)
         assert rows[0][0] == expected
+
+
+class TestFixCsvDir:
+    """Batch-processing a directory of CSV files."""
+
+    def _write_csv(self, path: Path, headers: list[str], rows: list[list[str]]) -> None:
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(headers)
+            writer.writerows(rows)
+
+    def test_processes_all_csv_files(self, tmp_path: Path) -> None:
+        input_dir = tmp_path / "input"
+        output_dir = tmp_path / "output"
+        input_dir.mkdir()
+
+        self._write_csv(input_dir / "a.csv", ["text"], [["line\none"]])
+        self._write_csv(input_dir / "b.csv", ["text"], [["hello\nworld"]])
+
+        fix_csv_dir(input_dir, output_dir)
+
+        assert (output_dir / "a.csv").exists()
+        assert (output_dir / "b.csv").exists()
+
+        with open(output_dir / "a.csv") as f:
+            reader = csv.reader(f)
+            next(reader)
+            assert next(reader)[0] == "line one"
+
+        with open(output_dir / "b.csv") as f:
+            reader = csv.reader(f)
+            next(reader)
+            assert next(reader)[0] == "hello world"
+
+    def test_empty_dir_logs_warning(self, tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+        import logging
+
+        input_dir = tmp_path / "empty"
+        output_dir = tmp_path / "output"
+        input_dir.mkdir()
+
+        with caplog.at_level(logging.WARNING):
+            fix_csv_dir(input_dir, output_dir)
+
+        assert any("No .csv files found" in r.message for r in caplog.records)
+
+
+class TestMain:
+    """Tests for the main() entry point."""
+
+    def test_wrong_arg_count_exits(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr("sys.argv", ["fix_csv_newlines.py"])
+        with pytest.raises(SystemExit) as exc_info:
+            main()
+        assert exc_info.value.code == 1
+
+    def test_too_many_args_exits(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr("sys.argv", ["fix_csv_newlines.py", "a", "b", "c"])
+        with pytest.raises(SystemExit) as exc_info:
+            main()
+        assert exc_info.value.code == 1
+
+    def test_happy_path(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        input_path = tmp_path / "input.csv"
+        output_path = tmp_path / "output.csv"
+
+        with open(input_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(["text"])
+            writer.writerow(["line\none"])
+
+        monkeypatch.setattr("sys.argv", ["fix_csv_newlines.py", str(input_path), str(output_path)])
+        main()
+
+        with open(output_path) as f:
+            reader = csv.reader(f)
+            next(reader)
+            assert next(reader)[0] == "line one"
