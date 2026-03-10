@@ -141,9 +141,20 @@ class TestTablesConfig:
                 f"{required_keys - table_config.keys()}"
             )
 
+    def test_release_table_has_unique_key_on_id(self) -> None:
+        """The release table must dedup on id to handle duplicate releases in CSVs."""
+        release_config = next(t for t in TABLES if t["table"] == "release")
+        assert "unique_key" in release_config, "release table needs unique_key for dedup"
+        assert release_config["unique_key"] == ["id"]
+
     def test_tables_with_unique_constraints_have_unique_key(self) -> None:
         """Tables with unique constraints must specify unique_key for dedup during import."""
-        tables_needing_dedup = {"release_artist", "release_label", "release_track_artist"}
+        tables_needing_dedup = {
+            "release",
+            "release_artist",
+            "release_label",
+            "release_track_artist",
+        }
         for table_config in TABLES:
             if table_config["table"] in tables_needing_dedup:
                 assert "unique_key" in table_config, (

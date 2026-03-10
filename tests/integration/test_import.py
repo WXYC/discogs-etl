@@ -413,3 +413,57 @@ class TestFilteredTrackImport:
         conn.close()
         # 1002: 3, 3001: 2, 4001: 2 = 7
         assert count == 7
+
+
+class TestDuplicateReleaseIds:
+    """Import a CSV with duplicate release IDs — first occurrence wins."""
+
+    @pytest.fixture(autouse=True, scope="class")
+    def _set_up_database(self, db_url):
+        self.__class__._db_url = db_url
+        _clean_db(db_url)
+        conn = psycopg.connect(db_url, autocommit=True)
+        with conn.cursor() as cur:
+            cur.execute(SCHEMA_DIR.joinpath("create_database.sql").read_text())
+        conn.close()
+
+    @pytest.fixture(autouse=True)
+    def _store_url(self):
+        self.db_url = self.__class__._db_url
+
+    def _connect(self):
+        return psycopg.connect(self.db_url)
+
+    def test_duplicate_release_ids_keep_first(self, tmp_path) -> None:
+        """When a CSV has duplicate release IDs, only the first row is imported."""
+        csv_path = tmp_path / "release.csv"
+        csv_path.write_text(
+            "id,status,title,country,released,notes,data_quality,master_id,format\n"
+            "5001,Accepted,DOGA,AR,2024-05-10,,Correct,8001,LP\n"
+            "5001,Accepted,Different Title,US,2025,,Correct,8002,CD\n"
+            "5002,Accepted,Aluminum Tunes,UK,1998-09-01,,Correct,8002,CD\n"
+        )
+
+        release_config = next(t for t in BASE_TABLES if t["table"] == "release")
+        conn = psycopg.connect(self.db_url)
+        count = import_csv_func(
+            conn,
+            csv_path,
+            release_config["table"],
+            release_config["csv_columns"],
+            release_config["db_columns"],
+            release_config["required"],
+            release_config["transforms"],
+            unique_key=release_config["unique_key"],
+        )
+        conn.close()
+
+        assert count == 2  # 2 unique IDs, not 3 rows
+
+        conn = self._connect()
+        with conn.cursor() as cur:
+            cur.execute("SELECT title FROM release WHERE id = 5001")
+            title = cur.fetchone()[0]
+        conn.close()
+        # First occurrence wins
+        assert title == "DOGA"

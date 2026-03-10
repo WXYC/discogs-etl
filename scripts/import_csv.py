@@ -82,6 +82,7 @@ BASE_TABLES: list[TableConfig] = [
         "db_columns": ["id", "title", "country", "release_year", "master_id"],
         "required": ["id", "title"],
         "transforms": {"released": extract_year},
+        "unique_key": ["id"],
     },
     {
         "csv_file": "release_artist.csv",
