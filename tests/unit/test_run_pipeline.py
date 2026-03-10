@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import logging
 import sys
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -492,3 +493,455 @@ class TestXmlModeEnrichment:
         assert convert_calls[0][3] is not None, (
             "library_artists path should be passed to convert_and_filter"
         )
+
+
+# ---------------------------------------------------------------------------
+# wait_for_postgres
+# ---------------------------------------------------------------------------
+
+
+class TestWaitForPostgres:
+    """wait_for_postgres() polls until Postgres is ready or times out."""
+
+    def test_success_on_first_try(self) -> None:
+        """Successful connection on the first attempt returns immediately."""
+        mock_conn = MagicMock()
+        with patch.object(run_pipeline.psycopg, "connect", return_value=mock_conn):
+            run_pipeline.wait_for_postgres("postgresql:///test")
+        mock_conn.close.assert_called_once()
+
+    def test_retry_then_success(self) -> None:
+        """First call raises OperationalError, second succeeds."""
+        mock_conn = MagicMock()
+        with (
+            patch.object(
+                run_pipeline.psycopg,
+                "connect",
+                side_effect=[run_pipeline.psycopg.OperationalError("refused"), mock_conn],
+            ),
+            patch.object(run_pipeline.time, "sleep"),
+        ):
+            run_pipeline.wait_for_postgres("postgresql:///test")
+        mock_conn.close.assert_called_once()
+
+    def test_timeout_exits(self) -> None:
+        """All connection attempts fail and timeout is exceeded -> sys.exit(1)."""
+        # monotonic returns: first call sets deadline, subsequent calls exceed it
+        with (
+            patch.object(
+                run_pipeline.psycopg,
+                "connect",
+                side_effect=run_pipeline.psycopg.OperationalError("refused"),
+            ),
+            patch.object(run_pipeline.time, "monotonic", side_effect=[0.0, 100.0]),
+            patch.object(run_pipeline.time, "sleep"),
+            pytest.raises(SystemExit, match="1"),
+        ):
+            run_pipeline.wait_for_postgres("postgresql:///test")
+
+
+# ---------------------------------------------------------------------------
+# run_sql_file
+# ---------------------------------------------------------------------------
+
+
+class TestRunSqlFile:
+    """run_sql_file() executes SQL from a file against the database."""
+
+    def test_happy_path(self, tmp_path) -> None:
+        """SQL file contents are executed via cursor."""
+        sql_file = tmp_path / "test.sql"
+        sql_file.write_text("CREATE TABLE t (id int)")
+
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
+        mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+
+        with patch.object(run_pipeline.psycopg, "connect", return_value=mock_conn):
+            run_pipeline.run_sql_file("postgresql:///test", sql_file)
+
+        mock_cursor.execute.assert_called_once_with("CREATE TABLE t (id int)")
+        mock_conn.close.assert_called_once()
+
+    def test_sql_error_exits(self, tmp_path) -> None:
+        """psycopg.Error during execution triggers sys.exit(1)."""
+        sql_file = tmp_path / "bad.sql"
+        sql_file.write_text("INVALID SQL")
+
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_cursor.execute.side_effect = run_pipeline.psycopg.Error("syntax error")
+        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
+        mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+
+        with (
+            patch.object(run_pipeline.psycopg, "connect", return_value=mock_conn),
+            pytest.raises(SystemExit, match="1"),
+        ):
+            run_pipeline.run_sql_file("postgresql:///test", sql_file)
+        mock_conn.close.assert_called()
+
+    def test_strip_concurrently_removes_keyword(self, tmp_path) -> None:
+        """strip_concurrently=True removes CONCURRENTLY from SQL."""
+        sql_file = tmp_path / "indexes.sql"
+        sql_file.write_text("CREATE INDEX CONCURRENTLY idx_a ON t(a)")
+
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
+        mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+
+        with patch.object(run_pipeline.psycopg, "connect", return_value=mock_conn):
+            run_pipeline.run_sql_file("postgresql:///test", sql_file, strip_concurrently=True)
+
+        executed_sql = mock_cursor.execute.call_args[0][0]
+        assert "CONCURRENTLY" not in executed_sql
+        assert "CREATE INDEX idx_a ON t(a)" == executed_sql
+
+
+# ---------------------------------------------------------------------------
+# run_sql_statements_parallel — error propagation
+# ---------------------------------------------------------------------------
+
+
+class TestRunSqlStatementsParallelError:
+    """Test that psycopg.Error from a parallel statement is re-raised."""
+
+    def test_psycopg_error_is_reraised(self) -> None:
+        """A psycopg.Error in a parallel statement propagates to the caller."""
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_cursor.execute.side_effect = run_pipeline.psycopg.Error("disk full")
+        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
+        mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+
+        with (
+            patch.object(run_pipeline.psycopg, "connect", return_value=mock_conn),
+            pytest.raises(run_pipeline.psycopg.Error, match="disk full"),
+        ):
+            run_sql_statements_parallel("postgresql:///test", ["CREATE INDEX idx_x ON t(x)"])
+
+
+# ---------------------------------------------------------------------------
+# report_sizes
+# ---------------------------------------------------------------------------
+
+
+class TestReportSizes:
+    """report_sizes() queries pg_stat_user_tables and logs results."""
+
+    def test_logs_table_sizes(self, caplog) -> None:
+        """Fetched rows are logged with table names and row counts."""
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_cursor.fetchall.return_value = [
+            ("release", 50000, "120 MB"),
+            ("release_artist", 80000, "45 MB"),
+        ]
+        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
+        mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+
+        with (
+            patch.object(run_pipeline.psycopg, "connect", return_value=mock_conn),
+            caplog.at_level(logging.INFO, logger=run_pipeline.logger.name),
+        ):
+            run_pipeline.report_sizes("postgresql:///test")
+
+        mock_cursor.execute.assert_called_once()
+        logged = [r.message for r in caplog.records]
+        assert any("release" in msg and "50,000" in msg for msg in logged)
+        assert any("release_artist" in msg and "80,000" in msg for msg in logged)
+        mock_conn.close.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# convert_and_filter
+# ---------------------------------------------------------------------------
+
+
+class TestConvertAndFilter:
+    """convert_and_filter() constructs the converter command and delegates to run_step."""
+
+    def test_command_with_library_artists(self) -> None:
+        """Command includes --library-artists when provided."""
+        with patch.object(run_pipeline, "run_step") as mock_run:
+            run_pipeline.convert_and_filter(
+                Path("/data/releases.xml.gz"),
+                Path("/tmp/csv"),
+                "discogs-xml-converter",
+                library_artists=Path("/data/library_artists.txt"),
+            )
+
+        mock_run.assert_called_once()
+        cmd = mock_run.call_args[0][1]
+        assert cmd[0] == "discogs-xml-converter"
+        assert "/data/releases.xml.gz" in cmd
+        assert "--output-dir" in cmd
+        assert "--library-artists" in cmd
+        assert "/data/library_artists.txt" in cmd
+
+    def test_command_with_database_url(self) -> None:
+        """Command includes --database-url for direct-PG mode."""
+        with patch.object(run_pipeline, "run_step") as mock_run:
+            run_pipeline.convert_and_filter(
+                Path("/data/releases.xml.gz"),
+                Path("/tmp/csv"),
+                "discogs-xml-converter",
+                database_url="postgresql:///discogs",
+            )
+
+        cmd = mock_run.call_args[0][1]
+        assert "--database-url" in cmd
+        assert "postgresql:///discogs" in cmd
+        # Description mentions PostgreSQL
+        description = mock_run.call_args[0][0]
+        assert "PostgreSQL" in description
+
+    def test_command_without_optional_args(self) -> None:
+        """Command omits --library-artists and --database-url when not provided."""
+        with patch.object(run_pipeline, "run_step") as mock_run:
+            run_pipeline.convert_and_filter(
+                Path("/data/releases.xml.gz"),
+                Path("/tmp/csv"),
+                "discogs-xml-converter",
+            )
+
+        cmd = mock_run.call_args[0][1]
+        assert "--library-artists" not in cmd
+        assert "--database-url" not in cmd
+        description = mock_run.call_args[0][0]
+        assert "CSV" in description
+
+
+# ---------------------------------------------------------------------------
+# enrich_library_artists (orchestrator wrapper)
+# ---------------------------------------------------------------------------
+
+
+class TestEnrichLibraryArtists:
+    """enrich_library_artists() constructs the enrichment command."""
+
+    def test_command_with_wxyc_db_url(self) -> None:
+        """Command includes --wxyc-db-url when provided."""
+        with patch.object(run_pipeline, "run_step") as mock_run:
+            run_pipeline.enrich_library_artists(
+                Path("/data/library.db"),
+                Path("/tmp/library_artists.txt"),
+                wxyc_db_url="mysql://user:pass@host/db",
+            )
+
+        cmd = mock_run.call_args[0][1]
+        assert "--library-db" in cmd
+        assert "/data/library.db" in cmd
+        assert "--output" in cmd
+        assert "/tmp/library_artists.txt" in cmd
+        assert "--wxyc-db-url" in cmd
+        assert "mysql://user:pass@host/db" in cmd
+
+    def test_command_without_wxyc_db_url(self) -> None:
+        """Command omits --wxyc-db-url when not provided."""
+        with patch.object(run_pipeline, "run_step") as mock_run:
+            run_pipeline.enrich_library_artists(
+                Path("/data/library.db"),
+                Path("/tmp/library_artists.txt"),
+            )
+
+        cmd = mock_run.call_args[0][1]
+        assert "--library-db" in cmd
+        assert "--output" in cmd
+        assert "--wxyc-db-url" not in cmd
+
+
+# ---------------------------------------------------------------------------
+# _load_or_create_state
+# ---------------------------------------------------------------------------
+
+
+class TestLoadOrCreateState:
+    """_load_or_create_state() handles resume modes."""
+
+    def test_resume_with_existing_state_file(self, tmp_path) -> None:
+        """When --resume and state file exists, load it."""
+        state_file = tmp_path / "state.json"
+        csv_dir = tmp_path / "csv"
+        csv_dir.mkdir()
+
+        # Write a valid state file
+        state_data = {
+            "version": 3,
+            "database_url": "postgresql:///test",
+            "csv_dir": str(csv_dir.resolve()),
+            "steps": {s: {"status": "pending"} for s in run_pipeline.STEP_NAMES},
+        }
+        state_data["steps"]["create_schema"] = {"status": "completed"}
+        state_file.write_text(json.dumps(state_data))
+
+        args = run_pipeline.parse_args(
+            [
+                "--csv-dir",
+                str(csv_dir),
+                "--resume",
+                "--state-file",
+                str(state_file),
+                "--database-url",
+                "postgresql:///test",
+            ]
+        )
+
+        state = run_pipeline._load_or_create_state(args)
+        assert state.is_completed("create_schema")
+        assert not state.is_completed("import_csv")
+
+    def test_resume_without_state_file_uses_db_introspect(self, tmp_path) -> None:
+        """When --resume but no state file, infer from database."""
+        csv_dir = tmp_path / "csv"
+        csv_dir.mkdir()
+        state_file = tmp_path / "nonexistent_state.json"
+
+        args = run_pipeline.parse_args(
+            [
+                "--csv-dir",
+                str(csv_dir),
+                "--resume",
+                "--state-file",
+                str(state_file),
+                "--database-url",
+                "postgresql:///test",
+            ]
+        )
+
+        mock_state = run_pipeline.PipelineState(db_url="postgresql:///test", csv_dir="")
+        mock_state.mark_completed("create_schema")
+
+        with patch("lib.db_introspect.infer_pipeline_state", return_value=mock_state):
+            state = run_pipeline._load_or_create_state(args)
+
+        assert state.is_completed("create_schema")
+        assert state.csv_dir == str(csv_dir.resolve())
+
+    def test_fresh_state_no_resume(self, tmp_path) -> None:
+        """Without --resume, create a fresh PipelineState."""
+        csv_dir = tmp_path / "csv"
+        csv_dir.mkdir()
+
+        args = run_pipeline.parse_args(
+            [
+                "--csv-dir",
+                str(csv_dir),
+                "--database-url",
+                "postgresql:///test",
+            ]
+        )
+
+        state = run_pipeline._load_or_create_state(args)
+        assert not any(state.is_completed(s) for s in run_pipeline.STEP_NAMES)
+        assert state.db_url == "postgresql:///test"
+
+
+# ---------------------------------------------------------------------------
+# main() — input validation
+# ---------------------------------------------------------------------------
+
+
+class TestMainValidation:
+    """main() validates file paths before running the pipeline."""
+
+    def test_missing_xml_file_exits(self, tmp_path) -> None:
+        """Non-existent XML file triggers sys.exit(1)."""
+        args = run_pipeline.parse_args(["--xml", str(tmp_path / "missing.xml.gz")])
+        with (
+            patch.object(run_pipeline, "parse_args", return_value=args),
+            pytest.raises(SystemExit, match="1"),
+        ):
+            run_pipeline.main()
+
+    def test_missing_library_artists_file_exits(self, tmp_path) -> None:
+        """Non-existent library_artists.txt triggers sys.exit(1)."""
+        xml_file = tmp_path / "releases.xml.gz"
+        xml_file.touch()
+        args = run_pipeline.parse_args(
+            [
+                "--xml",
+                str(xml_file),
+                "--library-artists",
+                str(tmp_path / "missing_artists.txt"),
+            ]
+        )
+        with (
+            patch.object(run_pipeline, "parse_args", return_value=args),
+            pytest.raises(SystemExit, match="1"),
+        ):
+            run_pipeline.main()
+
+    def test_missing_csv_dir_exits(self, tmp_path) -> None:
+        """Non-existent CSV directory triggers sys.exit(1)."""
+        args = run_pipeline.parse_args(["--csv-dir", str(tmp_path / "missing_csv")])
+        with (
+            patch.object(run_pipeline, "parse_args", return_value=args),
+            pytest.raises(SystemExit, match="1"),
+        ):
+            run_pipeline.main()
+
+    def test_missing_library_db_exits(self, tmp_path) -> None:
+        """Non-existent library.db triggers sys.exit(1)."""
+        csv_dir = tmp_path / "csv"
+        csv_dir.mkdir()
+        args = run_pipeline.parse_args(
+            [
+                "--csv-dir",
+                str(csv_dir),
+                "--library-db",
+                str(tmp_path / "missing_library.db"),
+            ]
+        )
+        with (
+            patch.object(run_pipeline, "parse_args", return_value=args),
+            pytest.raises(SystemExit, match="1"),
+        ):
+            run_pipeline.main()
+
+    def test_missing_library_labels_exits(self, tmp_path) -> None:
+        """Non-existent library_labels.csv triggers sys.exit(1)."""
+        csv_dir = tmp_path / "csv"
+        csv_dir.mkdir()
+        args = run_pipeline.parse_args(
+            [
+                "--csv-dir",
+                str(csv_dir),
+                "--library-labels",
+                str(tmp_path / "missing_labels.csv"),
+            ]
+        )
+        with (
+            patch.object(run_pipeline, "parse_args", return_value=args),
+            pytest.raises(SystemExit, match="1"),
+        ):
+            run_pipeline.main()
+
+
+# ---------------------------------------------------------------------------
+# parse_args — additional validation
+# ---------------------------------------------------------------------------
+
+
+class TestParseArgsValidation:
+    """Additional argument validation in parse_args."""
+
+    def test_direct_pg_without_xml_exits(self) -> None:
+        """--direct-pg without --xml triggers parser.error (sys.exit(2))."""
+        with pytest.raises(SystemExit):
+            run_pipeline.parse_args(["--csv-dir", "/tmp/csv", "--direct-pg"])
+
+    def test_generate_library_db_with_library_db_exits(self) -> None:
+        """--generate-library-db and --library-db are mutually exclusive."""
+        with pytest.raises(SystemExit):
+            run_pipeline.parse_args(
+                [
+                    "--csv-dir",
+                    "/tmp/csv",
+                    "--generate-library-db",
+                    "--library-db",
+                    "/tmp/library.db",
+                ]
+            )

@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.util
 import sys
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -17,6 +18,9 @@ sys.modules["enrich_library_artists"] = _mod
 _spec.loader.exec_module(_mod)
 
 extract_base_artists = _mod.extract_base_artists
+extract_alternate_names = _mod.extract_alternate_names
+extract_cross_referenced_artists = _mod.extract_cross_referenced_artists
+extract_release_cross_ref_artists = _mod.extract_release_cross_ref_artists
 merge_and_write = _mod.merge_and_write
 parse_args = _mod.parse_args
 
@@ -302,3 +306,219 @@ class TestMultiArtistSplitting:
         lines = set(output.read_text().splitlines())
         assert "Juana Molina" in lines
         assert "Various Artists" not in lines
+
+
+# ---------------------------------------------------------------------------
+# extract_alternate_names (mocked MySQL)
+# ---------------------------------------------------------------------------
+
+
+class TestExtractAlternateNames:
+    """extract_alternate_names() queries LIBRARY_RELEASE for alternate artist names."""
+
+    def test_returns_alternate_names(self) -> None:
+        """Mock cursor returns sample alternate artist names."""
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_cursor.__enter__ = MagicMock(return_value=mock_cursor)
+        mock_cursor.__exit__ = MagicMock(return_value=False)
+        mock_cursor.__iter__ = MagicMock(return_value=iter([("Body Count",), ("Ice Cube",)]))
+        mock_conn.cursor.return_value = mock_cursor
+
+        result = extract_alternate_names(mock_conn)
+        assert result == {"Body Count", "Ice Cube"}
+
+    def test_empty_result(self) -> None:
+        """Empty cursor returns empty set."""
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_cursor.__enter__ = MagicMock(return_value=mock_cursor)
+        mock_cursor.__exit__ = MagicMock(return_value=False)
+        mock_cursor.__iter__ = MagicMock(return_value=iter([]))
+        mock_conn.cursor.return_value = mock_cursor
+
+        result = extract_alternate_names(mock_conn)
+        assert result == set()
+
+    def test_strips_whitespace_and_skips_empty(self) -> None:
+        """Whitespace-only and None values are excluded."""
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_cursor.__enter__ = MagicMock(return_value=mock_cursor)
+        mock_cursor.__exit__ = MagicMock(return_value=False)
+        mock_cursor.__iter__ = MagicMock(return_value=iter([("  Stereolab  ",), ("",), (None,)]))
+        mock_conn.cursor.return_value = mock_cursor
+
+        result = extract_alternate_names(mock_conn)
+        assert result == {"Stereolab"}
+
+
+# ---------------------------------------------------------------------------
+# extract_cross_referenced_artists (mocked MySQL)
+# ---------------------------------------------------------------------------
+
+
+class TestExtractCrossReferencedArtists:
+    """extract_cross_referenced_artists() queries LIBRARY_CODE_CROSS_REFERENCE."""
+
+    def test_returns_cross_referenced_names(self) -> None:
+        """Mock cursor returns UNION query results."""
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_cursor.__enter__ = MagicMock(return_value=mock_cursor)
+        mock_cursor.__exit__ = MagicMock(return_value=False)
+        mock_cursor.__iter__ = MagicMock(
+            return_value=iter([("Cat Power",), ("Chan Marshall",), ("Cat Power",)])
+        )
+        mock_conn.cursor.return_value = mock_cursor
+
+        result = extract_cross_referenced_artists(mock_conn)
+        # Duplicates from UNION are already handled by the set
+        assert "Cat Power" in result
+        assert "Chan Marshall" in result
+
+    def test_deduplication(self) -> None:
+        """Duplicate names across UNION branches produce unique results."""
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_cursor.__enter__ = MagicMock(return_value=mock_cursor)
+        mock_cursor.__exit__ = MagicMock(return_value=False)
+        mock_cursor.__iter__ = MagicMock(
+            return_value=iter([("Jessica Pratt",), ("Jessica Pratt",), ("Chuquimamani-Condori",)])
+        )
+        mock_conn.cursor.return_value = mock_cursor
+
+        result = extract_cross_referenced_artists(mock_conn)
+        assert len(result) == 2
+        assert result == {"Jessica Pratt", "Chuquimamani-Condori"}
+
+
+# ---------------------------------------------------------------------------
+# extract_release_cross_ref_artists (mocked MySQL)
+# ---------------------------------------------------------------------------
+
+
+class TestExtractReleaseCrossRefArtists:
+    """extract_release_cross_ref_artists() queries RELEASE_CROSS_REFERENCE."""
+
+    def test_returns_release_cross_ref_names(self) -> None:
+        """Mock cursor returns cross-reference artist names."""
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_cursor.__enter__ = MagicMock(return_value=mock_cursor)
+        mock_cursor.__exit__ = MagicMock(return_value=False)
+        mock_cursor.__iter__ = MagicMock(return_value=iter([("Juana Molina",), ("Sessa",)]))
+        mock_conn.cursor.return_value = mock_cursor
+
+        result = extract_release_cross_ref_artists(mock_conn)
+        assert result == {"Juana Molina", "Sessa"}
+
+    def test_empty_result(self) -> None:
+        """Empty cursor returns empty set."""
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_cursor.__enter__ = MagicMock(return_value=mock_cursor)
+        mock_cursor.__exit__ = MagicMock(return_value=False)
+        mock_cursor.__iter__ = MagicMock(return_value=iter([]))
+        mock_conn.cursor.return_value = mock_cursor
+
+        result = extract_release_cross_ref_artists(mock_conn)
+        assert result == set()
+
+
+# ---------------------------------------------------------------------------
+# main (mocked)
+# ---------------------------------------------------------------------------
+
+
+class TestMain:
+    """main() orchestrates extraction and merge."""
+
+    def test_with_library_db_only(self, tmp_path) -> None:
+        """With --library-db only (no MySQL), base artists are extracted and written."""
+        library_db = tmp_path / "library.db"
+        # Create a minimal SQLite library.db
+        import sqlite3
+
+        conn = sqlite3.connect(library_db)
+        conn.execute("CREATE TABLE library (artist TEXT, title TEXT)")
+        conn.execute("INSERT INTO library VALUES ('Stereolab', 'Aluminum Tunes')")
+        conn.execute("INSERT INTO library VALUES ('Cat Power', 'Moon Pix')")
+        conn.commit()
+        conn.close()
+
+        output = tmp_path / "artists.txt"
+
+        with patch.object(
+            _mod,
+            "parse_args",
+            return_value=parse_args(["--library-db", str(library_db), "--output", str(output)]),
+        ):
+            _mod.main()
+
+        lines = set(output.read_text().splitlines())
+        assert "Stereolab" in lines
+        assert "Cat Power" in lines
+
+    def test_with_library_db_and_wxyc_db_url(self, tmp_path) -> None:
+        """With --library-db and --wxyc-db-url, MySQL enrichment is performed."""
+        library_db = tmp_path / "library.db"
+        import sqlite3
+
+        conn = sqlite3.connect(library_db)
+        conn.execute("CREATE TABLE library (artist TEXT, title TEXT)")
+        conn.execute("INSERT INTO library VALUES ('Stereolab', 'Aluminum Tunes')")
+        conn.commit()
+        conn.close()
+
+        output = tmp_path / "artists.txt"
+        mock_mysql_conn = MagicMock()
+
+        with (
+            patch.object(
+                _mod,
+                "parse_args",
+                return_value=parse_args(
+                    [
+                        "--library-db",
+                        str(library_db),
+                        "--output",
+                        str(output),
+                        "--wxyc-db-url",
+                        "mysql://user:pass@host/db",
+                    ]
+                ),
+            ),
+            patch.object(_mod, "connect_mysql", return_value=mock_mysql_conn),
+            patch.object(_mod, "extract_alternate_names", return_value={"Nourished by Time"}),
+            patch.object(_mod, "extract_cross_referenced_artists", return_value={"Buck Meek"}),
+            patch.object(_mod, "extract_release_cross_ref_artists", return_value={"Sessa"}),
+        ):
+            _mod.main()
+
+        lines = set(output.read_text().splitlines())
+        assert "Stereolab" in lines
+        assert "Nourished by Time" in lines
+        assert "Buck Meek" in lines
+        assert "Sessa" in lines
+        mock_mysql_conn.close.assert_called_once()
+
+    def test_missing_library_db_exits(self, tmp_path) -> None:
+        """Non-existent library.db triggers sys.exit(1)."""
+        output = tmp_path / "artists.txt"
+        with (
+            patch.object(
+                _mod,
+                "parse_args",
+                return_value=parse_args(
+                    [
+                        "--library-db",
+                        str(tmp_path / "missing.db"),
+                        "--output",
+                        str(output),
+                    ]
+                ),
+            ),
+            pytest.raises(SystemExit, match="1"),
+        ):
+            _mod.main()

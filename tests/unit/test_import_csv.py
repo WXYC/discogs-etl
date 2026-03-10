@@ -392,3 +392,106 @@ class TestImportCsvMissingColumns:
 
         assert count == 0
         assert "No header" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# main() argument parsing and dispatch
+# ---------------------------------------------------------------------------
+
+
+class TestMainArgParsing:
+    """import_csv.py main() validates args and dispatches to correct import mode."""
+
+    def test_missing_csv_dir_exits(self, tmp_path) -> None:
+        """Non-existent CSV directory triggers sys.exit(1)."""
+        from unittest.mock import patch
+
+        with (
+            patch("sys.argv", ["import_csv.py", str(tmp_path / "missing_csv")]),
+            pytest.raises(SystemExit, match="1"),
+        ):
+            _ic.main()
+
+    def test_default_mode_calls_import_tables(self, tmp_path) -> None:
+        """Default mode (no flags) calls _import_tables for all tables."""
+        from unittest.mock import MagicMock, patch
+
+        csv_dir = tmp_path / "csv"
+        csv_dir.mkdir()
+
+        mock_conn = MagicMock()
+
+        with (
+            patch("sys.argv", ["import_csv.py", str(csv_dir), "postgresql:///test"]),
+            patch.object(_ic.psycopg, "connect", return_value=mock_conn),
+            patch.object(_ic, "_import_tables", return_value=100) as mock_import,
+            patch.object(_ic, "import_artwork", return_value=10),
+            patch.object(_ic, "populate_cache_metadata", return_value=50),
+        ):
+            _ic.main()
+
+        mock_import.assert_called_once()
+        call_args = mock_import.call_args
+        assert call_args[0][0] is mock_conn
+        assert call_args[0][1] == csv_dir
+        assert call_args[0][2] == TABLES
+
+    def test_base_only_mode_calls_parallel(self, tmp_path) -> None:
+        """--base-only mode calls _import_tables_parallel with base tables."""
+        from unittest.mock import MagicMock, patch
+
+        csv_dir = tmp_path / "csv"
+        csv_dir.mkdir()
+
+        mock_conn = MagicMock()
+
+        with (
+            patch(
+                "sys.argv",
+                ["import_csv.py", "--base-only", str(csv_dir), "postgresql:///test"],
+            ),
+            patch.object(_ic.psycopg, "connect", return_value=mock_conn),
+            patch.object(_ic, "_import_tables_parallel", return_value=100) as mock_parallel,
+            patch.object(_ic, "import_artwork", return_value=10),
+            patch.object(_ic, "populate_cache_metadata", return_value=50),
+            patch.object(_ic, "create_track_count_table", return_value=20),
+        ):
+            _ic.main()
+
+        mock_parallel.assert_called_once()
+        call_args = mock_parallel.call_args
+        assert call_args[0][0] == "postgresql:///test"
+        assert call_args[0][1] == csv_dir
+        # Parent tables are BASE_TABLES[:1], child tables are BASE_TABLES[1:]
+        assert call_args[1]["parent_tables"] == BASE_TABLES[:1]
+        assert call_args[1]["child_tables"] == BASE_TABLES[1:]
+
+    def test_tracks_only_mode_uses_release_id_filter(self, tmp_path) -> None:
+        """--tracks-only mode queries release IDs and filters track import."""
+        from unittest.mock import MagicMock, patch
+
+        csv_dir = tmp_path / "csv"
+        csv_dir.mkdir()
+
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_cursor.fetchall.return_value = [(5001,), (5002,), (5003,)]
+        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
+        mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+
+        with (
+            patch(
+                "sys.argv",
+                ["import_csv.py", "--tracks-only", str(csv_dir), "postgresql:///test"],
+            ),
+            patch.object(_ic.psycopg, "connect", return_value=mock_conn),
+            patch.object(_ic, "_import_tables_parallel", return_value=200) as mock_parallel,
+        ):
+            _ic.main()
+
+        mock_parallel.assert_called_once()
+        call_args = mock_parallel.call_args
+        # --tracks-only passes empty parent_tables and TRACK_TABLES as children
+        assert call_args[1]["parent_tables"] == []
+        assert call_args[1]["child_tables"] == TRACK_TABLES
+        assert call_args[1]["release_id_filter"] == {5001, 5002, 5003}
