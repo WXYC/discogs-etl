@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-VERSION = 2
+VERSION = 3
 
 STEP_NAMES = [
     "create_schema",
@@ -20,10 +20,23 @@ STEP_NAMES = [
     "create_track_indexes",
     "prune",
     "vacuum",
+    "set_logged",
 ]
 
 # Mapping from v1 step names to v2 equivalents for migration
 _V1_STEP_NAMES = ["create_schema", "import_csv", "create_indexes", "dedup", "prune", "vacuum"]
+
+# V2 step names for migration
+_V2_STEP_NAMES = [
+    "create_schema",
+    "import_csv",
+    "create_indexes",
+    "dedup",
+    "import_tracks",
+    "create_track_indexes",
+    "prune",
+    "vacuum",
+]
 
 
 class PipelineState:
@@ -78,13 +91,15 @@ class PipelineState:
     def load(cls, path: Path) -> PipelineState:
         """Load state from a JSON file.
 
-        Supports v1 state files by migrating them to v2 format.
+        Supports v1 and v2 state files by migrating them to v3 format.
         """
         data = json.loads(path.read_text())
         version = data.get("version")
 
         if version == 1:
             return cls._migrate_v1(data)
+        if version == 2:
+            return cls._migrate_v2(data)
         if version != VERSION:
             raise ValueError(f"Unsupported state file version {version} (expected {VERSION})")
 
@@ -94,9 +109,10 @@ class PipelineState:
 
     @classmethod
     def _migrate_v1(cls, data: dict) -> PipelineState:
-        """Migrate a v1 state file to v2 format.
+        """Migrate a v1 state file to v3 format (via v2 migration rules).
 
         V2 adds import_tracks and create_track_indexes between dedup and prune.
+        V3 adds set_logged after vacuum.
 
         Migration rules:
         - All v1 steps map directly to their v2 equivalents
@@ -104,11 +120,13 @@ class PipelineState:
           (v1 imported tracks as part of import_csv)
         - If create_indexes or dedup was completed in v1, create_track_indexes
           is also completed (v1 created track indexes during those steps)
+        - If vacuum was completed in v1, set_logged is also completed
+          (v1 used LOGGED tables throughout, so no conversion needed)
         """
         state = cls(db_url=data["database_url"], csv_dir=data["csv_dir"])
         v1_steps = data.get("steps", {})
 
-        # Copy v1 steps that exist in v2
+        # Copy v1 steps that exist in v3
         for step_name in _V1_STEP_NAMES:
             if step_name in v1_steps:
                 state._steps[step_name] = v1_steps[step_name]
@@ -122,5 +140,34 @@ class PipelineState:
             state._steps["create_track_indexes"] = {"status": "completed"}
         elif v1_steps.get("create_indexes", {}).get("status") == "completed":
             state._steps["create_track_indexes"] = {"status": "completed"}
+
+        # Infer set_logged from vacuum (v1 used LOGGED tables throughout)
+        if v1_steps.get("vacuum", {}).get("status") == "completed":
+            state._steps["set_logged"] = {"status": "completed"}
+
+        return state
+
+    @classmethod
+    def _migrate_v2(cls, data: dict) -> PipelineState:
+        """Migrate a v2 state file to v3 format.
+
+        V3 adds set_logged after vacuum.
+
+        Migration rules:
+        - All v2 steps map directly to their v3 equivalents
+        - If vacuum was completed in v2, set_logged is also completed
+          (v2 used LOGGED tables throughout, so no conversion needed)
+        """
+        state = cls(db_url=data["database_url"], csv_dir=data["csv_dir"])
+        v2_steps = data.get("steps", {})
+
+        # Copy v2 steps that exist in v3
+        for step_name in _V2_STEP_NAMES:
+            if step_name in v2_steps:
+                state._steps[step_name] = v2_steps[step_name]
+
+        # Infer set_logged from vacuum (v2 used LOGGED tables throughout)
+        if v2_steps.get("vacuum", {}).get("status") == "completed":
+            state._steps["set_logged"] = {"status": "completed"}
 
         return state
