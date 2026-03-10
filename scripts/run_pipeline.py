@@ -534,6 +534,10 @@ def _run_xml_pipeline(
                 cur.execute("TRUNCATE release CASCADE")
             conn.close()
 
+            # Set tables UNLOGGED before the converter streams data via COPY.
+            # This skips WAL writes during the bulk import phase.
+            set_tables_unlogged(db_url)
+
             # Converter streams releases into PG; supplementary CSVs still
             # go to csv_out (artist_alias.csv, label_hierarchy.csv).
             convert_and_filter(
@@ -664,11 +668,10 @@ def _run_database_build_post_import(
     """Post-import database build for --direct-pg mode.
 
     Skips create_schema (already done), import_csv, and import_tracks
-    (converter loaded all data directly). Runs create_indexes through vacuum.
+    (converter loaded all data directly). Tables are already UNLOGGED
+    (set in _run_xml_pipeline before the converter). Runs create_indexes
+    through SET LOGGED.
     """
-    # -- set_tables_unlogged (skip WAL writes during bulk operations)
-    set_tables_unlogged(db_url)
-
     # -- create_indexes (base trigram indexes, run in parallel)
     conn = psycopg.connect(db_url, autocommit=True)
     with conn.cursor() as cur:
