@@ -17,11 +17,19 @@ CREATE EXTENSION IF NOT EXISTS pg_trgm;
 CREATE EXTENSION IF NOT EXISTS unaccent;
 
 -- ============================================
--- Core tables
+-- Core tables (drop + recreate for clean ETL)
 -- ============================================
 
+-- Drop in FK order: children first, then parent
+DROP TABLE IF EXISTS cache_metadata CASCADE;
+DROP TABLE IF EXISTS release_track_artist CASCADE;
+DROP TABLE IF EXISTS release_track CASCADE;
+DROP TABLE IF EXISTS release_label CASCADE;
+DROP TABLE IF EXISTS release_artist CASCADE;
+DROP TABLE IF EXISTS release CASCADE;
+
 -- Releases
-CREATE TABLE IF NOT EXISTS release (
+CREATE TABLE release (
     id              integer PRIMARY KEY,
     title           text NOT NULL,
     release_year    smallint,
@@ -31,7 +39,7 @@ CREATE TABLE IF NOT EXISTS release (
 );
 
 -- Artists on releases
-CREATE TABLE IF NOT EXISTS release_artist (
+CREATE TABLE release_artist (
     release_id      integer NOT NULL REFERENCES release(id) ON DELETE CASCADE,
     artist_id       integer,             -- Discogs artist ID (nullable for API-fetched releases)
     artist_name     text NOT NULL,
@@ -39,13 +47,13 @@ CREATE TABLE IF NOT EXISTS release_artist (
 );
 
 -- Labels on releases
-CREATE TABLE IF NOT EXISTS release_label (
+CREATE TABLE release_label (
     release_id      integer NOT NULL REFERENCES release(id) ON DELETE CASCADE,
     label_name      text NOT NULL
 );
 
 -- Tracks on releases
-CREATE TABLE IF NOT EXISTS release_track (
+CREATE TABLE release_track (
     release_id      integer NOT NULL REFERENCES release(id) ON DELETE CASCADE,
     sequence        integer NOT NULL,
     position        text,              -- "A1", "B2", etc.
@@ -54,7 +62,7 @@ CREATE TABLE IF NOT EXISTS release_track (
 );
 
 -- Artists on specific tracks (for compilations)
-CREATE TABLE IF NOT EXISTS release_track_artist (
+CREATE TABLE release_track_artist (
     release_id      integer NOT NULL REFERENCES release(id) ON DELETE CASCADE,
     track_sequence  integer NOT NULL,
     artist_name     text NOT NULL
@@ -64,7 +72,7 @@ CREATE TABLE IF NOT EXISTS release_track_artist (
 -- Cache metadata (for tracking data freshness)
 -- ============================================
 
-CREATE TABLE IF NOT EXISTS cache_metadata (
+CREATE TABLE cache_metadata (
     release_id      integer PRIMARY KEY REFERENCES release(id) ON DELETE CASCADE,
     cached_at       timestamptz NOT NULL DEFAULT now(),
     source          text NOT NULL,  -- 'bulk_import' or 'api_fetch'
