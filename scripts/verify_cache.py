@@ -41,7 +41,8 @@ import sqlite3
 import sys
 import time
 import unicodedata
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import multiprocessing
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -1351,6 +1352,29 @@ def classify_fuzzy_batch(
     return keep_ids, prune_ids, review_ids, review_by_artist
 
 
+# ---------------------------------------------------------------------------
+# Process pool worker functions for Phase 4 parallelization
+# ---------------------------------------------------------------------------
+
+_pool_index: LibraryIndex | None = None
+_pool_matcher: MultiIndexMatcher | None = None
+
+
+def _init_fuzzy_worker(index: LibraryIndex, matcher: MultiIndexMatcher) -> None:
+    """Initializer for ProcessPoolExecutor workers. Stores shared read-only state."""
+    global _pool_index, _pool_matcher
+    _pool_index = index
+    _pool_matcher = matcher
+
+
+def _classify_fuzzy_chunk(
+    chunk_args: tuple[list[str], dict[str, list[tuple[int, str, str]]]],
+) -> tuple[set[int], set[int], set[int], dict[str, list[tuple[int, str, MatchResult]]]]:
+    """Worker function for ProcessPoolExecutor. Reads index/matcher from module globals."""
+    artists, chunk_by_artist = chunk_args
+    return classify_fuzzy_batch(artists, chunk_by_artist, _pool_index, _pool_matcher)
+
+
 def classify_all_releases(
     releases: list[tuple[int, str, str]] | list[tuple[int, str, str, str | None]],
     index: LibraryIndex,
@@ -1472,6 +1496,7 @@ def classify_all_releases(
     # Phase 3: Token-overlap pre-screen for fuzzy candidates.
     # Build a set of all tokens from library artist names. Discard short tokens
     # (1-2 chars) that cause false positive overlaps ("dj", "mc", "j", etc.)
+    phase3_start = time.monotonic()
     min_token_len = 3
     library_tokens: set[str] = set()
     for artist in index.all_artists:
@@ -1495,8 +1520,10 @@ def classify_all_releases(
         if token_pruned
         else 0
     )
+    phase3_elapsed = time.monotonic() - phase3_start
     logger.info(
-        f"Phase 3 pre-screen: {token_pruned:,} artists pruned by token overlap "
+        f"Phase 3 pre-screen in {phase3_elapsed:.1f}s: "
+        f"{token_pruned:,} artists pruned by token overlap "
         f"({token_pruned_releases:,} releases), "
         f"{len(truly_fuzzy):,} artists remain for fuzzy matching"
     )
@@ -1506,8 +1533,12 @@ def classify_all_releases(
     # releases by title only against the matched library artist's albums.
     # This avoids the O(releases * all_library_pairs) cost of full scoring.
     #
-    # Parallelized via ThreadPoolExecutor. Rapidfuzz's C extension releases
-    # the GIL during extractOne, so threads achieve real parallelism.
+    # Parallelized via ProcessPoolExecutor with fork context. The Python loop
+    # overhead between rapidfuzz extractOne calls holds the GIL, so threads
+    # serialize on a single core. Separate processes give true multi-core
+    # parallelism. Fork context avoids the cost of re-importing the module
+    # in each worker; the pipeline is single-threaded before this point so
+    # fork is safe.
     logger.info(
         "Phase 4: Fuzzy artist matching for %s artists...",
         f"{len(truly_fuzzy):,}",
@@ -1515,38 +1546,62 @@ def classify_all_releases(
     phase4_start = time.monotonic()
 
     num_workers = min(os.cpu_count() or 4, 8)
-    chunk_size = max(1, len(truly_fuzzy) // (num_workers * 4))
+    # Target ~200 artists per chunk for frequent progress updates,
+    # but ensure at least num_workers * 2 chunks for load balancing.
+    min_chunks = num_workers * 2
+    target_chunk_size = 200
+    chunk_size = max(1, min(target_chunk_size, len(truly_fuzzy) // min_chunks))
     chunks = [truly_fuzzy[i : i + chunk_size] for i in range(0, len(truly_fuzzy), chunk_size)]
 
     logger.info(f"  Using {num_workers} workers, {len(chunks)} chunks of ~{chunk_size} artists")
 
     completed_chunks = 0
-    with ThreadPoolExecutor(max_workers=num_workers) as executor:
-        futures = {
-            executor.submit(classify_fuzzy_batch, chunk, by_artist, index, matcher): chunk
-            for chunk in chunks
-        }
-        for future in as_completed(futures):
-            batch_keep, batch_prune, batch_review, batch_review_by = future.result()
-            keep_ids |= batch_keep
-            prune_ids |= batch_prune
-            review_ids |= batch_review
-            for k, v in batch_review_by.items():
-                review_by_artist.setdefault(k, []).extend(v)
+    global _pool_index, _pool_matcher
+    _pool_index = index
+    _pool_matcher = matcher
+    try:
+        ctx = multiprocessing.get_context("fork")
+        with ProcessPoolExecutor(
+            max_workers=num_workers,
+            mp_context=ctx,
+            initializer=_init_fuzzy_worker,
+            initargs=(index, matcher),
+        ) as executor:
+            futures = {}
+            for chunk in chunks:
+                chunk_by_artist = {a: by_artist[a] for a in chunk}
+                future = executor.submit(_classify_fuzzy_chunk, (chunk, chunk_by_artist))
+                futures[future] = chunk
 
-            completed_chunks += 1
-            chunk = futures[future]
-            releases_processed += sum(len(by_artist[a]) for a in chunk)
-            artists_fuzzy_matched += len(chunk)
+            for future in as_completed(futures):
+                batch_keep, batch_prune, batch_review, batch_review_by = future.result()
+                keep_ids |= batch_keep
+                prune_ids |= batch_prune
+                review_ids |= batch_review
+                for k, v in batch_review_by.items():
+                    review_by_artist.setdefault(k, []).extend(v)
 
-            elapsed = time.monotonic() - phase4_start
-            logger.info(
-                f"  Chunk {completed_chunks}/{len(chunks)} done "
-                f"({releases_processed:,}/{total_releases:,} releases) "
-                f"| {elapsed:.1f}s elapsed "
-                f"| KEEP={len(keep_ids):,} PRUNE={len(prune_ids):,} "
-                f"REVIEW={len(review_ids):,}"
-            )
+                completed_chunks += 1
+                chunk = futures[future]
+                chunk_releases = sum(len(by_artist[a]) for a in chunk)
+                releases_processed += chunk_releases
+                artists_fuzzy_matched += len(chunk)
+
+                elapsed = time.monotonic() - phase4_start
+                rate = artists_fuzzy_matched / elapsed if elapsed > 0 else 0
+                remaining = len(truly_fuzzy) - artists_fuzzy_matched
+                eta_str = f", ETA {remaining / rate:.0f}s" if rate > 0 else ""
+                logger.info(
+                    f"  Chunk {completed_chunks}/{len(chunks)} done "
+                    f"({releases_processed:,}/{total_releases:,} releases, "
+                    f"{rate:.0f} artists/s{eta_str}) "
+                    f"| {elapsed:.1f}s elapsed "
+                    f"| KEEP={len(keep_ids):,} PRUNE={len(prune_ids):,} "
+                    f"REVIEW={len(review_ids):,}"
+                )
+    finally:
+        _pool_index = None
+        _pool_matcher = None
 
     elapsed = time.monotonic() - start_time
     logger.info(
