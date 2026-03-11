@@ -20,8 +20,10 @@ import_csv = _ic.import_csv
 TABLES = _ic.TABLES
 BASE_TABLES = _ic.BASE_TABLES
 TRACK_TABLES = _ic.TRACK_TABLES
+ARTIST_TABLES = _ic.ARTIST_TABLES
 TableConfig = _ic.TableConfig
 _import_tables_parallel = _ic._import_tables_parallel
+import_artist_details = _ic.import_artist_details
 
 FIXTURES_DIR = Path(__file__).parent.parent / "fixtures"
 CSV_DIR = FIXTURES_DIR / "csv"
@@ -516,3 +518,69 @@ class TestMainArgParsing:
         assert call_args[1]["parent_tables"] == []
         assert call_args[1]["child_tables"] == TRACK_TABLES
         assert call_args[1]["release_id_filter"] == {5001, 5002, 5003}
+
+
+# ---------------------------------------------------------------------------
+# Artist table dedup and filtering
+# ---------------------------------------------------------------------------
+
+
+class TestArtistTablesConfig:
+    """ARTIST_TABLES must have unique_key for dedup and be filtered by artist ID."""
+
+    def test_artist_alias_has_unique_key(self) -> None:
+        """artist_alias must dedup on (artist_id, alias_name)."""
+        config = next(t for t in ARTIST_TABLES if t["table"] == "artist_alias")
+        assert "unique_key" in config
+        assert config["unique_key"] == ["artist_id", "alias_name"]
+
+    def test_artist_member_has_unique_key(self) -> None:
+        """artist_member must dedup on (group_artist_id, member_artist_id)."""
+        config = next(t for t in ARTIST_TABLES if t["table"] == "artist_member")
+        assert "unique_key" in config
+        assert config["unique_key"] == ["group_artist_id", "member_artist_id"]
+
+
+class TestReleaseTrackUniqueKey:
+    """release_track must have unique_key for dedup."""
+
+    def test_release_track_has_unique_key(self) -> None:
+        """release_track must dedup on (release_id, sequence)."""
+        config = next(t for t in TRACK_TABLES if t["table"] == "release_track")
+        assert "unique_key" in config
+        assert config["unique_key"] == ["release_id", "sequence"]
+
+
+class TestImportArtistDetailsFiltersById:
+    """import_artist_details must filter artist tables to known artist IDs."""
+
+    def test_filters_artist_tables_by_artist_id(self, tmp_path) -> None:
+        """Only rows with artist_id in the artist table should be imported."""
+        from unittest.mock import MagicMock, patch
+
+        # Create dummy CSVs
+        alias_csv = tmp_path / "artist_alias.csv"
+        alias_csv.write_text("artist_id,alias_name\n1,Known Alias\n999,Unknown Alias\n")
+        member_csv = tmp_path / "artist_member.csv"
+        member_csv.write_text(
+            "group_artist_id,member_artist_id,member_name\n1,2,Member A\n999,3,Member B\n"
+        )
+
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        # Simulate artist table with only artist_id=1
+        mock_cursor.rowcount = 1
+        mock_cursor.fetchall.return_value = [(1,)]
+        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
+        mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+
+        with patch.object(_ic, "_import_tables") as mock_import:
+            mock_import.return_value = 1
+            import_artist_details(mock_conn, tmp_path)
+
+        # _import_tables should be called with an artist_id_filter
+        mock_import.assert_called_once()
+        call_kwargs = mock_import.call_args
+        assert "artist_id_filter" in call_kwargs[1] or (
+            len(call_kwargs[0]) > 3 and call_kwargs[0][3] is not None
+        )

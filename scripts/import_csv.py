@@ -115,6 +115,7 @@ TRACK_TABLES: list[TableConfig] = [
         "db_columns": ["release_id", "sequence", "position", "title", "duration"],
         "required": ["release_id", "title"],
         "transforms": {},
+        "unique_key": ["release_id", "sequence"],
     },
     {
         "csv_file": "release_track_artist.csv",
@@ -135,6 +136,7 @@ ARTIST_TABLES: list[TableConfig] = [
         "db_columns": ["artist_id", "alias_name"],
         "required": ["artist_id", "alias_name"],
         "transforms": {},
+        "unique_key": ["artist_id", "alias_name"],
     },
     {
         "csv_file": "artist_member.csv",
@@ -143,6 +145,7 @@ ARTIST_TABLES: list[TableConfig] = [
         "db_columns": ["artist_id", "member_id", "member_name"],
         "required": ["group_artist_id", "member_artist_id", "member_name"],
         "transforms": {},
+        "unique_key": ["group_artist_id", "member_artist_id"],
     },
 ]
 
@@ -159,6 +162,8 @@ def import_csv(
     transforms: dict,
     unique_key: list[str] | None = None,
     release_id_filter: set[int] | None = None,
+    id_filter: set[int] | None = None,
+    id_filter_column: str | None = None,
 ) -> int:
     """Import a CSV file into a table, selecting only needed columns.
 
@@ -171,6 +176,9 @@ def import_csv(
 
     If release_id_filter is provided, only rows whose release_id is in the
     set are imported. The CSV must have a 'release_id' or 'id' column.
+
+    If id_filter and id_filter_column are provided, only rows where the
+    specified column's integer value is in id_filter are imported.
     """
     logger.info(f"Importing {csv_path.name} into {table}...")
 
@@ -209,6 +217,12 @@ def import_csv(
                     release_id_idx = col_idx[col_name]
                     break
 
+        # Determine generic id_filter column index
+        id_filter_idx: int | None = None
+        if id_filter is not None and id_filter_column is not None:
+            if id_filter_column in header:
+                id_filter_idx = header.index(id_filter_column)
+
         with conn.cursor() as cur:
             with cur.copy(f"COPY {table} ({db_col_list}) FROM STDIN") as copy:
                 count = 0
@@ -224,6 +238,17 @@ def import_csv(
                             filtered += 1
                             continue
                         if rid not in release_id_filter:
+                            filtered += 1
+                            continue
+
+                    # Filter by generic id column if specified
+                    if id_filter is not None and id_filter_idx is not None:
+                        try:
+                            fid = int(row[id_filter_idx])
+                        except (ValueError, IndexError):
+                            filtered += 1
+                            continue
+                        if fid not in id_filter:
                             filtered += 1
                             continue
 
@@ -430,14 +455,30 @@ def _import_tables(
     csv_dir: Path,
     table_list: list[TableConfig],
     release_id_filter: set[int] | None = None,
+    artist_id_filter: set[int] | None = None,
 ) -> int:
-    """Import a list of table configs, returning total row count."""
+    """Import a list of table configs, returning total row count.
+
+    If artist_id_filter is provided, rows are filtered by the first column
+    in csv_columns that contains 'artist_id' (e.g., 'artist_id' or
+    'group_artist_id').
+    """
     total = 0
     for table_config in table_list:
         csv_path = csv_dir / table_config["csv_file"]
         if not csv_path.exists():
             logger.warning(f"Skipping {table_config['csv_file']} (not found)")
             continue
+
+        # Determine artist_id filter column for this table
+        id_filter = None
+        id_filter_column = None
+        if artist_id_filter is not None:
+            for col in table_config["csv_columns"]:
+                if "artist_id" in col:
+                    id_filter = artist_id_filter
+                    id_filter_column = col
+                    break
 
         count = import_csv(
             conn,
@@ -449,6 +490,8 @@ def _import_tables(
             table_config["transforms"],
             unique_key=table_config.get("unique_key"),
             release_id_filter=release_id_filter,
+            id_filter=id_filter,
+            id_filter_column=id_filter_column,
         )
         total += count
     return total
@@ -546,7 +589,14 @@ def import_artist_details(conn, csv_dir: Path) -> int:
     logger.info(f"  Created {count:,} stub artist rows")
 
     total = count
-    total += _import_tables(conn, csv_dir, ARTIST_TABLES)
+
+    # Query known artist IDs for filtering artist_alias and artist_member
+    with conn.cursor() as cur:
+        cur.execute("SELECT id FROM artist")
+        artist_ids = {row[0] for row in cur.fetchall()}
+    logger.info(f"  Filtering artist tables to {len(artist_ids):,} known artists")
+
+    total += _import_tables(conn, csv_dir, ARTIST_TABLES, artist_id_filter=artist_ids)
     return total
 
 
