@@ -23,6 +23,7 @@ import_csv_func = _ic.import_csv
 import_artwork = _ic.import_artwork
 create_track_count_table = _ic.create_track_count_table
 populate_cache_metadata = _ic.populate_cache_metadata
+populate_release_year = _ic.populate_release_year
 _import_tables = _ic._import_tables
 TABLES = _ic.TABLES
 BASE_TABLES = _ic.BASE_TABLES
@@ -56,6 +57,7 @@ class TestImportCsv:
                     table_config["transforms"],
                 )
         import_artwork(conn, CSV_DIR)
+        populate_release_year(conn)
 
         with conn.cursor() as cur:
             cur.execute("""

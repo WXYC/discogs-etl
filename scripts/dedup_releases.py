@@ -583,7 +583,12 @@ def main():
             "release_id, artist_id, artist_name, extra, role",
             "release_id",
         ),
-        ("release_label", "new_release_label", "release_id, label_id, label_name, catno", "release_id"),
+        (
+            "release_label",
+            "new_release_label",
+            "release_id, label_id, label_name, catno",
+            "release_id",
+        ),
         (
             "cache_metadata",
             "new_cache_metadata",
