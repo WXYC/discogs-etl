@@ -123,18 +123,22 @@ class TestPipeline:
             assert count > 0, f"Table {table} is empty"
         conn.close()
 
-    def test_duplicates_removed(self) -> None:
-        """Duplicate releases (same master_id) have been removed.
+    def test_format_aware_dedup_and_prune(self) -> None:
+        """Format-aware dedup + prune keeps only matching formats.
 
-        In the fixture data, releases 1001, 1002, 1003 share master_id 500.
-        After dedup, only release 1002 (US pressing) should remain.
+        In the fixture data, releases 1001 (CD), 1002 (Vinyl), 1003 (Cassette)
+        share master_id 500. Format-aware dedup keeps all three (different formats).
+        The library owns OK Computer on CD and LP (→Vinyl), so prune keeps
+        1001 (CD) and 1002 (Vinyl) but removes 1003 (Cassette).
         """
         conn = self._connect()
         with conn.cursor() as cur:
             cur.execute("SELECT id FROM release WHERE id IN (1001, 1002, 1003) ORDER BY id")
             ids = [row[0] for row in cur.fetchall()]
         conn.close()
-        assert ids == [1002], f"Expected only 1002 after dedup, got {ids}"
+        assert ids == [1001, 1002], (
+            f"Expected 1001 (CD) and 1002 (Vinyl) after dedup+prune, got {ids}"
+        )
 
     def test_prune_releases_gone(self) -> None:
         """Releases not matching the library have been pruned.
@@ -159,8 +163,13 @@ class TestPipeline:
         conn.close()
         assert count == 1, "Release 3001 (Kid A) should still exist"
 
-    def test_master_id_column_absent(self) -> None:
-        """master_id column is dropped by the dedup copy-swap."""
+    def test_master_id_column_persists_when_no_dedup(self) -> None:
+        """master_id column persists when dedup copy-swap doesn't run.
+
+        With format-aware dedup, the fixture data has unique formats per master_id,
+        so no duplicates are removed and copy-swap doesn't run. The master_id
+        column persists (it would be dropped by copy-swap if duplicates existed).
+        """
         conn = self._connect()
         with conn.cursor() as cur:
             cur.execute(
@@ -169,10 +178,10 @@ class TestPipeline:
             )
             result = cur.fetchone()
         conn.close()
-        assert result is None, "master_id column should not exist after dedup"
+        assert result is not None, "master_id should persist when no dedup copy-swap runs"
 
     def test_country_column_present(self) -> None:
-        """country column persists through the dedup copy-swap."""
+        """country column persists through the pipeline."""
         conn = self._connect()
         with conn.cursor() as cur:
             cur.execute(
@@ -181,7 +190,19 @@ class TestPipeline:
             )
             result = cur.fetchone()
         conn.close()
-        assert result is not None, "country column should exist after dedup"
+        assert result is not None, "country column should exist after pipeline"
+
+    def test_format_column_present(self) -> None:
+        """format column persists through the pipeline."""
+        conn = self._connect()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_name = 'release' AND column_name = 'format'"
+            )
+            result = cur.fetchone()
+        conn.close()
+        assert result is not None, "format column should exist after pipeline"
 
     def test_indexes_exist(self) -> None:
         """Trigram indexes exist on the final database."""
@@ -302,22 +323,36 @@ class TestPipelineWithLabels:
         return psycopg.connect(self.db_url)
 
     def test_label_match_overrides_track_count_master_500(self) -> None:
-        """Label-aware dedup keeps release 1001 (Parlophone) over 1002 (Capitol, more tracks)."""
+        """Format-aware label dedup keeps one release per (master_id, format).
+
+        Releases 1001 (CD, Parlophone), 1002 (Vinyl, Capitol), 1003 (Cassette, EMI)
+        share master_id 500 but have different formats. Format-aware dedup keeps
+        all three since each has a unique format. No prune step runs in this test
+        (no --library-db), so all three survive.
+        """
         conn = self._connect()
         with conn.cursor() as cur:
             cur.execute("SELECT id FROM release WHERE id IN (1001, 1002, 1003) ORDER BY id")
             ids = [row[0] for row in cur.fetchall()]
         conn.close()
-        assert ids == [1001], f"Expected only 1001 after label-aware dedup, got {ids}"
+        assert ids == [1001, 1002, 1003], (
+            f"Expected all three formats to survive format-aware dedup, got {ids}"
+        )
 
     def test_label_match_overrides_track_count_master_600(self) -> None:
-        """Label-aware dedup keeps release 2001 (Factory) over 2002 (Qwest, more tracks)."""
+        """Format-aware label dedup keeps one release per (master_id, format).
+
+        Releases 2001 (LP, Factory) and 2002 (CD, Qwest) share master_id 600
+        but have different formats. Both survive format-aware dedup.
+        """
         conn = self._connect()
         with conn.cursor() as cur:
             cur.execute("SELECT id FROM release WHERE id IN (2001, 2002) ORDER BY id")
             ids = [row[0] for row in cur.fetchall()]
         conn.close()
-        assert ids == [2001], f"Expected only 2001 after label-aware dedup, got {ids}"
+        assert ids == [2001, 2002], (
+            f"Expected both formats to survive format-aware dedup, got {ids}"
+        )
 
     def test_temp_tables_cleaned_up(self) -> None:
         """wxyc_label_pref and release_label_match are dropped after dedup."""
