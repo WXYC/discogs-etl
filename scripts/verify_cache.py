@@ -35,13 +35,13 @@ import asyncio
 import enum
 import json
 import logging
+import multiprocessing
 import os
 import re
 import sqlite3
 import sys
 import time
 import unicodedata
-import multiprocessing
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
