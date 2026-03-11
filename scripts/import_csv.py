@@ -18,7 +18,8 @@ from typing import TypedDict
 
 import psycopg
 
-from lib.format_normalization import normalize_format
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from lib.format_normalization import normalize_format  # noqa: E402
 
 logging.basicConfig(
     level=logging.INFO,
