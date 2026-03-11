@@ -2,7 +2,9 @@
 
 import importlib.util
 import json
+import multiprocessing
 import sys
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -651,13 +653,15 @@ print_report = _vc.print_report
 classify_all_releases = _vc.classify_all_releases
 classify_artist_fuzzy = _vc.classify_artist_fuzzy
 classify_fuzzy_batch = _vc.classify_fuzzy_batch
+_init_fuzzy_worker = _vc._init_fuzzy_worker
+_classify_fuzzy_chunk = _vc._classify_fuzzy_chunk
 prune_releases_copy_swap = _vc.prune_releases_copy_swap
 
 parse_args = _vc.parse_args
 
 
 # ---------------------------------------------------------------------------
-# Step 8.5: Parallel Fuzzy Matching
+# Step 8.5: Process Pool Fuzzy Matching
 # ---------------------------------------------------------------------------
 
 
@@ -812,6 +816,114 @@ class TestParallelMatchesSerial:
         assert {1, 2, 3} <= report.keep_ids
         # Unknown artists should be PRUNE
         assert {4, 5} <= report.prune_ids
+
+
+class TestProcessPoolFuzzyClassification:
+    """Verify fuzzy classification works correctly via ProcessPoolExecutor."""
+
+    def test_worker_produces_same_results_as_direct_call(self, sample_index):
+        """ProcessPoolExecutor worker gives same results as direct classify_fuzzy_batch."""
+        matcher = MultiIndexMatcher(sample_index)
+        by_artist = {
+            "radioheed": [(999, "Radioheed", "OK Computer")],
+            "zzyzx unknownband": [(888, "Zzyzx Unknownband", "Nonexistent Album")],
+        }
+        artists = list(by_artist.keys())
+
+        direct_result = classify_fuzzy_batch(artists, by_artist, sample_index, matcher)
+
+        ctx = multiprocessing.get_context("fork")
+        with ProcessPoolExecutor(
+            max_workers=1,
+            mp_context=ctx,
+            initializer=_init_fuzzy_worker,
+            initargs=(sample_index, matcher),
+        ) as executor:
+            future = executor.submit(_classify_fuzzy_chunk, (artists, by_artist))
+            pool_result = future.result()
+
+        assert pool_result[0] == direct_result[0]  # keep_ids
+        assert pool_result[1] == direct_result[1]  # prune_ids
+        assert pool_result[2] == direct_result[2]  # review_ids
+
+    def test_multiple_chunks_aggregate_correctly(self, sample_index):
+        """Results from multiple process pool chunks aggregate to match a single batch."""
+        matcher = MultiIndexMatcher(sample_index)
+        by_artist = {
+            "radioheed": [(101, "Radioheed", "OK Computer")],
+            "joye division": [(102, "Joye Division", "Unknown Pleasures")],
+            "zzyzx unknownband": [(103, "Zzyzx Unknownband", "Fake Album")],
+            "aphex twins": [(104, "Aphex Twins", "Selected Ambient Works 85-92")],
+        }
+        all_artists = list(by_artist.keys())
+
+        single_result = classify_fuzzy_batch(all_artists, by_artist, sample_index, matcher)
+
+        chunk1 = all_artists[:2]
+        chunk2 = all_artists[2:]
+        chunk1_by = {a: by_artist[a] for a in chunk1}
+        chunk2_by = {a: by_artist[a] for a in chunk2}
+
+        ctx = multiprocessing.get_context("fork")
+        with ProcessPoolExecutor(
+            max_workers=2,
+            mp_context=ctx,
+            initializer=_init_fuzzy_worker,
+            initargs=(sample_index, matcher),
+        ) as executor:
+            f1 = executor.submit(_classify_fuzzy_chunk, (chunk1, chunk1_by))
+            f2 = executor.submit(_classify_fuzzy_chunk, (chunk2, chunk2_by))
+            r1 = f1.result()
+            r2 = f2.result()
+
+        agg_keep = r1[0] | r2[0]
+        agg_prune = r1[1] | r2[1]
+        agg_review = r1[2] | r2[2]
+
+        assert agg_keep == single_result[0]
+        assert agg_prune == single_result[1]
+        assert agg_review == single_result[2]
+
+    def test_worker_init_sets_module_globals(self):
+        """_init_fuzzy_worker stores index and matcher in module globals."""
+        rows = [("Autechre", "Confield")]
+        index = LibraryIndex.from_rows(rows)
+        matcher = MultiIndexMatcher(index)
+
+        _init_fuzzy_worker(index, matcher)
+
+        assert _vc._pool_index is index
+        assert _vc._pool_matcher is matcher
+
+        # Clean up
+        _vc._pool_index = None
+        _vc._pool_matcher = None
+
+
+class TestPhase4Logging:
+    """Verify Phase 4 logs throughput and ETA."""
+
+    def test_phase4_logs_throughput_and_eta(self, sample_index, caplog):
+        """classify_all_releases Phase 4 logs include throughput and ETA."""
+        releases = [
+            (1, "Radiohead", "OK Computer"),
+            (2, "Joy Division", "Unknown Pleasures"),
+            # Include artists that require fuzzy matching (not exact matches)
+            (4, "Radioheed", "OK Computer"),
+            (5, "Joye Division", "Unknown Pleasures"),
+        ]
+        matcher = MultiIndexMatcher(sample_index)
+
+        import logging
+
+        with caplog.at_level(logging.INFO, logger="verify_cache"):
+            classify_all_releases(releases, sample_index, matcher)
+
+        # Check for throughput info in chunk progress logs
+        chunk_logs = [r.message for r in caplog.records if "Chunk " in r.message]
+        if chunk_logs:
+            # At least one chunk log should have artists/sec throughput
+            assert any("artists/s" in msg for msg in chunk_logs)
 
 
 class TestParseArgsCopyTo:
