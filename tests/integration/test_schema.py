@@ -156,10 +156,37 @@ class TestCreateDatabase:
         assert unique_constraints == [], f"Unexpected UNIQUE constraints: {unique_constraints}"
 
     def test_schema_is_idempotent(self) -> None:
-        """Running the schema twice doesn't error (IF NOT EXISTS)."""
+        """Running the schema twice doesn't error."""
         conn = psycopg.connect(self.db_url, autocommit=True)
         with conn.cursor() as cur:
             cur.execute(SCHEMA_DIR.joinpath("create_database.sql").read_text())
+        conn.close()
+
+    def test_schema_clears_stale_data_on_rerun(self) -> None:
+        """Re-running the schema drops old data so import doesn't hit UniqueViolation."""
+        conn = psycopg.connect(self.db_url, autocommit=True)
+
+        # Insert data as if a previous pipeline run completed
+        with conn.cursor() as cur:
+            cur.execute("INSERT INTO release (id, title) VALUES (1, 'DOGA')")
+            cur.execute(
+                "INSERT INTO release_artist (release_id, artist_name, extra) "
+                "VALUES (1, 'Juana Molina', 0)"
+            )
+            cur.execute("SELECT count(*) FROM release")
+            assert cur.fetchone()[0] == 1
+
+        # Re-run schema (simulates a fresh pipeline run)
+        with conn.cursor() as cur:
+            cur.execute(SCHEMA_DIR.joinpath("create_database.sql").read_text())
+
+        # Tables should be empty — no stale data to conflict with new imports
+        with conn.cursor() as cur:
+            cur.execute("SELECT count(*) FROM release")
+            assert cur.fetchone()[0] == 0
+            cur.execute("SELECT count(*) FROM release_artist")
+            assert cur.fetchone()[0] == 0
+
         conn.close()
 
 
