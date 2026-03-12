@@ -1456,10 +1456,15 @@ def classify_all_releases(
     # Phase 2: Process exact-match artists (fast: exact pair + two-stage only)
     # Format filtering is applied here for exact-match KEEP releases: if the library
     # has format data for the matched (artist, title) pair and the release has a format,
-    # the release is downgraded to PRUNE if its format doesn't match. Fuzzy-match
-    # releases skip format filtering because the matched library pair is not reliably
-    # known (the fuzzy artist match may not correspond to the exact library pair).
+    # the release is downgraded to PRUNE if its format doesn't match. However, if NO
+    # format-matching release exists for a pair, format-mismatched releases are promoted
+    # back to KEEP as a fallback — better to have the wrong format than lose the album.
+    # Fuzzy-match releases skip format filtering because the matched library pair is not
+    # reliably known (the fuzzy artist match may not correspond to the exact library pair).
     logger.info("Phase 2: Classifying exact-match artists by pair...")
+    # Track format-mismatched KEEP releases for fallback promotion
+    format_mismatched: dict[tuple[str, str], list[int]] = {}
+    format_matched_pairs: set[tuple[str, str]] = set()
     for norm_artist in exact_artist_match:
         artist_releases = by_artist[norm_artist]
         for release_id, _, raw_title in artist_releases:
@@ -1470,9 +1475,12 @@ def classify_all_releases(
                 rel_fmt = release_formats.get(release_id)
                 lib_formats = index.format_by_pair.get((norm_artist, norm_title), set())
                 if not format_matches(rel_fmt, lib_formats):
+                    pair = (norm_artist, norm_title)
+                    format_mismatched.setdefault(pair, []).append(release_id)
                     prune_ids.add(release_id)
                 else:
                     keep_ids.add(release_id)
+                    format_matched_pairs.add((norm_artist, norm_title))
             elif result.decision == Decision.PRUNE:
                 prune_ids.add(release_id)
             else:
@@ -1480,6 +1488,15 @@ def classify_all_releases(
                 review_by_artist.setdefault(norm_artist, []).append((release_id, raw_title, result))
         releases_processed += len(artist_releases)
         artists_exact_matched += 1
+
+    # Fallback: promote format-mismatched releases when no format-matching release exists
+    format_fallback_count = 0
+    for pair, release_ids in format_mismatched.items():
+        if pair not in format_matched_pairs:
+            for release_id in release_ids:
+                prune_ids.discard(release_id)
+                keep_ids.add(release_id)
+            format_fallback_count += len(release_ids)
 
     # Process mapped-prune artists
     for norm_artist in no_artist_match:

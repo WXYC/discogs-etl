@@ -1271,15 +1271,19 @@ class TestFormatFilterClassification:
         report = classify_all_releases(releases, idx, matcher)
         assert 1 in report.keep_ids
 
-    def test_format_filter_prunes_mismatching_format(self):
-        """KEEP release with mismatching format is downgraded to PRUNE."""
+    def test_format_filter_prunes_mismatching_when_match_exists(self):
+        """Mismatching format is pruned when a format-matching release also exists."""
         rows = [("Radiohead", "OK Computer", "CD")]
         idx = LibraryIndex.from_rows(rows)
         matcher = MultiIndexMatcher(idx)
-        # Release is Cassette, but library only has CD
-        releases = [(1, "Radiohead", "OK Computer", "Cassette")]
+        # Cassette is pruned because the CD release satisfies the library's format
+        releases = [
+            (1, "Radiohead", "OK Computer", "Cassette"),
+            (2, "Radiohead", "OK Computer", "CD"),
+        ]
         report = classify_all_releases(releases, idx, matcher)
         assert 1 in report.prune_ids
+        assert 2 in report.keep_ids
 
     def test_format_filter_keeps_null_release_format(self):
         """KEEP release with NULL format stays KEEP (graceful degradation)."""
@@ -1308,3 +1312,31 @@ class TestFormatFilterClassification:
         releases = [(1, "Radiohead", "OK Computer", None)]
         report = classify_all_releases(releases, idx, matcher)
         assert 1 in report.keep_ids
+
+    def test_format_fallback_keeps_when_no_matching_format_exists(self):
+        """When library has LP but Discogs only has CD, keep the CD as a fallback.
+
+        Without this fallback, the album would have zero KEEP releases and be
+        lost from the cache entirely.
+        """
+        rows = [("Cat Power", "Moon Pix", "LP")]
+        idx = LibraryIndex.from_rows(rows)
+        matcher = MultiIndexMatcher(idx)
+        # Discogs only has a CD release, library only has LP
+        releases = [(1, "Cat Power", "Moon Pix", "CD")]
+        report = classify_all_releases(releases, idx, matcher)
+        assert 1 in report.keep_ids, "CD should be kept as fallback when no LP exists in Discogs"
+
+    def test_format_filter_still_prunes_when_matching_format_exists(self):
+        """When both matching and non-matching formats exist, prune the non-matching one."""
+        rows = [("Cat Power", "Moon Pix", "LP")]
+        idx = LibraryIndex.from_rows(rows)
+        matcher = MultiIndexMatcher(idx)
+        # Discogs has both CD and Vinyl releases; library has LP (→ Vinyl)
+        releases = [
+            (1, "Cat Power", "Moon Pix", "CD"),
+            (2, "Cat Power", "Moon Pix", "Vinyl"),
+        ]
+        report = classify_all_releases(releases, idx, matcher)
+        assert 2 in report.keep_ids, "Vinyl should be kept (matches library LP)"
+        assert 1 in report.prune_ids, "CD should be pruned when Vinyl exists"
