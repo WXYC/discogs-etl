@@ -17,7 +17,9 @@ _mod = importlib.util.module_from_spec(_spec)
 sys.modules["enrich_library_artists"] = _mod
 _spec.loader.exec_module(_mod)
 
-connect_mysql = _mod.connect_mysql
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+from lib.wxyc import connect_mysql  # noqa: E402
+
 extract_alternate_names = _mod.extract_alternate_names
 extract_cross_referenced_artists = _mod.extract_cross_referenced_artists
 extract_release_cross_ref_artists = _mod.extract_release_cross_ref_artists
