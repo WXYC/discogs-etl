@@ -36,8 +36,8 @@ logger = logging.getLogger(__name__)
 _LIB_DIR = Path(__file__).parent.parent / "lib"
 sys.path.insert(0, str(_LIB_DIR.parent))
 from lib.artist_splitting import split_artist_name_contextual  # noqa: E402
+from lib.catalog_source import create_catalog_source  # noqa: E402
 from lib.matching import is_compilation_artist  # noqa: E402
-from lib.wxyc import connect_mysql  # noqa: E402
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -60,7 +60,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         metavar="URL",
         help="MySQL connection URL for WXYC catalog database "
         "(e.g. mysql://user:pass@host:port/dbname). "
+        "Alias for --catalog-source tubafrenzy --catalog-db-url <url>. "
         "If omitted, only base artists from library.db are extracted.",
+    )
+    parser.add_argument(
+        "--catalog-source",
+        type=str,
+        choices=["tubafrenzy", "backend-service"],
+        default=None,
+        metavar="SOURCE",
+        help="Catalog source type: 'tubafrenzy' (MySQL) or 'backend-service' (PostgreSQL).",
+    )
+    parser.add_argument(
+        "--catalog-db-url",
+        type=str,
+        default=None,
+        metavar="URL",
+        help="Database connection URL for the catalog source.",
     )
     parser.add_argument(
         "--output",
@@ -262,6 +278,24 @@ def merge_and_write(
     logger.info("Wrote %d artist names to %s", len(filtered), output)
 
 
+def _resolve_catalog_args(args: argparse.Namespace) -> tuple[str, str] | None:
+    """Resolve --catalog-source/--catalog-db-url or --wxyc-db-url into (source_type, db_url).
+
+    Returns None if no catalog source is configured (library.db-only mode).
+    """
+    if args.catalog_source and args.catalog_db_url:
+        return (args.catalog_source, args.catalog_db_url)
+    if args.wxyc_db_url:
+        return ("tubafrenzy", args.wxyc_db_url)
+    if args.catalog_source and not args.catalog_db_url:
+        logger.error("--catalog-source requires --catalog-db-url")
+        sys.exit(1)
+    if args.catalog_db_url and not args.catalog_source:
+        logger.error("--catalog-db-url requires --catalog-source")
+        sys.exit(1)
+    return None
+
+
 def main() -> None:
     args = parse_args()
 
@@ -272,19 +306,20 @@ def main() -> None:
     # Source 1: Base names from library.db
     base = extract_base_artists(args.library_db)
 
-    # Source 2: WXYC MySQL enrichment (optional)
+    # Source 2: Catalog enrichment (optional)
     alternates: set[str] = set()
     cross_refs: set[str] = set()
     release_cross_refs: set[str] = set()
 
-    if args.wxyc_db_url:
-        conn = connect_mysql(args.wxyc_db_url)
+    catalog_args = _resolve_catalog_args(args)
+    if catalog_args:
+        source = create_catalog_source(*catalog_args)
         try:
-            alternates = extract_alternate_names(conn)
-            cross_refs = extract_cross_referenced_artists(conn)
-            release_cross_refs = extract_release_cross_ref_artists(conn)
+            alternates = source.fetch_alternate_names()
+            cross_refs = source.fetch_cross_referenced_artists()
+            release_cross_refs = source.fetch_release_cross_ref_artists()
         finally:
-            conn.close()
+            source.close()
 
     # Merge and write output
     args.output.parent.mkdir(parents=True, exist_ok=True)

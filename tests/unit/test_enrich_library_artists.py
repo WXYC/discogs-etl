@@ -213,6 +213,28 @@ class TestParseArgs:
         with pytest.raises(SystemExit):
             parse_args(["--library-db", "library.db"])  # missing --output
 
+    def test_with_catalog_source_and_db_url(self) -> None:
+        args = parse_args(
+            [
+                "--library-db",
+                "library.db",
+                "--output",
+                "artists.txt",
+                "--catalog-source",
+                "backend-service",
+                "--catalog-db-url",
+                "postgresql://user:pass@host/db",
+            ]
+        )
+        assert args.catalog_source == "backend-service"
+        assert args.catalog_db_url == "postgresql://user:pass@host/db"
+        assert args.wxyc_db_url is None
+
+    def test_catalog_source_defaults_to_none(self) -> None:
+        args = parse_args(["--library-db", "library.db", "--output", "artists.txt"])
+        assert args.catalog_source is None
+        assert args.catalog_db_url is None
+
 
 # ---------------------------------------------------------------------------
 # Multi-artist splitting in merge_and_write
@@ -461,7 +483,7 @@ class TestMain:
         assert "Cat Power" in lines
 
     def test_with_library_db_and_wxyc_db_url(self, tmp_path) -> None:
-        """With --library-db and --wxyc-db-url, MySQL enrichment is performed."""
+        """With --library-db and --wxyc-db-url, catalog enrichment is performed."""
         library_db = tmp_path / "library.db"
         import sqlite3
 
@@ -472,7 +494,10 @@ class TestMain:
         conn.close()
 
         output = tmp_path / "artists.txt"
-        mock_mysql_conn = MagicMock()
+        mock_source = MagicMock()
+        mock_source.fetch_alternate_names.return_value = {"Nourished by Time"}
+        mock_source.fetch_cross_referenced_artists.return_value = {"Buck Meek"}
+        mock_source.fetch_release_cross_ref_artists.return_value = {"Sessa"}
 
         with (
             patch.object(
@@ -489,10 +514,7 @@ class TestMain:
                     ]
                 ),
             ),
-            patch.object(_mod, "connect_mysql", return_value=mock_mysql_conn),
-            patch.object(_mod, "extract_alternate_names", return_value={"Nourished by Time"}),
-            patch.object(_mod, "extract_cross_referenced_artists", return_value={"Buck Meek"}),
-            patch.object(_mod, "extract_release_cross_ref_artists", return_value={"Sessa"}),
+            patch.object(_mod, "create_catalog_source", return_value=mock_source),
         ):
             _mod.main()
 
@@ -501,7 +523,51 @@ class TestMain:
         assert "Nourished by Time" in lines
         assert "Buck Meek" in lines
         assert "Sessa" in lines
-        mock_mysql_conn.close.assert_called_once()
+        mock_source.close.assert_called_once()
+
+    def test_with_catalog_source_backend_service(self, tmp_path) -> None:
+        """With --catalog-source backend-service, BackendServiceSource enrichment is used."""
+        library_db = tmp_path / "library.db"
+        import sqlite3
+
+        conn = sqlite3.connect(library_db)
+        conn.execute("CREATE TABLE library (artist TEXT, title TEXT)")
+        conn.execute("INSERT INTO library VALUES ('Cat Power', 'Moon Pix')")
+        conn.commit()
+        conn.close()
+
+        output = tmp_path / "artists.txt"
+        mock_source = MagicMock()
+        mock_source.fetch_alternate_names.return_value = {"Rafael Toral"}
+        mock_source.fetch_cross_referenced_artists.return_value = set()
+        mock_source.fetch_release_cross_ref_artists.return_value = set()
+
+        with (
+            patch.object(
+                _mod,
+                "parse_args",
+                return_value=parse_args(
+                    [
+                        "--library-db",
+                        str(library_db),
+                        "--output",
+                        str(output),
+                        "--catalog-source",
+                        "backend-service",
+                        "--catalog-db-url",
+                        "postgresql://user:pass@host/db",
+                    ]
+                ),
+            ),
+            patch.object(_mod, "create_catalog_source", return_value=mock_source) as mock_factory,
+        ):
+            _mod.main()
+
+        mock_factory.assert_called_once_with("backend-service", "postgresql://user:pass@host/db")
+        lines = set(output.read_text().splitlines())
+        assert "Cat Power" in lines
+        assert "Rafael Toral" in lines
+        mock_source.close.assert_called_once()
 
     def test_missing_library_db_exits(self, tmp_path) -> None:
         """Non-existent library.db triggers sys.exit(1)."""

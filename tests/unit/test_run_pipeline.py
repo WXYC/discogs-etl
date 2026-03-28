@@ -473,8 +473,8 @@ class TestXmlModeEnrichment:
         enrich_calls = []
         convert_calls = []
 
-        def fake_enrich(lib_db, output, wxyc_url=None):
-            enrich_calls.append((lib_db, output, wxyc_url))
+        def fake_enrich(lib_db, output, wxyc_db_url=None, catalog_source=None, catalog_db_url=None):
+            enrich_calls.append((lib_db, output, catalog_source))
 
         def fake_convert(xml, output_dir, converter, library_artists=None):
             convert_calls.append((xml, output_dir, converter, library_artists))

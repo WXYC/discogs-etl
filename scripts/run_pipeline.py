@@ -123,9 +123,26 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         metavar="URL",
         help="MySQL connection URL for WXYC catalog database "
         "(e.g. mysql://user:pass@host:port/dbname). "
+        "Alias for --catalog-source tubafrenzy --catalog-db-url <url>. "
         "Enriches library_artists.txt with alternate names and cross-references, "
         "and extracts label preferences for label-aware dedup. "
         "Requires --library-db.",
+    )
+    parser.add_argument(
+        "--catalog-source",
+        type=str,
+        choices=["tubafrenzy", "backend-service"],
+        default=None,
+        metavar="SOURCE",
+        help="Catalog source type: 'tubafrenzy' (MySQL) or 'backend-service' (PostgreSQL). "
+        "Requires --catalog-db-url.",
+    )
+    parser.add_argument(
+        "--catalog-db-url",
+        type=str,
+        default=None,
+        metavar="URL",
+        help="Database connection URL for the catalog source. Requires --catalog-source.",
     )
     parser.add_argument(
         "--database-url",
@@ -209,8 +226,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     if args.generate_library_db and args.library_db:
         parser.error("--generate-library-db and --library-db are mutually exclusive")
 
-    if args.wxyc_db_url and not args.library_db and not args.generate_library_db:
-        parser.error("--library-db or --generate-library-db is required when using --wxyc-db-url")
+    if args.catalog_source and not args.catalog_db_url:
+        parser.error("--catalog-source requires --catalog-db-url")
+    if args.catalog_db_url and not args.catalog_source:
+        parser.error("--catalog-db-url requires --catalog-source")
+    if args.wxyc_db_url and args.catalog_source:
+        parser.error("--wxyc-db-url and --catalog-source are mutually exclusive")
+
+    # Normalize: treat --wxyc-db-url as --catalog-source tubafrenzy --catalog-db-url <url>
+    if args.wxyc_db_url and not args.catalog_source:
+        args.catalog_source = "tubafrenzy"
+        args.catalog_db_url = args.wxyc_db_url
+
+    has_catalog = args.catalog_source is not None
+    if has_catalog and not args.library_db and not args.generate_library_db:
+        parser.error(
+            "--library-db or --generate-library-db is required when using "
+            "--wxyc-db-url or --catalog-source"
+        )
 
     if args.target_db_url and not args.library_db and not args.generate_library_db:
         parser.error("--library-db or --generate-library-db is required when using --target-db-url")
@@ -434,6 +467,8 @@ def enrich_library_artists(
     library_db: Path,
     library_artists_out: Path,
     wxyc_db_url: str | None = None,
+    catalog_source: str | None = None,
+    catalog_db_url: str | None = None,
 ) -> None:
     """Step 2.5: Enrich library_artists.txt with WXYC cross-reference data."""
     cmd = [
@@ -444,7 +479,9 @@ def enrich_library_artists(
         "--output",
         str(library_artists_out),
     ]
-    if wxyc_db_url:
+    if catalog_source and catalog_db_url:
+        cmd.extend(["--catalog-source", catalog_source, "--catalog-db-url", catalog_db_url])
+    elif wxyc_db_url:
         cmd.extend(["--wxyc-db-url", wxyc_db_url])
     run_step("Enrich library artists", cmd)
 
@@ -516,7 +553,12 @@ def _run_xml_pipeline(
         library_artists_path = args.library_artists
         if args.library_db:
             enriched_artists = tmp_dir / "library_artists.txt"
-            enrich_library_artists(args.library_db, enriched_artists, args.wxyc_db_url)
+            enrich_library_artists(
+                args.library_db,
+                enriched_artists,
+                catalog_source=args.catalog_source,
+                catalog_db_url=args.catalog_db_url,
+            )
             library_artists_path = enriched_artists
 
         if args.direct_pg:
@@ -565,7 +607,8 @@ def _run_xml_pipeline(
                 python,
                 library_labels=args.library_labels,
                 label_hierarchy=hierarchy_csv,
-                wxyc_db_url=args.wxyc_db_url,
+                catalog_source=args.catalog_source,
+                catalog_db_url=args.catalog_db_url,
             )
         else:
             # Standard CSV mode
@@ -587,7 +630,8 @@ def _run_xml_pipeline(
                 python,
                 library_labels=args.library_labels,
                 label_hierarchy=hierarchy_csv,
-                wxyc_db_url=args.wxyc_db_url,
+                catalog_source=args.catalog_source,
+                catalog_db_url=args.catalog_db_url,
             )
 
     if keep_csv_dir is not None:
@@ -646,7 +690,8 @@ def main() -> None:
             target_db_url=args.target_db_url,
             library_labels=args.library_labels,
             label_hierarchy=args.label_hierarchy,
-            wxyc_db_url=args.wxyc_db_url,
+            catalog_source=args.catalog_source,
+            catalog_db_url=args.catalog_db_url,
             state=state,
             state_file=args.state_file,
         )
@@ -663,7 +708,8 @@ def _run_database_build_post_import(
     *,
     library_labels: Path | None = None,
     label_hierarchy: Path | None = None,
-    wxyc_db_url: str | None = None,
+    catalog_source: str | None = None,
+    catalog_db_url: str | None = None,
 ) -> None:
     """Post-import database build for --direct-pg mode.
 
@@ -691,15 +737,17 @@ def _run_database_build_post_import(
 
     # -- dedup (deduplicate by master_id)
     labels_csv = library_labels
-    if labels_csv is None and wxyc_db_url is not None:
+    if labels_csv is None and catalog_source is not None and catalog_db_url is not None:
         labels_csv = Path(tempfile.mkdtemp(prefix="discogs_labels_")) / "library_labels.csv"
         run_step(
             "Extract WXYC library labels",
             [
                 python,
                 str(SCRIPT_DIR / "extract_library_labels.py"),
-                "--wxyc-db-url",
-                wxyc_db_url,
+                "--catalog-source",
+                catalog_source,
+                "--catalog-db-url",
+                catalog_db_url,
                 "--output",
                 str(labels_csv),
             ],
@@ -773,7 +821,8 @@ def _run_database_build(
     target_db_url: str | None = None,
     library_labels: Path | None = None,
     label_hierarchy: Path | None = None,
-    wxyc_db_url: str | None = None,
+    catalog_source: str | None = None,
+    catalog_db_url: str | None = None,
     state: PipelineState | None = None,
     state_file: Path | None = None,
 ) -> None:
@@ -786,8 +835,9 @@ def _run_database_build(
     target database instead of pruning the source in place.
 
     When *library_labels* is provided, the CSV is passed to the dedup step
-    for label-aware ranking.  When *wxyc_db_url* is provided but
-    *library_labels* is not, labels are extracted automatically before dedup.
+    for label-aware ranking.  When *catalog_source*/*catalog_db_url* are
+    provided but *library_labels* is not, labels are extracted automatically
+    before dedup.
     """
 
     def _save_state() -> None:
@@ -852,15 +902,17 @@ def _run_database_build(
     else:
         # Resolve library labels CSV for label-aware dedup
         labels_csv = library_labels
-        if labels_csv is None and wxyc_db_url is not None:
+        if labels_csv is None and catalog_source is not None and catalog_db_url is not None:
             labels_csv = Path(tempfile.mkdtemp(prefix="discogs_labels_")) / "library_labels.csv"
             run_step(
                 "Extract WXYC library labels",
                 [
                     python,
                     str(SCRIPT_DIR / "extract_library_labels.py"),
-                    "--wxyc-db-url",
-                    wxyc_db_url,
+                    "--catalog-source",
+                    catalog_source,
+                    "--catalog-db-url",
+                    catalog_db_url,
                     "--output",
                     str(labels_csv),
                 ],

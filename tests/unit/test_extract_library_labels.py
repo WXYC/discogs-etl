@@ -126,9 +126,20 @@ class TestParseArgs:
         assert args.wxyc_db_url == "mysql://u:p@h/db"
         assert args.output == Path("out.csv")
 
-    def test_missing_wxyc_db_url_exits(self) -> None:
-        with pytest.raises(SystemExit):
-            parse_args(["--output", "out.csv"])
+    def test_catalog_source_args(self) -> None:
+        args = parse_args(
+            [
+                "--catalog-source",
+                "backend-service",
+                "--catalog-db-url",
+                "postgresql://u:p@h/db",
+                "--output",
+                "out.csv",
+            ]
+        )
+        assert args.catalog_source == "backend-service"
+        assert args.catalog_db_url == "postgresql://u:p@h/db"
+        assert args.wxyc_db_url is None
 
     def test_missing_output_exits(self) -> None:
         with pytest.raises(SystemExit):
