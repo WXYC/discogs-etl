@@ -17,6 +17,7 @@ Required environment variables:
     LIBRARY_DB_NAME     - MySQL database name
 """
 
+import argparse
 import itertools
 import os
 import sqlite3
@@ -25,6 +26,9 @@ import sys
 import threading
 import time
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from lib.catalog_source import create_catalog_source  # noqa: E402
 
 # Configuration from environment
 SSH_HOST = os.environ.get("LIBRARY_SSH_HOST", "")
@@ -143,9 +147,47 @@ def fetch_from_remote() -> list[dict]:
     return rows
 
 
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "--catalog-source",
+        type=str,
+        choices=["tubafrenzy", "backend-service"],
+        default=None,
+        metavar="SOURCE",
+        help="Catalog source type: 'tubafrenzy' (MySQL) or 'backend-service' (PostgreSQL).",
+    )
+    parser.add_argument(
+        "--catalog-db-url",
+        type=str,
+        default=None,
+        metavar="URL",
+        help="Database connection URL for the catalog source.",
+    )
+    return parser.parse_args(argv)
+
+
 def export():
-    # Check required environment variables when using SSH
-    if SSH_HOST:
+    args = parse_args()
+
+    # If --catalog-source is provided, use it regardless of SSH env vars
+    if args.catalog_source and args.catalog_db_url:
+        print(f"Fetching library from {args.catalog_source}...")
+        source = create_catalog_source(args.catalog_source, args.catalog_db_url)
+        try:
+            rows = source.fetch_library_rows()
+        finally:
+            source.close()
+        print(f"Fetched {len(rows):,} rows")
+    elif args.catalog_source and not args.catalog_db_url:
+        print("ERROR: --catalog-source requires --catalog-db-url")
+        sys.exit(1)
+    elif SSH_HOST:
+        # Check required environment variables when using SSH
         missing = []
         for var in [
             "LIBRARY_SSH_HOST",

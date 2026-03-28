@@ -29,7 +29,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from lib.wxyc import connect_mysql  # noqa: E402
+from lib.catalog_source import create_catalog_source  # noqa: E402
 
 EXTRACTION_QUERY = """
     SELECT DISTINCT
@@ -54,10 +54,26 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--wxyc-db-url",
         type=str,
-        required=True,
+        default=None,
         metavar="URL",
         help="MySQL connection URL for WXYC catalog database "
-        "(e.g. mysql://user:pass@host:port/dbname).",
+        "(e.g. mysql://user:pass@host:port/dbname). "
+        "Alias for --catalog-source tubafrenzy --catalog-db-url <url>.",
+    )
+    parser.add_argument(
+        "--catalog-source",
+        type=str,
+        choices=["tubafrenzy", "backend-service"],
+        default=None,
+        metavar="SOURCE",
+        help="Catalog source type: 'tubafrenzy' (MySQL) or 'backend-service' (PostgreSQL).",
+    )
+    parser.add_argument(
+        "--catalog-db-url",
+        type=str,
+        default=None,
+        metavar="URL",
+        help="Database connection URL for the catalog source.",
     )
     parser.add_argument(
         "--output",
@@ -116,11 +132,27 @@ def write_library_labels_csv(triples: set[tuple[str, str, str]], output: Path) -
 
 def main() -> None:
     args = parse_args()
-    conn = connect_mysql(args.wxyc_db_url)
+
+    # Resolve catalog source
+    if args.catalog_source and args.catalog_db_url:
+        source_type, db_url = args.catalog_source, args.catalog_db_url
+    elif args.wxyc_db_url:
+        source_type, db_url = "tubafrenzy", args.wxyc_db_url
+    elif args.catalog_source and not args.catalog_db_url:
+        logger.error("--catalog-source requires --catalog-db-url")
+        sys.exit(1)
+    elif args.catalog_db_url and not args.catalog_source:
+        logger.error("--catalog-db-url requires --catalog-source")
+        sys.exit(1)
+    else:
+        logger.error("One of --wxyc-db-url or --catalog-source/--catalog-db-url is required")
+        sys.exit(1)
+
+    source = create_catalog_source(source_type, db_url)
     try:
-        triples = extract_library_labels(conn)
+        triples = source.fetch_library_labels()
     finally:
-        conn.close()
+        source.close()
     write_library_labels_csv(triples, args.output)
 
 
