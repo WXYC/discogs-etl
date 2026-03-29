@@ -1,0 +1,44 @@
+name: Sync Library
+
+on:
+  schedule:
+    # Daily at noon UTC (7 AM EST / 8 AM EDT)
+    - cron: "0 12 * * *"
+  workflow_dispatch:
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install -e .
+
+      - uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+
+      - name: Add Kattare host key
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -H "$LIBRARY_SSH_HOST" >> ~/.ssh/known_hosts
+        env:
+          LIBRARY_SSH_HOST: ${{ secrets.LIBRARY_SSH_HOST }}
+
+      - name: Run library sync
+        run: scripts/sync-library.sh --notify
+        env:
+          LIBRARY_SSH_HOST: ${{ secrets.LIBRARY_SSH_HOST }}
+          LIBRARY_SSH_USER: ${{ secrets.LIBRARY_SSH_USER }}
+          LIBRARY_DB_HOST: ${{ secrets.LIBRARY_DB_HOST }}
+          LIBRARY_DB_USER: ${{ secrets.LIBRARY_DB_USER }}
+          LIBRARY_DB_PASSWORD: ${{ secrets.LIBRARY_DB_PASSWORD }}
+          LIBRARY_DB_NAME: ${{ secrets.LIBRARY_DB_NAME }}
+          ADMIN_TOKEN: ${{ secrets.ADMIN_TOKEN }}
+          STAGING_URL: ${{ secrets.STAGING_URL }}
+          PRODUCTION_URL: ${{ secrets.PRODUCTION_URL }}
+          SLACK_MONITORING_WEBHOOK: ${{ secrets.SLACK_MONITORING_WEBHOOK }}

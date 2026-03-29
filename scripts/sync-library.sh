@@ -1,11 +1,21 @@
 #!/bin/bash
 set -eo pipefail
 
-LOG_FILE="$HOME/Library/Logs/library-metadata-lookup-etl.log"
+if [[ -d "$HOME/Library/Logs" ]]; then
+    LOG_FILE="$HOME/Library/Logs/library-metadata-lookup-etl.log"
+else
+    LOG_FILE="$(mktemp)"
+fi
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 SLACK_WEBHOOK_URL="${SLACK_MONITORING_WEBHOOK:-}"
 NOTIFY_ENABLED=false
 EXIT_CODE=0
+
+# Python interpreter: allow override via PYTHON_BIN, prefer .venv, fall back to python3
+PYTHON="${PYTHON_BIN:-.venv/bin/python}"
+if ! command -v "$PYTHON" &>/dev/null; then
+    PYTHON="python3"
+fi
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -55,7 +65,7 @@ upload_library_db() {
         2>> "$LOG_FILE")
 
     if [[ "$HTTP_CODE" -eq 200 ]]; then
-        ROW_COUNT=$(python3 -c "import json,sys; print(json.load(sys.stdin).get('row_count','?'))" < "$UPLOAD_OUTPUT" 2>/dev/null || echo "?")
+        ROW_COUNT=$($PYTHON -c "import json,sys; print(json.load(sys.stdin).get('row_count','?'))" < "$UPLOAD_OUTPUT" 2>/dev/null || echo "?")
         log "Uploaded to $label successfully ($ROW_COUNT rows)"
         rm -f "$UPLOAD_OUTPUT"
         return 0
@@ -89,7 +99,7 @@ DB_PATH=$(mktemp -d)/library.db
 export LIBRARY_DB_OUTPUT_PATH="$DB_PATH"
 
 ETL_OUTPUT=$(mktemp)
-if ! .venv/bin/python scripts/export_to_sqlite.py 2>&1 | tee "$ETL_OUTPUT"; then
+if ! $PYTHON scripts/export_to_sqlite.py 2>&1 | tee "$ETL_OUTPUT"; then
     ERROR_DETAILS=$(grep -v '^[[:space:]]' "$ETL_OUTPUT" | grep -v '^$' | tail -1 | sed 's/"/\\"/g')
     cat "$ETL_OUTPUT" >> "$LOG_FILE"
     rm -f "$ETL_OUTPUT" "$DB_PATH"

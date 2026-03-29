@@ -133,6 +133,34 @@ Test fixtures are in `tests/fixtures/` (CSV files, library.db, library_artists.t
 
 This pipeline runs monthly (or when Discogs publishes new data dumps). It has a completely different lifecycle from the request-handling services that consume its output.
 
+## Automation
+
+### Library Sync (`sync-library.yml`)
+
+A GitHub Actions cron workflow runs `scripts/sync-library.sh` daily at noon UTC (7 AM EST / 8 AM EDT) to export the WXYC library catalog from MySQL on Kattare to SQLite and upload it to library-metadata-lookup staging and production environments.
+
+The workflow can also be triggered manually: `gh workflow run sync-library.yml`
+
+The `--notify` flag is always passed, so Slack notifications are sent on failure when `SLACK_MONITORING_WEBHOOK` is configured.
+
+**Required GitHub secrets:**
+
+| Secret | Description |
+|--------|-------------|
+| `SSH_PRIVATE_KEY` | Private key authorized on Kattare |
+| `LIBRARY_SSH_HOST` | Kattare SSH hostname |
+| `LIBRARY_SSH_USER` | SSH username |
+| `LIBRARY_DB_HOST` | MySQL host (as seen from SSH host) |
+| `LIBRARY_DB_USER` | MySQL username |
+| `LIBRARY_DB_PASSWORD` | MySQL password |
+| `LIBRARY_DB_NAME` | MySQL database name |
+| `ADMIN_TOKEN` | Bearer token for library-metadata-lookup admin endpoints |
+| `STAGING_URL` | Staging base URL for library-metadata-lookup |
+| `PRODUCTION_URL` | Production base URL for library-metadata-lookup |
+| `SLACK_MONITORING_WEBHOOK` | Slack webhook for error notifications (optional) |
+
+After a successful run, verify the library-metadata-lookup health endpoint returns healthy with the expected row count.
+
 ## Development Practices
 
 ### TDD (Required)
