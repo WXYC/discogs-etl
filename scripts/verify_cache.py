@@ -102,6 +102,8 @@ RELEASE_TABLES = [
     ("release", "id"),
     ("release_artist", "release_id"),
     ("release_label", "release_id"),
+    ("release_genre", "release_id"),
+    ("release_style", "release_id"),
     ("release_track", "release_id"),
     ("release_track_artist", "release_id"),
     ("cache_metadata", "release_id"),
@@ -767,6 +769,8 @@ def prune_releases_copy_swap(
                 "release_id",
             ),
             ("release_label", "new_release_label", "release_id, label_name", "release_id"),
+            ("release_genre", "new_release_genre", "release_id, genre", "release_id"),
+            ("release_style", "new_release_style", "release_id, style", "release_id"),
             (
                 "release_track",
                 "new_release_track",
@@ -807,6 +811,8 @@ def prune_releases_copy_swap(
             for stmt in [
                 "ALTER TABLE release_artist DROP CONSTRAINT IF EXISTS fk_release_artist_release",
                 "ALTER TABLE release_label DROP CONSTRAINT IF EXISTS fk_release_label_release",
+                "ALTER TABLE release_genre DROP CONSTRAINT IF EXISTS fk_release_genre_release",
+                "ALTER TABLE release_style DROP CONSTRAINT IF EXISTS fk_release_style_release",
                 "ALTER TABLE release_track DROP CONSTRAINT IF EXISTS fk_release_track_release",
                 "ALTER TABLE release_track_artist DROP CONSTRAINT IF EXISTS fk_release_track_artist_release",
                 "ALTER TABLE cache_metadata DROP CONSTRAINT IF EXISTS fk_cache_metadata_release",
@@ -837,6 +843,14 @@ def prune_releases_copy_swap(
                 "FOREIGN KEY (release_id) REFERENCES release(id) ON DELETE CASCADE"
             )
             cur.execute(
+                "ALTER TABLE release_genre ADD CONSTRAINT fk_release_genre_release "
+                "FOREIGN KEY (release_id) REFERENCES release(id) ON DELETE CASCADE"
+            )
+            cur.execute(
+                "ALTER TABLE release_style ADD CONSTRAINT fk_release_style_release "
+                "FOREIGN KEY (release_id) REFERENCES release(id) ON DELETE CASCADE"
+            )
+            cur.execute(
                 "ALTER TABLE release_track ADD CONSTRAINT fk_release_track_release "
                 "FOREIGN KEY (release_id) REFERENCES release(id) ON DELETE CASCADE"
             )
@@ -853,6 +867,8 @@ def prune_releases_copy_swap(
             # FK indexes
             cur.execute("CREATE INDEX idx_release_artist_release_id ON release_artist(release_id)")
             cur.execute("CREATE INDEX idx_release_label_release_id ON release_label(release_id)")
+            cur.execute("CREATE INDEX idx_release_genre_release_id ON release_genre(release_id)")
+            cur.execute("CREATE INDEX idx_release_style_release_id ON release_style(release_id)")
             cur.execute("CREATE INDEX idx_release_track_release_id ON release_track(release_id)")
             cur.execute(
                 "CREATE INDEX idx_release_track_artist_release_id "
@@ -904,6 +920,8 @@ COPY_TABLE_SPEC = [
     ("release", "id", ["id", "title", "release_year", "country", "artwork_url", "format"]),
     ("release_artist", "release_id", ["release_id", "artist_name", "extra"]),
     ("release_label", "release_id", ["release_id", "label_name"]),
+    ("release_genre", "release_id", ["release_id", "genre"]),
+    ("release_style", "release_id", ["release_id", "style"]),
     ("release_track", "release_id", ["release_id", "sequence", "position", "title", "duration"]),
     (
         "release_track_artist",
@@ -960,6 +978,8 @@ def _create_target_schema(target_url: str) -> None:
             "cache_metadata",
             "release_track_artist",
             "release_track",
+            "release_style",
+            "release_genre",
             "release_label",
             "release_artist",
             "release",

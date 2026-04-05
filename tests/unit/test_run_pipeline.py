@@ -286,7 +286,7 @@ class TestRunVacuum:
         args, kwargs = mock_parallel.call_args
         db_url, statements = args[0], args[1]
         assert db_url == "postgresql:///test"
-        assert len(statements) == 6
+        assert len(statements) == 8
         assert all(s.startswith("VACUUM FULL ") for s in statements)
         assert "VACUUM FULL release" in statements
         assert "VACUUM FULL cache_metadata" in statements
@@ -302,6 +302,8 @@ class TestPipelineTables:
             "release",
             "release_artist",
             "release_label",
+            "release_genre",
+            "release_style",
             "release_track",
             "release_track_artist",
             "cache_metadata",

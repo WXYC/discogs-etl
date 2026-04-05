@@ -67,6 +67,8 @@ PIPELINE_TABLES = [
     "release",
     "release_artist",
     "release_label",
+    "release_genre",
+    "release_style",
     "release_track",
     "release_track_artist",
     "cache_metadata",
