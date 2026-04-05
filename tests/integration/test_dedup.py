@@ -830,6 +830,8 @@ class TestAddConstraintsAndIndexes:
             for constraint, table in [
                 ("release_artist_release_id_fkey", "release_artist"),
                 ("release_label_release_id_fkey", "release_label"),
+                ("release_genre_release_id_fkey", "release_genre"),
+                ("release_style_release_id_fkey", "release_style"),
                 ("release_track_release_id_fkey", "release_track"),
                 ("release_track_artist_release_id_fkey", "release_track_artist"),
                 ("cache_metadata_release_id_fkey", "cache_metadata"),
@@ -842,6 +844,8 @@ class TestAddConstraintsAndIndexes:
             for idx in [
                 "idx_release_artist_release_id",
                 "idx_release_label_release_id",
+                "idx_release_genre_release_id",
+                "idx_release_style_release_id",
                 "idx_release_track_release_id",
                 "idx_release_track_artist_release_id",
                 "idx_release_artist_name_trgm",
