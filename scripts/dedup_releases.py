@@ -406,11 +406,17 @@ def add_base_constraints_and_indexes(conn, db_url: str | None = None) -> None:
             "FOREIGN KEY (release_id) REFERENCES release(id) ON DELETE CASCADE",
             "ALTER TABLE release_label ADD CONSTRAINT fk_release_label_release "
             "FOREIGN KEY (release_id) REFERENCES release(id) ON DELETE CASCADE",
+            "ALTER TABLE release_genre ADD CONSTRAINT fk_release_genre_release "
+            "FOREIGN KEY (release_id) REFERENCES release(id) ON DELETE CASCADE",
+            "ALTER TABLE release_style ADD CONSTRAINT fk_release_style_release "
+            "FOREIGN KEY (release_id) REFERENCES release(id) ON DELETE CASCADE",
             "ALTER TABLE cache_metadata ADD CONSTRAINT fk_cache_metadata_release "
             "FOREIGN KEY (release_id) REFERENCES release(id) ON DELETE CASCADE",
             "ALTER TABLE cache_metadata ADD PRIMARY KEY (release_id)",
             "CREATE INDEX idx_release_artist_release_id ON release_artist(release_id)",
             "CREATE INDEX idx_release_label_release_id ON release_label(release_id)",
+            "CREATE INDEX idx_release_genre_release_id ON release_genre(release_id)",
+            "CREATE INDEX idx_release_style_release_id ON release_style(release_id)",
         ],
         "Level 2: FK constraints + FK indexes",
     )
@@ -595,6 +601,18 @@ def main():
             "release_id",
         ),
         (
+            "release_genre",
+            "new_release_genre",
+            "release_id, genre",
+            "release_id",
+        ),
+        (
+            "release_style",
+            "new_release_style",
+            "release_id, style",
+            "release_id",
+        ),
+        (
             "cache_metadata",
             "new_cache_metadata",
             "release_id, cached_at, source, last_validated",
@@ -611,6 +629,8 @@ def main():
         for stmt in [
             "ALTER TABLE release_artist DROP CONSTRAINT IF EXISTS fk_release_artist_release",
             "ALTER TABLE release_label DROP CONSTRAINT IF EXISTS fk_release_label_release",
+            "ALTER TABLE release_genre DROP CONSTRAINT IF EXISTS fk_release_genre_release",
+            "ALTER TABLE release_style DROP CONSTRAINT IF EXISTS fk_release_style_release",
             "ALTER TABLE cache_metadata DROP CONSTRAINT IF EXISTS fk_cache_metadata_release",
         ]:
             cur.execute(stmt)

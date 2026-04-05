@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """Import Discogs CSV files into PostgreSQL with proper multiline handling.
 
-Imports only the columns needed by the optimized schema (see 04-create-database.sql).
-Dropped tables (release_genre, release_style, artist) are skipped.
+Imports only the columns needed by the schema (see 04-create-database.sql).
 The release_image.csv is processed separately to populate artwork_url on release.
 """
 
@@ -104,6 +103,24 @@ BASE_TABLES: list[TableConfig] = [
         "required": ["release_id", "label"],
         "transforms": {},
         "unique_key": ["release_id", "label"],
+    },
+    {
+        "csv_file": "release_genre.csv",
+        "table": "release_genre",
+        "csv_columns": ["release_id", "genre"],
+        "db_columns": ["release_id", "genre"],
+        "required": ["release_id", "genre"],
+        "transforms": {},
+        "unique_key": ["release_id", "genre"],
+    },
+    {
+        "csv_file": "release_style.csv",
+        "table": "release_style",
+        "csv_columns": ["release_id", "style"],
+        "db_columns": ["release_id", "style"],
+        "required": ["release_id", "style"],
+        "transforms": {},
+        "unique_key": ["release_id", "style"],
     },
 ]
 

@@ -23,12 +23,12 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # CSV files that need to be filtered by release_id.
-# Only includes files needed by the optimized schema (see 04-create-database.sql).
-# Dropped tables (release_genre, release_style) are excluded.
 RELEASE_ID_FILES = [
     "release.csv",
     "release_artist.csv",
     "release_label.csv",
+    "release_genre.csv",
+    "release_style.csv",
     "release_track.csv",
     "release_track_artist.csv",
     "release_image.csv",  # for artwork_url extraction during import
