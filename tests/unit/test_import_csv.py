@@ -350,7 +350,13 @@ class TestTableSplit:
 
     def test_base_tables_names(self) -> None:
         names = [t["table"] for t in BASE_TABLES]
-        assert names == ["release", "release_artist", "release_label", "release_genre", "release_style"]
+        assert names == [
+            "release",
+            "release_artist",
+            "release_label",
+            "release_genre",
+            "release_style",
+        ]
 
     def test_track_tables_are_release_track_and_release_track_artist(self) -> None:
         names = [t["table"] for t in TRACK_TABLES]

@@ -1,7 +1,7 @@
 -- Create Discogs cache database schema (optimized)
 -- Run with: psql -U postgres -f 04-create-database.sql
 --
--- This schema only includes columns actively queried by cache_service.py.
+-- This schema includes all columns used by cache_service.py and downstream consumers.
 -- FK constraints with ON DELETE CASCADE enable single-table pruning.
 
 -- Create database (run as superuser)
@@ -30,6 +30,8 @@ DROP TABLE IF EXISTS artist CASCADE;
 DROP TABLE IF EXISTS release_video CASCADE;
 DROP TABLE IF EXISTS release_track_artist CASCADE;
 DROP TABLE IF EXISTS release_track CASCADE;
+DROP TABLE IF EXISTS release_style CASCADE;
+DROP TABLE IF EXISTS release_genre CASCADE;
 DROP TABLE IF EXISTS release_label CASCADE;
 DROP TABLE IF EXISTS release_artist CASCADE;
 DROP TABLE IF EXISTS release CASCADE;
@@ -61,6 +63,18 @@ CREATE TABLE release_label (
     label_id        integer,
     label_name      text NOT NULL,
     catno           text
+);
+
+-- Genres on releases
+CREATE TABLE release_genre (
+    release_id      integer NOT NULL REFERENCES release(id) ON DELETE CASCADE,
+    genre           text NOT NULL
+);
+
+-- Styles on releases (more specific than genres)
+CREATE TABLE release_style (
+    release_id      integer NOT NULL REFERENCES release(id) ON DELETE CASCADE,
+    style           text NOT NULL
 );
 
 -- Tracks on releases
@@ -142,6 +156,8 @@ CREATE TABLE cache_metadata (
 -- Foreign key indexes
 CREATE INDEX IF NOT EXISTS idx_release_artist_release_id ON release_artist(release_id);
 CREATE INDEX IF NOT EXISTS idx_release_label_release_id ON release_label(release_id);
+CREATE INDEX IF NOT EXISTS idx_release_genre_release_id ON release_genre(release_id);
+CREATE INDEX IF NOT EXISTS idx_release_style_release_id ON release_style(release_id);
 CREATE INDEX IF NOT EXISTS idx_release_track_release_id ON release_track(release_id);
 CREATE INDEX IF NOT EXISTS idx_release_track_artist_release_id ON release_track_artist(release_id);
 CREATE INDEX IF NOT EXISTS idx_release_video_release_id ON release_video(release_id);
