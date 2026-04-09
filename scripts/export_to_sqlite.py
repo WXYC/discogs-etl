@@ -147,6 +147,50 @@ def fetch_from_remote() -> list[dict]:
     return rows
 
 
+COMPILATION_TRACK_ARTIST_QUERY = """
+SELECT LIBRARY_RELEASE_ID, ARTIST_NAME, TRACK_TITLE
+FROM COMPILATION_TRACK_ARTIST
+ORDER BY LIBRARY_RELEASE_ID
+"""
+
+
+def fetch_compilation_track_artists_from_remote() -> list[dict]:
+    """Fetch compilation track artists via SSH. Returns empty list if table doesn't exist."""
+    ssh_target = f"{SSH_USER}@{SSH_HOST}"
+    mysql_cmd = (
+        f"mysql -h {MYSQL_HOST} -u {MYSQL_USER} -p'{MYSQL_PASSWORD}' "
+        f'-B -N {MYSQL_DATABASE} -e "{COMPILATION_TRACK_ARTIST_QUERY}"'
+    )
+
+    result = subprocess.run(["ssh", ssh_target, mysql_cmd], capture_output=True)
+
+    if result.returncode != 0:
+        stderr = result.stderr.decode("utf-8", errors="replace")
+        if "doesn't exist" in stderr:
+            print("COMPILATION_TRACK_ARTIST table not found, skipping")
+            return []
+        raise RuntimeError(f"MySQL query failed: {stderr}")
+
+    try:
+        output = result.stdout.decode("utf-8")
+    except UnicodeDecodeError:
+        output = result.stdout.decode("latin-1")
+
+    rows = []
+    columns = ["library_release_id", "artist_name", "track_title"]
+    for line in output.strip().split("\n"):
+        if not line:
+            continue
+        values = line.split("\t")
+        if len(values) == len(columns):
+            cleaned = [None if v == "\\N" else v for v in values]
+            row = dict(zip(columns, cleaned, strict=True))
+            row["library_release_id"] = int(row["library_release_id"])
+            rows.append(row)
+
+    return rows
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse command-line arguments."""
     parser = argparse.ArgumentParser(
@@ -174,12 +218,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def export():
     args = parse_args()
 
+    compilation_track_artists: list[dict] | None = None
+
     # If --catalog-source is provided, use it regardless of SSH env vars
     if args.catalog_source and args.catalog_db_url:
         print(f"Fetching library from {args.catalog_source}...")
         source = create_catalog_source(args.catalog_source, args.catalog_db_url)
         try:
             rows = source.fetch_library_rows()
+            compilation_track_artists = source.fetch_compilation_track_artists()
+            if compilation_track_artists:
+                print(f"Fetched {len(compilation_track_artists):,} compilation track artists")
         finally:
             source.close()
         print(f"Fetched {len(rows):,} rows")
@@ -204,6 +253,9 @@ def export():
             sys.exit(1)
 
         rows = fetch_from_remote()
+        compilation_track_artists = fetch_compilation_track_artists_from_remote()
+        if compilation_track_artists:
+            print(f"Fetched {len(compilation_track_artists):,} compilation track artists")
     else:
         # Local MySQL connection (legacy support)
         import pymysql  # type: ignore[import-untyped]
@@ -222,10 +274,10 @@ def export():
             rows = cursor.fetchall()
         conn.close()
 
-    _do_export(rows)
+    _do_export(rows, compilation_track_artists)
 
 
-def _do_export(rows: list[dict]):
+def _do_export(rows: list[dict], compilation_track_artists: list[dict] | None = None):
     """Export rows to SQLite database."""
     # Remove existing SQLite file
     if OUTPUT_PATH.exists():
@@ -295,6 +347,27 @@ def _do_export(rows: list[dict]):
     sqlite_cur.execute("CREATE INDEX idx_artist ON library(artist)")
     sqlite_cur.execute("CREATE INDEX idx_title ON library(title)")
     sqlite_cur.execute("CREATE INDEX idx_alternate_artist ON library(alternate_artist_name)")
+
+    # Export compilation track artists (if available)
+    if compilation_track_artists:
+        sqlite_cur.execute("""
+            CREATE TABLE compilation_track_artist (
+                library_release_id INTEGER NOT NULL,
+                artist_name TEXT NOT NULL,
+                track_title TEXT
+            )
+        """)
+        for row in compilation_track_artists:
+            sqlite_cur.execute(
+                "INSERT INTO compilation_track_artist (library_release_id, artist_name, track_title) VALUES (?, ?, ?)",
+                (row["library_release_id"], row["artist_name"], row.get("track_title")),
+            )
+        sqlite_cur.execute("CREATE INDEX idx_cta_release ON compilation_track_artist(library_release_id)")
+        sqlite_cur.execute("CREATE INDEX idx_cta_artist ON compilation_track_artist(artist_name)")
+
+        cta_count = sqlite_cur.execute("SELECT COUNT(*) FROM compilation_track_artist").fetchone()[0]
+        cta_releases = sqlite_cur.execute("SELECT COUNT(DISTINCT library_release_id) FROM compilation_track_artist").fetchone()[0]
+        print(f"Exported {cta_count} compilation track artists across {cta_releases} releases")
 
     sqlite_conn.commit()
 
