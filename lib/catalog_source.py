@@ -44,6 +44,14 @@ class CatalogSource(Protocol):
         """Return (artist_name, release_title, label_name) triples from flowsheet plays."""
         ...
 
+    def fetch_compilation_track_artists(self) -> list[dict[str, Any]]:
+        """Return per-track artist credits from compilation releases.
+
+        Keys: library_release_id, artist_name, track_title.
+        Returns empty list if the table does not exist.
+        """
+        ...
+
     def close(self) -> None:
         """Release the underlying database connection."""
         ...
@@ -150,6 +158,21 @@ class TubafrenzySource:
             """)
             return _strip_label_rows(cur.fetchall())
 
+    def fetch_compilation_track_artists(self) -> list[dict[str, Any]]:
+        columns = ["library_release_id", "artist_name", "track_title"]
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute("""
+                    SELECT LIBRARY_RELEASE_ID, ARTIST_NAME, TRACK_TITLE
+                    FROM COMPILATION_TRACK_ARTIST
+                    ORDER BY LIBRARY_RELEASE_ID
+                """)
+                rows = cur.fetchall()
+            return [dict(zip(columns, row, strict=True)) for row in rows]
+        except Exception:
+            logger.info("COMPILATION_TRACK_ARTIST table not found, skipping")
+            return []
+
     def close(self) -> None:
         self._conn.close()
 
@@ -230,6 +253,10 @@ class BackendServiceSource:
                   AND f.album_id IS NOT NULL
             """)
             return _strip_label_rows(cur.fetchall())
+
+    def fetch_compilation_track_artists(self) -> list[dict[str, Any]]:
+        # Backend-Service does not have COMPILATION_TRACK_ARTIST yet
+        return []
 
     def close(self) -> None:
         self._conn.close()

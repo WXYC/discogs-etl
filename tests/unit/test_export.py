@@ -240,6 +240,93 @@ class TestDoExport:
         conn.close()
 
 
+class TestDoExportCompilationTrackArtists:
+    """Tests for compilation_track_artist table in _do_export."""
+
+    @pytest.fixture(autouse=True)
+    def use_tmp_output(self, tmp_path, monkeypatch):
+        """Redirect OUTPUT_PATH to a temp directory."""
+        self.output_path = tmp_path / "library.db"
+        monkeypatch.setattr(_mod, _OUTPUT_PATH_ATTR, self.output_path)
+
+    def _make_rows(self):
+        return [
+            {
+                "id": "1",
+                "title": "Vintage Palmwine",
+                "artist": "Various Artists",
+                "call_letters": "Z-X",
+                "artist_call_number": "1",
+                "release_call_number": "1",
+                "genre": "World",
+                "format": "CD",
+                "alternate_artist_name": None,
+            },
+        ]
+
+    def _make_track_artists(self):
+        return [
+            {"library_release_id": 1, "artist_name": "Koo Nimo", "track_title": "odo akosomo"},
+            {"library_release_id": 1, "artist_name": "T.O. Jazz", "track_title": "Yaa Amponsah"},
+        ]
+
+    def test_creates_compilation_track_artist_table(self):
+        """The compilation_track_artist table should be created when track artists are provided."""
+        _do_export(self._make_rows(), self._make_track_artists())
+
+        conn = sqlite3.connect(self.output_path)
+        cursor = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='compilation_track_artist'"
+        )
+        assert cursor.fetchone() is not None
+        conn.close()
+
+    def test_inserts_track_artist_rows(self):
+        """Track artist rows should be inserted into the compilation_track_artist table."""
+        _do_export(self._make_rows(), self._make_track_artists())
+
+        conn = sqlite3.connect(self.output_path)
+        cursor = conn.execute("SELECT library_release_id, artist_name, track_title FROM compilation_track_artist ORDER BY artist_name")
+        rows = cursor.fetchall()
+        conn.close()
+
+        assert len(rows) == 2
+        assert rows[0] == (1, "Koo Nimo", "odo akosomo")
+        assert rows[1] == (1, "T.O. Jazz", "Yaa Amponsah")
+
+    def test_creates_indexes_on_compilation_track_artist(self):
+        """Indexes should be created on library_release_id and artist_name columns."""
+        _do_export(self._make_rows(), self._make_track_artists())
+
+        conn = sqlite3.connect(self.output_path)
+        cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='index' AND name LIKE 'idx_cta_%'")
+        indexes = {row[0] for row in cursor.fetchall()}
+        conn.close()
+
+        assert "idx_cta_release" in indexes
+        assert "idx_cta_artist" in indexes
+
+    def test_no_compilation_table_when_empty(self):
+        """When no track artists are provided, the table should not be created."""
+        _do_export(self._make_rows())
+
+        conn = sqlite3.connect(self.output_path)
+        cursor = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='compilation_track_artist'"
+        )
+        assert cursor.fetchone() is None
+        conn.close()
+
+    def test_backward_compatible_without_track_artists(self):
+        """Calling _do_export without track artists should work as before."""
+        _do_export(self._make_rows())
+
+        conn = sqlite3.connect(self.output_path)
+        cursor = conn.execute("SELECT COUNT(*) FROM library")
+        assert cursor.fetchone()[0] == 1
+        conn.close()
+
+
 class TestFormatSize:
     """Test human-readable size formatting."""
 

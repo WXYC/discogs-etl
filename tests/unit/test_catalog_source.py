@@ -199,6 +199,36 @@ class TestTubafrenzySourceFetchLibraryLabels:
         assert labels == {("Juana Molina", "DOGA", "Sonamos")}
 
 
+class TestTubafrenzySourceFetchCompilationTrackArtists:
+    """TubafrenzySource.fetch_compilation_track_artists returns per-track artist credits."""
+
+    @patch("lib.catalog_source.connect_mysql")
+    def test_returns_list_of_dicts(self, mock_connect) -> None:
+        cursor = _make_mock_cursor(
+            [(1, "Koo Nimo", "odo akosomo"), (1, "T.O. Jazz", "Yaa Amponsah")]
+        )
+        mock_connect.return_value.cursor.return_value = cursor
+
+        source = TubafrenzySource("mysql://user:pass@host/db")
+        rows = source.fetch_compilation_track_artists()
+
+        assert len(rows) == 2
+        assert rows[0] == {"library_release_id": 1, "artist_name": "Koo Nimo", "track_title": "odo akosomo"}
+        assert rows[1] == {"library_release_id": 1, "artist_name": "T.O. Jazz", "track_title": "Yaa Amponsah"}
+
+    @patch("lib.catalog_source.connect_mysql")
+    def test_returns_empty_list_when_table_missing(self, mock_connect) -> None:
+        """Gracefully returns empty list if COMPILATION_TRACK_ARTIST table doesn't exist."""
+        cursor = _make_mock_cursor([])
+        cursor.execute.side_effect = Exception("Table 'COMPILATION_TRACK_ARTIST' doesn't exist")
+        mock_connect.return_value.cursor.return_value = cursor
+
+        source = TubafrenzySource("mysql://user:pass@host/db")
+        rows = source.fetch_compilation_track_artists()
+
+        assert rows == []
+
+
 class TestTubafrenzySourceClose:
     """TubafrenzySource.close() closes the underlying connection."""
 
