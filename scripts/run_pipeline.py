@@ -1001,8 +1001,7 @@ def _run_database_build(
             run_step(
                 "Extract WXYC library labels",
                 [
-                    python,
-                    str(SCRIPT_DIR / "extract_library_labels.py"),
+                    "wxyc-extract-library-labels",
                     "--catalog-source",
                     catalog_source,
                     "--catalog-db-url",

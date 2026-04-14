@@ -60,8 +60,9 @@ except ImportError:
 from rapidfuzz import fuzz, process
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from lib.format_normalization import format_matches, normalize_library_format
 from wxyc_etl.text import is_compilation_artist, split_artist_name_contextual
+
+from lib.format_normalization import format_matches, normalize_library_format
 
 logging.basicConfig(
     level=logging.INFO,
