@@ -36,9 +36,19 @@ import time
 from pathlib import Path
 
 import psycopg
+from wxyc_etl.state import PipelineState
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
-from lib.pipeline_state import STEP_NAMES, PipelineState
+STEP_NAMES = [
+    "create_schema",
+    "import_csv",
+    "create_indexes",
+    "dedup",
+    "import_tracks",
+    "create_track_indexes",
+    "prune",
+    "vacuum",
+    "set_logged",
+]
 
 logging.basicConfig(
     level=logging.INFO,
@@ -490,6 +500,79 @@ def enrich_library_artists(
     run_step("Enrich library artists", cmd)
 
 
+def _infer_pipeline_state(db_url: str, csv_dir: str) -> PipelineState:
+    """Infer pipeline state from database structure.
+
+    Inspects table existence, row counts, column presence, and index names
+    to determine which pipeline steps have already completed. Steps that
+    cannot be inferred (prune, vacuum) are left as pending since they are
+    safe to re-run.
+    """
+    state = PipelineState(db_url=db_url, csv_dir=csv_dir, steps=STEP_NAMES)
+
+    conn = psycopg.connect(db_url)
+    try:
+        with conn.cursor() as cur:
+            # create_schema: release table exists?
+            cur.execute(
+                "SELECT EXISTS ("
+                "  SELECT 1 FROM information_schema.tables"
+                "  WHERE table_schema = 'public' AND table_name = 'release'"
+                ")"
+            )
+            if not cur.fetchone()[0]:
+                return state
+            state.mark_completed("create_schema")
+
+            # import_csv: release table has rows?
+            cur.execute("SELECT EXISTS (SELECT 1 FROM release LIMIT 1)")
+            if not cur.fetchone()[0]:
+                return state
+            state.mark_completed("import_csv")
+
+            # create_indexes: base trigram indexes exist?
+            cur.execute(
+                "SELECT indexname FROM pg_indexes"
+                " WHERE schemaname = 'public' AND indexname LIKE '%trgm%'"
+            )
+            indexes = {row[0] for row in cur.fetchall()}
+            base_expected = {"idx_release_artist_name_trgm", "idx_release_title_trgm"}
+            if not base_expected.issubset(indexes):
+                return state
+            state.mark_completed("create_indexes")
+
+            # dedup: master_id column gone?
+            cur.execute(
+                "SELECT EXISTS ("
+                "  SELECT 1 FROM information_schema.columns"
+                "  WHERE table_name = 'release' AND column_name = 'master_id'"
+                ")"
+            )
+            if cur.fetchone()[0]:
+                return state
+            state.mark_completed("dedup")
+
+            # import_tracks: release_track has rows?
+            cur.execute("SELECT EXISTS (SELECT 1 FROM release_track LIMIT 1)")
+            if not cur.fetchone()[0]:
+                return state
+            state.mark_completed("import_tracks")
+
+            # create_track_indexes: track trigram indexes exist?
+            track_expected = {
+                "idx_release_track_title_trgm",
+                "idx_release_track_artist_name_trgm",
+            }
+            if not track_expected.issubset(indexes):
+                return state
+            state.mark_completed("create_track_indexes")
+    finally:
+        conn.close()
+
+    # prune and vacuum cannot be inferred from database state
+    return state
+
+
 def _load_or_create_state(args: argparse.Namespace) -> PipelineState:
     """Load existing state for --resume, or create fresh state.
 
@@ -501,16 +584,13 @@ def _load_or_create_state(args: argparse.Namespace) -> PipelineState:
 
     if args.resume and state_file.exists():
         logger.info("Loading pipeline state from %s", state_file)
-        state = PipelineState.load(state_file)
+        state = PipelineState.load(str(state_file))
         state.validate_resume(db_url=args.database_url, csv_dir=csv_dir_str)
         return state
 
     if args.resume and not state_file.exists():
         logger.info("No state file found; inferring state from database")
-        from lib.db_introspect import infer_pipeline_state
-
-        state = infer_pipeline_state(args.database_url)
-        state.csv_dir = csv_dir_str
+        state = _infer_pipeline_state(args.database_url, csv_dir_str)
         completed = [s for s in STEP_NAMES if state.is_completed(s)]
         if completed:
             logger.info("  Inferred completed steps: %s", ", ".join(completed))
@@ -518,7 +598,7 @@ def _load_or_create_state(args: argparse.Namespace) -> PipelineState:
             logger.info("  No completed steps detected; starting from scratch")
         return state
 
-    return PipelineState(db_url=args.database_url, csv_dir=csv_dir_str)
+    return PipelineState(db_url=args.database_url, csv_dir=csv_dir_str, steps=STEP_NAMES)
 
 
 def generate_library_db(
@@ -856,7 +936,7 @@ def _run_database_build(
 
     def _save_state() -> None:
         if state is not None and state_file is not None:
-            state.save(state_file)
+            state.save(str(state_file))
 
     wait_for_postgres(db_url)
 

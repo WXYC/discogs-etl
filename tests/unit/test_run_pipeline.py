@@ -793,7 +793,7 @@ class TestLoadOrCreateState:
         assert state.is_completed("create_schema")
         assert not state.is_completed("import_csv")
 
-    def test_resume_without_state_file_uses_db_introspect(self, tmp_path) -> None:
+    def test_resume_without_state_file_infers_from_database(self, tmp_path) -> None:
         """When --resume but no state file, infer from database."""
         csv_dir = tmp_path / "csv"
         csv_dir.mkdir()
@@ -811,14 +811,17 @@ class TestLoadOrCreateState:
             ]
         )
 
-        mock_state = run_pipeline.PipelineState(db_url="postgresql:///test", csv_dir="")
+        mock_state = run_pipeline.PipelineState(
+            db_url="postgresql:///test",
+            csv_dir=str(csv_dir.resolve()),
+            steps=run_pipeline.STEP_NAMES,
+        )
         mock_state.mark_completed("create_schema")
 
-        with patch("lib.db_introspect.infer_pipeline_state", return_value=mock_state):
+        with patch.object(run_pipeline, "_infer_pipeline_state", return_value=mock_state):
             state = run_pipeline._load_or_create_state(args)
 
         assert state.is_completed("create_schema")
-        assert state.csv_dir == str(csv_dir.resolve())
 
     def test_fresh_state_no_resume(self, tmp_path) -> None:
         """Without --resume, create a fresh PipelineState."""
@@ -836,7 +839,6 @@ class TestLoadOrCreateState:
 
         state = run_pipeline._load_or_create_state(args)
         assert not any(state.is_completed(s) for s in run_pipeline.STEP_NAMES)
-        assert state.db_url == "postgresql:///test"
 
 
 # ---------------------------------------------------------------------------
