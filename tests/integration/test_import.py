@@ -28,6 +28,7 @@ _import_tables = _ic._import_tables
 TABLES = _ic.TABLES
 BASE_TABLES = _ic.BASE_TABLES
 TRACK_TABLES = _ic.TRACK_TABLES
+VIDEO_TABLES = _ic.VIDEO_TABLES
 
 pytestmark = pytest.mark.postgres
 
@@ -233,6 +234,7 @@ class TestImportCsv:
 
 ALL_TABLES = (
     "cache_metadata",
+    "release_video",
     "release_track_artist",
     "release_track",
     "release_label",
@@ -730,3 +732,271 @@ class TestImportTables:
         total = _import_tables(conn, tmp_path, TRACK_TABLES)
         conn.close()
         assert total == 0
+
+
+class TestImportReleaseVideo:
+    """Import release_video.csv into a real database and verify results."""
+
+    @pytest.fixture(autouse=True, scope="class")
+    def _set_up_database(self, db_url):
+        """Apply schema, import release data, then import release_video."""
+        self.__class__._db_url = db_url
+        _clean_db(db_url)
+
+        conn = psycopg.connect(db_url, autocommit=True)
+        with conn.cursor() as cur:
+            cur.execute(SCHEMA_DIR.joinpath("create_database.sql").read_text())
+        conn.close()
+
+        conn = psycopg.connect(db_url)
+        for table_config in BASE_TABLES:
+            csv_path = CSV_DIR / table_config["csv_file"]
+            if csv_path.exists():
+                import_csv_func(
+                    conn,
+                    csv_path,
+                    table_config["table"],
+                    table_config["csv_columns"],
+                    table_config["db_columns"],
+                    table_config["required"],
+                    table_config["transforms"],
+                )
+        for table_config in VIDEO_TABLES:
+            csv_path = CSV_DIR / table_config["csv_file"]
+            if csv_path.exists():
+                import_csv_func(
+                    conn,
+                    csv_path,
+                    table_config["table"],
+                    table_config["csv_columns"],
+                    table_config["db_columns"],
+                    table_config["required"],
+                    table_config["transforms"],
+                    unique_key=table_config.get("unique_key"),
+                )
+        conn.close()
+
+    @pytest.fixture(autouse=True)
+    def _store_url(self):
+        self.db_url = self.__class__._db_url
+
+    def _connect(self):
+        return psycopg.connect(self.db_url)
+
+    def test_row_count(self) -> None:
+        """All 5 fixture rows are imported (no required fields missing)."""
+        conn = self._connect()
+        with conn.cursor() as cur:
+            cur.execute("SELECT count(*) FROM release_video")
+            count = cur.fetchone()[0]
+        conn.close()
+        assert count == 5
+
+    def test_multiple_videos_per_release(self) -> None:
+        """Release 1001 has two video rows imported in sequence order."""
+        conn = self._connect()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT sequence, title FROM release_video WHERE release_id = 1001 ORDER BY sequence"
+            )
+            rows = cur.fetchall()
+        conn.close()
+        assert len(rows) == 2
+        assert rows[0] == (1, "Airbag")
+        assert rows[1] == (2, "Paranoid Android")
+
+    def test_embed_false_stored_correctly(self) -> None:
+        """embed=false in CSV is stored as FALSE boolean in the database."""
+        conn = self._connect()
+        with conn.cursor() as cur:
+            cur.execute("SELECT embed FROM release_video WHERE release_id = 2001")
+            embed = cur.fetchone()[0]
+        conn.close()
+        assert embed is False
+
+    def test_embed_true_stored_correctly(self) -> None:
+        """embed=true in CSV is stored as TRUE boolean in the database."""
+        conn = self._connect()
+        with conn.cursor() as cur:
+            cur.execute("SELECT embed FROM release_video WHERE release_id = 1001 AND sequence = 1")
+            embed = cur.fetchone()[0]
+        conn.close()
+        assert embed is True
+
+    def test_duration_null_when_empty(self) -> None:
+        """Empty duration in CSV becomes NULL in the database."""
+        conn = self._connect()
+        with conn.cursor() as cur:
+            cur.execute("SELECT duration FROM release_video WHERE release_id = 5001")
+            duration = cur.fetchone()[0]
+        conn.close()
+        assert duration is None
+
+    def test_duration_integer_when_present(self) -> None:
+        """Non-empty duration is stored as an integer (seconds)."""
+        conn = self._connect()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT duration FROM release_video WHERE release_id = 1001 AND sequence = 1"
+            )
+            duration = cur.fetchone()[0]
+        conn.close()
+        assert duration == 284
+
+    def test_src_stored(self) -> None:
+        """src URL is stored as-is."""
+        conn = self._connect()
+        with conn.cursor() as cur:
+            cur.execute("SELECT src FROM release_video WHERE release_id = 3001 AND sequence = 1")
+            src = cur.fetchone()[0]
+        conn.close()
+        assert src == "https://www.youtube.com/watch?v=ghijkl01"
+
+    def test_empty_src_skipped(self, tmp_path) -> None:
+        """Rows with empty src (required field) are skipped during import."""
+        csv_path = tmp_path / "release_video.csv"
+        csv_path.write_text(
+            "release_id,sequence,src,title,duration,embed\n"
+            "1001,99,,Empty src title,100,true\n"
+            "1001,98,https://www.youtube.com/watch?v=valid,Valid,100,true\n"
+        )
+        conn = self._connect()
+        config = VIDEO_TABLES[0]
+        count = import_csv_func(
+            conn,
+            csv_path,
+            config["table"],
+            config["csv_columns"],
+            config["db_columns"],
+            config["required"],
+            config["transforms"],
+            unique_key=config.get("unique_key"),
+            release_id_filter={1001},
+        )
+        conn.close()
+        assert count == 1  # only the row with valid src is imported
+
+    def test_index_exists(self) -> None:
+        """idx_release_video_release_id index exists on release_video."""
+        conn = self._connect()
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT indexname FROM pg_indexes
+                WHERE tablename = 'release_video'
+                  AND indexname = 'idx_release_video_release_id'
+            """)
+            result = cur.fetchone()
+        conn.close()
+        assert result is not None, "idx_release_video_release_id index should exist"
+
+    def test_on_delete_cascade(self) -> None:
+        """Deleting a release cascades to delete its release_video rows."""
+        conn = self._connect()
+        with conn.cursor() as cur:
+            # Verify 5001 has a video before deletion
+            cur.execute("SELECT count(*) FROM release_video WHERE release_id = 5001")
+            before = cur.fetchone()[0]
+        conn.close()
+        assert before == 1
+
+        # Delete release 5001 — should cascade to release_video
+        conn = self._connect()
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM release WHERE id = 5001")
+        conn.commit()
+        with conn.cursor() as cur:
+            cur.execute("SELECT count(*) FROM release_video WHERE release_id = 5001")
+            after = cur.fetchone()[0]
+        conn.close()
+        assert after == 0
+
+
+class TestFilteredVideoImport:
+    """Import videos filtered to a subset of release IDs."""
+
+    @pytest.fixture(autouse=True, scope="class")
+    def _set_up_database(self, db_url):
+        """Import base tables, then import videos filtered to a subset."""
+        self.__class__._db_url = db_url
+        _clean_db(db_url)
+        conn = psycopg.connect(db_url, autocommit=True)
+        with conn.cursor() as cur:
+            cur.execute(SCHEMA_DIR.joinpath("create_database.sql").read_text())
+        conn.close()
+
+        conn = psycopg.connect(db_url)
+        # Import base tables
+        for table_config in BASE_TABLES:
+            csv_path = CSV_DIR / table_config["csv_file"]
+            if csv_path.exists():
+                import_csv_func(
+                    conn,
+                    csv_path,
+                    table_config["table"],
+                    table_config["csv_columns"],
+                    table_config["db_columns"],
+                    table_config["required"],
+                    table_config["transforms"],
+                )
+
+        # Import videos filtered to only a subset of releases
+        filter_ids = {1001, 3001}
+        for table_config in VIDEO_TABLES:
+            csv_path = CSV_DIR / table_config["csv_file"]
+            if csv_path.exists():
+                import_csv_func(
+                    conn,
+                    csv_path,
+                    table_config["table"],
+                    table_config["csv_columns"],
+                    table_config["db_columns"],
+                    table_config["required"],
+                    table_config["transforms"],
+                    unique_key=table_config.get("unique_key"),
+                    release_id_filter=filter_ids,
+                )
+        conn.close()
+
+    @pytest.fixture(autouse=True)
+    def _store_url(self):
+        self.db_url = self.__class__._db_url
+
+    def _connect(self):
+        return psycopg.connect(self.db_url)
+
+    def test_only_filtered_videos_imported(self) -> None:
+        """Only videos for the filtered release IDs should be present."""
+        conn = self._connect()
+        with conn.cursor() as cur:
+            cur.execute("SELECT DISTINCT release_id FROM release_video ORDER BY release_id")
+            ids = [row[0] for row in cur.fetchall()]
+        conn.close()
+        assert ids == [1001, 3001]
+
+    def test_excluded_release_has_no_videos(self) -> None:
+        """Releases not in the filter set should have no videos."""
+        conn = self._connect()
+        with conn.cursor() as cur:
+            cur.execute("SELECT count(*) FROM release_video WHERE release_id = 2001")
+            count = cur.fetchone()[0]
+        conn.close()
+        assert count == 0
+
+    def test_included_release_has_correct_video_count(self) -> None:
+        """Release 1001 should have all 2 videos."""
+        conn = self._connect()
+        with conn.cursor() as cur:
+            cur.execute("SELECT count(*) FROM release_video WHERE release_id = 1001")
+            count = cur.fetchone()[0]
+        conn.close()
+        assert count == 2
+
+    def test_total_video_count(self) -> None:
+        """Total videos should be the sum for the filtered releases."""
+        conn = self._connect()
+        with conn.cursor() as cur:
+            cur.execute("SELECT count(*) FROM release_video")
+            count = cur.fetchone()[0]
+        conn.close()
+        # 1001: 2, 3001: 1 = 3
+        assert count == 3

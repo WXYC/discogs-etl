@@ -115,6 +115,7 @@ class TestPipeline:
             "release_artist",
             "release_label",
             "release_track",
+            "release_video",
             "cache_metadata",
         ):
             with conn.cursor() as cur:
@@ -239,6 +240,7 @@ class TestPipeline:
             "release_label",
             "release_track",
             "release_track_artist",
+            "release_video",
             "cache_metadata",
         }
         assert expected.issubset(fk_tables)
@@ -252,6 +254,45 @@ class TestPipeline:
         conn.close()
         assert count == 0
 
+    def test_release_video_table_populated(self) -> None:
+        """release_video has rows after pipeline completes."""
+        conn = self._connect()
+        with conn.cursor() as cur:
+            cur.execute("SELECT count(*) FROM release_video")
+            count = cur.fetchone()[0]
+        conn.close()
+        assert count > 0, "release_video should have rows after pipeline"
+
+    def test_release_video_surviving_release(self) -> None:
+        """Videos for a surviving release (3001) are present after prune."""
+        conn = self._connect()
+        with conn.cursor() as cur:
+            cur.execute("SELECT count(*) FROM release_video WHERE release_id = 3001")
+            count = cur.fetchone()[0]
+        conn.close()
+        assert count == 1, "Release 3001 (Kid A) should have its video after pipeline"
+
+    def test_release_video_cascade_delete_on_prune(self) -> None:
+        """Videos for pruned release 5001 are removed via ON DELETE CASCADE."""
+        conn = self._connect()
+        with conn.cursor() as cur:
+            cur.execute("SELECT count(*) FROM release_video WHERE release_id = 5001")
+            count = cur.fetchone()[0]
+        conn.close()
+        assert count == 0, "Release 5001 was pruned; its videos should be gone"
+
+    def test_release_video_fk_constraint(self) -> None:
+        """release_video has a FK constraint referencing release."""
+        conn = self._connect()
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT count(*) FROM information_schema.table_constraints
+                WHERE table_name = 'release_video' AND constraint_type = 'FOREIGN KEY'
+            """)
+            count = cur.fetchone()[0]
+        conn.close()
+        assert count >= 1, "release_video should have a FK constraint"
+
     def test_tables_are_logged(self) -> None:
         """All tables are LOGGED after pipeline completion (not UNLOGGED)."""
         conn = self._connect()
@@ -261,7 +302,7 @@ class TestPipeline:
                 FROM pg_class
                 WHERE relname IN (
                     'release', 'release_artist', 'release_label',
-                    'release_track', 'release_track_artist', 'cache_metadata'
+                    'release_track', 'release_track_artist', 'release_video', 'cache_metadata'
                 )
             """)
             results = cur.fetchall()
@@ -556,6 +597,7 @@ class TestPipelineWithCopyTo:
             "release_artist",
             "release_label",
             "release_track",
+            "release_video",
             "cache_metadata",
         ):
             with conn.cursor() as cur:
@@ -563,6 +605,25 @@ class TestPipelineWithCopyTo:
                 count = cur.fetchone()[0]
             assert count > 0, f"Table {table} is empty in target"
         conn.close()
+
+    def test_target_has_videos_for_matched_release(self) -> None:
+        """Videos for matched releases are copied to the target database."""
+        conn = psycopg.connect(self.target_url)
+        with conn.cursor() as cur:
+            # Release 3001 (Kid A) should be in target with its video
+            cur.execute("SELECT count(*) FROM release_video WHERE release_id = 3001")
+            count = cur.fetchone()[0]
+        conn.close()
+        assert count == 1, "Release 3001 (Kid A) should have its video in target"
+
+    def test_target_pruned_release_has_no_videos(self) -> None:
+        """Videos for pruned releases are not in the target database."""
+        conn = psycopg.connect(self.target_url)
+        with conn.cursor() as cur:
+            cur.execute("SELECT count(*) FROM release_video WHERE release_id = 10001")
+            count = cur.fetchone()[0]
+        conn.close()
+        assert count == 0, "Pruned release 10001 should have no videos in target"
 
     def _count_releases(self, db_url: str) -> int:
         conn = psycopg.connect(db_url)
