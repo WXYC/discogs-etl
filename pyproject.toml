@@ -7,20 +7,15 @@ dependencies = [
     "psycopg[binary]>=3.1.0",
     "asyncpg>=0.29.0",
     "rapidfuzz>=3.0.0",
+    "wxyc-etl>=0.1.0",
+    "wxyc-catalog>=0.1.0",
 ]
 
 [project.optional-dependencies]
-rust = [
-    "wxyc-etl>=0.1.0",  # PyO3 bindings for Rust ETL utilities (build from WXYC/wxyc-etl)
-]
-mysql = [
-    "pymysql>=1.0.0",
-]
 dev = [
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",
     "ruff>=0.4.0",
-    "pymysql>=1.0.0",
 ]
 
 [build-system]
@@ -51,9 +46,8 @@ ignore = [
 markers = [
     "integration: marks tests as integration tests (needs library.db)",
     "postgres: marks tests that need a PostgreSQL database",
-    "mysql: marks tests that need a MySQL database",
     "e2e: full pipeline end-to-end test",
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",
 ]
-addopts = "-m 'not integration and not postgres and not mysql and not e2e and not slow'"
+addopts = "-m 'not integration and not postgres and not e2e and not slow'"
 testpaths = ["tests"]

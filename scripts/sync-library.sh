@@ -99,7 +99,7 @@ DB_PATH=$(mktemp -d)/library.db
 export LIBRARY_DB_OUTPUT_PATH="$DB_PATH"
 
 ETL_OUTPUT=$(mktemp)
-if ! $PYTHON scripts/export_to_sqlite.py 2>&1 | tee "$ETL_OUTPUT"; then
+if ! wxyc-export-to-sqlite 2>&1 | tee "$ETL_OUTPUT"; then
     ERROR_DETAILS=$(grep -v '^[[:space:]]' "$ETL_OUTPUT" | grep -v '^$' | tail -1 | sed 's/"/\\"/g')
     cat "$ETL_OUTPUT" >> "$LOG_FILE"
     rm -f "$ETL_OUTPUT" "$DB_PATH"

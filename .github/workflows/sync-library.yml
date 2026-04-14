@@ -16,7 +16,7 @@ jobs:
         with:
           python-version: "3.12"
 
-      - run: pip install -e ".[mysql]"
+      - run: pip install -e "."
 
       - uses: webfactory/ssh-agent@v0.9.0
         with:

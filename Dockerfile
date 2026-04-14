@@ -24,8 +24,8 @@ RUN pip install --no-cache-dir \
     "psycopg[binary]>=3.1.0" \
     "asyncpg>=0.29.0" \
     "rapidfuzz>=3.0.0" \
-    "lxml>=4.9.0" \
-    "pymysql>=1.0.0"
+    "wxyc-etl>=0.1.0" \
+    "wxyc-catalog>=0.1.0"
 
 # Copy application code
 COPY scripts/ scripts/
