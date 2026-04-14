@@ -10,6 +10,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+rust = [
+    "wxyc-etl>=0.1.0",  # PyO3 bindings for Rust ETL utilities (build from WXYC/wxyc-etl)
+]
 mysql = [
     "pymysql>=1.0.0",
 ]
