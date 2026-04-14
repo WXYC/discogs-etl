@@ -50,6 +50,7 @@ markers = [
     "postgres: marks tests that need a PostgreSQL database",
     "mysql: marks tests that need a MySQL database",
     "e2e: full pipeline end-to-end test",
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
 ]
-addopts = "-m 'not integration and not postgres and not mysql and not e2e'"
+addopts = "-m 'not integration and not postgres and not mysql and not e2e and not slow'"
 testpaths = ["tests"]

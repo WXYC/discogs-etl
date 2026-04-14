@@ -312,3 +312,94 @@ class TestImportCsvUsesDedupSet:
         # Should still dedup correctly with Python set
         assert count == 2
         assert len(rows) == 2
+
+
+# ---------------------------------------------------------------------------
+# Performance benchmark
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.slow
+class TestDedupSetPerformance:
+    """Benchmark DedupSet vs Python set on realistic import workloads.
+
+    The primary benefit of DedupSet is reduced Python-side memory (Rust
+    allocations live outside the Python heap). Speed is comparable to Python
+    set because PyO3 boundary crossing (tuple -> Vec<Option<String>> conversion)
+    on each call offsets the faster Rust hashing. A future batch API would
+    eliminate the per-key crossing overhead.
+    """
+
+    def test_dedup_set_throughput(self) -> None:
+        """Benchmark DedupSet vs Python set on 1M two-column string keys."""
+        import random
+        import time
+
+        random.seed(42)
+
+        n = 1_000_000
+        base_keys = [(str(i), f"Artist {i % 50_000}") for i in range(n)]
+        dupes = [random.choice(base_keys) for _ in range(n // 10)]
+        all_keys = base_keys + dupes
+        random.shuffle(all_keys)
+
+        # Benchmark Python set
+        py_set: set[tuple[str | None, ...]] = set()
+        t0 = time.perf_counter()
+        for key in all_keys:
+            if key not in py_set:
+                py_set.add(key)
+        py_time = time.perf_counter() - t0
+
+        # Benchmark Rust DedupSet
+        rust_set = DedupSet()
+        t0 = time.perf_counter()
+        for key in all_keys:
+            if key not in rust_set:
+                rust_set.add(key)
+        rust_time = time.perf_counter() - t0
+
+        assert len(py_set) == len(rust_set)
+        speedup = py_time / rust_time
+        print(
+            f"\nPython set: {py_time:.3f}s, Rust DedupSet: {rust_time:.3f}s, ratio: {speedup:.1f}x"
+        )
+
+    def test_dedup_set_lower_memory(self) -> None:
+        """DedupSet should use less Python-side memory than Python set on 500K keys.
+
+        Rust allocations live outside the Python heap, so tracemalloc measures
+        only the Python-side overhead of the DedupSet wrapper, not the actual
+        hash set storage.
+        """
+        import tracemalloc
+
+        n = 500_000
+        keys = [(str(i), f"Artist {i % 25_000}") for i in range(n)]
+
+        # Measure Python set memory
+        tracemalloc.start()
+        py_set: set[tuple[str | None, ...]] = set()
+        for key in keys:
+            py_set.add(key)
+        _, py_peak = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
+        del py_set
+
+        # Measure Rust DedupSet memory (only Python-side overhead is tracked)
+        tracemalloc.start()
+        rust_set = DedupSet()
+        for key in keys:
+            rust_set.add(key)
+        _, rust_peak = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
+        del rust_set
+
+        print(
+            f"\nPython set peak: {py_peak / 1024 / 1024:.1f} MB, "
+            f"Rust DedupSet Python-side peak: {rust_peak / 1024 / 1024:.1f} MB"
+        )
+        assert rust_peak < py_peak, (
+            f"Expected Rust DedupSet to have lower Python-side memory, "
+            f"got Python: {py_peak / 1024:.0f} KB, Rust: {rust_peak / 1024:.0f} KB"
+        )
