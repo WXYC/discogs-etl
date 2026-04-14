@@ -48,6 +48,15 @@ from pathlib import Path
 
 import asyncpg
 import psycopg
+
+try:
+    import wxyc_etl
+    from wxyc_etl.fuzzy import batch_classify_releases as _rust_batch_classify
+
+    _HAS_WXYC_ETL = True
+except ImportError:
+    _HAS_WXYC_ETL = False
+
 from rapidfuzz import fuzz, process
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -1532,76 +1541,120 @@ def classify_all_releases(
     # Match each artist ONCE against library artists, then classify their
     # releases by title only against the matched library artist's albums.
     # This avoids the O(releases * all_library_pairs) cost of full scoring.
-    #
-    # Parallelized via ProcessPoolExecutor with fork context. The Python loop
-    # overhead between rapidfuzz extractOne calls holds the GIL, so threads
-    # serialize on a single core. Separate processes give true multi-core
-    # parallelism. Fork context avoids the cost of re-importing the module
-    # in each worker; the pipeline is single-threaded before this point so
-    # fork is safe.
     logger.info(
         "Phase 4: Fuzzy artist matching for %s artists...",
         f"{len(truly_fuzzy):,}",
     )
     phase4_start = time.monotonic()
 
-    num_workers = min(os.cpu_count() or 4, 8)
-    # Target ~200 artists per chunk for frequent progress updates,
-    # but ensure at least num_workers * 2 chunks for load balancing.
-    min_chunks = num_workers * 2
-    target_chunk_size = 200
-    chunk_size = max(1, min(target_chunk_size, len(truly_fuzzy) // min_chunks))
-    chunks = [truly_fuzzy[i : i + chunk_size] for i in range(0, len(truly_fuzzy), chunk_size)]
+    use_rust = _HAS_WXYC_ETL and not os.environ.get("WXYC_ETL_NO_RUST")
 
-    logger.info(f"  Using {num_workers} workers, {len(chunks)} chunks of ~{chunk_size} artists")
+    if use_rust:
+        # Rust path: batch_classify_releases handles parallelism internally via
+        # rayon, eliminating ProcessPoolExecutor fork/IPC overhead entirely.
+        logger.info("  Using Rust (wxyc_etl) batch classification")
 
-    completed_chunks = 0
-    global _pool_index, _pool_matcher
-    _pool_index = index
-    _pool_matcher = matcher
-    try:
-        ctx = multiprocessing.get_context("fork")
-        with ProcessPoolExecutor(
-            max_workers=num_workers,
-            mp_context=ctx,
-            initializer=_init_fuzzy_worker,
-            initargs=(index, matcher),
-        ) as executor:
-            futures = {}
-            for chunk in chunks:
-                chunk_by_artist = {a: by_artist[a] for a in chunk}
-                future = executor.submit(_classify_fuzzy_chunk, (chunk, chunk_by_artist))
-                futures[future] = chunk
+        # Flatten truly_fuzzy artists into individual releases
+        flat_artists: list[str] = []
+        flat_titles: list[str] = []
+        flat_ids: list[int] = []
+        flat_raw_artists: list[str] = []
+        for norm_artist in truly_fuzzy:
+            for release_id, raw_artist, raw_title in by_artist[norm_artist]:
+                flat_artists.append(raw_artist)
+                flat_titles.append(raw_title)
+                flat_ids.append(release_id)
+                flat_raw_artists.append(raw_artist)
 
-            for future in as_completed(futures):
-                batch_keep, batch_prune, batch_review, batch_review_by = future.result()
-                keep_ids |= batch_keep
-                prune_ids |= batch_prune
-                review_ids |= batch_review
-                for k, v in batch_review_by.items():
-                    review_by_artist.setdefault(k, []).extend(v)
+        # Build LibraryIndex for Rust from the Python index's exact_pairs
+        rust_pairs = [(artist, title) for artist, title in index.exact_pairs]
+        rust_index = wxyc_etl.LibraryIndex(rust_pairs)
 
-                completed_chunks += 1
-                chunk = futures[future]
-                chunk_releases = sum(len(by_artist[a]) for a in chunk)
-                releases_processed += chunk_releases
-                artists_fuzzy_matched += len(chunk)
+        decisions = _rust_batch_classify(flat_artists, flat_titles, rust_index)
 
-                elapsed = time.monotonic() - phase4_start
-                rate = artists_fuzzy_matched / elapsed if elapsed > 0 else 0
-                remaining = len(truly_fuzzy) - artists_fuzzy_matched
-                eta_str = f", ETA {remaining / rate:.0f}s" if rate > 0 else ""
-                logger.info(
-                    f"  Chunk {completed_chunks}/{len(chunks)} done "
-                    f"({releases_processed:,}/{total_releases:,} releases, "
-                    f"{rate:.0f} artists/s{eta_str}) "
-                    f"| {elapsed:.1f}s elapsed "
-                    f"| KEEP={len(keep_ids):,} PRUNE={len(prune_ids):,} "
-                    f"REVIEW={len(review_ids):,}"
-                )
-    finally:
-        _pool_index = None
-        _pool_matcher = None
+        for i, decision in enumerate(decisions):
+            release_id = flat_ids[i]
+            raw_artist = flat_raw_artists[i]
+            norm_artist = normalize_artist(raw_artist)
+            if decision == "keep":
+                keep_ids.add(release_id)
+            elif decision == "review":
+                review_ids.add(release_id)
+                raw_title = flat_titles[i]
+                result = MatchResult(Decision.REVIEW, 0.0, 0.0, 0.0, 0.0)
+                review_by_artist.setdefault(norm_artist, []).append((release_id, raw_title, result))
+            else:
+                prune_ids.add(release_id)
+
+        artists_fuzzy_matched = len(truly_fuzzy)
+        releases_processed += len(flat_ids)
+    else:
+        # Python fallback: ProcessPoolExecutor with fork context.
+        # The Python loop overhead between rapidfuzz extractOne calls holds the
+        # GIL, so threads serialize on a single core. Separate processes give
+        # true multi-core parallelism. Fork context avoids the cost of
+        # re-importing the module in each worker; the pipeline is single-threaded
+        # before this point so fork is safe.
+        num_workers = min(os.cpu_count() or 4, 8)
+        # Target ~200 artists per chunk for frequent progress updates,
+        # but ensure at least num_workers * 2 chunks for load balancing.
+        min_chunks = num_workers * 2
+        target_chunk_size = 200
+        chunk_size = max(1, min(target_chunk_size, len(truly_fuzzy) // min_chunks))
+        chunks = [truly_fuzzy[i : i + chunk_size] for i in range(0, len(truly_fuzzy), chunk_size)]
+
+        logger.info(
+            f"  Using Python fallback: {num_workers} workers, "
+            f"{len(chunks)} chunks of ~{chunk_size} artists"
+        )
+
+        completed_chunks = 0
+        global _pool_index, _pool_matcher
+        _pool_index = index
+        _pool_matcher = matcher
+        try:
+            ctx = multiprocessing.get_context("fork")
+            with ProcessPoolExecutor(
+                max_workers=num_workers,
+                mp_context=ctx,
+                initializer=_init_fuzzy_worker,
+                initargs=(index, matcher),
+            ) as executor:
+                futures = {}
+                for chunk in chunks:
+                    chunk_by_artist = {a: by_artist[a] for a in chunk}
+                    future = executor.submit(_classify_fuzzy_chunk, (chunk, chunk_by_artist))
+                    futures[future] = chunk
+
+                for future in as_completed(futures):
+                    batch_keep, batch_prune, batch_review, batch_review_by = future.result()
+                    keep_ids |= batch_keep
+                    prune_ids |= batch_prune
+                    review_ids |= batch_review
+                    for k, v in batch_review_by.items():
+                        review_by_artist.setdefault(k, []).extend(v)
+
+                    completed_chunks += 1
+                    chunk = futures[future]
+                    chunk_releases = sum(len(by_artist[a]) for a in chunk)
+                    releases_processed += chunk_releases
+                    artists_fuzzy_matched += len(chunk)
+
+                    elapsed = time.monotonic() - phase4_start
+                    rate = artists_fuzzy_matched / elapsed if elapsed > 0 else 0
+                    remaining = len(truly_fuzzy) - artists_fuzzy_matched
+                    eta_str = f", ETA {remaining / rate:.0f}s" if rate > 0 else ""
+                    logger.info(
+                        f"  Chunk {completed_chunks}/{len(chunks)} done "
+                        f"({releases_processed:,}/{total_releases:,} releases, "
+                        f"{rate:.0f} artists/s{eta_str}) "
+                        f"| {elapsed:.1f}s elapsed "
+                        f"| KEEP={len(keep_ids):,} PRUNE={len(prune_ids):,} "
+                        f"REVIEW={len(review_ids):,}"
+                    )
+        finally:
+            _pool_index = None
+            _pool_matcher = None
 
     elapsed = time.monotonic() - start_time
     logger.info(
