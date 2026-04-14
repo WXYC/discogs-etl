@@ -39,10 +39,7 @@ XML_FIXTURE = XML_CONVERTER_REPO / "tests" / "fixtures" / "releases_fixture.xml"
 LML_REPO = ORG_ROOT / "library-metadata-lookup"
 
 # Check for sibling repo availability
-HAS_XML_CONVERTER = (
-    XML_CONVERTER_BINARY is not None
-    and XML_FIXTURE.exists()
-)
+HAS_XML_CONVERTER = XML_CONVERTER_BINARY is not None and XML_FIXTURE.exists()
 
 try:
     sys.path.insert(0, str(LML_REPO))
@@ -398,9 +395,7 @@ class TestXmlConverterToPipelineIntegration:
             text=True,
             timeout=60,
         )
-        assert convert_result.returncode == 0, (
-            f"XML conversion failed:\n{convert_result.stderr}"
-        )
+        assert convert_result.returncode == 0, f"XML conversion failed:\n{convert_result.stderr}"
 
         # Step 2: Run the pipeline on the converter's output (no --library-db
         # so prune is skipped -- this test verifies the XML->CSV->PG chain,

@@ -274,10 +274,7 @@ class TestEntityReconciliationDirect:
             cur.execute(ENTITY_SCHEMA_DDL)
 
         # Seed entity.identity with test artists
-        all_artists = (
-            list(FIXTURE_ARTISTS_WITH_DISCOGS.keys())
-            + UNKNOWN_ARTISTS
-        )
+        all_artists = list(FIXTURE_ARTISTS_WITH_DISCOGS.keys()) + UNKNOWN_ARTISTS
         with conn.cursor() as cur:
             for artist in all_artists:
                 cur.execute(
@@ -355,9 +352,7 @@ class TestEntityReconciliationDirect:
                 )
                 row = cur.fetchone()
             assert row is not None, f"No identity record for {artist_name}"
-            assert row[0] is None, (
-                f"{artist_name}: should have no discogs_artist_id, got {row[0]}"
-            )
+            assert row[0] is None, f"{artist_name}: should have no discogs_artist_id, got {row[0]}"
             assert row[1] == "unreconciled", (
                 f"{artist_name}: expected status='unreconciled', got '{row[1]}'"
             )
@@ -464,6 +459,5 @@ class TestEntityReconciliationCrossRepo:
         for artist_name in UNKNOWN_ARTISTS:
             lower_name = artist_name.lower()
             assert lower_name not in results, (
-                f"{artist_name} should not have matched, "
-                f"got {results.get(lower_name)}"
+                f"{artist_name} should not have matched, got {results.get(lower_name)}"
             )
