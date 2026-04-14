@@ -48,6 +48,7 @@ markers = [
     "postgres: marks tests that need a PostgreSQL database",
     "e2e: full pipeline end-to-end test",
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "parity: old vs new implementation comparison",
 ]
-addopts = "-m 'not integration and not postgres and not e2e and not slow'"
+addopts = "-m 'not integration and not postgres and not e2e and not slow and not parity'"
 testpaths = ["tests"]
