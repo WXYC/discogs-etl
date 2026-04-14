@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import csv
 import logging
+import os
 import re
 import sys
 from collections.abc import Callable
@@ -17,6 +18,13 @@ from pathlib import Path
 from typing import TypedDict
 
 import psycopg
+
+try:
+    from wxyc_etl.import_utils import DedupSet
+
+    _HAS_WXYC_ETL = True
+except ImportError:
+    _HAS_WXYC_ETL = False
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from lib.format_normalization import normalize_format  # noqa: E402
@@ -207,7 +215,10 @@ def import_csv(
 
         # Find indices of required columns for null checking
         required_set = set(required_columns)
-        seen: set[tuple[str | None, ...]] = set()
+        if _HAS_WXYC_ETL and not os.environ.get("WXYC_ETL_NO_RUST"):
+            seen = DedupSet()
+        else:
+            seen: set[tuple[str | None, ...]] = set()
 
         # Determine release_id column index for filtering
         release_id_idx: int | None = None
