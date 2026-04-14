@@ -25,7 +25,10 @@ from pathlib import Path
 import pytest
 from rapidfuzz import process
 from rapidfuzz.distance import JaroWinkler
-from wxyc_etl.fuzzy import batch_fuzzy_resolve, jaro_winkler_similarity
+
+wxyc_etl_fuzzy = pytest.importorskip("wxyc_etl.fuzzy", reason="wxyc-etl not installed")
+batch_fuzzy_resolve = wxyc_etl_fuzzy.batch_fuzzy_resolve
+jaro_winkler_similarity = wxyc_etl_fuzzy.jaro_winkler_similarity
 
 pytestmark = pytest.mark.parity
 
@@ -195,12 +198,12 @@ class TestJaroWinklerSimilarityParity:
         """
         query = "stereolab"
         candidates = [
-            "stereolab",       # exact match (highest)
-            "stereo lab",      # near match
-            "stereolaab",      # typo
-            "stereolabs",      # suffix
-            "stereo",          # truncated
-            "cat power",       # unrelated
+            "stereolab",  # exact match (highest)
+            "stereo lab",  # near match
+            "stereolaab",  # typo
+            "stereolabs",  # suffix
+            "stereo",  # truncated
+            "cat power",  # unrelated
         ]
 
         python_scores = [JaroWinkler.similarity(query, c) for c in candidates]
@@ -310,9 +313,7 @@ class TestBatchFuzzyResolveParity:
     )
     def test_same_resolved_name(self, query: str, expected_match: str | None) -> None:
         """Rust and Python resolve to the same catalog entry (or both None)."""
-        rust_results = batch_fuzzy_resolve(
-            [query], WXYC_ARTIST_CATALOG, 0.85, 2, 0.02
-        )
+        rust_results = batch_fuzzy_resolve([query], WXYC_ARTIST_CATALOG, 0.85, 2, 0.02)
         python_result = self._python_resolve(query, WXYC_ARTIST_CATALOG)
 
         assert rust_results[0] == python_result, (
@@ -325,8 +326,12 @@ class TestBatchFuzzyResolveParity:
     def test_batch_matches_individual(self) -> None:
         """Batch results match running queries one at a time."""
         queries = [
-            "stereolab", "juana mollina", "cat power",
-            "unknown artist", "jessika pratt", "duke ellington",
+            "stereolab",
+            "juana mollina",
+            "cat power",
+            "unknown artist",
+            "jessika pratt",
+            "duke ellington",
         ]
         batch_results = batch_fuzzy_resolve(queries, WXYC_ARTIST_CATALOG, 0.85, 2, 0.02)
 
@@ -470,9 +475,7 @@ class TestClassificationParity:
         assert result.token_sort_score == 1.0
         assert result.two_stage_score == 1.0
 
-    def test_prune_max_fuzzy_score_below_review_threshold(
-        self, matcher: MultiIndexMatcher
-    ) -> None:
+    def test_prune_max_fuzzy_score_below_review_threshold(self, matcher: MultiIndexMatcher) -> None:
         """PRUNE decisions should have max fuzzy score below 0.65 (review threshold)."""
         norm_artist = normalize_artist("Autechre")
         norm_title = normalize_title("Confield")
@@ -483,9 +486,7 @@ class TestClassificationParity:
             f"PRUNE but max_fuzzy_score={result.max_fuzzy_score:.2f} >= 0.65"
         )
 
-    def test_keep_decisions_consistent_across_calls(
-        self, matcher: MultiIndexMatcher
-    ) -> None:
+    def test_keep_decisions_consistent_across_calls(self, matcher: MultiIndexMatcher) -> None:
         """Classification is deterministic -- same input always produces same output."""
         norm_artist = normalize_artist("Cat Power")
         norm_title = normalize_title("Moon Pix")
