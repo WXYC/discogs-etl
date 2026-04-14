@@ -115,12 +115,12 @@ class TestUnloggedEdgeCases:
 
     def test_set_unlogged_without_schema_raises(self) -> None:
         """set_tables_unlogged on a fresh DB (no tables) raises an error."""
-        with pytest.raises(Exception):
+        with pytest.raises((psycopg.Error, RuntimeError, OSError)):
             run_pipeline.set_tables_unlogged(self.db_url)
 
     def test_set_logged_without_schema_raises(self) -> None:
         """set_tables_logged on a fresh DB (no tables) raises an error."""
-        with pytest.raises(Exception):
+        with pytest.raises((psycopg.Error, RuntimeError, OSError)):
             run_pipeline.set_tables_logged(self.db_url)
 
     def test_set_unlogged_idempotent(self) -> None:
@@ -170,7 +170,7 @@ class TestUnloggedEdgeCases:
         conn.close()
 
         # Should fail because child tables referenced in PIPELINE_TABLES don't exist
-        with pytest.raises(Exception):
+        with pytest.raises((psycopg.Error, RuntimeError, OSError)):
             run_pipeline.set_tables_unlogged(self.db_url)
 
 
@@ -228,10 +228,8 @@ class TestDedupConnectionLoss:
     def test_copy_table_to_nonexistent_target_fails(self) -> None:
         """copy_table to a non-existent target connection fails with clear error."""
         bad_url = "postgresql://bogus_user:bad_pass@localhost:59999/nonexistent"
-        with pytest.raises(Exception):
-            dedup_releases.copy_table(
-                self.db_url, bad_url, "release", "SELECT * FROM release"
-            )
+        with pytest.raises((psycopg.Error, RuntimeError, OSError)):
+            dedup_releases.copy_table(self.db_url, bad_url, "release", "SELECT * FROM release")
 
 
 # ---------------------------------------------------------------------------
@@ -254,7 +252,7 @@ class TestImportCopyInterruption:
             # release table expects (id, title, release_year, country, artwork_url,
             # released, format, master_id) -- 8 columns.
             # Send data with too few columns.
-            with pytest.raises(Exception):
+            with pytest.raises((psycopg.Error, RuntimeError, OSError)):
                 with cur.copy("COPY release (id, title) FROM STDIN") as copy:
                     # Three tab-separated values where two are expected
                     copy.write(b"9001\tBad Data\tExtra\n")
@@ -290,7 +288,7 @@ class TestImportCopyInterruption:
         """COPY with type mismatch (text in integer column) fails cleanly."""
         conn = psycopg.connect(self.db_url)
         with conn.cursor() as cur:
-            with pytest.raises(Exception):
+            with pytest.raises((psycopg.Error, RuntimeError, OSError)):
                 with cur.copy("COPY release (id, title) FROM STDIN") as copy:
                     copy.write(b"not_a_number\tStereolab Album\n")
         conn.rollback()
@@ -305,7 +303,7 @@ class TestImportCopyInterruption:
                     copy.write(b"5001\tDOGA\n")
 
                 # Now try to insert release_artist with bad data (should fail)
-                with pytest.raises(Exception):
+                with pytest.raises((psycopg.Error, RuntimeError, OSError)):
                     with cur.copy(
                         "COPY release_artist (release_id, artist_id, artist_name, extra) FROM STDIN"
                     ) as copy:
@@ -327,7 +325,7 @@ class TestImportCopyInterruption:
         """COPY with \\N in a NOT NULL column (title) fails cleanly."""
         conn = psycopg.connect(self.db_url)
         with conn.cursor() as cur:
-            with pytest.raises(Exception):
+            with pytest.raises((psycopg.Error, RuntimeError, OSError)):
                 with cur.copy("COPY release (id, title) FROM STDIN") as copy:
                     copy.write(b"5001\t\\N\n")
         conn.rollback()
@@ -336,7 +334,7 @@ class TestImportCopyInterruption:
         """COPY with some valid and some invalid rows fails atomically."""
         conn = psycopg.connect(self.db_url)
         with conn.cursor() as cur:
-            with pytest.raises(Exception):
+            with pytest.raises((psycopg.Error, RuntimeError, OSError)):
                 with cur.copy("COPY release (id, title) FROM STDIN") as copy:
                     copy.write(b"5001\tDOGA\n")
                     copy.write(b"5002\tAluminum Tunes\n")
@@ -372,5 +370,5 @@ class TestVacuumEdgeCases:
     def test_vacuum_nonexistent_tables_fails(self) -> None:
         """VACUUM FULL on non-existent tables raises an error."""
         # Don't apply schema, so tables don't exist
-        with pytest.raises(Exception):
+        with pytest.raises((psycopg.Error, RuntimeError, OSError)):
             run_pipeline.run_vacuum(self.db_url)
