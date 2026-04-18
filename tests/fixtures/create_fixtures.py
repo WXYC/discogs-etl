@@ -232,6 +232,37 @@ def create_release_label_csv() -> None:
     write_csv("release_label.csv", headers, rows)
 
 
+def create_release_video_csv() -> None:
+    """Create release_video.csv with video entries for various releases.
+
+    Includes:
+    - Multiple videos for one release (1001: 2 videos)
+    - embed=false (2001: one video without embed)
+    - Missing duration (5001: empty duration → NULL)
+    - A release that will be pruned (5001: Unknown Album, not in library)
+    """
+    headers = ["release_id", "sequence", "src", "title", "duration", "embed"]
+    rows = [
+        # OK Computer UK CD (1001) — survives pipeline prune
+        [1001, 1, "https://www.youtube.com/watch?v=abcdef01", "Airbag", 284, "true"],
+        [1001, 2, "https://www.youtube.com/watch?v=abcdef02", "Paranoid Android", 383, "true"],
+        # Unknown Pleasures UK LP (2001) — survives pipeline prune; embed=false
+        [2001, 1, "https://www.youtube.com/watch?v=uvwxyz01", "Disorder", 209, "false"],
+        # Kid A (3001) — survives pipeline prune
+        [
+            3001,
+            1,
+            "https://www.youtube.com/watch?v=ghijkl01",
+            "Everything In Its Right Place",
+            251,
+            "true",
+        ],
+        # Unknown Album (5001) — pruned; empty duration
+        [5001, 1, "https://www.youtube.com/watch?v=mnopqr01", "Unknown Track", "", "true"],
+    ]
+    write_csv("release_video.csv", headers, rows)
+
+
 def create_release_image_csv() -> None:
     """Create release_image.csv for artwork URL testing."""
     headers = ["release_id", "type", "width", "height", "uri"]
@@ -390,6 +421,7 @@ def main() -> None:
     create_release_track_csv()
     create_release_track_artist_csv()
     create_release_label_csv()
+    create_release_video_csv()
     create_release_image_csv()
     create_library_labels_csv()
     create_label_hierarchy_csv()
