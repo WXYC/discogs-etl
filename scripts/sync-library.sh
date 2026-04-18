@@ -109,6 +109,23 @@ fi
 cat "$ETL_OUTPUT" >> "$LOG_FILE"
 rm -f "$ETL_OUTPUT"
 
+# Enrich with streaming links (optional — skipped if streaming_availability.db unavailable)
+LML_DIR="${LML_REPO_DIR:-$(dirname "$REPO_DIR")/library-metadata-lookup}"
+STREAMING_DB="$LML_DIR/streaming_availability.db"
+
+if [[ -f "$STREAMING_DB" && -f "$LML_DIR/scripts/export_streaming_links.py" ]]; then
+    log "Enriching with streaming links..."
+    if $PYTHON "$LML_DIR/scripts/export_streaming_links.py" \
+        --library-db "$DB_PATH" \
+        --streaming-db "$STREAMING_DB" 2>&1 | tee -a "$LOG_FILE"; then
+        log "Streaming links enrichment complete"
+    else
+        log "WARNING: Streaming links enrichment failed (continuing without)"
+    fi
+else
+    log "Skipping streaming links (streaming_availability.db not found)"
+fi
+
 # Upload to staging (if URL configured)
 if [[ -n "$STAGING_URL" ]]; then
     upload_library_db "$STAGING_URL" "staging" "$DB_PATH" || EXIT_CODE=1
