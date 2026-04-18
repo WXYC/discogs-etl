@@ -456,6 +456,7 @@ class TestMainArgParsing:
             patch.object(_ic, "populate_release_year", return_value=50),
             patch.object(_ic, "populate_cache_metadata", return_value=50),
             patch.object(_ic, "import_artist_details", return_value=20),
+            patch.object(_ic, "import_masters", return_value=10),
         ):
             _ic.main()
 
