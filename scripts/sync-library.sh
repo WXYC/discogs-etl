@@ -94,12 +94,37 @@ fi
 
 log "Starting library sync"
 
+# Build MySQL connection URL from individual env vars
+if [[ -z "$LIBRARY_DB_HOST" || -z "$LIBRARY_DB_USER" || -z "$LIBRARY_DB_PASSWORD" || -z "$LIBRARY_DB_NAME" ]]; then
+    notify_error "Missing required LIBRARY_DB_* environment variables"
+    exit 1
+fi
+# Set up SSH tunnel to Kattare if LIBRARY_SSH_HOST is configured
+if [[ -n "$LIBRARY_SSH_HOST" && -n "$LIBRARY_SSH_USER" ]]; then
+    LOCAL_DB_PORT=13306
+    log "Opening SSH tunnel to $LIBRARY_SSH_HOST..."
+    ssh -f -N -L "${LOCAL_DB_PORT}:${LIBRARY_DB_HOST}:3306" \
+        "${LIBRARY_SSH_USER}@${LIBRARY_SSH_HOST}" \
+        -o StrictHostKeyChecking=no -o ConnectTimeout=10
+    # URL-encode user/password to handle special characters
+    ENCODED_PASSWORD=$($PYTHON -c "from urllib.parse import quote; import os; print(quote(os.environ['LIBRARY_DB_PASSWORD'], safe=''))")
+    ENCODED_USER=$($PYTHON -c "from urllib.parse import quote; import os; print(quote(os.environ['LIBRARY_DB_USER'], safe=''))")
+    CATALOG_DB_URL="mysql://${ENCODED_USER}:${ENCODED_PASSWORD}@127.0.0.1:${LOCAL_DB_PORT}/${LIBRARY_DB_NAME}"
+    log "SSH tunnel established on port $LOCAL_DB_PORT"
+else
+    ENCODED_PASSWORD=$($PYTHON -c "from urllib.parse import quote; import os; print(quote(os.environ['LIBRARY_DB_PASSWORD'], safe=''))")
+    ENCODED_USER=$($PYTHON -c "from urllib.parse import quote; import os; print(quote(os.environ['LIBRARY_DB_USER'], safe=''))")
+    CATALOG_DB_URL="mysql://${ENCODED_USER}:${ENCODED_PASSWORD}@${LIBRARY_DB_HOST}/${LIBRARY_DB_NAME}"
+fi
+
 # Run ETL, capturing output for error reporting
 DB_PATH=$(mktemp -d)/library.db
-export LIBRARY_DB_OUTPUT_PATH="$DB_PATH"
 
 ETL_OUTPUT=$(mktemp)
-if ! wxyc-export-to-sqlite 2>&1 | tee "$ETL_OUTPUT"; then
+if ! wxyc-export-to-sqlite \
+    --catalog-source tubafrenzy \
+    --catalog-db-url "$CATALOG_DB_URL" \
+    --output "$DB_PATH" 2>&1 | tee "$ETL_OUTPUT"; then
     ERROR_DETAILS=$(grep -v '^[[:space:]]' "$ETL_OUTPUT" | grep -v '^$' | tail -1 | sed 's/"/\\"/g')
     cat "$ETL_OUTPUT" >> "$LOG_FILE"
     rm -f "$ETL_OUTPUT" "$DB_PATH"
