@@ -76,9 +76,9 @@ class TestTubafrenzySourceFetchLibraryRows:
 
     @patch("lib.catalog_source.connect_mysql")
     def test_returns_list_of_dicts(self, mock_connect) -> None:
-        cursor = _make_mock_cursor([
-            (1, "DOGA", "Juana Molina", "JM", 42, 1, "Rock", "LP", None, "Sonamos")
-        ])
+        cursor = _make_mock_cursor(
+            [(1, "DOGA", "Juana Molina", "JM", 42, 1, "Rock", "LP", None, "Sonamos")]
+        )
         mock_connect.return_value.cursor.return_value = cursor
 
         source = TubafrenzySource("mysql://user:pass@host/db")
@@ -99,9 +99,9 @@ class TestTubafrenzySourceFetchLibraryRows:
     @patch("lib.catalog_source.connect_mysql")
     def test_returns_null_label(self, mock_connect) -> None:
         """Rows without a matching rotation release should have label=None."""
-        cursor = _make_mock_cursor([
-            (1, "DOGA", "Juana Molina", "JM", 42, 1, "Rock", "LP", None, None)
-        ])
+        cursor = _make_mock_cursor(
+            [(1, "DOGA", "Juana Molina", "JM", 42, 1, "Rock", "LP", None, None)]
+        )
         mock_connect.return_value.cursor.return_value = cursor
 
         source = TubafrenzySource("mysql://user:pass@host/db")

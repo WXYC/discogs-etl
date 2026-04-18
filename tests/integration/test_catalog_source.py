@@ -177,6 +177,7 @@ class TestFetchLibraryRows:
             "genre",
             "format",
             "alternate_artist_name",
+            "label",
         }
         assert set(rows[0].keys()) == expected_keys
 
