@@ -21,7 +21,6 @@ from pathlib import Path
 
 import psycopg
 import pytest
-
 from lib.pipeline_state import PipelineState
 
 SCHEMA_DIR = Path(__file__).parent.parent.parent / "schema"
