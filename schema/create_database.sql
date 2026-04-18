@@ -27,6 +27,7 @@ DROP TABLE IF EXISTS artist_member CASCADE;
 DROP TABLE IF EXISTS artist_name_variation CASCADE;
 DROP TABLE IF EXISTS artist_alias CASCADE;
 DROP TABLE IF EXISTS artist CASCADE;
+DROP TABLE IF EXISTS release_video CASCADE;
 DROP TABLE IF EXISTS release_track_artist CASCADE;
 DROP TABLE IF EXISTS release_track CASCADE;
 DROP TABLE IF EXISTS release_label CASCADE;
@@ -69,6 +70,16 @@ CREATE TABLE release_track (
     position        text,              -- "A1", "B2", etc.
     title           text NOT NULL,
     duration        text
+);
+
+-- Videos on releases
+CREATE TABLE release_video (
+    release_id integer NOT NULL REFERENCES release(id) ON DELETE CASCADE,
+    sequence   integer NOT NULL,
+    src        text NOT NULL,
+    title      text,
+    duration   integer,
+    embed      boolean DEFAULT true
 );
 
 -- Artists on specific tracks (for compilations)
@@ -133,6 +144,7 @@ CREATE INDEX IF NOT EXISTS idx_release_artist_release_id ON release_artist(relea
 CREATE INDEX IF NOT EXISTS idx_release_label_release_id ON release_label(release_id);
 CREATE INDEX IF NOT EXISTS idx_release_track_release_id ON release_track(release_id);
 CREATE INDEX IF NOT EXISTS idx_release_track_artist_release_id ON release_track_artist(release_id);
+CREATE INDEX IF NOT EXISTS idx_release_video_release_id ON release_video(release_id);
 
 -- Artist detail indexes
 CREATE INDEX IF NOT EXISTS idx_artist_alias_artist_id ON artist_alias(artist_id);

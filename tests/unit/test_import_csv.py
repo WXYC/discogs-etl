@@ -20,6 +20,7 @@ import_csv = _ic.import_csv
 TABLES = _ic.TABLES
 BASE_TABLES = _ic.BASE_TABLES
 TRACK_TABLES = _ic.TRACK_TABLES
+VIDEO_TABLES = _ic.VIDEO_TABLES
 ARTIST_TABLES = _ic.ARTIST_TABLES
 TableConfig = _ic.TableConfig
 _import_tables_parallel = _ic._import_tables_parallel
@@ -340,10 +341,10 @@ class TestParallelImport:
 
 
 class TestTableSplit:
-    """TABLES is the union of BASE_TABLES and TRACK_TABLES."""
+    """TABLES is the union of BASE_TABLES, TRACK_TABLES, and VIDEO_TABLES."""
 
     def test_tables_is_union(self) -> None:
-        assert TABLES == BASE_TABLES + TRACK_TABLES
+        assert TABLES == BASE_TABLES + TRACK_TABLES + VIDEO_TABLES
 
     def test_base_tables_names(self) -> None:
         names = [t["table"] for t in BASE_TABLES]
@@ -353,10 +354,17 @@ class TestTableSplit:
         names = [t["table"] for t in TRACK_TABLES]
         assert names == ["release_track", "release_track_artist"]
 
+    def test_video_tables_are_release_video(self) -> None:
+        names = [t["table"] for t in VIDEO_TABLES]
+        assert names == ["release_video"]
+
     def test_no_overlap(self) -> None:
         base_names = {t["table"] for t in BASE_TABLES}
         track_names = {t["table"] for t in TRACK_TABLES}
+        video_names = {t["table"] for t in VIDEO_TABLES}
         assert base_names.isdisjoint(track_names)
+        assert base_names.isdisjoint(video_names)
+        assert track_names.isdisjoint(video_names)
 
 
 # ---------------------------------------------------------------------------
@@ -514,9 +522,9 @@ class TestMainArgParsing:
 
         mock_parallel.assert_called_once()
         call_args = mock_parallel.call_args
-        # --tracks-only passes empty parent_tables and TRACK_TABLES as children
+        # --tracks-only passes empty parent_tables and TRACK_TABLES + VIDEO_TABLES as children
         assert call_args[1]["parent_tables"] == []
-        assert call_args[1]["child_tables"] == TRACK_TABLES
+        assert call_args[1]["child_tables"] == TRACK_TABLES + VIDEO_TABLES
         assert call_args[1]["release_id_filter"] == {5001, 5002, 5003}
 
 
@@ -549,6 +557,70 @@ class TestReleaseTrackUniqueKey:
         config = next(t for t in TRACK_TABLES if t["table"] == "release_track")
         assert "unique_key" in config
         assert config["unique_key"] == ["release_id", "sequence"]
+
+
+class TestVideoTablesConfig:
+    """VIDEO_TABLES must have correct structure for release_video import."""
+
+    def test_video_tables_has_release_video(self) -> None:
+        """VIDEO_TABLES contains exactly one entry for release_video."""
+        assert len(VIDEO_TABLES) == 1
+        assert VIDEO_TABLES[0]["table"] == "release_video"
+
+    def test_release_video_csv_file(self) -> None:
+        config = VIDEO_TABLES[0]
+        assert config["csv_file"] == "release_video.csv"
+
+    def test_release_video_has_all_columns(self) -> None:
+        config = VIDEO_TABLES[0]
+        expected = ["release_id", "sequence", "src", "title", "duration", "embed"]
+        assert config["csv_columns"] == expected
+        assert config["db_columns"] == expected
+
+    def test_release_video_matching_column_lengths(self) -> None:
+        config = VIDEO_TABLES[0]
+        assert len(config["csv_columns"]) == len(config["db_columns"])
+
+    def test_release_video_required_columns(self) -> None:
+        """release_id and src are required; title/duration/embed are optional."""
+        config = VIDEO_TABLES[0]
+        assert "release_id" in config["required"]
+        assert "src" in config["required"]
+        assert "title" not in config["required"]
+        assert "duration" not in config["required"]
+        assert "embed" not in config["required"]
+
+    def test_release_video_no_transforms(self) -> None:
+        config = VIDEO_TABLES[0]
+        assert config["transforms"] == {}
+
+    def test_release_video_unique_key(self) -> None:
+        """release_video must dedup on (release_id, sequence)."""
+        config = VIDEO_TABLES[0]
+        assert "unique_key" in config
+        assert config["unique_key"] == ["release_id", "sequence"]
+
+    def test_release_video_unique_key_subset_of_csv_columns(self) -> None:
+        config = VIDEO_TABLES[0]
+        key_set = set(config["unique_key"])
+        csv_set = set(config["csv_columns"])
+        assert key_set.issubset(csv_set)
+
+    def test_release_video_has_all_required_keys(self) -> None:
+        required_keys = {"csv_file", "table", "csv_columns", "db_columns", "required", "transforms"}
+        assert required_keys.issubset(VIDEO_TABLES[0].keys())
+
+    def test_release_video_csv_has_expected_headers(self) -> None:
+        import csv as csv_mod
+
+        csv_path = CSV_DIR / "release_video.csv"
+        assert csv_path.exists(), "release_video.csv fixture must exist"
+        with open(csv_path) as f:
+            reader = csv_mod.DictReader(f)
+            headers = reader.fieldnames
+        assert headers is not None
+        for col in VIDEO_TABLES[0]["csv_columns"]:
+            assert col in headers, f"Column {col!r} missing from release_video.csv"
 
 
 class TestImportArtistDetailsFiltersById:

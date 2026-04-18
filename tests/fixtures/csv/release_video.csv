@@ -1,0 +1,6 @@
+release_id,sequence,src,title,duration,embed
+1001,1,https://www.youtube.com/watch?v=abcdef01,Airbag,284,true
+1001,2,https://www.youtube.com/watch?v=abcdef02,Paranoid Android,383,true
+2001,1,https://www.youtube.com/watch?v=uvwxyz01,Disorder,209,false
+3001,1,https://www.youtube.com/watch?v=ghijkl01,Everything In Its Right Place,251,true
+5001,1,https://www.youtube.com/watch?v=mnopqr01,Unknown Track,,true

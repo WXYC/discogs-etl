@@ -136,6 +136,18 @@ TRACK_TABLES: list[TableConfig] = [
     },
 ]
 
+VIDEO_TABLES: list[TableConfig] = [
+    {
+        "csv_file": "release_video.csv",
+        "table": "release_video",
+        "csv_columns": ["release_id", "sequence", "src", "title", "duration", "embed"],
+        "db_columns": ["release_id", "sequence", "src", "title", "duration", "embed"],
+        "required": ["release_id", "src"],
+        "transforms": {},
+        "unique_key": ["release_id", "sequence"],
+    },
+]
+
 ARTIST_TABLES: list[TableConfig] = [
     {
         "csv_file": "artist_alias.csv",
@@ -157,7 +169,7 @@ ARTIST_TABLES: list[TableConfig] = [
     },
 ]
 
-TABLES: list[TableConfig] = BASE_TABLES + TRACK_TABLES
+TABLES: list[TableConfig] = BASE_TABLES + TRACK_TABLES + VIDEO_TABLES
 
 
 def import_csv(
@@ -654,12 +666,12 @@ def main():
             release_ids = {row[0] for row in cur.fetchall()}
         conn.close()
         logger.info(f"Filtering tracks to {len(release_ids):,} surviving releases")
-        # release_track and release_track_artist are independent — import in parallel
+        # release_track, release_track_artist, and release_video are independent — import in parallel
         total = _import_tables_parallel(
             db_url,
             csv_dir,
             parent_tables=[],
-            child_tables=TRACK_TABLES,
+            child_tables=TRACK_TABLES + VIDEO_TABLES,
             release_id_filter=release_ids,
         )
     elif args.base_only:
