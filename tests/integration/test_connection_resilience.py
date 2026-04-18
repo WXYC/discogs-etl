@@ -21,7 +21,22 @@ from pathlib import Path
 
 import psycopg
 import pytest
-from lib.pipeline_state import PipelineState
+
+wxyc_etl_state = pytest.importorskip("wxyc_etl.state", reason="wxyc-etl not installed")
+PipelineState = wxyc_etl_state.PipelineState
+
+# STEP_NAMES mirrors the canonical list in scripts/run_pipeline.py
+STEP_NAMES = [
+    "create_schema",
+    "import_csv",
+    "create_indexes",
+    "dedup",
+    "import_tracks",
+    "create_track_indexes",
+    "prune",
+    "vacuum",
+    "set_logged",
+]
 
 SCHEMA_DIR = Path(__file__).parent.parent.parent / "schema"
 FIXTURES_DIR = Path(__file__).parent.parent / "fixtures"
@@ -189,9 +204,9 @@ class TestCopyConnectionLoss:
         """
         _apply_schema(self.db_url)
 
-        state = PipelineState(db_url=self.db_url, csv_dir=str(CSV_DIR))
+        state = PipelineState(db_url=self.db_url, csv_dir=str(CSV_DIR), steps=STEP_NAMES)
         state_file = tmp_path / ".pipeline_state.json"
-        state.save(state_file)
+        state.save(str(state_file))
 
         # Create a CSV that will cause COPY to fail — use a non-nullable column
         # with an empty value that passes the Python filter but violates the DB constraint.
@@ -219,12 +234,12 @@ class TestCopyConnectionLoss:
                 # mark_completed is NOT called on failure.
             except Exception:
                 state.mark_failed("import_csv", "COPY failed: table not found")
-                state.save(state_file)
+                state.save(str(state_file))
         finally:
             bad_conn.close()
 
         # Reload state and verify import_csv is NOT completed
-        loaded = PipelineState.load(state_file)
+        loaded = PipelineState.load(str(state_file))
         assert not loaded.is_completed("import_csv"), (
             "import_csv should not be marked completed after COPY failure"
         )
@@ -321,16 +336,16 @@ class TestImportResumeAfterConnectionLoss:
         """
         _apply_schema(self.db_url)
 
-        state = PipelineState(db_url=self.db_url, csv_dir=str(CSV_DIR))
+        state = PipelineState(db_url=self.db_url, csv_dir=str(CSV_DIR), steps=STEP_NAMES)
         state_file = tmp_path / ".pipeline_state.json"
 
         # First attempt: mark schema complete, fail import
         state.mark_completed("create_schema")
         state.mark_failed("import_csv", "Connection terminated during COPY")
-        state.save(state_file)
+        state.save(str(state_file))
 
         # Verify state persisted
-        loaded = PipelineState.load(state_file)
+        loaded = PipelineState.load(str(state_file))
         assert loaded.is_completed("create_schema")
         assert not loaded.is_completed("import_csv")
         assert loaded.step_status("import_csv") == "failed"
@@ -354,10 +369,10 @@ class TestImportResumeAfterConnectionLoss:
 
         # Mark step complete
         loaded.mark_completed("import_csv")
-        loaded.save(state_file)
+        loaded.save(str(state_file))
 
         # Verify final state
-        final = PipelineState.load(state_file)
+        final = PipelineState.load(str(state_file))
         assert final.is_completed("create_schema")
         assert final.is_completed("import_csv")
         assert total > 0

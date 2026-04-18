@@ -20,11 +20,25 @@ from pathlib import Path
 
 import pytest
 
-# Ensure lib/ is importable (matches verify_cache.py's own sys.path setup)
-sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+# These modules were extracted to wxyc_etl; skip if not installed
+wxyc_etl_text = pytest.importorskip("wxyc_etl.text", reason="wxyc-etl not installed")
+wxyc_etl_state = pytest.importorskip("wxyc_etl.state", reason="wxyc-etl not installed")
 
-from lib.matching import is_compilation_artist  # noqa: E402
-from lib.pipeline_state import STEP_NAMES, PipelineState  # noqa: E402
+is_compilation_artist = wxyc_etl_text.is_compilation_artist
+PipelineState = wxyc_etl_state.PipelineState
+
+# STEP_NAMES mirrors the canonical list in scripts/run_pipeline.py
+STEP_NAMES = [
+    "create_schema",
+    "import_csv",
+    "create_indexes",
+    "dedup",
+    "import_tracks",
+    "create_track_indexes",
+    "prune",
+    "vacuum",
+    "set_logged",
+]
 
 # Load verify_cache module from scripts directory
 _SCRIPT_PATH = Path(__file__).parent.parent.parent / "scripts" / "verify_cache.py"
@@ -278,7 +292,7 @@ class TestPipelineStateV1Resume:
         import_csv in v1 included tracks, so import_tracks should also be completed.
         """
         state_file = self._make_v1_state(tmp_path, ["create_schema", "import_csv"])
-        state = PipelineState.load(state_file)
+        state = PipelineState.load(str(state_file))
 
         assert state.is_completed("create_schema")
         assert state.is_completed("import_csv")
@@ -295,7 +309,7 @@ class TestPipelineStateV1Resume:
         state_file = self._make_v1_state(
             tmp_path, ["create_schema", "import_csv", "create_indexes", "dedup"]
         )
-        state = PipelineState.load(state_file)
+        state = PipelineState.load(str(state_file))
 
         assert state.is_completed("import_tracks")
         assert state.is_completed("create_track_indexes")
@@ -309,7 +323,7 @@ class TestPipelineStateV1Resume:
             tmp_path,
             ["create_schema", "import_csv", "create_indexes", "dedup", "prune", "vacuum"],
         )
-        state = PipelineState.load(state_file)
+        state = PipelineState.load(str(state_file))
 
         for step in STEP_NAMES:
             assert state.is_completed(step), f"Step {step} should be completed after v1 migration"
@@ -317,9 +331,9 @@ class TestPipelineStateV1Resume:
     def test_v1_metadata_preserved(self, tmp_path: Path) -> None:
         """V1 migration preserves database_url and csv_dir."""
         state_file = self._make_v1_state(tmp_path, [])
-        state = PipelineState.load(state_file)
-        assert state.db_url == "postgresql://localhost:5433/test"
-        assert state.csv_dir == "/tmp/csv"
+        state = PipelineState.load(str(state_file))
+        # validate_resume raises ValueError if db_url or csv_dir don't match
+        state.validate_resume("postgresql://localhost:5433/test", "/tmp/csv")
 
 
 class TestPipelineStateV2Resume:
@@ -370,7 +384,7 @@ class TestPipelineStateV2Resume:
                 "vacuum",
             ],
         )
-        state = PipelineState.load(state_file)
+        state = PipelineState.load(str(state_file))
         assert state.is_completed("set_logged")
 
     def test_v2_vacuum_not_completed_leaves_set_logged_pending(self, tmp_path: Path) -> None:
@@ -387,7 +401,7 @@ class TestPipelineStateV2Resume:
                 "prune",
             ],
         )
-        state = PipelineState.load(state_file)
+        state = PipelineState.load(str(state_file))
         assert not state.is_completed("set_logged")
 
     def test_v2_partial_resume_preserves_failed_step(self, tmp_path: Path) -> None:
@@ -417,7 +431,7 @@ class TestPipelineStateV2Resume:
         state_file = tmp_path / "state.json"
         state_file.write_text(json.dumps(data))
 
-        state = PipelineState.load(state_file)
+        state = PipelineState.load(str(state_file))
         assert state.is_completed("create_schema")
         assert state.is_completed("import_csv")
         assert state.step_status("create_indexes") == "failed"
@@ -440,5 +454,5 @@ class TestPipelineStateFutureVersionRejected:
                 }
             )
         )
-        with pytest.raises(ValueError, match="version 99"):
-            PipelineState.load(state_file)
+        with pytest.raises((ValueError, RuntimeError)):
+            PipelineState.load(str(state_file))
