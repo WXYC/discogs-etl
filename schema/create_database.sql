@@ -177,6 +177,7 @@ CREATE INDEX IF NOT EXISTS idx_release_master_id ON release(master_id) WHERE mas
 
 -- Master indexes
 CREATE INDEX IF NOT EXISTS idx_master_artist_master_id ON master_artist(master_id);
+CREATE INDEX IF NOT EXISTS idx_master_title_trgm ON master USING GIN (lower(f_unaccent(title)) gin_trgm_ops);
 
 -- Cache metadata indexes
 CREATE INDEX IF NOT EXISTS idx_cache_metadata_cached_at ON cache_metadata(cached_at);
