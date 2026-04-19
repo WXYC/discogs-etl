@@ -33,7 +33,7 @@ jobs:
       - name: Set up streaming links enrichment
         run: |
           git clone --depth 1 --branch main https://github.com/WXYC/library-metadata-lookup.git /tmp/library-metadata-lookup
-          gh release download streaming-data-v1 --repo WXYC/discogs-cache --dir /tmp/library-metadata-lookup
+          gh release download streaming-data-v1 --repo WXYC/discogs-etl --dir /tmp/library-metadata-lookup
         env:
           GH_TOKEN: ${{ github.token }}
 

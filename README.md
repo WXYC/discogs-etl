@@ -1,4 +1,4 @@
-# discogs-cache
+# discogs-etl
 
 ETL pipeline for building a PostgreSQL cache of Discogs release data, filtered to artists in the WXYC radio library catalog. Reduces Discogs API calls by providing a local cache for album lookups, track validation, and artwork URLs.
 
@@ -344,4 +344,4 @@ The `migrations/` directory contains historical one-time migrations:
 
 ## Documentation
 
-- [Cache Technical Overview](docs/discogs-cache-technical-overview.md) -- design rationale, benchmarks, and pipeline architecture details
+- [Cache Technical Overview](docs/discogs-etl-technical-overview.md) -- design rationale, benchmarks, and pipeline architecture details

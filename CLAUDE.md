@@ -1,4 +1,4 @@
-# Claude Code Instructions for discogs-cache
+# Claude Code Instructions for discogs-etl
 
 ## Project Overview
 
@@ -74,7 +74,7 @@ docker compose up db -d     # just the database (for tests)
 - `scripts/fix_csv_newlines.py` -- Fix multiline CSV fields
 - `lib/format_normalization.py` -- Normalize raw Discogs/library format strings to broad categories (Vinyl, CD, Cassette, 7", Digital)
 - `scripts/sync-library.sh` -- Orchestrate library.db generation + upload to library-metadata-lookup
-- `docs/discogs-cache-technical-overview.md` -- Design rationale, benchmarks, and pipeline architecture details
+- `docs/discogs-etl-technical-overview.md` -- Design rationale, benchmarks, and pipeline architecture details
 
 ### Shared Package Dependencies
 
