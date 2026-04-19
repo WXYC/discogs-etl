@@ -138,44 +138,7 @@ ROW_COUNT=$(wc -l < "$CSV_FILE" | tr -d ' ')
 log "Fetched $ROW_COUNT rows from MySQL"
 
 # Build SQLite database from TSV output
-if ! $PYTHON - "$CSV_FILE" "$DB_PATH" <<'PYEOF'
-import sqlite3, sys
-
-tsv_path, db_path = sys.argv[1], sys.argv[2]
-
-conn = sqlite3.connect(db_path)
-cur = conn.cursor()
-cur.execute("""CREATE TABLE library (
-    id INTEGER PRIMARY KEY, title TEXT, artist TEXT, call_letters TEXT,
-    artist_call_number INTEGER, release_call_number INTEGER,
-    genre TEXT, format TEXT, alternate_artist_name TEXT
-)""")
-cur.execute("""CREATE VIRTUAL TABLE library_fts USING fts5(
-    title, artist, alternate_artist_name, content='library', content_rowid='id'
-)""")
-
-count = 0
-with open(tsv_path, encoding="utf-8") as f:
-    for line in f:
-        fields = line.rstrip("\n").split("\t")
-        if len(fields) != 9:
-            print(f"WARNING: skipping malformed row with {len(fields)} fields", file=sys.stderr)
-            continue
-        # MySQL -B outputs \N for NULL
-        row = [None if v == "\\N" else v for v in fields]
-        cur.execute("INSERT INTO library VALUES (?,?,?,?,?,?,?,?,?)", row)
-        count += 1
-
-cur.execute("""INSERT INTO library_fts(rowid, title, artist, alternate_artist_name)
-    SELECT id, title, artist, alternate_artist_name FROM library""")
-cur.execute("CREATE INDEX idx_artist ON library(artist)")
-cur.execute("CREATE INDEX idx_title ON library(title)")
-cur.execute("CREATE INDEX idx_alternate_artist ON library(alternate_artist_name)")
-conn.commit()
-conn.close()
-print(f"Exported {count} rows to {db_path}")
-PYEOF
-then
+if ! $PYTHON scripts/tsv_to_sqlite.py "$CSV_FILE" "$DB_PATH" 2>&1 | tee -a "$LOG_FILE"; then
     rm -f "$CSV_FILE" "$DB_PATH"
     notify_error "SQLite export failed"
     exit 1
