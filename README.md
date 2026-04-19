@@ -342,6 +342,32 @@ The `migrations/` directory contains historical one-time migrations:
 
 - `01_optimize_schema.sql` - Initial schema optimization (drops unused tables/columns, adds artwork_url and release_year, deduplicates by master_id). Already applied to the production database.
 
+## Library Sync Pipeline
+
+In addition to the monthly Discogs ETL, this repo orchestrates a **daily library catalog sync** that builds `library.db` from the WXYC MySQL database (Kattare) and uploads it to the library-metadata-lookup service.
+
+### How it works
+
+1. **MySQL query** via the MariaDB `mysql` CLI (required — Kattare runs MySQL 4.1.22 with old-format password hashes that no Python driver supports)
+2. **TSV → SQLite** conversion via `scripts/tsv_to_sqlite.py` (creates library table, FTS5 index, and lookup indexes)
+3. **Streaming links enrichment** from `streaming_availability.db` (downloaded from a [GitHub Release](https://github.com/WXYC/library-metadata-lookup/releases/tag/streaming-data-v1) in library-metadata-lookup)
+4. **Upload** to LML staging and production via `POST /admin/upload-library-db`
+
+### Automation
+
+- **Daily sync**: GitHub Actions workflow (`.github/workflows/sync-library.yml`) runs at noon UTC
+- **Streaming data refresh**: Weekly workflow in library-metadata-lookup queries Spotify, Apple Music, and Deezer APIs to update `streaming_availability.db`
+
+### Manual run
+
+```bash
+# Requires ADMIN_TOKEN, LIBRARY_SSH_HOST, LIBRARY_SSH_USER, LIBRARY_DB_* env vars
+scripts/sync-library.sh
+
+# Or with Slack error notifications
+scripts/sync-library.sh --notify
+```
+
 ## Documentation
 
 - [Cache Technical Overview](docs/discogs-etl-technical-overview.md) -- design rationale, benchmarks, and pipeline architecture details

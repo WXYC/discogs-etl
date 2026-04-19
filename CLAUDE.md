@@ -73,7 +73,8 @@ docker compose up db -d     # just the database (for tests)
 - `scripts/csv_to_tsv.py` -- CSV to TSV conversion utility
 - `scripts/fix_csv_newlines.py` -- Fix multiline CSV fields
 - `lib/format_normalization.py` -- Normalize raw Discogs/library format strings to broad categories (Vinyl, CD, Cassette, 7", Digital)
-- `scripts/sync-library.sh` -- Orchestrate library.db generation + upload to library-metadata-lookup
+- `scripts/sync-library.sh` -- Daily library sync orchestrator: MySQL query (via MariaDB `mysql` CLI for MySQL 4.1 compat) → `tsv_to_sqlite.py` → streaming links enrichment → upload to LML. Automated by `.github/workflows/sync-library.yml` (daily at noon UTC).
+- `scripts/tsv_to_sqlite.py` -- Converts MySQL TSV output to SQLite with FTS5 index. Called by sync-library.sh.
 - `docs/discogs-etl-technical-overview.md` -- Design rationale, benchmarks, and pipeline architecture details
 
 ### Shared Package Dependencies
@@ -94,7 +95,7 @@ Functionality that was previously local to this repo has been extracted to share
 1. **`library_artists.txt`** -- Generated from `library.db` by `wxyc-enrich-library-artists` (wxyc-catalog CLI), one artist name per line, used by `discogs-xml-converter --library-artists` for filtering
 2. **KEEP/PRUNE classification** -- `scripts/verify_cache.py` uses `library.db` to match cached releases against the WXYC catalog
 
-`scripts/sync-library.sh` orchestrates the full flow: generate `library.db`, then upload it to library-metadata-lookup staging and production. The pipeline can also generate `library.db` inline via `--generate-library-db`.
+`scripts/sync-library.sh` orchestrates the daily sync: query Kattare MySQL via the MariaDB `mysql` CLI (required for MySQL 4.1's old-format password hashes), convert TSV to SQLite via `scripts/tsv_to_sqlite.py`, enrich with streaming links from `streaming_availability.db` (a [GitHub Release artifact](https://github.com/WXYC/library-metadata-lookup/releases/tag/streaming-data-v1) in library-metadata-lookup, refreshed weekly), then upload to LML staging and production via `POST /admin/upload-library-db`. The Discogs pipeline can also generate `library.db` inline via `--generate-library-db` using the wxyc-catalog CLI.
 
 ## Development
 
