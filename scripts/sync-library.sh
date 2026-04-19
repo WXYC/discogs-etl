@@ -172,6 +172,12 @@ if [[ -n "$PRODUCTION_URL" ]]; then
     upload_library_db "$PRODUCTION_URL" "production" "$DB_PATH" || EXIT_CODE=1
 fi
 
+# Copy library.db to LIBRARY_DB_OUTPUT if set (for CI to upload as artifact)
+if [[ -n "$LIBRARY_DB_OUTPUT" && -f "$DB_PATH" ]]; then
+    cp "$DB_PATH" "$LIBRARY_DB_OUTPUT"
+    log "Copied library.db to $LIBRARY_DB_OUTPUT"
+fi
+
 # Clean up
 rm -f "$DB_PATH"
 rmdir "$(dirname "$DB_PATH")" 2>/dev/null || true

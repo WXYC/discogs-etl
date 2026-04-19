@@ -41,6 +41,7 @@ jobs:
         run: scripts/sync-library.sh
         env:
           LML_REPO_DIR: /tmp/library-metadata-lookup
+          LIBRARY_DB_OUTPUT: /tmp/library.db
           LIBRARY_SSH_HOST: ${{ secrets.LIBRARY_SSH_HOST }}
           LIBRARY_SSH_USER: ${{ secrets.LIBRARY_SSH_USER }}
           LIBRARY_DB_HOST: ${{ secrets.LIBRARY_DB_HOST }}
@@ -50,3 +51,10 @@ jobs:
           ADMIN_TOKEN: ${{ secrets.ADMIN_TOKEN }}
           STAGING_URL: ${{ secrets.STAGING_URL }}
           PRODUCTION_URL: ${{ secrets.PRODUCTION_URL }}
+
+      - name: Update library.db in LML release
+        if: success()
+        run: |
+          gh release upload streaming-data-v1 /tmp/library.db --clobber --repo WXYC/library-metadata-lookup
+        env:
+          GH_TOKEN: ${{ secrets.LML_RELEASE_TOKEN }}
