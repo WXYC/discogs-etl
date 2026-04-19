@@ -5,8 +5,9 @@ corresponding to the WXYC library catalog schema and creates a SQLite
 database containing:
 
 - A ``library`` table with id, title, artist, call_letters,
-  artist_call_number, release_call_number, genre, format, and
-  alternate_artist_name columns.
+  artist_call_number, release_call_number, genre, format,
+  alternate_artist_name, and label columns (label is always NULL
+  since the MySQL query doesn't include it).
 - An FTS5 virtual table (``library_fts``) for full-text search on title,
   artist, and alternate_artist_name.
 - Indexes on artist, title, and alternate_artist_name.
@@ -36,7 +37,8 @@ def tsv_to_sqlite(tsv_path: str, db_path: str) -> int:
     cur.execute("""CREATE TABLE library (
         id INTEGER PRIMARY KEY, title TEXT, artist TEXT, call_letters TEXT,
         artist_call_number INTEGER, release_call_number INTEGER,
-        genre TEXT, format TEXT, alternate_artist_name TEXT
+        genre TEXT, format TEXT, alternate_artist_name TEXT,
+        label TEXT
     )""")
     cur.execute("""CREATE VIRTUAL TABLE library_fts USING fts5(
         title, artist, alternate_artist_name, content='library', content_rowid='id'
@@ -54,7 +56,12 @@ def tsv_to_sqlite(tsv_path: str, db_path: str) -> int:
                 continue
             # MySQL -B outputs \N for NULL
             row = [None if v == "\\N" else v for v in fields]
-            cur.execute("INSERT INTO library VALUES (?,?,?,?,?,?,?,?,?)", row)
+            cur.execute(
+                "INSERT INTO library (id, title, artist, call_letters,"
+                " artist_call_number, release_call_number, genre, format,"
+                " alternate_artist_name) VALUES (?,?,?,?,?,?,?,?,?)",
+                row,
+            )
             count += 1
 
     cur.execute("""INSERT INTO library_fts(rowid, title, artist, alternate_artist_name)
