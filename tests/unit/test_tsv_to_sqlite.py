@@ -61,7 +61,18 @@ class TestTsvToSqlite:
         """TSV with \\N values are stored as Python None (SQL NULL) in SQLite."""
         tsv = _make_tsv(
             [
-                ["1", "Aluminum Tunes", "Stereolab", "ST", "100", "\\N", "Rock", "CD", "\\N", "\\N"],
+                [
+                    "1",
+                    "Aluminum Tunes",
+                    "Stereolab",
+                    "ST",
+                    "100",
+                    "\\N",
+                    "Rock",
+                    "CD",
+                    "\\N",
+                    "\\N",
+                ],
             ]
         )
         tsv_file = tmp_path / "input.tsv"
