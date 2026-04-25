@@ -44,11 +44,12 @@ ignore = [
 
 [tool.pytest.ini_options]
 markers = [
-    "integration: marks tests as integration tests (needs library.db)",
-    "postgres: marks tests that need a PostgreSQL database",
+    "unit: pure logic tests, no external dependencies",
+    "postgres: needs PostgreSQL (gated by DATABASE_URL_TEST)",
+    "integration: needs external service or fixture data",
     "e2e: full pipeline end-to-end test",
-    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
     "parity: old vs new implementation comparison",
+    "slow: marks tests as slow",
 ]
-addopts = "-m 'not integration and not postgres and not e2e and not slow and not parity'"
+addopts = "-m 'not integration and not postgres and not e2e and not parity and not slow'"
 testpaths = ["tests"]
