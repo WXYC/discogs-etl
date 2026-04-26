@@ -79,10 +79,40 @@ def create_release_csv() -> None:
         # Missing title (should be skipped during import - required field)
         [7001, "Accepted", "", "US", "2023", "", "Correct", 1100, "CD"],
         # Compilation release
-        [8001, "Accepted", "Nordic Roots: A Northside Collection", "US", "1998", "", "Correct", 1200, "CD"],
+        [
+            8001,
+            "Accepted",
+            "Nordic Roots: A Northside Collection",
+            "US",
+            "1998",
+            "",
+            "Correct",
+            1200,
+            "CD",
+        ],
         # Various date format edge cases
-        [9001, "Accepted", "From Here We Go Sublime", "UK", "2007-03-26", "", "Correct", 1300, "LP"],
-        [9002, "Accepted", "Duke Ellington & John Coltrane", "US", "1963", "", "Correct", 1400, "LP"],
+        [
+            9001,
+            "Accepted",
+            "From Here We Go Sublime",
+            "UK",
+            "2007-03-26",
+            "",
+            "Correct",
+            1300,
+            "LP",
+        ],
+        [
+            9002,
+            "Accepted",
+            "Duke Ellington & John Coltrane",
+            "US",
+            "1963",
+            "",
+            "Correct",
+            1400,
+            "LP",
+        ],
         # Artist not in library
         [10001, "Accepted", "Some Random Album", "US", "2023-05-01", "", "Correct", 1500, "CD"],
         [10002, "Accepted", "Obscure Release", "DE", "2022", "", "Correct", 1600, "CD"],

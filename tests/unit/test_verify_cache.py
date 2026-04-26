@@ -174,7 +174,10 @@ class TestLibraryIndex:
 
     def test_exact_pairs_normalizes_artists(self, sample_index):
         """Artist normalization handles ampersands and accents."""
-        assert ("duke ellington and john coltrane", "duke ellington & john coltrane") in sample_index.exact_pairs
+        assert (
+            "duke ellington and john coltrane",
+            "duke ellington & john coltrane",
+        ) in sample_index.exact_pairs
         assert ("nilufer yanya", "painless") in sample_index.exact_pairs
 
     def test_artist_to_titles_mapping(self, sample_index):
