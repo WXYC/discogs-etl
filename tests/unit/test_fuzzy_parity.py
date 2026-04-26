@@ -37,11 +37,18 @@ pytestmark = pytest.mark.parity
 # ---------------------------------------------------------------------------
 
 _SCRIPT_PATH = Path(__file__).parent.parent.parent / "scripts" / "verify_cache.py"
-_spec = importlib.util.spec_from_file_location("verify_cache", _SCRIPT_PATH)
-assert _spec is not None and _spec.loader is not None
-_vc = importlib.util.module_from_spec(_spec)
-sys.modules["verify_cache"] = _vc
-_spec.loader.exec_module(_vc)
+# Idempotent load: re-use any already-loaded copy in sys.modules so multiple test
+# files share one module object -- otherwise the second-loaded copy shadows the
+# first and breaks ProcessPool pickling for any worker holding references to
+# symbols from the original load (see #109).
+if "verify_cache" in sys.modules:
+    _vc = sys.modules["verify_cache"]
+else:
+    _spec = importlib.util.spec_from_file_location("verify_cache", _SCRIPT_PATH)
+    assert _spec is not None and _spec.loader is not None
+    _vc = importlib.util.module_from_spec(_spec)
+    sys.modules["verify_cache"] = _vc
+    _spec.loader.exec_module(_vc)
 
 LibraryIndex = _vc.LibraryIndex
 MultiIndexMatcher = _vc.MultiIndexMatcher

@@ -10,13 +10,19 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-# Load verify_cache module from scripts directory
+# Load verify_cache module from scripts directory.
+# Guarded so multiple test files share one module object -- otherwise the
+# second-loaded copy shadows the first and breaks ProcessPool pickling for
+# any worker holding references to symbols from the original load (see #109).
 _SCRIPT_PATH = Path(__file__).parent.parent.parent / "scripts" / "verify_cache.py"
-_spec = importlib.util.spec_from_file_location("verify_cache", _SCRIPT_PATH)
-assert _spec is not None and _spec.loader is not None
-_vc = importlib.util.module_from_spec(_spec)
-sys.modules["verify_cache"] = _vc
-_spec.loader.exec_module(_vc)
+if "verify_cache" in sys.modules:
+    _vc = sys.modules["verify_cache"]
+else:
+    _spec = importlib.util.spec_from_file_location("verify_cache", _SCRIPT_PATH)
+    assert _spec is not None and _spec.loader is not None
+    _vc = importlib.util.module_from_spec(_spec)
+    sys.modules["verify_cache"] = _vc
+    _spec.loader.exec_module(_vc)
 
 # Re-export for cleaner access in tests
 normalize_title = _vc.normalize_title
