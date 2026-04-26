@@ -70,7 +70,13 @@ def _get_table_persistence(db_url: str, table_name: str) -> str | None:
 
 
 def _drop_all_tables(db_url: str) -> None:
-    """Drop all pipeline tables with CASCADE."""
+    """Drop all pipeline tables with CASCADE.
+
+    Includes dedup transient tables (dedup_delete_ids, new_release,
+    new_release_artist, wxyc_label_pref, release_track_count,
+    release_label_match) so tests that crash mid-dedup do not leak state
+    into subsequent tests sharing the module-scoped db_url.
+    """
     conn = psycopg.connect(db_url, autocommit=True)
     with conn.cursor() as cur:
         for table in [
@@ -85,17 +91,38 @@ def _drop_all_tables(db_url: str) -> None:
             "artist_name_variation",
             "artist_alias",
             "artist",
+            "dedup_delete_ids",
+            "new_release",
+            "new_release_artist",
+            "wxyc_label_pref",
+            "release_track_count",
+            "release_label_match",
         ]:
             cur.execute(f"DROP TABLE IF EXISTS {table} CASCADE")
     conn.close()
 
 
 def _apply_schema(db_url: str) -> None:
-    """Apply the pipeline schema to a test database."""
+    """Apply the pipeline schema to a test database.
+
+    create_database.sql references f_unaccent() in the master_title_trgm
+    index expression, and create_functions.sql defines f_unaccent() in
+    terms of the unaccent extension. psycopg raises on the first error in
+    a multi-statement execute, so we must order setup as:
+      1. Create the unaccent + pg_trgm extensions.
+      2. Define f_unaccent() (depends on unaccent).
+      3. Run create_database.sql (depends on f_unaccent).
+    psql tolerates out-of-order setup because it continues past per-
+    statement errors; psycopg does not, so this ordering is mandatory
+    for the integration tests even if production gets away with running
+    create_database.sql first.
+    """
     conn = psycopg.connect(db_url, autocommit=True)
     with conn.cursor() as cur:
-        cur.execute(SCHEMA_DIR.joinpath("create_database.sql").read_text())
+        cur.execute("CREATE EXTENSION IF NOT EXISTS unaccent")
+        cur.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm")
         cur.execute(SCHEMA_DIR.joinpath("create_functions.sql").read_text())
+        cur.execute(SCHEMA_DIR.joinpath("create_database.sql").read_text())
     conn.close()
 
 
@@ -416,6 +443,11 @@ def _seed_dedup_workload(db_url: str, n_releases: int = 50_000) -> None:
     Uses canonical WXYC artists. Each release has a master_id derived from
     (id // 2), so every pair of consecutive rows form duplicates that dedup
     must collapse.
+
+    Also seeds one release_track row per release: dedup's ROW_NUMBER query
+    inner-joins release_track (or release_track_count) to compute track
+    counts, so releases with no tracks are silently excluded from
+    dedup_delete_ids and dedup becomes a no-op.
     """
     artists = [
         "Juana Molina",
@@ -450,7 +482,10 @@ def _seed_dedup_workload(db_url: str, n_releases: int = 50_000) -> None:
                 title = titles[i % len(titles)]
                 country = "US" if (i % 3 == 0) else "AR"
                 master_id = 50_000 + (i // 2)
-                fmt = "LP" if (i % 2 == 0) else "CD"
+                # Both rows in a (master_id) pair share the same format so
+                # they fall into the same (master_id, format) dedup partition
+                # and one of the pair is marked as a duplicate.
+                fmt = "LP"
                 copy.write_row((rid, title, country, master_id, fmt))
 
         with cur.copy(
@@ -461,6 +496,13 @@ def _seed_dedup_workload(db_url: str, n_releases: int = 50_000) -> None:
                 artist_id = 100 + (i % len(artists))
                 artist_name = artists[i % len(artists)]
                 copy.write_row((rid, artist_id, artist_name, 0))
+
+        with cur.copy(
+            "COPY release_track (release_id, sequence, position, title) FROM STDIN"
+        ) as copy:
+            for i in range(n_releases):
+                rid = 10_000 + i
+                copy.write_row((rid, 1, "A1", titles[i % len(titles)]))
     conn.commit()
     conn.close()
 
@@ -476,13 +518,20 @@ def _terminate_when(
     pattern_substrings: tuple[str, ...],
     max_polls: int = 400,
     poll_interval_s: float = 0.005,
-) -> threading.Event:
+) -> tuple[threading.Event, threading.Event]:
     """Spawn a thread that polls pg_stat_activity for ``target_pid`` and
     pg_terminate_backend()s it as soon as one of ``pattern_substrings`` (case
-    insensitive) appears in the running query. Returns an Event that is set
-    when termination has fired (whether or not the pattern matched).
+    insensitive) appears in the running query.
+
+    Returns ``(matched, finished)``:
+      * ``matched`` is set ONLY when termination fired against a query that
+        matched ``pattern_substrings``. If we time out without seeing the
+        pattern we kill the backend anyway (so the worker can return) but
+        leave ``matched`` cleared.
+      * ``finished`` is set when the runner exits, regardless of outcome.
     """
-    fired = threading.Event()
+    matched = threading.Event()
+    finished = threading.Event()
 
     def _runner() -> None:
         admin = psycopg.connect(db_url, autocommit=True)
@@ -498,20 +547,22 @@ def _terminate_when(
                         q = row[0].upper()
                         if any(p.upper() in q for p in pattern_substrings):
                             cur.execute("SELECT pg_terminate_backend(%s)", (target_pid,))
-                            fired.set()
+                            matched.set()
                             return
                 time.sleep(poll_interval_s)
-            # Timed out waiting for the pattern. Fire anyway so the test
-            # doesn't hang waiting for the dedup thread to return.
+            # Timed out waiting for the pattern. Fire anyway so the worker
+            # thread doesn't hang waiting for the dedup connection to return.
+            # ``matched`` stays cleared so the caller can distinguish this
+            # case (and skip rather than assert mid-operation behaviour).
             with admin.cursor() as cur:
                 cur.execute("SELECT pg_terminate_backend(%s)", (target_pid,))
         finally:
             admin.close()
-            fired.set()
+            finished.set()
 
     t = threading.Thread(target=_runner, daemon=True)
     t.start()
-    return fired
+    return matched, finished
 
 
 class TestDedupTerminatedMidOperation:
@@ -587,10 +638,15 @@ class TestDedupTerminatedMidOperation:
                 result["raised"] = True
                 result["exc"] = exc
 
-        terminator = _terminate_when(
+        # Match only the genuinely long copy-swap statements. ALTER TABLE
+        # RENAME and the trivial DROP TABLE IF EXISTS new_release at the
+        # start of copy_table are too fast to meaningfully interrupt --
+        # if we matched them we'd be killing during a no-op and claiming
+        # to test mid-CREATE-TABLE-AS behaviour.
+        matched, finished = _terminate_when(
             self.db_url,
             dedup_pid,
-            pattern_substrings=("CREATE TABLE", "ALTER TABLE", "DROP TABLE"),
+            pattern_substrings=("CREATE TABLE",),
         )
 
         worker = threading.Thread(target=_drive_copy_swap, daemon=True)
@@ -598,14 +654,19 @@ class TestDedupTerminatedMidOperation:
         worker.join(timeout=60)
         assert not worker.is_alive(), "Dedup worker thread hung after kill"
 
-        terminator.wait(timeout=30)
-        assert terminator.is_set(), "Terminator thread did not fire"
+        finished.wait(timeout=30)
+        assert finished.is_set(), "Terminator thread did not exit"
 
         try:
             dedup_conn.close()
         except Exception:
             pass
 
+        if not matched.is_set():
+            pytest.skip(
+                "Terminator did not catch a CREATE TABLE on this machine; "
+                "cannot assert mid-copy-swap kill behaviour"
+            )
         if not result["raised"]:
             pytest.skip(
                 "Dedup completed before pg_terminate_backend fired; "
@@ -682,7 +743,7 @@ class TestDedupTerminatedMidOperation:
         analyze_conn = _build_dedup_conn(self.db_url)
         analyze_pid = analyze_conn.info.backend_pid
 
-        terminator = _terminate_when(
+        matched, finished = _terminate_when(
             self.db_url,
             analyze_pid,
             pattern_substrings=("ANALYZE",),
@@ -702,8 +763,10 @@ class TestDedupTerminatedMidOperation:
             except Exception:
                 pass
 
-        terminator.wait(timeout=10)
-        assert terminator.is_set(), "Terminator thread did not fire"
+        finished.wait(timeout=10)
+        assert finished.is_set(), "Terminator thread did not exit"
+        if not matched.is_set():
+            pytest.skip("Terminator did not catch an ANALYZE on this machine")
         if not raised:
             pytest.skip("ANALYZE completed before pg_terminate_backend fired")
 
