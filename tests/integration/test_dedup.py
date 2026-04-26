@@ -826,7 +826,12 @@ class TestAddConstraintsAndIndexes:
         with conn.cursor() as cur:
             cur.execute(SCHEMA_DIR.joinpath("create_database.sql").read_text())
             cur.execute(SCHEMA_DIR.joinpath("create_functions.sql").read_text())
-            # Drop all FK constraints and indexes (schema creates them)
+            # Drop all FK constraints and indexes (schema creates them).
+            # release_video must be included so the subsequent
+            # ``DROP CONSTRAINT release_pkey`` doesn't fail with
+            # ``cannot drop constraint release_pkey on table release because
+            # other objects depend on it`` (release_video's FK depends on
+            # the release primary key index; see #105).
             for constraint, table in [
                 ("release_artist_release_id_fkey", "release_artist"),
                 ("release_label_release_id_fkey", "release_label"),
@@ -834,6 +839,7 @@ class TestAddConstraintsAndIndexes:
                 ("release_style_release_id_fkey", "release_style"),
                 ("release_track_release_id_fkey", "release_track"),
                 ("release_track_artist_release_id_fkey", "release_track_artist"),
+                ("release_video_release_id_fkey", "release_video"),
                 ("cache_metadata_release_id_fkey", "cache_metadata"),
             ]:
                 cur.execute(f"ALTER TABLE {table} DROP CONSTRAINT IF EXISTS {constraint}")

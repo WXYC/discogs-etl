@@ -286,7 +286,10 @@ class TestRunVacuum:
         args, kwargs = mock_parallel.call_args
         db_url, statements = args[0], args[1]
         assert db_url == "postgresql:///test"
-        assert len(statements) == 8
+        # One VACUUM FULL per pipeline table (derived from the constant so this
+        # test stays in sync as PIPELINE_TABLES grows; see #105 for the
+        # ``release_video`` addition).
+        assert len(statements) == len(run_pipeline.PIPELINE_TABLES)
         assert all(s.startswith("VACUUM FULL ") for s in statements)
         assert "VACUUM FULL release" in statements
         assert "VACUUM FULL cache_metadata" in statements
@@ -306,9 +309,62 @@ class TestPipelineTables:
             "release_style",
             "release_track",
             "release_track_artist",
+            "release_video",
             "cache_metadata",
         }
         assert set(run_pipeline.PIPELINE_TABLES) == expected
+
+    def test_release_video_included(self) -> None:
+        """Regression for #105: ``release_video`` must be in PIPELINE_TABLES.
+
+        ``release_video`` has a FK to ``release``. PostgreSQL prohibits an
+        UNLOGGED table from being referenced by a LOGGED table (and vice
+        versa), so ``ALTER TABLE release SET UNLOGGED`` fails with
+        ``could not change table "release" to unlogged because it
+        references logged table "release_video"`` unless ``release_video``
+        is toggled in lockstep with the other pipeline tables.
+        """
+        assert "release_video" in run_pipeline.PIPELINE_TABLES, (
+            "release_video must be in PIPELINE_TABLES so set_tables_unlogged "
+            "and set_tables_logged toggle it together with release; otherwise "
+            "the FK constraint blocks the ALTER TABLE (see #105)."
+        )
+
+    def test_pipeline_tables_covers_all_release_fk_referrers(self) -> None:
+        """Every table with a FK to ``release`` in create_database.sql must
+        be in PIPELINE_TABLES, so the SET UNLOGGED / SET LOGGED toggles
+        cannot leave the schema in a mixed-persistence state that PG
+        rejects.
+
+        This static check catches the next ``release_video``-style
+        omission at unit-test time, before it manifests as an integration
+        failure.
+        """
+        import re
+
+        schema_sql = (
+            Path(__file__).parent.parent.parent / "schema" / "create_database.sql"
+        ).read_text()
+        # Find every "CREATE TABLE <name> (" header followed by a body
+        # containing "REFERENCES release(id)". This is intentionally
+        # forgiving of whitespace.
+        table_pattern = re.compile(
+            r"CREATE\s+TABLE\s+(\w+)\s*\((.*?)\n\);",
+            re.DOTALL | re.IGNORECASE,
+        )
+        referrers: set[str] = set()
+        for match in table_pattern.finditer(schema_sql):
+            name, body = match.group(1), match.group(2)
+            if re.search(r"REFERENCES\s+release\s*\(\s*id\s*\)", body, re.IGNORECASE):
+                referrers.add(name)
+        assert referrers, "expected to find FK references to release(id)"
+        # release itself is the parent and is always in PIPELINE_TABLES.
+        missing = referrers - set(run_pipeline.PIPELINE_TABLES)
+        assert not missing, (
+            f"Tables with FK to release(id) missing from PIPELINE_TABLES: "
+            f"{sorted(missing)}. They will block ALTER TABLE release "
+            "SET UNLOGGED/LOGGED (see #105)."
+        )
 
     def test_run_vacuum_uses_pipeline_tables(self) -> None:
         """run_vacuum should generate VACUUM FULL from PIPELINE_TABLES."""

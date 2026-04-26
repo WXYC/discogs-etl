@@ -62,7 +62,16 @@ SCHEMA_DIR = SCRIPT_DIR.parent / "schema"
 # Maximum seconds to wait for Postgres to become ready.
 PG_CONNECT_TIMEOUT = 30
 
-# Tables managed by the pipeline (shared by run_vacuum, set_tables_unlogged, set_tables_logged).
+# Tables managed by the pipeline (shared by run_vacuum, set_tables_unlogged,
+# set_tables_logged).
+#
+# Every table with a FK to ``release`` must be listed here. PostgreSQL prohibits
+# an UNLOGGED table from being referenced by a LOGGED table (and vice versa),
+# so any FK referrer of ``release`` that is missing from this list will cause
+# ``ALTER TABLE release SET UNLOGGED`` to fail with ``could not change table
+# "release" to unlogged because it references logged table "<missing>"`` (see
+# #105). The ``test_pipeline_tables_covers_all_release_fk_referrers`` unit test
+# enforces this invariant against ``schema/create_database.sql``.
 PIPELINE_TABLES = [
     "release",
     "release_artist",
@@ -71,6 +80,7 @@ PIPELINE_TABLES = [
     "release_style",
     "release_track",
     "release_track_artist",
+    "release_video",
     "cache_metadata",
 ]
 
