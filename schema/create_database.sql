@@ -17,6 +17,27 @@ CREATE EXTENSION IF NOT EXISTS pg_trgm;
 CREATE EXTENSION IF NOT EXISTS unaccent;
 
 -- ============================================
+-- Helper functions
+-- ============================================
+
+-- Immutable wrapper for unaccent() so it can be used in index expressions
+-- (the built-in unaccent() is STABLE, depending on search_path).
+--
+-- Defined here AND in create_functions.sql so that create_database.sql is
+-- self-sufficient: the idx_master_title_trgm index expression below
+-- references f_unaccent and would otherwise fail with "function
+-- f_unaccent(text) does not exist" on a fresh database (see #104).
+--
+-- create_functions.sql remains the canonical source of this definition;
+-- later steps (create_indexes.sql, create_track_indexes.sql) also depend
+-- on f_unaccent and must be runnable independently of this file. The two
+-- definitions are kept identical; both use CREATE OR REPLACE so whichever
+-- runs last simply re-asserts the same body.
+CREATE OR REPLACE FUNCTION f_unaccent(text) RETURNS text AS $$
+  SELECT public.unaccent('public.unaccent', $1)
+$$ LANGUAGE sql IMMUTABLE PARALLEL SAFE STRICT;
+
+-- ============================================
 -- Core tables (drop + recreate for clean ETL)
 -- ============================================
 
