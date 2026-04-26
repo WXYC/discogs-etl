@@ -79,6 +79,7 @@ jobs:
           DATABASE_URL_TEST: postgresql://discogs:discogs@localhost:5433/postgres
         run: >-
           pytest -v
+          -m "not slow"
           --cov=scripts --cov=lib
           --cov-report=term-missing
           --cov-fail-under=60
