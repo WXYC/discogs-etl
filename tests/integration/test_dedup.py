@@ -122,6 +122,22 @@ DEDUP_TABLES = [
         "release_id, label_id, label_name, catno",
         "release_id",
     ),
+    # release_genre and release_style must be in this list so swap_tables drops the
+    # original tables (and their indexes from create_database.sql) before
+    # add_base_constraints_and_indexes recreates them. Otherwise the index creation
+    # in add_base_constraints_and_indexes fails with DuplicateTable.
+    (
+        "release_genre",
+        "new_release_genre",
+        "release_id, genre",
+        "release_id",
+    ),
+    (
+        "release_style",
+        "new_release_style",
+        "release_id, style",
+        "release_id",
+    ),
     (
         "cache_metadata",
         "new_cache_metadata",
@@ -144,6 +160,8 @@ def _run_dedup(db_url: str) -> None:
             for stmt in [
                 "ALTER TABLE release_artist DROP CONSTRAINT IF EXISTS fk_release_artist_release",
                 "ALTER TABLE release_label DROP CONSTRAINT IF EXISTS fk_release_label_release",
+                "ALTER TABLE release_genre DROP CONSTRAINT IF EXISTS fk_release_genre_release",
+                "ALTER TABLE release_style DROP CONSTRAINT IF EXISTS fk_release_style_release",
                 "ALTER TABLE cache_metadata DROP CONSTRAINT IF EXISTS fk_cache_metadata_release",
             ]:
                 cur.execute(stmt)
@@ -1152,7 +1170,6 @@ class TestDedupCopySwapAbortCleanup:
         # Only the US release (id=2) survives dedup (US preference)
         assert count == 1
 
-    @pytest.mark.skip(reason="Pre-existing test isolation failure unmasked by #103; see #109")
     def test_full_dedup_succeeds_despite_dangling_tables(self) -> None:
         """A complete dedup cycle succeeds even with leftover new_* tables.
 
