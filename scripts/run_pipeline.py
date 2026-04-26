@@ -662,8 +662,11 @@ def _run_xml_pipeline(
             # Direct-to-PG mode: create schema first, then converter writes
             # releases directly into PostgreSQL via COPY.
             wait_for_postgres(db_url)
-            run_sql_file(db_url, SCHEMA_DIR / "create_database.sql")
+            # create_functions.sql must run BEFORE create_database.sql:
+            # create_database.sql's idx_master_title_trgm index expression
+            # references f_unaccent (see #104).
             run_sql_file(db_url, SCHEMA_DIR / "create_functions.sql")
+            run_sql_file(db_url, SCHEMA_DIR / "create_database.sql")
 
             # Truncate release tables so COPY doesn't hit unique violations
             # from a previous run. CASCADE removes child rows.
@@ -946,8 +949,11 @@ def _run_database_build(
     if state and state.is_completed("create_schema"):
         logger.info("Skipping create_schema (already completed)")
     else:
-        run_sql_file(db_url, SCHEMA_DIR / "create_database.sql")
+        # create_functions.sql must run BEFORE create_database.sql:
+        # create_database.sql's idx_master_title_trgm index expression
+        # references f_unaccent (see #104).
         run_sql_file(db_url, SCHEMA_DIR / "create_functions.sql")
+        run_sql_file(db_url, SCHEMA_DIR / "create_database.sql")
         if state:
             state.mark_completed("create_schema")
             _save_state()

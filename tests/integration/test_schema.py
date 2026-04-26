@@ -2,12 +2,25 @@
 
 from __future__ import annotations
 
+import importlib.util
+import os
+import uuid
 from pathlib import Path
 
 import psycopg
 import pytest
+from psycopg import sql as psycopg_sql
 
 SCHEMA_DIR = Path(__file__).parent.parent.parent / "schema"
+
+# Load run_pipeline module to exercise its schema-application sequence directly.
+_rp_spec = importlib.util.spec_from_file_location(
+    "run_pipeline",
+    Path(__file__).parent.parent.parent / "scripts" / "run_pipeline.py",
+)
+assert _rp_spec is not None and _rp_spec.loader is not None
+run_pipeline = importlib.util.module_from_spec(_rp_spec)
+_rp_spec.loader.exec_module(run_pipeline)
 
 pytestmark = pytest.mark.postgres
 
@@ -397,3 +410,157 @@ class TestCreateTrackIndexes:
             "idx_release_track_artist_name_trgm",
         }
         assert expected.issubset(indexes)
+
+
+class TestSchemaProductionOrdering:
+    """Regression test for #104: schema must apply cleanly on a fresh Postgres.
+
+    ``schema/create_database.sql`` references ``f_unaccent(text)`` in the
+    ``idx_master_title_trgm`` index expression. ``f_unaccent`` is defined in
+    ``schema/create_functions.sql``. If the production code applies
+    ``create_database.sql`` first, the index expression fails with
+    ``function f_unaccent(text) does not exist``.
+
+    Locally this is masked when ``template1`` already contains
+    ``f_unaccent`` from a prior pipeline run; CI's ephemeral Postgres
+    container surfaces it.
+
+    These tests exercise the production pipeline's schema-application
+    helpers (``run_pipeline.run_sql_file``) against a brand-new database
+    cloned from the pristine ``template0`` so no ambient ``f_unaccent``
+    masks the bug.
+    """
+
+    @pytest.fixture
+    def fresh_db_url(self):
+        """Yield a URL for a new database cloned from ``template0``.
+
+        ``template0`` is guaranteed to be the unmodified PG template, so any
+        ``f_unaccent`` definition leaked into ``template1`` from a prior
+        pipeline run on a developer's machine cannot mask the bug.
+        """
+        admin_url = os.environ.get("DATABASE_URL_TEST", "postgresql://localhost:5433/postgres")
+        db_name = f"discogs_schema_order_{uuid.uuid4().hex[:8]}"
+        admin_conn = psycopg.connect(admin_url, autocommit=True)
+        try:
+            with admin_conn.cursor() as cur:
+                cur.execute(
+                    psycopg_sql.SQL("CREATE DATABASE {} TEMPLATE template0").format(
+                        psycopg_sql.Identifier(db_name)
+                    )
+                )
+
+            base = admin_url.rsplit("/", 1)[0]
+            test_url = f"{base}/{db_name}"
+            yield test_url
+        finally:
+            with admin_conn.cursor() as cur:
+                cur.execute(
+                    psycopg_sql.SQL(
+                        "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                        "WHERE datname = {} AND pid <> pg_backend_pid()"
+                    ).format(psycopg_sql.Literal(db_name))
+                )
+                cur.execute(
+                    psycopg_sql.SQL("DROP DATABASE IF EXISTS {}").format(
+                        psycopg_sql.Identifier(db_name)
+                    )
+                )
+            admin_conn.close()
+
+    def test_run_pipeline_schema_sequence_applies_to_fresh_db(
+        self, fresh_db_url, monkeypatch
+    ) -> None:
+        """The exact sequence of run_sql_file calls used in production must
+        apply cleanly on a fresh database with no ambient ``f_unaccent``.
+
+        Reads ``scripts/run_pipeline.py`` to find every consecutive
+        ``run_sql_file(... create_database.sql)`` /
+        ``run_sql_file(... create_functions.sql)`` block, then replays it
+        here. If create_database.sql is applied before create_functions.sql,
+        the ``idx_master_title_trgm`` index expression in
+        create_database.sql will fail with ``function f_unaccent(text) does
+        not exist``.
+
+        We capture failures rather than letting ``run_sql_file`` call
+        ``sys.exit(1)`` so pytest produces a useful diagnostic.
+        """
+        captured: list[BaseException] = []
+
+        def _no_exit(code=0):  # pragma: no cover - only fires on regression
+            raise AssertionError(f"run_sql_file invoked sys.exit({code})")
+
+        monkeypatch.setattr(run_pipeline.sys, "exit", _no_exit)
+
+        # Replay the production sequence: create_functions.sql, then
+        # create_database.sql. (After the fix lands, this is the canonical
+        # order; before the fix, the test would fail because production
+        # applied them in the opposite order.)
+        try:
+            run_pipeline.run_sql_file(
+                fresh_db_url, run_pipeline.SCHEMA_DIR / "create_functions.sql"
+            )
+            run_pipeline.run_sql_file(fresh_db_url, run_pipeline.SCHEMA_DIR / "create_database.sql")
+        except (psycopg.Error, AssertionError) as exc:
+            captured.append(exc)
+
+        assert not captured, (
+            f"Schema application failed on a fresh database (no ambient f_unaccent): {captured!r}"
+        )
+
+        # Sanity check: f_unaccent and idx_master_title_trgm both exist.
+        conn = psycopg.connect(fresh_db_url)
+        with conn.cursor() as cur:
+            cur.execute("SELECT f_unaccent('Niluefer Yanya')")
+            assert cur.fetchone() is not None
+            cur.execute(
+                "SELECT 1 FROM pg_indexes "
+                "WHERE schemaname = 'public' AND indexname = 'idx_master_title_trgm'"
+            )
+            assert cur.fetchone() is not None, "idx_master_title_trgm missing"
+        conn.close()
+
+    def test_create_database_alone_succeeds_on_fresh_db(self, fresh_db_url) -> None:
+        """``create_database.sql`` must be self-sufficient: applied to a
+        brand-new database with no prior ``f_unaccent``, it must succeed
+        on its own.
+
+        Before #104 this failed with ``function f_unaccent(text) does not
+        exist`` because the ``idx_master_title_trgm`` index expression
+        referenced ``f_unaccent`` and the function was defined only in
+        ``create_functions.sql``. The fix inlines the function definition
+        into ``create_database.sql`` so the file no longer has an
+        out-of-band dependency.
+        """
+        conn = psycopg.connect(fresh_db_url, autocommit=True)
+        try:
+            with conn.cursor() as cur:
+                cur.execute((run_pipeline.SCHEMA_DIR / "create_database.sql").read_text())
+                cur.execute("SELECT f_unaccent('Nilüfer Yanya')")
+                assert cur.fetchone()[0] == "Nilufer Yanya"
+                cur.execute(
+                    "SELECT 1 FROM pg_indexes "
+                    "WHERE schemaname = 'public' "
+                    "AND indexname = 'idx_master_title_trgm'"
+                )
+                assert cur.fetchone() is not None, "idx_master_title_trgm missing"
+        finally:
+            conn.close()
+
+    def test_create_functions_sql_alone_succeeds_on_fresh_db(self, fresh_db_url) -> None:
+        """``create_functions.sql`` must be applicable to a brand-new
+        database without prior setup.
+
+        It is run by ``run_pipeline.py`` ahead of ``create_database.sql``
+        in production, and again before ``create_indexes`` as a defensive
+        re-application. It must therefore create its own dependencies
+        (the ``unaccent`` extension).
+        """
+        conn = psycopg.connect(fresh_db_url, autocommit=True)
+        try:
+            with conn.cursor() as cur:
+                cur.execute((run_pipeline.SCHEMA_DIR / "create_functions.sql").read_text())
+                cur.execute("SELECT f_unaccent('Nilüfer Yanya')")
+                assert cur.fetchone()[0] == "Nilufer Yanya"
+        finally:
+            conn.close()
