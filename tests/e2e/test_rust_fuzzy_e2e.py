@@ -253,3 +253,100 @@ class TestVerifyCacheFuzzy:
             f"Database was modified during dry-run: "
             f"before={self.__class__._release_count_before}, after={count_after}"
         )
+
+    def test_rust_path_was_taken(self) -> None:
+        """The Rust (wxyc_etl) batch classifier ran during fuzzy classification.
+
+        ``test_fuzzy_classification_exercised`` only proves that some kind of
+        classification phase ran -- both the Rust path and the Python fallback
+        emit "Phase" / "fuzzy" log lines. This test asserts on the Rust-only
+        marker emitted at scripts/verify_cache.py line ~1575:
+
+            logger.info("  Using Rust (wxyc_etl) batch classification")
+
+        If wxyc_etl is not installed in the test environment (e.g. local dev
+        without the Rust wheel), the test is skipped rather than failing,
+        because the Python fallback is the correct -- and the only available
+        -- path in that situation.
+        """
+        try:
+            import wxyc_etl  # noqa: F401
+            from wxyc_etl.fuzzy import batch_classify_releases  # noqa: F401
+        except ImportError:
+            pytest.skip("wxyc_etl Rust batch classifier not installed; Python fallback is expected")
+
+        combined = self.verify_stderr + self.verify_stdout
+        assert "Using Rust (wxyc_etl) batch classification" in combined, (
+            "Expected Rust-path marker in verify_cache output. The fuzzy "
+            "classifier may have silently fallen back to the Python path. "
+            f"\nstdout (last 2KB):\n{self.verify_stdout[-2000:]}"
+            f"\nstderr (last 2KB):\n{self.verify_stderr[-2000:]}"
+        )
+        # Defensive: the Python fallback's marker should NOT also appear --
+        # the two paths are mutually exclusive within a single run.
+        assert "Using Python fallback" not in combined, (
+            "Both Rust and Python fallback markers appeared in the same run; "
+            "verify_cache.py may be running both paths."
+        )
+
+
+class TestPythonFallbackPathSelection:
+    """Verify that WXYC_ETL_NO_RUST=1 forces the Python fallback even when
+    the Rust wheel is installed."""
+
+    @pytest.fixture(scope="class")
+    def fallback_run(self, e2e_db_url):
+        """Bootstrap a fresh database via run_pipeline, then run verify_cache
+        with WXYC_ETL_NO_RUST=1 and capture its output."""
+        # Reuse the e2e_db_url fixture; populate it identically to the parent
+        # test's bootstrap step.
+        pipeline_result = subprocess.run(
+            [
+                sys.executable,
+                str(RUN_PIPELINE),
+                "--csv-dir",
+                str(CSV_DIR),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            env={
+                **os.environ,
+                "DATABASE_URL": e2e_db_url,
+            },
+        )
+        assert pipeline_result.returncode == 0, (
+            f"Pipeline bootstrap failed (exit {pipeline_result.returncode}):\n"
+            f"{pipeline_result.stderr}"
+        )
+
+        verify_result = subprocess.run(
+            [
+                sys.executable,
+                str(VERIFY_CACHE),
+                str(FIXTURE_LIBRARY_DB),
+                e2e_db_url,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            env={**os.environ, "WXYC_ETL_NO_RUST": "1"},
+        )
+        assert verify_result.returncode == 0, (
+            f"verify_cache.py failed under WXYC_ETL_NO_RUST=1 (exit "
+            f"{verify_result.returncode}):\n{verify_result.stderr}"
+        )
+        return verify_result
+
+    def test_python_path_with_wxyc_etl_no_rust_env(self, fallback_run) -> None:
+        """When WXYC_ETL_NO_RUST=1 is set, verify_cache logs the Python
+        fallback marker and does NOT log the Rust marker."""
+        combined = fallback_run.stderr + fallback_run.stdout
+        assert "Using Python fallback" in combined, (
+            "Expected Python fallback marker in verify_cache output under "
+            "WXYC_ETL_NO_RUST=1.\nstderr:\n"
+            f"{fallback_run.stderr[-2000:]}"
+        )
+        assert "Using Rust (wxyc_etl) batch classification" not in combined, (
+            "Rust marker should NOT appear when WXYC_ETL_NO_RUST=1 is set."
+        )
