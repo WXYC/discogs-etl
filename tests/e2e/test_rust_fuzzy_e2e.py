@@ -275,6 +275,15 @@ class TestVerifyCacheFuzzy:
         except ImportError:
             pytest.skip("wxyc_etl Rust batch classifier not installed; Python fallback is expected")
 
+        # If the test runner's environment has WXYC_ETL_NO_RUST set, the
+        # parent class's verify_cache subprocess (which inherits os.environ
+        # via env={**os.environ, ...}) will have used the Python fallback.
+        # That is correct behavior, not a regression -- skip rather than fail.
+        if os.environ.get("WXYC_ETL_NO_RUST"):
+            pytest.skip(
+                "WXYC_ETL_NO_RUST is set in the test runner environment; Rust path is intentionally disabled"
+            )
+
         combined = self.verify_stderr + self.verify_stdout
         assert "Using Rust (wxyc_etl) batch classification" in combined, (
             "Expected Rust-path marker in verify_cache output. The fuzzy "
