@@ -27,23 +27,36 @@ ALL_TABLES = (
 
 ADMIN_URL = os.environ.get("DATABASE_URL_TEST", "postgresql://localhost:5433/postgres")
 
-# Load import_csv module
+# Load import_csv module from the scripts/ directory (not on sys.path).
+# Idempotent: re-use any already-loaded copy in sys.modules so multiple test
+# files can import it without each one shadowing the previous load (which
+# breaks ProcessPool pickling -- see #109).
 _IMPORT_PATH = Path(__file__).parent.parent.parent / "scripts" / "import_csv.py"
-_spec = importlib.util.spec_from_file_location("import_csv", _IMPORT_PATH)
-assert _spec is not None and _spec.loader is not None
-_ic = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(_ic)
+if "import_csv" in _sys.modules:
+    _ic = _sys.modules["import_csv"]
+else:
+    _spec = importlib.util.spec_from_file_location("import_csv", _IMPORT_PATH)
+    assert _spec is not None and _spec.loader is not None
+    _ic = importlib.util.module_from_spec(_spec)
+    _sys.modules["import_csv"] = _ic
+    _spec.loader.exec_module(_ic)
 
 import_csv_func = _ic.import_csv
 import_artwork = _ic.import_artwork
 TABLES = _ic.TABLES
 
-# Load verify_cache module
+# Load verify_cache module the same way -- guarded so the second test file to
+# import it doesn't replace the module object the first one's worker processes
+# may need to unpickle.
 _VC_PATH = Path(__file__).parent.parent.parent / "scripts" / "verify_cache.py"
-_vc_spec = importlib.util.spec_from_file_location("verify_cache", _VC_PATH)
-assert _vc_spec is not None and _vc_spec.loader is not None
-_sys.modules["verify_cache"] = _vc = importlib.util.module_from_spec(_vc_spec)
-_vc_spec.loader.exec_module(_vc)
+if "verify_cache" in _sys.modules:
+    _vc = _sys.modules["verify_cache"]
+else:
+    _vc_spec = importlib.util.spec_from_file_location("verify_cache", _VC_PATH)
+    assert _vc_spec is not None and _vc_spec.loader is not None
+    _vc = importlib.util.module_from_spec(_vc_spec)
+    _sys.modules["verify_cache"] = _vc
+    _vc_spec.loader.exec_module(_vc)
 
 LibraryIndex = _vc.LibraryIndex
 MultiIndexMatcher = _vc.MultiIndexMatcher
@@ -51,15 +64,7 @@ Decision = _vc.Decision
 classify_all_releases = _vc.classify_all_releases
 copy_releases_to_target = _vc.copy_releases_to_target
 
-pytestmark = [
-    pytest.mark.postgres,
-    pytest.mark.skip(
-        reason="Pre-existing pickling failure unmasked by #103: test_copy_to_target and "
-        "test_prune both load verify_cache.py into sys.modules['verify_cache'] at module "
-        "import time, second-loaded file replaces the first's reference, breaking "
-        "ProcessPool pickling for class-scoped fixtures. See #109."
-    ),
-]
+pytestmark = [pytest.mark.postgres]
 
 
 def _fresh_import(db_url: str) -> None:
