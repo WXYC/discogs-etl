@@ -124,7 +124,6 @@ class TestPipeline:
             assert count > 0, f"Table {table} is empty"
         conn.close()
 
-    @pytest.mark.skip(reason="Pre-existing failure unmasked by #103; see #109")
     def test_format_aware_dedup_and_prune(self) -> None:
         """Format-aware dedup + prune keeps only matching formats.
 

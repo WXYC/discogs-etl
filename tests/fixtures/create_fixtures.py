@@ -413,7 +413,10 @@ def create_library_db() -> None:
         # Multi-album per artist + null format (Stereolab Dots and Loops)
         ("Stereolab", "Dots and Loops", None),  # some entries have no format
         # Multi-album per artist (Autechre catalog)
+        # Confield is in CD and LP so format-aware prune keeps both
+        # 1001 (CD) and 1002 (Vinyl, mapped from LP).
         ("Autechre", "Confield", "CD"),
+        ("Autechre", "Confield", "LP"),
         ("Autechre", "Amber", "CD"),
         ("Autechre", "Tri Repetae", "CD"),
         # Already-canonical artists from the original fixture (kept)
