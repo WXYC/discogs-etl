@@ -31,6 +31,7 @@ FIXTURES_DIR = Path(__file__).parent.parent / "fixtures"
 CSV_DIR = FIXTURES_DIR / "csv"
 FIXTURE_LIBRARY_DB = FIXTURES_DIR / "library.db"
 RUN_PIPELINE = Path(__file__).parent.parent.parent / "scripts" / "run_pipeline.py"
+SCHEMA_DIR = Path(__file__).parent.parent.parent / "schema"
 
 ADMIN_URL = os.environ.get("DATABASE_URL_TEST", "postgresql://localhost:5433/postgres")
 
@@ -204,9 +205,6 @@ def _final_state_is_v3_complete(state_file: Path) -> dict:
 class TestStateResumeOldFormat:
     """Resume from v1 / v2 state files via the run_pipeline CLI."""
 
-    @pytest.mark.skip(
-        reason="Pre-existing test setup bug unmasked by #103 (UniqueViolation on re-import); see #109"
-    )
     def test_v1_state_file_resumes_via_cli(self, fresh_db_url, tmp_path) -> None:
         """A v1 state file with create_schema completed resumes from import_csv,
         completes the run, and writes a v3 state file with all steps marked done."""
@@ -239,11 +237,24 @@ class TestStateResumeOldFormat:
         )
         _assert_pipeline_succeeded(bootstrap)
 
+        # Reset the database back to the post-create_schema / pre-import_csv
+        # state. The bootstrap left the DB in its post-pipeline shape (no
+        # master_id column on release, child tables fully populated), but the
+        # v1 state we're about to write claims only create_schema is complete,
+        # so resume will re-run import_csv -- which would PK-violate against
+        # the bootstrap rows. Drop and re-apply the schema so import_csv has
+        # a clean slate. This mirrors what a real v1-format on-disk state
+        # would look like: schema applied, no data yet.
+        reset_conn = psycopg.connect(fresh_db_url, autocommit=True)
+        with reset_conn.cursor() as cur:
+            cur.execute(SCHEMA_DIR.joinpath("create_functions.sql").read_text())
+            cur.execute(SCHEMA_DIR.joinpath("create_database.sql").read_text())
+        reset_conn.close()
+
         # Now overwrite the persisted state file with a v1 file claiming only
         # create_schema is completed. The migration will infer that import_csv,
         # import_tracks, etc. are NOT completed -- so on resume the pipeline
-        # should re-run those steps. Since the database itself is already
-        # populated, re-running idempotent steps must still succeed.
+        # should re-run those steps against the freshly-reset schema.
         _write_v1_state(
             state_file,
             db_url=fresh_db_url,
