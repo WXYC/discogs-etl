@@ -101,7 +101,7 @@ Functionality that was previously local to this repo has been extracted to share
 
 ### Testing
 
-The repo follows architecture A from `wxyc/plans/test-patterns.md`: markers route CI by infrastructure, not by tier. Directory layout (`tests/unit/`, `tests/integration/`, `tests/e2e/`) documents the tier; markers describe operational requirements only.
+The repo follows architecture A from [the wiki test-patterns doc](https://github.com/WXYC/wiki/blob/main/plans/test-patterns.md): markers route CI by infrastructure, not by tier. Directory layout (`tests/unit/`, `tests/integration/`, `tests/e2e/`) documents the tier; markers describe operational requirements only.
 
 Declared markers:
 
