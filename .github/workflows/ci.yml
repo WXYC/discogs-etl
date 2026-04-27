@@ -74,12 +74,17 @@ jobs:
         run: |
           PGPASSWORD=discogs psql -h localhost -p 5433 -U discogs -d postgres \
             -c "CREATE EXTENSION IF NOT EXISTS pg_trgm;"
-      - name: Run pg-marked tests with coverage
+      - name: Run pg-marked + default tests with coverage
         env:
           DATABASE_URL_TEST: postgresql://discogs:discogs@localhost:5433/postgres
+        # The expression "pg or not slow" selects PG-marked tests plus the
+        # default no-marker tests (everything that is not `slow`). Running
+        # both in a single invocation means the --cov-fail-under gate sees
+        # combined coverage. The positive `pg` term satisfies the marker
+        # sync-check.
         run: >-
           pytest -v
-          -m "pg and not slow"
+          -m "pg or not slow"
           --cov=scripts --cov=lib
           --cov-report=term-missing
           --cov-fail-under=60
