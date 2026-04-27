@@ -158,6 +158,23 @@ This pipeline runs monthly (or when Discogs publishes new data dumps). It has a 
 
 ## Automation
 
+### Monthly Cache Rebuild (`rebuild-cache.yml`)
+
+A GitHub Actions cron workflow runs `scripts/run_pipeline.py --xml ...` on the 4th of each month at 06:00 UTC, staggered a few days after Discogs publishes the new dump. It can also be triggered manually with an optional `dump_url` input: `gh workflow run rebuild-cache.yml`.
+
+The job downloads `releases.xml.gz` for the current month from `discogs-data-dumps.s3.us-west-2.amazonaws.com`, builds `discogs-xml-converter` from source, and runs the full XML-mode pipeline (steps 2-10) against `DATABASE_URL_DISCOGS`. Library catalog is generated inline via `--generate-library-db --catalog-source tubafrenzy`.
+
+**Caveat — runner capacity**: the Discogs releases dump is ~63 GB compressed XML and the conversion + Postgres bulk load can exceed the GitHub Actions free hosted runner's ~14 GB disk and 6-hour wall-clock budget. The workflow file is the deliverable; provisioning a self-hosted or larger hosted runner is a follow-up operator task. Until then, expect the scheduled tick to fail loudly rather than silently produce a half-built cache.
+
+**Required GitHub secrets:**
+
+| Secret | Description |
+|--------|-------------|
+| `DATABASE_URL_DISCOGS` | PostgreSQL URL for the destination cache database |
+| `LIBRARY_CATALOG_DB_URL` | MySQL URL for the tubafrenzy catalog (used by `--generate-library-db`) |
+| `DISCOGS_TOKEN` | Discogs API token (optional; only matters if rate limits are hit) |
+| `SENTRY_DSN` | Sentry DSN for error reporting (optional; JSON logging still works without it) |
+
 ### Library Sync (`sync-library.yml`)
 
 A GitHub Actions cron workflow runs `scripts/sync-library.sh` daily at noon UTC (7 AM EST / 8 AM EDT) to export the WXYC library catalog to SQLite (via `wxyc-export-to-sqlite` from wxyc-catalog) and upload it to library-metadata-lookup staging and production environments.
