@@ -1,0 +1,94 @@
+name: Rebuild Discogs Cache
+
+# Monthly Discogs cache rebuild. Discogs publishes a new dump on the 1st of
+# each month; this workflow runs a few days later to give the dump time to
+# settle and to stagger against sister cache-builder repos (e.g. wikidata-cache,
+# musicbrainz-cache).
+#
+# TODO: the Discogs releases dump is ~63 GB compressed XML; expanding +
+# converting it can exceed the GitHub Actions free-runner disk (~14 GB) and
+# 6-hour wall-clock budget. The skeleton here lets operators kick the rebuild
+# manually via workflow_dispatch on a self-hosted runner or a beefier hosted
+# runner; converting the scheduled run to use the same once one is provisioned
+# is a follow-up. Until then, the cron tick will fail loudly rather than
+# silently producing a half-built cache, which is the desired signal.
+
+on:
+  schedule:
+    # 06:00 UTC on the 4th of each month (staggered from sister rebuilds).
+    - cron: "0 6 4 * *"
+  workflow_dispatch:
+    inputs:
+      dump_url:
+        description: "Override Discogs releases.xml.gz URL (optional)"
+        required: false
+        type: string
+
+jobs:
+  rebuild:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install wxyc-etl from git (Rust/PyO3)
+        run: |
+          pip install maturin
+          git clone --depth 1 --branch etl-unification/1g-pyo3-bindings https://github.com/WXYC/wxyc-etl.git /tmp/wxyc-etl
+          cd /tmp/wxyc-etl/wxyc-etl-python && maturin build --release && pip install /tmp/wxyc-etl/target/wheels/*.whl
+
+      - name: Install wxyc-catalog from git
+        run: |
+          git clone --depth 1 --branch main https://github.com/WXYC/wxyc-catalog.git /tmp/wxyc-catalog
+          cd /tmp/wxyc-catalog && sed -i 's|setuptools.backends._legacy:_Backend|setuptools.build_meta|' pyproject.toml && pip install -e .
+
+      - name: Install discogs-etl
+        run: pip install -e ".[dev]"
+
+      - name: Build discogs-xml-converter
+        run: |
+          git clone --depth 1 --branch main https://github.com/WXYC/discogs-xml-converter.git /tmp/discogs-xml-converter
+          cd /tmp/discogs-xml-converter && cargo build --release
+          echo "/tmp/discogs-xml-converter/target/release" >> "$GITHUB_PATH"
+
+      - name: Resolve dump URL
+        id: dump
+        env:
+          OVERRIDE_URL: ${{ inputs.dump_url }}
+        run: |
+          if [ -n "$OVERRIDE_URL" ]; then
+            echo "Using operator-supplied dump URL"
+            echo "url=$OVERRIDE_URL" >> "$GITHUB_OUTPUT"
+          else
+            # Discogs publishes monthly dumps named
+            # data/<YYYY>/discogs_<YYYYMMDD>_releases.xml.gz on the 1st of each
+            # month. Resolve the most recent published month relative to today.
+            year=$(date -u +%Y)
+            stamp=$(date -u +%Y%m01)
+            echo "url=https://discogs-data-dumps.s3.us-west-2.amazonaws.com/data/${year}/discogs_${stamp}_releases.xml.gz" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download Discogs releases dump
+        run: |
+          mkdir -p data
+          curl -fL --retry 3 --retry-delay 30 -o data/releases.xml.gz "${{ steps.dump.outputs.url }}"
+
+      - name: Run pipeline
+        env:
+          DATABASE_URL_DISCOGS: ${{ secrets.DATABASE_URL_DISCOGS }}
+          DISCOGS_TOKEN: ${{ secrets.DISCOGS_TOKEN }}
+          # TODO: provision SENTRY_DSN as a separate operator task. Until then
+          # JSON logging still emits to stderr and Sentry stays inactive.
+          SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
+        run: |
+          python scripts/run_pipeline.py \
+            --xml data/releases.xml.gz \
+            --generate-library-db \
+            --catalog-source tubafrenzy \
+            --catalog-db-url "${{ secrets.LIBRARY_CATALOG_DB_URL }}"
