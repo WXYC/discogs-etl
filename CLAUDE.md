@@ -28,7 +28,20 @@ ETL pipeline for building and maintaining a PostgreSQL cache of Discogs release 
 - `--xml` mode: runs steps 2-10 (enrich, convert+filter, database build through SET LOGGED). `--xml` accepts a single file or a directory.
 - `--csv-dir` mode: runs steps 4-10 (database build from pre-filtered CSVs)
 
-Both modes support `--target-db-url` to copy matched releases to a separate database instead of pruning in place, and `--resume` (csv-dir only) to skip already-completed steps. `--keep-csv` (xml mode only) writes converted CSVs to a persistent directory instead of a temp dir, so they survive pipeline failures.
+Both modes support `--target-db-url` (deprecated, see below) to copy matched releases to a separate database instead of pruning in place, and `--resume` (csv-dir only) to skip already-completed steps. `--keep-csv` (xml mode only) writes converted CSVs to a persistent directory instead of a temp dir, so they survive pipeline failures.
+
+### Cache database CLI convention
+
+discogs-etl follows the shared cache-builder CLI convention defined in `wxyc-etl::cli` (Rust) and mirrored here in Python:
+
+| Flag / env | Status | Notes |
+|---|---|---|
+| `--database-url` | canonical | PostgreSQL URL for the cache database. |
+| `DATABASE_URL_DISCOGS` | canonical | Service-specific env fallback; preferred over `DATABASE_URL`. |
+| `DATABASE_URL` | deprecated fallback | Still works; emits a stderr warning that `DATABASE_URL_DISCOGS` is preferred. |
+| `--target-db-url` | deprecated | Still functional but emits a stderr warning. The cache convention is consolidating on a single `--database-url`. |
+
+Resolution order for `--database-url`: explicit flag > `DATABASE_URL_DISCOGS` > `DATABASE_URL` (deprecated) > `postgresql://localhost:5432/discogs`.
 
 Step 1 (download) is always manual.
 

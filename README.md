@@ -105,7 +105,8 @@ python scripts/run_pipeline.py \
 
 - `--library-db` is optional; if omitted, the prune step is skipped
 - `--library-labels` accepts a pre-generated `library_labels.csv` for [label-aware dedup](#label-aware-dedup)
-- `--database-url` defaults to `DATABASE_URL` env var or `postgresql://localhost:5432/discogs`
+- `--database-url` defaults to `DATABASE_URL_DISCOGS`, then `DATABASE_URL` (deprecated, emits a warning), then `postgresql://localhost:5432/discogs`
+- `--target-db-url` is deprecated; the cache convention is consolidating on a single `--database-url`. Existing workflows still work.
 
 ### Docker Compose
 

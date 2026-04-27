@@ -147,6 +147,68 @@ class TestArgParsing:
                 ]
             )
 
+    def test_target_db_url_emits_deprecation_warning(self, capsys) -> None:
+        """--target-db-url is accepted but warns it is deprecated."""
+        run_pipeline.parse_args(
+            [
+                "--csv-dir",
+                "/tmp/csv",
+                "--library-db",
+                "/tmp/library.db",
+                "--target-db-url",
+                "postgresql://localhost/target",
+            ]
+        )
+        err = capsys.readouterr().err
+        assert "--target-db-url" in err
+        assert "deprecated" in err.lower()
+
+    def test_database_url_flag_overrides_env(self, monkeypatch) -> None:
+        """Explicit --database-url takes precedence over env vars."""
+        monkeypatch.setenv("DATABASE_URL_DISCOGS", "postgresql://from-discogs-env/db")
+        monkeypatch.setenv("DATABASE_URL", "postgresql://from-generic-env/db")
+        args = run_pipeline.parse_args(
+            [
+                "--csv-dir",
+                "/tmp/csv",
+                "--database-url",
+                "postgresql://from-flag/db",
+            ]
+        )
+        assert args.database_url == "postgresql://from-flag/db"
+
+    def test_database_url_discogs_env_var_used(self, monkeypatch) -> None:
+        """DATABASE_URL_DISCOGS is the preferred env fallback."""
+        monkeypatch.delenv("DATABASE_URL", raising=False)
+        monkeypatch.setenv("DATABASE_URL_DISCOGS", "postgresql://from-discogs-env/db")
+        args = run_pipeline.parse_args(["--csv-dir", "/tmp/csv"])
+        assert args.database_url == "postgresql://from-discogs-env/db"
+
+    def test_database_url_discogs_preferred_over_generic(self, monkeypatch) -> None:
+        """DATABASE_URL_DISCOGS wins over DATABASE_URL when both are set."""
+        monkeypatch.setenv("DATABASE_URL_DISCOGS", "postgresql://from-discogs-env/db")
+        monkeypatch.setenv("DATABASE_URL", "postgresql://from-generic-env/db")
+        args = run_pipeline.parse_args(["--csv-dir", "/tmp/csv"])
+        assert args.database_url == "postgresql://from-discogs-env/db"
+
+    def test_database_url_generic_env_var_with_warning(self, monkeypatch, capsys) -> None:
+        """Falling back to DATABASE_URL still works but emits a deprecation warning."""
+        monkeypatch.delenv("DATABASE_URL_DISCOGS", raising=False)
+        monkeypatch.setenv("DATABASE_URL", "postgresql://from-generic-env/db")
+        args = run_pipeline.parse_args(["--csv-dir", "/tmp/csv"])
+        assert args.database_url == "postgresql://from-generic-env/db"
+        err = capsys.readouterr().err
+        assert "DATABASE_URL" in err
+        assert "DATABASE_URL_DISCOGS" in err
+        assert "deprecated" in err.lower()
+
+    def test_database_url_default_when_no_env(self, monkeypatch) -> None:
+        """Falls back to the built-in default when no env vars are set."""
+        monkeypatch.delenv("DATABASE_URL_DISCOGS", raising=False)
+        monkeypatch.delenv("DATABASE_URL", raising=False)
+        args = run_pipeline.parse_args(["--csv-dir", "/tmp/csv"])
+        assert args.database_url == "postgresql://localhost:5432/discogs"
+
     def test_library_labels_parsed(self) -> None:
         args = run_pipeline.parse_args(
             [

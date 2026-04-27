@@ -20,7 +20,8 @@ Two modes of operation:
       [--resume] [--state-file <path>]
 
 Environment variables:
-    DATABASE_URL  Default database URL when --database-url is not specified.
+    DATABASE_URL_DISCOGS  Preferred default for --database-url.
+    DATABASE_URL          Deprecated fallback; emits a warning when used.
 """
 
 from __future__ import annotations
@@ -71,6 +72,31 @@ PG_CONNECT_TIMEOUT = 30
 # "release" to unlogged because it references logged table "<missing>"`` (see
 # #105). The ``test_pipeline_tables_covers_all_release_fk_referrers`` unit test
 # enforces this invariant against ``schema/create_database.sql``.
+DEFAULT_DATABASE_URL = "postgresql://localhost:5432/discogs"
+
+
+def _resolve_database_url(cli_value: str | None) -> str:
+    """Resolve the cache database URL.
+
+    Priority: CLI flag > DATABASE_URL_DISCOGS env > DATABASE_URL env (deprecated)
+    > built-in default. The generic DATABASE_URL fallback emits a stderr
+    deprecation warning to nudge consumers to the service-specific name.
+    """
+    if cli_value is not None:
+        return cli_value
+    discogs_env = os.environ.get("DATABASE_URL_DISCOGS")
+    if discogs_env:
+        return discogs_env
+    generic_env = os.environ.get("DATABASE_URL")
+    if generic_env:
+        print(
+            "warning: DATABASE_URL is deprecated; set DATABASE_URL_DISCOGS instead.",
+            file=sys.stderr,
+        )
+        return generic_env
+    return DEFAULT_DATABASE_URL
+
+
 PIPELINE_TABLES = [
     "release",
     "release_artist",
@@ -168,17 +194,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--database-url",
         type=str,
-        default=os.environ.get("DATABASE_URL", "postgresql://localhost:5432/discogs"),
-        help="PostgreSQL connection URL "
-        "(default: DATABASE_URL env var or postgresql://localhost:5432/discogs).",
+        default=None,
+        help="PostgreSQL connection URL for the cache database "
+        "(default: DATABASE_URL_DISCOGS env var, then DATABASE_URL with a "
+        "deprecation warning, then postgresql://localhost:5432/discogs).",
     )
     parser.add_argument(
         "--target-db-url",
         type=str,
         default=None,
         metavar="URL",
-        help="Copy matched releases to a separate target database instead of "
-        "pruning in place. Requires --library-db.",
+        help="[DEPRECATED] Copy matched releases to a separate target database "
+        "instead of pruning in place. Requires --library-db. Will be removed in "
+        "a future release.",
     )
     parser.add_argument(
         "--library-labels",
@@ -235,6 +263,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
 
     args = parser.parse_args(argv)
+
+    args.database_url = _resolve_database_url(args.database_url)
+
+    if args.target_db_url is not None:
+        print(
+            "warning: --target-db-url is deprecated; the cache convention is "
+            "moving to a single --database-url. The flag still works for now.",
+            file=sys.stderr,
+        )
 
     # Validate --xml mode dependencies
     if args.xml is not None:
