@@ -35,7 +35,7 @@ SCHEMA_DIR = Path(__file__).parent.parent.parent / "schema"
 
 ADMIN_URL = os.environ.get("DATABASE_URL_TEST", "postgresql://localhost:5433/postgres")
 
-pytestmark = [pytest.mark.postgres, pytest.mark.e2e]
+pytestmark = pytest.mark.pg
 
 
 # v1 had 6 steps (no separate import_tracks/create_track_indexes/set_logged).

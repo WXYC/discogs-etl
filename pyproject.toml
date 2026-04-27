@@ -43,13 +43,10 @@ ignore = [
 ]
 
 [tool.pytest.ini_options]
+# ci-sync-skip: slow reason: perf benchmarks are run manually on demand, not in CI
 markers = [
-    "unit: pure logic tests, no external dependencies",
-    "postgres: needs PostgreSQL (gated by DATABASE_URL_TEST)",
-    "integration: needs external service or fixture data",
-    "e2e: full pipeline end-to-end test",
-    "parity: old vs new implementation comparison",
-    "slow: marks tests as slow",
+    "pg: needs a PostgreSQL service (DATABASE_URL_TEST)",
+    "slow: takes longer than ~10s (orthogonal to infra)",
 ]
-addopts = "-m 'not integration and not postgres and not e2e and not parity and not slow'"
+addopts = "-m 'not pg and not slow'"
 testpaths = ["tests"]

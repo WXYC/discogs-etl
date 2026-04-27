@@ -22,7 +22,7 @@ _spec = importlib.util.spec_from_file_location(
 run_pipeline = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(run_pipeline)
 
-pytestmark = pytest.mark.postgres
+pytestmark = pytest.mark.pg
 
 
 def _get_table_persistence(db_url: str, table_name: str) -> str:

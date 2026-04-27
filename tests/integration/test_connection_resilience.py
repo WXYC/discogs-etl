@@ -54,7 +54,7 @@ import_csv_func = _ic.import_csv
 populate_cache_metadata = _ic.populate_cache_metadata
 BASE_TABLES = _ic.BASE_TABLES
 
-pytestmark = pytest.mark.postgres
+pytestmark = pytest.mark.pg
 
 
 ALL_TABLES = (

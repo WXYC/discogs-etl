@@ -6,8 +6,6 @@ import importlib.util
 import sqlite3
 from pathlib import Path
 
-import pytest
-
 # Load tsv_to_sqlite module from scripts directory
 _SCRIPT_PATH = Path(__file__).parent.parent.parent / "scripts" / "tsv_to_sqlite.py"
 _spec = importlib.util.spec_from_file_location("tsv_to_sqlite", _SCRIPT_PATH)
@@ -18,7 +16,6 @@ _spec.loader.exec_module(_mod)
 tsv_to_sqlite = _mod.tsv_to_sqlite
 
 
-@pytest.mark.integration
 class TestTsvToSqliteIntegration:
     """Integration tests using realistic MySQL output."""
 

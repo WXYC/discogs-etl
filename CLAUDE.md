@@ -101,22 +101,35 @@ Functionality that was previously local to this repo has been extracted to share
 
 ### Testing
 
-Three test layers with pytest markers:
+The repo follows architecture A from `wxyc/plans/test-patterns.md`: markers route CI by infrastructure, not by tier. Directory layout (`tests/unit/`, `tests/integration/`, `tests/e2e/`) documents the tier; markers describe operational requirements only.
+
+Declared markers:
+
+| Marker | Meaning | When to use |
+|---|---|---|
+| `pg` | needs a PostgreSQL service (`DATABASE_URL_TEST`) | every test that connects to Postgres, regardless of tier |
+| `slow` | takes longer than ~10s (orthogonal to infra) | perf benchmarks; opt-out from CI sync-check, run manually |
+
+Tests with no marker are the default pytest run (no infrastructure required).
 
 ```bash
-# Unit tests (no external dependencies, run by default)
-pytest tests/unit/ -v
+# Default run: no-marker tests only (pure-logic unit tests + in-memory SQLite + library.db fixture tests)
+pytest
 
-# Integration tests (needs PostgreSQL on port 5433)
+# PG-backed tests (integration + E2E that touch Postgres)
+docker compose up db -d
 DATABASE_URL_TEST=postgresql://discogs:discogs@localhost:5433/postgres \
-  pytest -m postgres -v
+  pytest -m pg -v
 
-# E2E tests (runs full pipeline as subprocess against test Postgres)
+# Combine PG with the default tier
 DATABASE_URL_TEST=postgresql://discogs:discogs@localhost:5433/postgres \
-  pytest -m e2e -v
+  pytest -m "pg or not pg" -v --ignore-glob='*slow*'   # everything but slow
+
+# Perf benchmarks (rare, manual)
+pytest -m slow -v
 ```
 
-Markers: `postgres` (needs PostgreSQL), `e2e` (full pipeline), `integration` (needs library.db). Integration and E2E tests are excluded from the default `pytest` run via `addopts` in `pyproject.toml`.
+CI runs three pytest jobs per push/PR: `lint`, `test` (default no-marker run, unit dir only), `pg` (PG-marked tests with coverage), and `marker-sync` (the reusable sync-check workflow from wxyc-etl that catches markers silently deselected by addopts).
 
 Test fixtures are in `tests/fixtures/` (CSV files, library.db, library_artists.txt). Regenerate with `python tests/fixtures/create_fixtures.py`.
 

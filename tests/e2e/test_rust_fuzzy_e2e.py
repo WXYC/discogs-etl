@@ -34,7 +34,7 @@ VERIFY_CACHE = Path(__file__).parent.parent.parent / "scripts" / "verify_cache.p
 
 ADMIN_URL = os.environ.get("DATABASE_URL_TEST", "postgresql://localhost:5433/postgres")
 
-pytestmark = pytest.mark.e2e
+pytestmark = pytest.mark.pg
 
 
 def _postgres_available() -> bool:

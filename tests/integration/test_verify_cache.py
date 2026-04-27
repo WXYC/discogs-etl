@@ -57,7 +57,6 @@ def matcher(library_index):
     return MultiIndexMatcher(library_index)
 
 
-@pytest.mark.integration
 class TestMultiIndexRealLibrary:
     """Test multi-index matching against the real WXYC library catalog."""
 
@@ -151,7 +150,6 @@ SCRIPT_PATH = Path(__file__).parent.parent.parent / "scripts" / "verify_cache.py
 PYTHON = sys.executable
 
 
-@pytest.mark.integration
 class TestVerifyCacheE2E:
     """Test the verify_cache.py script as a subprocess."""
 

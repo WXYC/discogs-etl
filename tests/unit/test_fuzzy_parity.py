@@ -30,8 +30,6 @@ wxyc_etl_fuzzy = pytest.importorskip("wxyc_etl.fuzzy", reason="wxyc-etl not inst
 batch_fuzzy_resolve = wxyc_etl_fuzzy.batch_fuzzy_resolve
 jaro_winkler_similarity = wxyc_etl_fuzzy.jaro_winkler_similarity
 
-pytestmark = pytest.mark.parity
-
 # ---------------------------------------------------------------------------
 # Load verify_cache module from scripts directory (same pattern as test_verify_cache.py)
 # ---------------------------------------------------------------------------

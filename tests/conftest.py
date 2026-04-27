@@ -2,7 +2,7 @@
 
 The fixtures create a temporary test database, run the schema, and clean up
 on teardown.  Tests that need Postgres should use the ``db_url`` or ``db_conn``
-fixtures and be marked with ``@pytest.mark.postgres``.
+fixtures and be marked with ``@pytest.mark.pg``.
 
 Connection target:
     DATABASE_URL_TEST env var, default ``postgresql://localhost:5433/postgres``.

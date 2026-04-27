@@ -62,7 +62,7 @@ get_table_sizes = _vc.get_table_sizes
 count_rows_to_delete = _vc.count_rows_to_delete
 prune_releases = _vc.prune_releases
 
-pytestmark = [pytest.mark.postgres]
+pytestmark = [pytest.mark.pg]
 
 
 def _fresh_import(db_url: str) -> None:

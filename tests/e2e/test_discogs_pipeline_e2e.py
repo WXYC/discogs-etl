@@ -60,7 +60,7 @@ try:
 except ImportError:
     HAS_ASYNCPG = False
 
-pytestmark = pytest.mark.e2e
+pytestmark = pytest.mark.pg
 
 
 @pytest.fixture(scope="class")

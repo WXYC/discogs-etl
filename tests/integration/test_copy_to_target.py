@@ -64,7 +64,7 @@ Decision = _vc.Decision
 classify_all_releases = _vc.classify_all_releases
 copy_releases_to_target = _vc.copy_releases_to_target
 
-pytestmark = [pytest.mark.postgres]
+pytestmark = [pytest.mark.pg]
 
 
 def _fresh_import(db_url: str) -> None:
