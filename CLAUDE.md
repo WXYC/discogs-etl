@@ -65,6 +65,37 @@ The SQL files in `schema/` define the contract between this ETL pipeline and all
 
 Consumers connect via `DATABASE_URL_DISCOGS` environment variable.
 
+### Migrations
+
+`schema/*.sql` remains the canonical, hand-maintained schema. On top of that we keep an [alembic](https://alembic.sqlalchemy.org/) revision history at `alembic/versions/` so future schema changes have a recorded order, and so that downstream services (Backend-Service, library-metadata-lookup) can rely on a stamped version when introspecting the cache.
+
+Layout:
+
+- `alembic.ini` -- alembic config; the `sqlalchemy.url` placeholder is overridden by `alembic/env.py`.
+- `alembic/env.py` -- resolves the URL from `DATABASE_URL_DISCOGS` (canonical) or `DATABASE_URL` (deprecated, warns to stderr); rewrites `postgresql://` to `postgresql+psycopg://` so SQLAlchemy uses psycopg3 instead of pulling in psycopg2.
+- `alembic/versions/0001_initial.py` -- baseline migration. Hand-written; its `upgrade()` opens an autocommit psycopg connection and replays `schema/create_functions.sql`, `schema/create_database.sql`, `schema/create_indexes.sql`, `schema/create_track_indexes.sql` in pipeline order. CONCURRENTLY is stripped because the baseline only ever runs against an empty database (mirrors the `strip_concurrently=True` path in `scripts/run_pipeline.py`).
+
+Apply against an empty Postgres:
+
+```bash
+createdb discogs_cache_migrations_test
+DATABASE_URL_DISCOGS=postgresql://localhost:5433/discogs_cache_migrations_test \
+  alembic upgrade head
+```
+
+Add a new migration:
+
+```bash
+alembic revision -m "<short-name>"
+# edit alembic/versions/<rev>_<short-name>.py and write upgrade()/downgrade()
+```
+
+Prefer hand-written `op.execute()` migrations -- `--autogenerate` is intentionally off (no SQLAlchemy ORM models exist in this repo). When the change is simple SQL, it's fine to embed the DDL directly in `upgrade()`. When it's a large refactor, drop a new file under `schema/` and have `upgrade()` `op.execute(open(...).read())` it, the same pattern as `0001_initial`.
+
+**Not yet wired into deploy.** `alembic upgrade head` is *not* called by `scripts/run_pipeline.py`, the GitHub Actions cache-rebuild workflow, or the Docker entrypoint. The pipeline still applies `schema/*.sql` directly via `run_sql_file`. Switching the runtime path to drive everything through alembic is tracked in [WXYC/wxyc-etl#56](https://github.com/WXYC/wxyc-etl/issues/56). On first post-#56 deploy, existing production databases will be `alembic stamp head` stamped so they don't try to re-apply the baseline.
+
+Alembic is a `[project.optional-dependencies] dev` dep -- install via `pip install -e .[dev]` and use `.venv/bin/alembic`.
+
 ### Docker Compose
 
 `docker-compose.yml` provides a self-contained environment:
