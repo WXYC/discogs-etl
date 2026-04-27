@@ -121,15 +121,15 @@ docker compose up db -d
 DATABASE_URL_TEST=postgresql://discogs:discogs@localhost:5433/postgres \
   pytest -m pg -v
 
-# Combine PG with the default tier
+# Everything that is not slow (PG-backed plus default tier in one run, for coverage)
 DATABASE_URL_TEST=postgresql://discogs:discogs@localhost:5433/postgres \
-  pytest -m "pg or not pg" -v --ignore-glob='*slow*'   # everything but slow
+  pytest -m "pg or not slow" -v
 
-# Perf benchmarks (rare, manual)
+# Perf benchmarks (rare, manual; opted-out from the marker sync-check)
 pytest -m slow -v
 ```
 
-CI runs three pytest jobs per push/PR: `lint`, `test` (default no-marker run, unit dir only), `pg` (PG-marked tests with coverage), and `marker-sync` (the reusable sync-check workflow from wxyc-etl that catches markers silently deselected by addopts).
+CI runs four jobs per push/PR: `lint`, `test` (default no-marker run, unit dir only), `pg` (`-m "pg or not slow"` against PostgreSQL with `--cov-fail-under=60` -- the PG-and-default combined run is what hits the gate), and `marker-sync` (the reusable sync-check workflow from wxyc-etl that catches markers silently deselected by addopts).
 
 Test fixtures are in `tests/fixtures/` (CSV files, library.db, library_artists.txt). Regenerate with `python tests/fixtures/create_fixtures.py`.
 
