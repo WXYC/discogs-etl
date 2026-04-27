@@ -90,7 +90,7 @@ UNKNOWN_ARTISTS = [
     "Fake Artist 12345",
 ]
 
-pytestmark = pytest.mark.e2e
+pytestmark = pytest.mark.pg
 
 # -- Entity schema DDL (matches wxyc-etl schema/entity.rs) --
 

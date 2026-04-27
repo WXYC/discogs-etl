@@ -30,7 +30,7 @@ BASE_TABLES = _ic.BASE_TABLES
 TRACK_TABLES = _ic.TRACK_TABLES
 VIDEO_TABLES = _ic.VIDEO_TABLES
 
-pytestmark = pytest.mark.postgres
+pytestmark = pytest.mark.pg
 
 
 class TestImportCsv:

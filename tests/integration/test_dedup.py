@@ -40,7 +40,7 @@ load_library_labels = _dd.load_library_labels
 load_label_hierarchy = _dd.load_label_hierarchy
 create_label_match_table = _dd.create_label_match_table
 
-pytestmark = pytest.mark.postgres
+pytestmark = pytest.mark.pg
 
 ALL_TABLES = (
     "cache_metadata",

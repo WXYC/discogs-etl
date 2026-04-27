@@ -38,7 +38,6 @@ def _load_export_streaming_links():
         sys.path.pop(0)
 
 
-@pytest.mark.e2e
 @pytest.mark.skipif(not _has_lml, reason="library-metadata-lookup repo not found")
 class TestSyncLibraryE2E:
     """End-to-end test: generate TSV, build library.db, enrich with streaming links."""

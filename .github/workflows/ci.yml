@@ -38,7 +38,7 @@ jobs:
       - run: pip install -e ".[dev]"
       - run: pytest tests/unit/ -v
 
-  test-postgres:
+  pg:
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -74,12 +74,19 @@ jobs:
         run: |
           PGPASSWORD=discogs psql -h localhost -p 5433 -U discogs -d postgres \
             -c "CREATE EXTENSION IF NOT EXISTS pg_trgm;"
-      - name: Run all tests with coverage
+      - name: Run pg-marked tests with coverage
         env:
           DATABASE_URL_TEST: postgresql://discogs:discogs@localhost:5433/postgres
         run: >-
           pytest -v
-          -m "not slow"
+          -m "pg and not slow"
           --cov=scripts --cov=lib
           --cov-report=term-missing
           --cov-fail-under=60
+
+  marker-sync:
+    uses: WXYC/wxyc-etl/.github/workflows/check-ci-marker-sync.yml@main
+    with:
+      repo-path: "."
+      workflows-dir: ".github/workflows"
+      tests-dir: "tests"

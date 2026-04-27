@@ -6,7 +6,7 @@ Tests that external dependency failures are handled gracefully:
 - Dedup mid-ANALYZE / mid-copy-swap connection termination
 - Import COPY interruption (malformed data, partial failures)
 
-All tests require PostgreSQL and are marked with @pytest.mark.postgres.
+All tests require PostgreSQL and are marked with @pytest.mark.pg.
 Uses WXYC example artists for fixture data.
 """
 
@@ -49,7 +49,7 @@ assert _dd_spec is not None and _dd_spec.loader is not None
 dedup_releases = importlib.util.module_from_spec(_dd_spec)
 _dd_spec.loader.exec_module(dedup_releases)
 
-pytestmark = pytest.mark.postgres
+pytestmark = pytest.mark.pg
 
 PIPELINE_TABLES = run_pipeline.PIPELINE_TABLES
 

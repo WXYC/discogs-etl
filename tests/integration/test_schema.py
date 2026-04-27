@@ -22,7 +22,7 @@ assert _rp_spec is not None and _rp_spec.loader is not None
 run_pipeline = importlib.util.module_from_spec(_rp_spec)
 _rp_spec.loader.exec_module(run_pipeline)
 
-pytestmark = pytest.mark.postgres
+pytestmark = pytest.mark.pg
 
 
 class TestCreateDatabase:
