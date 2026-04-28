@@ -92,7 +92,11 @@ alembic revision -m "<short-name>"
 
 Prefer hand-written `op.execute()` migrations -- `--autogenerate` is intentionally off (no SQLAlchemy ORM models exist in this repo). When the change is simple SQL, it's fine to embed the DDL directly in `upgrade()`. When it's a large refactor, drop a new file under `schema/` and have `upgrade()` `op.execute(open(...).read())` it, the same pattern as `0001_initial`.
 
-**Not yet wired into deploy.** `alembic upgrade head` is *not* called by `scripts/run_pipeline.py`, the GitHub Actions cache-rebuild workflow, or the Docker entrypoint. The pipeline still applies `schema/*.sql` directly via `run_sql_file`. Switching the runtime path to drive everything through alembic is tracked in [WXYC/wxyc-etl#56](https://github.com/WXYC/wxyc-etl/issues/56). On first post-#56 deploy, existing production databases will be `alembic stamp head` stamped so they don't try to re-apply the baseline.
+**Deploy wiring**: the monthly rebuild workflow (`.github/workflows/rebuild-cache.yml`) runs `alembic upgrade head` before the pipeline kicks off. This applies any new migrations added since the last rebuild. The pipeline itself still applies `schema/*.sql` directly via `run_sql_file` for fresh-rebuild DDL — alembic and the legacy path stay in parity by way of the dual-write convention below.
+
+**Dual-write convention**: when adding a schema change, write the new `alembic/versions/<rev>_*.py` (or its referenced `schema/*.sql` snippet) AND mirror the change into `schema/create_database.sql` / `create_indexes.sql` / etc. so a fresh rebuild produces the same end-state as the alembic upgrade chain.
+
+**One-shot stamp procedure** (one-time operator action, see `docs/migrations-runbook.md`): existing production `discogs-cache` databases must be `alembic stamp head`-ed once, with a backup snapshot taken first, before the rebuild workflow runs `alembic upgrade head` for the first time. Without the stamp, alembic would try to re-apply `0001_initial.py` against the populated DB and fail with "relation already exists" because the underlying SQL files use bare `CREATE TABLE` (no `IF NOT EXISTS`).
 
 Alembic is a `[project.optional-dependencies] dev` dep -- install via `pip install -e .[dev]` and use `.venv/bin/alembic`.
 
