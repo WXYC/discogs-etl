@@ -1594,15 +1594,24 @@ def classify_all_releases(
 
         decisions = _rust_batch_classify(flat_artists, flat_titles, rust_pairs)
 
+        # A release with multiple primary artists fans out to one (artist,
+        # title) entry per artist (load_discogs_releases joins release_artist
+        # with extra=0). Reduce to one decision per release_id with precedence
+        # KEEP > REVIEW > PRUNE so the same release_id never lands in two sets.
+        precedence = {"keep": 2, "review": 1, "prune": 0}
+        best_for_release: dict[int, tuple[int, str, str, str]] = {}
         for i, decision in enumerate(decisions):
             release_id = flat_ids[i]
-            raw_artist = flat_raw_artists[i]
-            norm_artist = normalize_artist(raw_artist)
+            current = best_for_release.get(release_id)
+            if current is None or precedence[decision] > precedence[current[3]]:
+                best_for_release[release_id] = (i, flat_raw_artists[i], flat_titles[i], decision)
+
+        for release_id, (_, raw_artist, raw_title, decision) in best_for_release.items():
             if decision == "keep":
                 keep_ids.add(release_id)
             elif decision == "review":
                 review_ids.add(release_id)
-                raw_title = flat_titles[i]
+                norm_artist = normalize_artist(raw_artist)
                 result = MatchResult(Decision.REVIEW, 0.0, 0.0, 0.0, 0.0)
                 review_by_artist.setdefault(norm_artist, []).append((release_id, raw_title, result))
             else:
