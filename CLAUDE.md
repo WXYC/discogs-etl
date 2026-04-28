@@ -92,7 +92,7 @@ alembic revision -m "<short-name>"
 
 Prefer hand-written `op.execute()` migrations -- `--autogenerate` is intentionally off (no SQLAlchemy ORM models exist in this repo). When the change is simple SQL, it's fine to embed the DDL directly in `upgrade()`. When it's a large refactor, drop a new file under `schema/` and have `upgrade()` `op.execute(open(...).read())` it, the same pattern as `0001_initial`.
 
-**Deploy wiring**: the monthly rebuild workflow (`.github/workflows/rebuild-cache.yml`) runs `alembic upgrade head` before the pipeline kicks off. This applies any new migrations added since the last rebuild. The pipeline itself still applies `schema/*.sql` directly via `run_sql_file` for fresh-rebuild DDL — alembic and the legacy path stay in parity by way of the dual-write convention below.
+**Deploy wiring**: the monthly rebuild workflow (`.github/workflows/rebuild-cache.yml`) runs `alembic upgrade head` before the pipeline kicks off, gated by a `Verify alembic baseline is stamped` step that aborts the workflow within ~30 seconds (before the multi-GB dump download) if the target DB lacks an `alembic_version` table. Once stamped, the upgrade applies any new migrations added since the last rebuild. The pipeline itself still applies `schema/*.sql` directly via `run_sql_file` for fresh-rebuild DDL — alembic and the legacy path stay in parity by way of the dual-write convention below.
 
 **Dual-write convention**: when adding a schema change, write the new `alembic/versions/<rev>_*.py` (or its referenced `schema/*.sql` snippet) AND mirror the change into `schema/create_database.sql` / `create_indexes.sql` / etc. so a fresh rebuild produces the same end-state as the alembic upgrade chain.
 

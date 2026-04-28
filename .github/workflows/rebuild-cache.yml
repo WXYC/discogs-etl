@@ -53,6 +53,32 @@ jobs:
           cd /tmp/discogs-xml-converter && cargo build --release
           echo "/tmp/discogs-xml-converter/target/release" >> "$GITHUB_PATH"
 
+      # Migration steps run BEFORE the dump download/resolve so a missing stamp
+      # or DB connectivity problem fails the workflow inside ~30 seconds rather
+      # than after a 10-20 minute, ~63 GB dump download.
+
+      # Guard: refuse to upgrade if the DB hasn't been stamped with the alembic
+      # baseline. Without this, `alembic upgrade head` would try to re-apply
+      # 0001_initial against the populated DB and fail with the cryptic
+      # `psycopg.errors.DuplicateTable: relation "release" already exists`.
+      # The one-time stamp procedure lives in docs/migrations-runbook.md.
+      - name: Verify alembic baseline is stamped
+        env:
+          PGURL: ${{ secrets.DATABASE_URL_DISCOGS }}
+        run: |
+          set -euo pipefail
+          version=$(psql "$PGURL" -tAc "SELECT version_num FROM alembic_version" 2>/dev/null || true)
+          if [ -z "$version" ]; then
+            echo "::error::alembic_version table missing or empty on this database. Run the one-time stamp procedure in docs/migrations-runbook.md against this DB before re-running the workflow. Aborting before download to avoid wasting bandwidth."
+            exit 1
+          fi
+          echo "Current alembic version: $version"
+
+      - name: Apply pending alembic migrations
+        env:
+          DATABASE_URL_DISCOGS: ${{ secrets.DATABASE_URL_DISCOGS }}
+        run: alembic upgrade head
+
       - name: Resolve dump URL
         id: dump
         env:
@@ -74,19 +100,6 @@ jobs:
         run: |
           mkdir -p data
           curl -fL --retry 3 --retry-delay 30 -o data/releases.xml.gz "${{ steps.dump.outputs.url }}"
-
-      # Apply pending alembic migrations before kicking off the rebuild.
-      # Prerequisite (one-time, manual): operator must `alembic stamp head` the
-      # prod discogs-cache once before the first run of this step — see
-      # docs/migrations-runbook.md. Without the stamp, this would try to
-      # re-apply 0001_initial against the populated DB and fail with "relation
-      # release already exists" because the underlying schema/*.sql files use
-      # bare `CREATE TABLE` (no IF NOT EXISTS). Once stamped, every subsequent
-      # rebuild applies only newly-added migrations incrementally.
-      - name: Apply pending alembic migrations
-        env:
-          DATABASE_URL_DISCOGS: ${{ secrets.DATABASE_URL_DISCOGS }}
-        run: alembic upgrade head
 
       - name: Run pipeline
         env:
