@@ -61,7 +61,7 @@ from rapidfuzz import fuzz, process
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from wxyc_etl.text import is_compilation_artist, split_artist_name_contextual
 
-from lib.format_normalization import format_matches, normalize_format, normalize_library_format
+from lib.format_normalization import format_matches, normalize_library_format
 from lib.observability import init_logger
 
 logger = logging.getLogger(__name__)
@@ -1497,12 +1497,8 @@ def classify_all_releases(
             norm_title = normalize_title(raw_title)
             result = matcher.classify_known_artist(norm_artist, norm_title)
             if result.decision == Decision.KEEP:
-                # Format filtering for exact-match KEEP releases.
-                # Library formats are normalized in LibraryIndex.from_rows; the
-                # release format may arrive raw (e.g. "LP" from a SQL row that
-                # bypassed normalize_format at import), so normalize defensively
-                # here. normalize_format is idempotent on already-normalized input.
-                rel_fmt = normalize_format(release_formats.get(release_id))
+                # Format filtering for exact-match KEEP releases
+                rel_fmt = release_formats.get(release_id)
                 lib_formats = index.format_by_pair.get((norm_artist, norm_title), set())
                 if not format_matches(rel_fmt, lib_formats):
                     prune_ids.add(release_id)
