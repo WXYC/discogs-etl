@@ -214,7 +214,9 @@ class TestBatchClassifyFormatFiltering:
         rows = [("Juana Molina", "DOGA", "LP")]
         idx = LibraryIndex.from_rows(rows)
         matcher = MultiIndexMatcher(idx)
-        releases = [(31, "Juana Molina", "DOGA", "LP")]
+        # Production stores already-normalized release.format ("Vinyl"),
+        # while the library side is normalized inside LibraryIndex.from_rows.
+        releases = [(31, "Juana Molina", "DOGA", "Vinyl")]
 
         report_rust = classify_all_releases(releases, idx, matcher)
         with patch.dict(os.environ, {"WXYC_ETL_NO_RUST": "1"}):
