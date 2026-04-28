@@ -75,6 +75,19 @@ jobs:
           mkdir -p data
           curl -fL --retry 3 --retry-delay 30 -o data/releases.xml.gz "${{ steps.dump.outputs.url }}"
 
+      # Apply pending alembic migrations before kicking off the rebuild.
+      # Prerequisite (one-time, manual): operator must `alembic stamp head` the
+      # prod discogs-cache once before the first run of this step — see
+      # docs/migrations-runbook.md. Without the stamp, this would try to
+      # re-apply 0001_initial against the populated DB and fail with "relation
+      # release already exists" because the underlying schema/*.sql files use
+      # bare `CREATE TABLE` (no IF NOT EXISTS). Once stamped, every subsequent
+      # rebuild applies only newly-added migrations incrementally.
+      - name: Apply pending alembic migrations
+        env:
+          DATABASE_URL_DISCOGS: ${{ secrets.DATABASE_URL_DISCOGS }}
+        run: alembic upgrade head
+
       - name: Run pipeline
         env:
           DATABASE_URL_DISCOGS: ${{ secrets.DATABASE_URL_DISCOGS }}
