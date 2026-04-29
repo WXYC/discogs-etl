@@ -264,7 +264,7 @@ When wired up, this installs a JSON formatter on the root logger and (when `SENT
 | `step` | per-event, supplied via `logger.info("...", extra={"step": "import"})` |
 | `run_id` | UUIDv4 generated at `init_logger` time (one per process) |
 
-`SENTRY_DSN` is read from the environment. When unset, JSON logging still works and Sentry stays inactive — there is no hard requirement on the DSN being configured. **TODO**: provision `SENTRY_DSN` in the GitHub Actions runtime env (sync-library workflow) and on EC2 / Railway as a separate child task.
+`SENTRY_DSN` is read from the environment. When unset, JSON logging still works and Sentry stays inactive — there is no hard requirement on the DSN being configured. Both the `rebuild-cache.yml` and `sync-library.yml` workflows propagate `secrets.SENTRY_DSN` into their pipeline-running steps, so adding the secret to the repo is enough to activate Sentry across both. EC2 / Railway runtime envs are separate operator tasks and not yet wired.
 
 Scripts that initialize the logger (subprocesses each get their own run_id, since they are independent processes): `run_pipeline.py`, `import_csv.py`, `dedup_releases.py`, `verify_cache.py`, `filter_csv.py`, `resolve_collisions.py`, `tsv_to_sqlite.py`. The shim itself lives in `lib/observability.py`.
 

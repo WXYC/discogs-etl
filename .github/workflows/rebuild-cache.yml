@@ -109,8 +109,9 @@ jobs:
         env:
           DATABASE_URL_DISCOGS: ${{ secrets.DATABASE_URL_DISCOGS }}
           DISCOGS_TOKEN: ${{ secrets.DISCOGS_TOKEN }}
-          # TODO: provision SENTRY_DSN as a separate operator task. Until then
-          # JSON logging still emits to stderr and Sentry stays inactive.
+          # When SENTRY_DSN is set as a repo secret, wxyc_etl.logger.init_logger
+          # hands exception events to the Sentry SDK. Unset → Sentry stays
+          # inactive, JSON logging still emits to stderr.
           SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
         run: |
           python scripts/run_pipeline.py \

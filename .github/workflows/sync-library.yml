@@ -51,6 +51,11 @@ jobs:
           ADMIN_TOKEN: ${{ secrets.ADMIN_TOKEN }}
           STAGING_URL: ${{ secrets.STAGING_URL }}
           PRODUCTION_URL: ${{ secrets.PRODUCTION_URL }}
+          # Optional: when SENTRY_DSN is set, scripts/tsv_to_sqlite.py and the
+          # other Python entrypoints invoked by sync-library.sh hand exception
+          # events to Sentry via wxyc_etl.logger. Unset → Sentry stays inactive,
+          # JSON logging still emits to stderr.
+          SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
 
       - name: Update library.db in LML release
         if: success()
