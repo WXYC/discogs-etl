@@ -139,7 +139,7 @@ This is what wiped the WXYC prod discogs-cache on 2026-04-28 (~14,667 release ro
 **Defensive guards now in place:**
 
 - `0001_initial.py.upgrade()` raises `RuntimeError` immediately if `context.is_offline_mode()` is true. `alembic upgrade head --sql` will fail fast with a clear message instead of silently dropping tables.
-- A second guard short-circuits `upgrade()` if `release` and `alembic_version` are both already present, so a misconfigured live invocation also fails safe.
-- An integration test (`tests/integration/test_alembic_baseline.py::test_alembic_upgrade_head_sql_against_populated_db_is_safe`) pins both behaviors.
+- A second guard short-circuits `upgrade()` if `release` and `cache_metadata` are both already present (the latter is specific to this schema, so the pair is unlikely to match an unrelated DB). The short-circuit logs a warning and returns; alembic itself records `version_num = '0001_initial'` afterward, leaving the DB equivalent to one that was `alembic stamp head`-ed. This catches both the stamped+populated and populated+unstamped accident cases.
+- Two pg-marked integration tests pin both guards: `tests/integration/test_alembic_baseline.py::test_alembic_upgrade_head_sql_against_populated_db_is_safe` and `::test_alembic_upgrade_head_against_populated_unstamped_db_is_safe`.
 
 If a future migration needs autocommit DDL (e.g., `CREATE INDEX CONCURRENTLY`, extension creation), keep the guards: either follow the same `is_offline_mode()` check, or write the migration with `op.execute(..., execution_options={"isolation_level": "AUTOCOMMIT"})` so alembic's offline mode can intercept it.
