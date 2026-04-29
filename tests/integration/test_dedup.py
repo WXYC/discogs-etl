@@ -39,6 +39,7 @@ add_constraints_and_indexes = _dd.add_constraints_and_indexes
 load_library_labels = _dd.load_library_labels
 load_label_hierarchy = _dd.load_label_hierarchy
 create_label_match_table = _dd.create_label_match_table
+DEDUP_TABLES = _dd.DEDUP_TABLES
 
 pytestmark = pytest.mark.pg
 
@@ -101,50 +102,6 @@ def _fresh_import(db_url: str) -> None:
     conn.commit()
     create_track_count_table(conn, CSV_DIR)
     conn.close()
-
-
-DEDUP_TABLES = [
-    (
-        "release",
-        "new_release",
-        "id, title, release_year, country, artwork_url, released, format",
-        "id",
-    ),
-    (
-        "release_artist",
-        "new_release_artist",
-        "release_id, artist_id, artist_name, extra, role",
-        "release_id",
-    ),
-    (
-        "release_label",
-        "new_release_label",
-        "release_id, label_id, label_name, catno",
-        "release_id",
-    ),
-    # release_genre and release_style must be in this list so swap_tables drops the
-    # original tables (and their indexes from create_database.sql) before
-    # add_base_constraints_and_indexes recreates them. Otherwise the index creation
-    # in add_base_constraints_and_indexes fails with DuplicateTable.
-    (
-        "release_genre",
-        "new_release_genre",
-        "release_id, genre",
-        "release_id",
-    ),
-    (
-        "release_style",
-        "new_release_style",
-        "release_id, style",
-        "release_id",
-    ),
-    (
-        "cache_metadata",
-        "new_cache_metadata",
-        "release_id, cached_at, source, last_validated",
-        "release_id",
-    ),
-]
 
 
 def _run_dedup(db_url: str) -> None:
@@ -1248,3 +1205,92 @@ class TestDedupCopySwapAbortCleanup:
         assert ids == [2], f"Only US release should survive dedup, got {ids}"
         assert dangling == [], f"No dangling temp tables should remain: {dangling}"
         assert not dedup_exists, "dedup_delete_ids should be cleaned up"
+
+
+class TestDedupCopySwapPreservesMasterId:
+    """Regression for WXYC/discogs-etl#129.
+
+    Before the fix, the copy-swap step's SELECT list at dedup_releases.py:589
+    omitted ``release.master_id``. Because copy_table() uses ``CREATE TABLE
+    new_release AS SELECT {columns} ...``, the column was absent from
+    new_release, and the swap (RENAME) carried that absence onto the live
+    ``release`` table. After every monthly rebuild ``master_id`` was gone from
+    the schema entirely — silent because no test exercised the copy-swap path
+    against fixtures with a collision. The 2026-04-28 incident recovery
+    needed master_id and we had to re-import it manually.
+    """
+
+    @pytest.fixture(autouse=True, scope="class")
+    def _set_up_and_dedup(self, db_url):
+        self.__class__._db_url = db_url
+        conn = psycopg.connect(db_url, autocommit=True)
+        _drop_all_tables(conn)
+        with conn.cursor() as cur:
+            cur.execute(SCHEMA_DIR.joinpath("create_database.sql").read_text())
+            cur.execute(SCHEMA_DIR.joinpath("create_functions.sql").read_text())
+            # Collision pair on (master_id=100, format='LP'). US release wins.
+            cur.execute(
+                "INSERT INTO release (id, title, master_id, format, country) "
+                "VALUES (1, 'Aluminum Tunes', 100, 'LP', 'UK')"
+            )
+            cur.execute(
+                "INSERT INTO release (id, title, master_id, format, country) "
+                "VALUES (2, 'Aluminum Tunes', 100, 'LP', 'US')"
+            )
+            # Singleton survivor with a distinct master_id, so we can prove
+            # post-swap master_id is populated rather than uniformly NULL.
+            cur.execute(
+                "INSERT INTO release (id, title, master_id, format, country) "
+                "VALUES (3, 'DOGA', 200, 'LP', 'AR')"
+            )
+            cur.execute(
+                "INSERT INTO release_artist (release_id, artist_name) VALUES (1, 'Stereolab')"
+            )
+            cur.execute(
+                "INSERT INTO release_artist (release_id, artist_name) VALUES (2, 'Stereolab')"
+            )
+            cur.execute(
+                "INSERT INTO release_artist (release_id, artist_name) VALUES (3, 'Juana Molina')"
+            )
+            cur.execute("INSERT INTO cache_metadata (release_id, source) VALUES (1, 'bulk_import')")
+            cur.execute("INSERT INTO cache_metadata (release_id, source) VALUES (2, 'bulk_import')")
+            cur.execute("INSERT INTO cache_metadata (release_id, source) VALUES (3, 'bulk_import')")
+            cur.execute("""
+                CREATE UNLOGGED TABLE release_track_count (
+                    release_id integer PRIMARY KEY,
+                    track_count integer NOT NULL
+                )
+            """)
+            cur.execute("INSERT INTO release_track_count VALUES (1, 5), (2, 3), (3, 4)")
+        conn.close()
+        _run_dedup(db_url)
+
+    @pytest.fixture(autouse=True)
+    def _store_url(self):
+        self.db_url = self.__class__._db_url
+
+    def _connect(self):
+        return psycopg.connect(self.db_url)
+
+    def test_master_id_column_persists_after_copy_swap(self) -> None:
+        """The release table still has a master_id column after the copy-swap fires."""
+        conn = self._connect()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_name = 'release' AND column_name = 'master_id'"
+            )
+            assert cur.fetchone() is not None, (
+                "master_id column dropped by copy-swap — see WXYC/discogs-etl#129"
+            )
+        conn.close()
+
+    def test_master_id_values_preserved_for_surviving_releases(self) -> None:
+        """master_id values on surviving rows match what was inserted, not NULL."""
+        conn = self._connect()
+        with conn.cursor() as cur:
+            cur.execute("SELECT id, master_id FROM release ORDER BY id")
+            rows = cur.fetchall()
+        conn.close()
+        # Release 1 lost the dedup; release 2 (US) won; release 3 untouched.
+        assert rows == [(2, 100), (3, 200)], f"master_id values not preserved post-dedup: {rows}"

@@ -304,6 +304,51 @@ def ensure_dedup_ids(conn) -> int:
     return count
 
 
+# Tables copied during the dedup swap. Each tuple is
+# (old_table, new_table, copied_columns, id_col_for_dedup_filter). This lives
+# at module scope so tests/integration/test_dedup.py imports the same list the
+# production main() uses, instead of maintaining a parallel copy that can
+# silently drift (which is how WXYC/discogs-etl#129 hid for a release).
+DEDUP_TABLES: list[tuple[str, str, str, str]] = [
+    (
+        "release",
+        "new_release",
+        "id, title, release_year, country, artwork_url, released, format, master_id",
+        "id",
+    ),
+    (
+        "release_artist",
+        "new_release_artist",
+        "release_id, artist_id, artist_name, extra, role",
+        "release_id",
+    ),
+    (
+        "release_label",
+        "new_release_label",
+        "release_id, label_id, label_name, catno",
+        "release_id",
+    ),
+    (
+        "release_genre",
+        "new_release_genre",
+        "release_id, genre",
+        "release_id",
+    ),
+    (
+        "release_style",
+        "new_release_style",
+        "release_id, style",
+        "release_id",
+    ),
+    (
+        "cache_metadata",
+        "new_cache_metadata",
+        "release_id, cached_at, source, last_validated",
+        "release_id",
+    ),
+]
+
+
 def copy_table(conn, old_table: str, new_table: str, columns: str, id_col: str) -> int:
     """Copy rows NOT in dedup_delete_ids to a new table.
 
@@ -582,46 +627,7 @@ def main():
 
     # Step 2: Copy each table (keeping only non-duplicate rows)
     # Only base tables + cache_metadata (tracks are imported after dedup)
-    tables = [
-        (
-            "release",
-            "new_release",
-            "id, title, release_year, country, artwork_url, released, format",
-            "id",
-        ),
-        (
-            "release_artist",
-            "new_release_artist",
-            "release_id, artist_id, artist_name, extra, role",
-            "release_id",
-        ),
-        (
-            "release_label",
-            "new_release_label",
-            "release_id, label_id, label_name, catno",
-            "release_id",
-        ),
-        (
-            "release_genre",
-            "new_release_genre",
-            "release_id, genre",
-            "release_id",
-        ),
-        (
-            "release_style",
-            "new_release_style",
-            "release_id, style",
-            "release_id",
-        ),
-        (
-            "cache_metadata",
-            "new_cache_metadata",
-            "release_id, cached_at, source, last_validated",
-            "release_id",
-        ),
-    ]
-
-    for old, new, cols, id_col in tables:
+    for old, new, cols, id_col in DEDUP_TABLES:
         copy_table(conn, old, new, cols, id_col)
 
     # Step 3: Drop old FK constraints before swap
@@ -638,7 +644,7 @@ def main():
 
     # Step 4: Swap tables
     logger.info("Swapping tables...")
-    for old, new, _, _ in tables:
+    for old, new, _, _ in DEDUP_TABLES:
         swap_tables(conn, old, new)
 
     # Step 5: Add base constraints and indexes

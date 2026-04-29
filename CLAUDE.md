@@ -47,9 +47,11 @@ Step 1 (download) is always manual.
 
 ### master_id Column Lifecycle
 
-The `release` table includes a `master_id` column used during import and dedup. The dedup copy-swap strategy (`CREATE TABLE AS SELECT ...` without `master_id`) drops the column automatically. After dedup, `master_id` no longer exists in the schema.
+The `release` table includes a `master_id` column populated during import (links a release to its Discogs "master" — the conceptual album, distinct from any specific pressing/edition). It is used during dedup (`PARTITION BY master_id, format` in `ensure_dedup_ids`) and persists through the dedup copy-swap so consumers can group editions of the same album. NULL is allowed (singles, demos, and obscure pressings often lack a master).
 
-The `country` column, by contrast, is permanent -- it is included in the dedup copy-swap SELECT list and persists in the final schema for consumers.
+The dedup `CREATE TABLE new_release AS SELECT ... FROM release` SELECT list at `scripts/dedup_releases.py` (`DEDUP_TABLES` module constant) must include `master_id` for the column to survive the swap. Tests in `tests/integration/test_dedup.py::TestDedupCopySwapPreservesMasterId` pin this — they import `DEDUP_TABLES` from the production module rather than mirroring it, so the test cannot drift from production.
+
+The `country` column behaves the same way — listed in the dedup SELECT and therefore permanent.
 
 ### format Column Lifecycle
 
