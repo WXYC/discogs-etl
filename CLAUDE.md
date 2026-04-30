@@ -128,6 +128,7 @@ docker compose up db -d     # just the database (for tests)
 - `lib/format_normalization.py` -- Normalize raw Discogs/library format strings to broad categories (Vinyl, CD, Cassette, 7", Digital)
 - `scripts/sync-library.sh` -- Daily library sync orchestrator: MySQL query (via MariaDB `mysql` CLI for MySQL 4.1 compat) → `tsv_to_sqlite.py` → streaming links enrichment → upload to LML. Automated by `.github/workflows/sync-library.yml` (daily at noon UTC).
 - `scripts/tsv_to_sqlite.py` -- Converts MySQL TSV output to SQLite with FTS5 index. Called by sync-library.sh.
+- `scripts/check_cache_drift.py` -- Drift watchdog: compares `COUNT(DISTINCT artist) FROM library` (sqlite) to `COUNT(DISTINCT artist_name) FROM release_artist` (cache). Exits non-zero (and posts to `SLACK_MONITORING_WEBHOOK` when set) if the ratio falls below `--min-ratio` (default 0.7). Run as the final step of `rebuild-cache.yml` so coverage regressions surface as workflow failures.
 - `docs/discogs-etl-technical-overview.md` -- Design rationale, benchmarks, and pipeline architecture details
 
 ### Shared Package Dependencies
@@ -206,6 +207,8 @@ The job downloads `releases.xml.gz` for the current month from `discogs-data-dum
 
 The workflow runs `--pair-filter` so the import payload to `DATABASE_URL_DISCOGS` is ~50K release rows instead of the converter's ~4M, which is what makes a Railway-sized destination DB feasible (the unfiltered import overflows the volume at `COPY release_artist`; see #128).
 
+After the pipeline succeeds, the workflow runs `scripts/check_cache_drift.py` against the just-rebuilt cache. It compares `COUNT(DISTINCT artist) FROM library` (sqlite) to `COUNT(DISTINCT artist_name) FROM release_artist` (cache); if the ratio falls below `0.7`, the step exits non-zero, the workflow's `failure()` Slack notifier fires, and the watchdog itself posts a more specific drift message via `SLACK_MONITORING_WEBHOOK`. This is the third acceptance criterion of [#125](https://github.com/WXYC/discogs-etl/issues/125): drift between rebuilds must be visible without a human looking. A pipeline-level failure (the rebuild itself crashing) also fires the same Slack notifier through the workflow's final `if: failure()` step, mirroring the `--notify` pattern in `scripts/sync-library.sh`.
+
 **Caveat — runner capacity**: the Discogs releases dump is ~63 GB compressed XML and the conversion + Postgres bulk load can exceed the GitHub Actions free hosted runner's ~14 GB disk and 6-hour wall-clock budget. The workflow file is the deliverable; provisioning a self-hosted or larger hosted runner is a follow-up operator task. Until then, expect the scheduled tick to fail loudly rather than silently produce a half-built cache.
 
 **Required GitHub secrets:**
@@ -213,9 +216,10 @@ The workflow runs `--pair-filter` so the import payload to `DATABASE_URL_DISCOGS
 | Secret | Description |
 |--------|-------------|
 | `DATABASE_URL_DISCOGS` | PostgreSQL URL for the destination cache database |
-| `LIBRARY_CATALOG_DB_URL` | MySQL URL for the tubafrenzy catalog (used by `--generate-library-db`) |
+| `LIBRARY_CATALOG_DB_URL` | MySQL URL for the tubafrenzy catalog (used by `--generate-library-db` and the watchdog's library.db re-export) |
 | `DISCOGS_TOKEN` | Discogs API token (optional; only matters if rate limits are hit) |
 | `SENTRY_DSN` | Sentry DSN for error reporting (optional; JSON logging still works without it) |
+| `SLACK_MONITORING_WEBHOOK` | Slack incoming webhook for failure + drift alerts (optional; without it failures still fail the workflow but only Sentry sees them) |
 
 ### Library Sync (`sync-library.yml`)
 
@@ -266,7 +270,7 @@ When wired up, this installs a JSON formatter on the root logger and (when `SENT
 
 `SENTRY_DSN` is read from the environment. When unset, JSON logging still works and Sentry stays inactive — there is no hard requirement on the DSN being configured. Both the `rebuild-cache.yml` and `sync-library.yml` workflows propagate `secrets.SENTRY_DSN` into their pipeline-running steps, so adding the secret to the repo is enough to activate Sentry across both. EC2 / Railway runtime envs are separate operator tasks and not yet wired.
 
-Scripts that initialize the logger (subprocesses each get their own run_id, since they are independent processes): `run_pipeline.py`, `import_csv.py`, `dedup_releases.py`, `verify_cache.py`, `filter_csv.py`, `resolve_collisions.py`, `tsv_to_sqlite.py`. The shim itself lives in `lib/observability.py`.
+Scripts that initialize the logger (subprocesses each get their own run_id, since they are independent processes): `run_pipeline.py`, `import_csv.py`, `dedup_releases.py`, `verify_cache.py`, `filter_csv.py`, `resolve_collisions.py`, `tsv_to_sqlite.py`, `check_cache_drift.py`. The shim itself lives in `lib/observability.py`.
 
 ## Development Practices
 

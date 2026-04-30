@@ -120,3 +120,48 @@ jobs:
             --catalog-source tubafrenzy \
             --catalog-db-url "${{ secrets.LIBRARY_CATALOG_DB_URL }}" \
             --pair-filter
+
+      # Watchdog: cache_distinct_artists / library_distinct_artists ratio
+      # exposes drift between the just-rebuilt cache and the WXYC library
+      # catalog. A ratio below --min-ratio fails this step (and the workflow),
+      # firing the Slack alert below as a separate signal from "the rebuild
+      # itself crashed". Issue #125, third acceptance criterion.
+      #
+      # The pipeline above generates library.db inside a tempdir that we
+      # don't have a handle to here, so we re-export it in this step using
+      # the same wxyc-catalog CLI. The export is cheap relative to the
+      # pipeline (≈seconds vs hours).
+      - name: Check cache drift vs. library
+        if: success()
+        env:
+          DATABASE_URL_DISCOGS: ${{ secrets.DATABASE_URL_DISCOGS }}
+          SLACK_MONITORING_WEBHOOK: ${{ secrets.SLACK_MONITORING_WEBHOOK }}
+          SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
+        run: |
+          set -euo pipefail
+          wxyc-export-to-sqlite \
+            --catalog-source tubafrenzy \
+            --catalog-db-url "${{ secrets.LIBRARY_CATALOG_DB_URL }}" \
+            --output /tmp/library-watchdog.db
+          python scripts/check_cache_drift.py \
+            --library-db /tmp/library-watchdog.db \
+            --min-ratio 0.7
+
+      # Slack alert on any failure in this workflow (rebuild or watchdog).
+      # Mirrors the --notify pattern in scripts/sync-library.sh; posts only
+      # when SLACK_MONITORING_WEBHOOK is set as a repo secret. Issue #125,
+      # second acceptance criterion.
+      - name: Notify Slack on failure
+        if: failure()
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_MONITORING_WEBHOOK }}
+          RUN_URL: "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+        run: |
+          if [ -z "${SLACK_WEBHOOK_URL:-}" ]; then
+            echo "SLACK_MONITORING_WEBHOOK unset; skipping Slack post."
+            exit 0
+          fi
+          curl -s -X POST "$SLACK_WEBHOOK_URL" \
+            -H "Content-Type: application/json" \
+            -d "{\"text\":\":warning: *Discogs cache rebuild failed*\nRun: $RUN_URL\"}" \
+            || true
