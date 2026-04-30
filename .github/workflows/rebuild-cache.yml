@@ -11,6 +11,14 @@ name: Rebuild Discogs Cache
 # this, the import overflows small destination DBs (Railway-sized) at
 # `COPY release_artist` — see #128.
 #
+# Library catalog: this workflow consumes the `library.db` produced daily by
+# `sync-library.yml` (uploaded as an asset on the `streaming-data-v1` release
+# in WXYC/library-metadata-lookup). Earlier iterations called
+# `--generate-library-db --catalog-source tubafrenzy` here, but Kattare's
+# MySQL is not directly internet-reachable — the daily sync workflow tunnels
+# in over SSH. Reusing its output asset keeps that connectivity story in one
+# place and avoids duplicating SSH credentials across workflows.
+#
 # TODO: the Discogs releases dump is ~63 GB compressed XML; expanding +
 # converting it can exceed the GitHub Actions free-runner disk (~14 GB) and
 # 6-hour wall-clock budget. The skeleton here lets operators kick the rebuild
@@ -100,6 +108,29 @@ jobs:
             echo "url=https://discogs-data-dumps.s3.us-west-2.amazonaws.com/data/${year}/discogs_${stamp}_releases.xml.gz" >> "$GITHUB_OUTPUT"
           fi
 
+      # Pull the daily-fresh library.db from sync-library.yml's release artifact
+      # rather than regenerating it here from MySQL. Kattare's MySQL is reachable
+      # only through an SSH tunnel; sync-library.yml owns that tunnel + handles
+      # MySQL 4.1 quirks via the MariaDB CLI. By the time this monthly cron tick
+      # fires (06:00 UTC on the 4th), the previous day's sync upload (12:00 UTC
+      # on the 3rd) is the freshest available snapshot.
+      #
+      # `gh release download --pattern` filters to the single asset we need, so
+      # we don't pull the much-larger streaming_availability.db that ships in
+      # the same release. ${{ github.token }} has read scope on public repos
+      # (LML is public); the upstream upload step uses LML_RELEASE_TOKEN.
+      - name: Download library.db from LML release artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p data
+          gh release download streaming-data-v1 \
+            --repo WXYC/library-metadata-lookup \
+            --pattern library.db \
+            --output data/library.db
+          echo "library.db size: $(du -h data/library.db | cut -f1)"
+
       - name: Download Discogs releases dump
         run: |
           mkdir -p data
@@ -116,9 +147,7 @@ jobs:
         run: |
           python scripts/run_pipeline.py \
             --xml data/releases.xml.gz \
-            --generate-library-db \
-            --catalog-source tubafrenzy \
-            --catalog-db-url "${{ secrets.LIBRARY_CATALOG_DB_URL }}" \
+            --library-db data/library.db \
             --pair-filter
 
       # Watchdog: cache_distinct_artists / library_distinct_artists ratio
@@ -127,10 +156,9 @@ jobs:
       # firing the Slack alert below as a separate signal from "the rebuild
       # itself crashed". Issue #125, third acceptance criterion.
       #
-      # The pipeline above generates library.db inside a tempdir that we
-      # don't have a handle to here, so we re-export it in this step using
-      # the same wxyc-catalog CLI. The export is cheap relative to the
-      # pipeline (≈seconds vs hours).
+      # Reuses data/library.db that the earlier "Download library.db from LML
+      # release artifact" step already pulled — same snapshot the pipeline
+      # filtered against, so the drift comparison is apples-to-apples.
       - name: Check cache drift vs. library
         if: success()
         env:
@@ -139,12 +167,8 @@ jobs:
           SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
         run: |
           set -euo pipefail
-          wxyc-export-to-sqlite \
-            --catalog-source tubafrenzy \
-            --catalog-db-url "${{ secrets.LIBRARY_CATALOG_DB_URL }}" \
-            --output /tmp/library-watchdog.db
           python scripts/check_cache_drift.py \
-            --library-db /tmp/library-watchdog.db \
+            --library-db data/library.db \
             --min-ratio 0.7
 
       # Slack alert on any failure in this workflow (rebuild or watchdog).

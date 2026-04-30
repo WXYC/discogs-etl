@@ -203,11 +203,13 @@ This pipeline runs monthly (or when Discogs publishes new data dumps). It has a 
 
 A GitHub Actions cron workflow runs `scripts/run_pipeline.py --xml ...` on the 4th of each month at 06:00 UTC, staggered a few days after Discogs publishes the new dump. It can also be triggered manually with an optional `dump_url` input: `gh workflow run rebuild-cache.yml`.
 
-The job downloads `releases.xml.gz` for the current month from `discogs-data-dumps.s3.us-west-2.amazonaws.com`, builds `discogs-xml-converter` from source, and runs the full XML-mode pipeline (steps 2-10) against `DATABASE_URL_DISCOGS`. Library catalog is generated inline via `--generate-library-db --catalog-source tubafrenzy`.
+The job downloads `releases.xml.gz` for the current month from `discogs-data-dumps.s3.us-west-2.amazonaws.com`, downloads the daily-fresh `library.db` from `WXYC/library-metadata-lookup`'s `streaming-data-v1` release (produced by `sync-library.yml`), builds `discogs-xml-converter` from source, and runs the full XML-mode pipeline (steps 2-10) against `DATABASE_URL_DISCOGS`.
 
 The workflow runs `--pair-filter` so the import payload to `DATABASE_URL_DISCOGS` is ~50K release rows instead of the converter's ~4M, which is what makes a Railway-sized destination DB feasible (the unfiltered import overflows the volume at `COPY release_artist`; see #128).
 
 After the pipeline succeeds, the workflow runs `scripts/check_cache_drift.py` against the just-rebuilt cache. It compares `COUNT(DISTINCT artist) FROM library` (sqlite) to `COUNT(DISTINCT artist_name) FROM release_artist` (cache); if the ratio falls below `0.7`, the step exits non-zero, the workflow's `failure()` Slack notifier fires, and the watchdog itself posts a more specific drift message via `SLACK_MONITORING_WEBHOOK`. This is the third acceptance criterion of [#125](https://github.com/WXYC/discogs-etl/issues/125): drift between rebuilds must be visible without a human looking. A pipeline-level failure (the rebuild itself crashing) also fires the same Slack notifier through the workflow's final `if: failure()` step, mirroring the `--notify` pattern in `scripts/sync-library.sh`.
+
+**Library catalog source**: the workflow used to call `--generate-library-db --catalog-source tubafrenzy --catalog-db-url ...` to build `library.db` inline. That path required direct MySQL connectivity to Kattare, which is impossible from a GitHub-hosted runner (Kattare's MySQL only resolves from inside Kattare's network — the daily `sync-library.yml` workflow tunnels in over SSH). Reusing sync-library's pre-built artifact keeps the SSH credentials in one place. By 06:00 UTC on the 4th, the sync upload from 12:00 UTC on the 3rd is the freshest available snapshot. The watchdog reuses the same `data/library.db` for its drift comparison so the rebuild and the comparison are looking at the same library snapshot.
 
 **Caveat — runner capacity**: the Discogs releases dump is ~63 GB compressed XML and the conversion + Postgres bulk load can exceed the GitHub Actions free hosted runner's ~14 GB disk and 6-hour wall-clock budget. The workflow file is the deliverable; provisioning a self-hosted or larger hosted runner is a follow-up operator task. Until then, expect the scheduled tick to fail loudly rather than silently produce a half-built cache.
 
@@ -216,10 +218,11 @@ After the pipeline succeeds, the workflow runs `scripts/check_cache_drift.py` ag
 | Secret | Description |
 |--------|-------------|
 | `DATABASE_URL_DISCOGS` | PostgreSQL URL for the destination cache database |
-| `LIBRARY_CATALOG_DB_URL` | MySQL URL for the tubafrenzy catalog (used by `--generate-library-db` and the watchdog's library.db re-export) |
 | `DISCOGS_TOKEN` | Discogs API token (optional; only matters if rate limits are hit) |
 | `SENTRY_DSN` | Sentry DSN for error reporting (optional; JSON logging still works without it) |
 | `SLACK_MONITORING_WEBHOOK` | Slack incoming webhook for failure + drift alerts (optional; without it failures still fail the workflow but only Sentry sees them) |
+
+**Upstream dependency**: a successful `sync-library.yml` run must have uploaded `library.db` to the `streaming-data-v1` release on `WXYC/library-metadata-lookup` before this workflow fires, or the `Download library.db from LML release artifact` step fails with `release asset not found`. The default `${{ github.token }}` has read scope on the public LML repo; no extra PAT required.
 
 ### Library Sync (`sync-library.yml`)
 
