@@ -27,6 +27,9 @@ def test_pg_text_roundtrip(
         request.applymarker(pytest.mark.xfail(reason=xfail_reason, strict=True, raises=Exception))
 
     with db_conn.cursor() as cur:
+        # Defensive: TEMP TABLEs survive rollbacks; if a future db_conn fixture
+        # widens its scope, the next test would fail with "relation already exists".
+        cur.execute("DROP TABLE IF EXISTS charset_probe")
         cur.execute("CREATE TEMP TABLE charset_probe (id SERIAL PRIMARY KEY, value TEXT NOT NULL)")
         cur.execute("INSERT INTO charset_probe (value) VALUES (%s) RETURNING id", (entry["input"],))
         row_id = cur.fetchone()[0]
