@@ -128,7 +128,8 @@ docker compose up db -d     # just the database (for tests)
 - `lib/format_normalization.py` -- Normalize raw Discogs/library format strings to broad categories (Vinyl, CD, Cassette, 7", Digital)
 - `scripts/sync-library.sh` -- Daily library sync orchestrator: MySQL query (via MariaDB `mysql` CLI for MySQL 4.1 compat) → `tsv_to_sqlite.py` → streaming links enrichment → upload to LML. Automated by `.github/workflows/sync-library.yml` (daily at noon UTC).
 - `scripts/tsv_to_sqlite.py` -- Converts MySQL TSV output to SQLite with FTS5 index. Called by sync-library.sh.
-- `scripts/check_cache_drift.py` -- Drift watchdog: compares `COUNT(DISTINCT artist) FROM library` (sqlite) to `COUNT(DISTINCT artist_name) FROM release_artist` (cache). Exits non-zero (and posts to `SLACK_MONITORING_WEBHOOK` when set) if the ratio falls below `--min-ratio` (default 0.7). Run as the final step of `rebuild-cache.yml` so coverage regressions surface as workflow failures.
+- `scripts/check_cache_drift.py` -- Drift watchdog: compares `COUNT(DISTINCT artist) FROM library` (sqlite) to `COUNT(DISTINCT artist_name) FROM release_artist` (cache). Exits non-zero (and posts to `SLACK_MONITORING_WEBHOOK` when set) if the ratio falls below `--min-ratio` (default 0.7). Run as the final step of `rebuild-cache.sh` so coverage regressions surface as alerts.
+- `scripts/rebuild-cache.sh` -- EC2 cron wrapper: pulls latest discogs-etl + discogs-xml-converter, downloads library.db from LML release artifact, streams the Discogs dump from data.discogs.com through a FIFO into the converter, runs `run_pipeline.py --pair-filter`, then the drift watchdog. Setup runbook at `docs/ec2-rebuild-runbook.md`.
 - `docs/discogs-etl-technical-overview.md` -- Design rationale, benchmarks, and pipeline architecture details
 
 ### Shared Package Dependencies
@@ -201,9 +202,9 @@ This pipeline runs monthly (or when Discogs publishes new data dumps). It has a 
 
 ### Monthly Cache Rebuild (`rebuild-cache.yml`)
 
-**Status (2026-05-05)**: the cron schedule has been disabled. Two cron-tick attempts (2026-05-04, 2026-05-05) demonstrated that this rebuild doesn't fit a GitHub-hosted runner — Discogs's Cloudflare front blocks GH-runner egress IPs from `data.discogs.com/?download=` (residential IPs get 200, runner gets 403), and the job's compute envelope (~30+ min wall, multi-tens-of-GB stream) consumes meaningful Actions minutes for what should be a short job on hardware co-located with the destination DB. The migration to a Railway-side cron service is the planned replacement; the workflow file stays in the repo as a `workflow_dispatch`-only manual escape hatch until that lands.
+**Status (2026-05-05)**: the GH Actions cron is disabled. The rebuild now runs on the Backend-Service EC2 host as a cron-driven shell wrapper at `scripts/rebuild-cache.sh`. Setup + recurring-ops instructions in [`docs/ec2-rebuild-runbook.md`](docs/ec2-rebuild-runbook.md). The GH workflow file stays in the repo as a `workflow_dispatch`-only manual escape hatch (no scheduled trigger).
 
-The (now-disabled) cron used to fire `scripts/run_pipeline.py --xml ...` on the 4th of each month at 06:00 UTC. The workflow can still be triggered manually via `gh workflow run rebuild-cache.yml` with an optional `dump_url` input.
+**Why EC2**: GH-hosted runner egress IPs are 403'd by Discogs's Cloudflare front at `data.discogs.com/?download=`; residential and EC2 IPs aren't. Plus the job's compute envelope (multi-tens-of-GB stream + 60-90 min wall) is wrong for free Actions minutes. EC2 already hosts Backend-Service, so the marginal cost of adding this cron is effectively $0.
 
 The job streams `releases.xml.gz` for the current month from `data.discogs.com` (the public download endpoint — direct S3 access via `discogs-data-dumps.s3.us-west-2.amazonaws.com` returns 403), downloads the daily-fresh `library.db` from `WXYC/library-metadata-lookup`'s `streaming-data-v1` release (produced by `sync-library.yml`), builds `discogs-xml-converter` from source, and runs the full XML-mode pipeline (steps 2-10) against `DATABASE_URL_DISCOGS`.
 

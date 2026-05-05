@@ -783,8 +783,8 @@ class TestReportSizes:
 class TestConvertAndFilter:
     """convert_and_filter() constructs the converter command and delegates to run_step."""
 
-    def test_command_with_library_artists(self) -> None:
-        """Command includes --library-artists when provided."""
+    def test_build_subcommand_when_no_database_url(self) -> None:
+        """CSV mode dispatches to the converter's `build` subcommand."""
         with patch.object(run_pipeline, "run_step") as mock_run:
             run_pipeline.convert_and_filter(
                 Path("/data/releases.xml.gz"),
@@ -796,13 +796,18 @@ class TestConvertAndFilter:
         mock_run.assert_called_once()
         cmd = mock_run.call_args[0][1]
         assert cmd[0] == "discogs-xml-converter"
+        # Subcommand is the first positional arg after the binary, before any flags.
+        assert cmd[1] == "build"
         assert "/data/releases.xml.gz" in cmd
-        assert "--output-dir" in cmd
+        # New CLI uses --data-dir; --output-dir is the deprecated alias.
+        assert "--data-dir" in cmd
+        assert "--output-dir" not in cmd
         assert "--library-artists" in cmd
         assert "/data/library_artists.txt" in cmd
 
-    def test_command_with_database_url(self) -> None:
-        """Command includes --database-url for direct-PG mode."""
+    def test_import_subcommand_when_database_url_set(self) -> None:
+        """Direct-PG mode dispatches to the converter's `import` subcommand
+        and includes --database-url."""
         with patch.object(run_pipeline, "run_step") as mock_run:
             run_pipeline.convert_and_filter(
                 Path("/data/releases.xml.gz"),
@@ -812,6 +817,7 @@ class TestConvertAndFilter:
             )
 
         cmd = mock_run.call_args[0][1]
+        assert cmd[1] == "import"
         assert "--database-url" in cmd
         assert "postgresql:///discogs" in cmd
         # Description mentions PostgreSQL
@@ -828,6 +834,7 @@ class TestConvertAndFilter:
             )
 
         cmd = mock_run.call_args[0][1]
+        assert cmd[1] == "build"
         assert "--library-artists" not in cmd
         assert "--database-url" not in cmd
         description = mock_run.call_args[0][0]
