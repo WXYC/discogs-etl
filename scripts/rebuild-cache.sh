@@ -19,6 +19,13 @@
 #   GH_TOKEN                     used by `gh release download` (any token with
 #                                read scope on WXYC/library-metadata-lookup)
 #   DRIFT_MIN_RATIO              watchdog threshold (default 0.7)
+#   REBUILD_SMOKE                when set to 1, exercise everything that can
+#                                fail at host setup (env, gh auth, git pulls,
+#                                cargo build, library.db download, dump URL,
+#                                FIFO + curl handshake) and exit 0 *before*
+#                                writing anything to $DATABASE_URL_DISCOGS.
+#                                Use to validate a fresh EC2 setup without
+#                                touching prod.
 
 set -euo pipefail
 
@@ -119,6 +126,29 @@ echo "    dump URL: $url"
 # 5. Stream dump into converter via FIFO + run pipeline
 # ---------------------------------------------------------------------------
 mkfifo "$WORK_DIR/releases.xml.gz"
+
+if [ "${REBUILD_SMOKE:-}" = "1" ]; then
+    # Smoke mode: prove that curl can write into the FIFO and a reader
+    # can pull bytes back, then bail out before any DB write. Reads only
+    # the first ~64 KB and SIGTERMs curl — enough to confirm the URL
+    # serves bytes, gzip magic is right, and the FIFO machinery works.
+    echo "[$(date -u +%H:%M:%SZ)] REBUILD_SMOKE=1 — validating curl→FIFO handshake"
+    curl -fL --max-time 30 \
+        -o "$WORK_DIR/releases.xml.gz" \
+        "$url" &
+    CURL_PID=$!
+    head_bytes=$(head -c 65536 "$WORK_DIR/releases.xml.gz" | wc -c)
+    # head closing its read end gives curl a SIGPIPE; reap.
+    wait "$CURL_PID" 2>/dev/null || true
+    if [ "$head_bytes" -lt 1024 ]; then
+        echo "::error:: smoke mode read only ${head_bytes} bytes from the FIFO" >&2
+        exit 1
+    fi
+    echo "    smoke OK: read ${head_bytes} bytes from the streamed dump"
+    notify_slack ":mag:" "smoke test passed (no DB write performed)"
+    exit 0
+fi
+
 echo "[$(date -u +%H:%M:%SZ)] start streaming download → pipeline"
 curl -fL --retry 3 --retry-delay 30 \
     -o "$WORK_DIR/releases.xml.gz" \

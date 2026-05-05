@@ -85,12 +85,14 @@ SENTRY_DSN=https://<key>@<org>.ingest.sentry.io/<project>      # optional
 GH_TOKEN=...                                                   # if not using `gh auth login`
 ```
 
-Lock it down so secrets don't leak via `world-readable`:
+Lock it down so the file isn't world-readable, but leave it readable to the cron user (`ec2-user` by default — root mode 600 means cron can't `source` it):
 
 ```bash
-sudo chmod 600 /etc/discogs-rebuild.env
-sudo chown root:root /etc/discogs-rebuild.env
+sudo chown root:ec2-user /etc/discogs-rebuild.env
+sudo chmod 640 /etc/discogs-rebuild.env
 ```
+
+If you'd rather run the cron as root, use `sudo crontab -e` in step 7 instead and tighten the file to `chown root:root` + `chmod 600`.
 
 ### 5. Set up logging directory
 
@@ -99,19 +101,42 @@ sudo mkdir -p /var/log/discogs-rebuild
 sudo chown ec2-user:ec2-user /var/log/discogs-rebuild
 ```
 
-### 6. Test the script manually before scheduling
+### 6. Validate the host setup with smoke mode (no DB write)
+
+`REBUILD_SMOKE=1` runs everything that can fail at host setup time —
+git pulls, venv refresh, cargo build, gh release download, dump URL
+resolution, FIFO + curl handshake — and exits 0 *before* writing anything
+to `$DATABASE_URL_DISCOGS`. Run this first so you can fix any host-side
+issue without touching prod:
 
 ```bash
-sudo --preserve-env=DATABASE_URL_DISCOGS,SLACK_MONITORING_WEBHOOK,SENTRY_DSN,GH_TOKEN \
-    bash -c 'set -a; source /etc/discogs-rebuild.env; set +a; \
-        bash /opt/discogs-etl/scripts/rebuild-cache.sh'
+sudo -u ec2-user bash -c '
+    set -a; . /etc/discogs-rebuild.env; set +a
+    REBUILD_SMOKE=1 /opt/discogs-etl/scripts/rebuild-cache.sh
+'
 ```
 
-Expected: ~60-90 minute run, ends with `rebuild complete` in
+Expected: ~3-5 min, ends with `smoke OK: read NNNNN bytes from the
+streamed dump` and (if configured) a `🔍 smoke test passed (no DB
+write performed)` Slack message.
+
+### 7. Test the full rebuild manually before scheduling
+
+Once smoke is green, run the real thing once before adding the cron
+entry — `~60-90 min`, writes to Railway prod:
+
+```bash
+sudo -u ec2-user bash -c '
+    set -a; . /etc/discogs-rebuild.env; set +a
+    /opt/discogs-etl/scripts/rebuild-cache.sh
+'
+```
+
+Expected: ends with `rebuild complete` in
 `/var/log/discogs-rebuild/<timestamp>.log` and (if configured) a
 `✅ Discogs cache rebuild: rebuilt successfully` Slack message.
 
-### 7. Add the cron entry
+### 8. Add the cron entry
 
 Edit `ec2-user`'s crontab (`crontab -e`):
 
@@ -138,13 +163,28 @@ ssh wxyc-ec2 'tail -f /var/log/discogs-rebuild/$(ls -1 /var/log/discogs-rebuild 
 
 ```bash
 ssh wxyc-ec2
-sudo --preserve-env=DATABASE_URL_DISCOGS,SLACK_MONITORING_WEBHOOK,SENTRY_DSN,GH_TOKEN \
-    bash -c 'set -a; source /etc/discogs-rebuild.env; set +a; \
-        /opt/discogs-etl/scripts/rebuild-cache.sh'
+sudo -u ec2-user bash -c '
+    set -a; . /etc/discogs-rebuild.env; set +a
+    /opt/discogs-etl/scripts/rebuild-cache.sh
+'
 ```
 
 The script's `flock` will refuse to start if another rebuild is already
 running (zero-exit no-op).
+
+### Smoke mode
+
+Same recipe with `REBUILD_SMOKE=1` exits before any DB write — useful to
+re-validate after upgrading the EC2 host (Python, Rust, system packages)
+or after rotating the Railway PG password without risking a partial
+rebuild against a broken connection:
+
+```bash
+sudo -u ec2-user bash -c '
+    set -a; . /etc/discogs-rebuild.env; set +a
+    REBUILD_SMOKE=1 /opt/discogs-etl/scripts/rebuild-cache.sh
+'
+```
 
 ## Troubleshooting
 
