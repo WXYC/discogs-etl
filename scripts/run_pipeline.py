@@ -534,11 +534,15 @@ def convert_and_filter(
     with a single call to the Rust binary.
 
     When database_url is provided, releases are streamed directly into
-    PostgreSQL via COPY instead of being written to CSV files. Supplementary
-    CSVs (artist_alias.csv, label_hierarchy.csv) are still written to
-    output_dir.
+    PostgreSQL via COPY (`import` subcommand) instead of being written to
+    CSV files (`build` subcommand). Supplementary CSVs (artist_alias.csv,
+    label_hierarchy.csv) are still written to output_dir in either mode.
     """
-    cmd = [converter, str(xml_file), "--output-dir", str(output_dir)]
+    # Converter CLI uses clap subcommands (`build` for CSV output, `import`
+    # for direct-to-PG). The old positional invocation surfaces as an
+    # `unrecognized subcommand` error against current main.
+    subcommand = "import" if database_url else "build"
+    cmd = [converter, subcommand, str(xml_file), "--data-dir", str(output_dir)]
     if library_artists:
         cmd.extend(["--library-artists", str(library_artists)])
     if database_url:
