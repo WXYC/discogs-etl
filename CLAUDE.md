@@ -203,7 +203,9 @@ This pipeline runs monthly (or when Discogs publishes new data dumps). It has a 
 
 A GitHub Actions cron workflow runs `scripts/run_pipeline.py --xml ...` on the 4th of each month at 06:00 UTC, staggered a few days after Discogs publishes the new dump. It can also be triggered manually with an optional `dump_url` input: `gh workflow run rebuild-cache.yml`.
 
-The job downloads `releases.xml.gz` for the current month from `discogs-data-dumps.s3.us-west-2.amazonaws.com`, downloads the daily-fresh `library.db` from `WXYC/library-metadata-lookup`'s `streaming-data-v1` release (produced by `sync-library.yml`), builds `discogs-xml-converter` from source, and runs the full XML-mode pipeline (steps 2-10) against `DATABASE_URL_DISCOGS`.
+The job streams `releases.xml.gz` for the current month from `data.discogs.com` (the public download endpoint — direct S3 access via `discogs-data-dumps.s3.us-west-2.amazonaws.com` returns 403), downloads the daily-fresh `library.db` from `WXYC/library-metadata-lookup`'s `streaming-data-v1` release (produced by `sync-library.yml`), builds `discogs-xml-converter` from source, and runs the full XML-mode pipeline (steps 2-10) against `DATABASE_URL_DISCOGS`.
+
+The dump is streamed through a named pipe (`mkfifo data/releases.xml.gz`) into the converter instead of being materialised on disk — the compressed dump is multi-tens-of-GB and expanded XML hits ~80 GB, far past the GitHub Actions free-runner disk budget (~14 GB). The converter detects gzip via the `.gz` filename extension and decodes via flate2's `GzDecoder`, which is a pure streaming reader that works the same against a FIFO as against a real file. Only the much smaller filtered CSV outputs land on disk.
 
 The workflow runs `--pair-filter` so the import payload to `DATABASE_URL_DISCOGS` is ~50K release rows instead of the converter's ~4M, which is what makes a Railway-sized destination DB feasible (the unfiltered import overflows the volume at `COPY release_artist`; see #128).
 
@@ -211,7 +213,7 @@ After the pipeline succeeds, the workflow runs `scripts/check_cache_drift.py` ag
 
 **Library catalog source**: the workflow used to call `--generate-library-db --catalog-source tubafrenzy --catalog-db-url ...` to build `library.db` inline. That path required direct MySQL connectivity to Kattare, which is impossible from a GitHub-hosted runner (Kattare's MySQL only resolves from inside Kattare's network — the daily `sync-library.yml` workflow tunnels in over SSH). Reusing sync-library's pre-built artifact keeps the SSH credentials in one place. By 06:00 UTC on the 4th, the sync upload from 12:00 UTC on the 3rd is the freshest available snapshot. The watchdog reuses the same `data/library.db` for its drift comparison so the rebuild and the comparison are looking at the same library snapshot.
 
-**Caveat — runner capacity**: the Discogs releases dump is ~63 GB compressed XML and the conversion + Postgres bulk load can exceed the GitHub Actions free hosted runner's ~14 GB disk and 6-hour wall-clock budget. The workflow file is the deliverable; provisioning a self-hosted or larger hosted runner is a follow-up operator task. Until then, expect the scheduled tick to fail loudly rather than silently produce a half-built cache.
+**Caveat — runner capacity**: streaming the dump cuts the disk concern out — only the filtered CSV outputs land on the runner, comfortably inside the 14 GB free-runner budget. The remaining concern is the 6-hour wall-clock budget for a single-pass parse of the dump; if a future month exceeds it, the escalation is `runs-on: ubuntu-latest-large` (paid hosted runner) or a self-hosted runner. The 2026-05-04 cron tick will be the empirical signal for whether the free runner is sized correctly.
 
 **Required GitHub secrets:**
 

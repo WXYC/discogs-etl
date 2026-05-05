@@ -19,13 +19,17 @@ name: Rebuild Discogs Cache
 # in over SSH. Reusing its output asset keeps that connectivity story in one
 # place and avoids duplicating SSH credentials across workflows.
 #
-# TODO: the Discogs releases dump is ~63 GB compressed XML; expanding +
-# converting it can exceed the GitHub Actions free-runner disk (~14 GB) and
-# 6-hour wall-clock budget. The skeleton here lets operators kick the rebuild
-# manually via workflow_dispatch on a self-hosted runner or a beefier hosted
-# runner; converting the scheduled run to use the same once one is provisioned
-# is a follow-up. Until then, the cron tick will fail loudly rather than
-# silently producing a half-built cache, which is the desired signal.
+# Disk: the Discogs releases dump is multi-tens-of-GB compressed and
+# expands to ~80 GB raw XML, well beyond the GitHub Actions free-runner
+# disk budget (~14 GB). The dump is therefore *streamed* through a named
+# pipe straight into the converter rather than materialised on disk —
+# only the much smaller filtered CSV outputs land on the runner. See the
+# `Run pipeline (with streamed dump)` step.
+#
+# Wall-clock: a single-pass parse of the dump is still bounded by the
+# 6-hour free-runner budget. If a future month's dump pushes past that,
+# the next escalation is `runs-on: ubuntu-latest-large` (paid hosted) or
+# a self-hosted runner.
 
 on:
   schedule:
@@ -96,6 +100,11 @@ jobs:
         env:
           OVERRIDE_URL: ${{ inputs.dump_url }}
         run: |
+          # Direct S3 (discogs-data-dumps.s3.us-west-2.amazonaws.com) returns
+          # 403 to anonymous requests as of 2026-05; downloads are gated through
+          # data.discogs.com which signs/proxies the request. Use the public
+          # download endpoint with URL-encoded `data/<YYYY>/<file>` after the
+          # `?download=` query parameter.
           if [ -n "$OVERRIDE_URL" ]; then
             echo "Using operator-supplied dump URL"
             echo "url=$OVERRIDE_URL" >> "$GITHUB_OUTPUT"
@@ -105,7 +114,7 @@ jobs:
             # month. Resolve the most recent published month relative to today.
             year=$(date -u +%Y)
             stamp=$(date -u +%Y%m01)
-            echo "url=https://discogs-data-dumps.s3.us-west-2.amazonaws.com/data/${year}/discogs_${stamp}_releases.xml.gz" >> "$GITHUB_OUTPUT"
+            echo "url=https://data.discogs.com/?download=data%2F${year}%2Fdiscogs_${stamp}_releases.xml.gz" >> "$GITHUB_OUTPUT"
           fi
 
       # Pull the daily-fresh library.db from sync-library.yml's release artifact
@@ -131,12 +140,20 @@ jobs:
             --output data/library.db
           echo "library.db size: $(du -h data/library.db | cut -f1)"
 
-      - name: Download Discogs releases dump
-        run: |
-          mkdir -p data
-          curl -fL --retry 3 --retry-delay 30 -o data/releases.xml.gz "${{ steps.dump.outputs.url }}"
-
-      - name: Run pipeline
+      # Stream the dump through a named pipe instead of materializing it on
+      # disk. Compressed releases.xml.gz is multi-tens-of-GB and expanded XML
+      # exceeds the GitHub Actions free-runner disk (~14 GB) by an order of
+      # magnitude. The converter (discogs-xml-converter) detects gzip by the
+      # `.gz` extension and decodes via flate2's GzDecoder, which is a pure
+      # streaming reader — feeding it from a FIFO works the same as feeding
+      # it from a real file.
+      #
+      # Layout: curl runs in the background writing into the FIFO; the pipeline
+      # invocation runs the converter against that FIFO. Kernel pipe buffer
+      # backpressures curl when the converter falls behind. We `wait` on the
+      # curl PID afterwards so a network-side failure mid-stream doesn't get
+      # masked by the pipeline succeeding on partial input.
+      - name: Run pipeline (with streamed dump)
         env:
           DATABASE_URL_DISCOGS: ${{ secrets.DATABASE_URL_DISCOGS }}
           DISCOGS_TOKEN: ${{ secrets.DISCOGS_TOKEN }}
@@ -145,10 +162,22 @@ jobs:
           # inactive, JSON logging still emits to stderr.
           SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
         run: |
+          set -euo pipefail
+          mkdir -p data
+          mkfifo data/releases.xml.gz
+          curl -fL --retry 3 --retry-delay 30 \
+            -o data/releases.xml.gz \
+            "${{ steps.dump.outputs.url }}" &
+          CURL_PID=$!
+
           python scripts/run_pipeline.py \
             --xml data/releases.xml.gz \
             --library-db data/library.db \
             --pair-filter
+
+          # Curl should already be done by the time the pipeline returns;
+          # wait surfaces any non-zero exit so a streaming failure is visible.
+          wait "$CURL_PID"
 
       # Watchdog: cache_distinct_artists / library_distinct_artists ratio
       # exposes drift between the just-rebuilt cache and the WXYC library
