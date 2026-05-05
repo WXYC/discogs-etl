@@ -27,12 +27,16 @@ All commands run on the EC2 host as `ec2-user` unless noted.
 
 ### 1. Install runtimes
 
-```bash
-# Postgres client (psql) for the alembic stamp guard + smoke tests
-sudo dnf install -y postgresql15
+The Backend-Service EC2 runs Amazon Linux 2023. Package names below match that. If the host is a different distro, adapt accordingly.
 
-# Python 3.12 (or whatever's in `python_requires` in pyproject.toml)
-sudo dnf install -y python3.12 python3.12-pip python3.12-devel
+```bash
+# Build toolchain (cargo needs `cc` to link) + git + Postgres client
+sudo dnf install -y gcc gcc-c++ make git postgresql15
+
+# Python 3.11 — the highest the AL2023 default repos ship; pyproject.toml
+# requires >=3.9 so this is well within range. (3.12 is not in the default
+# repo on AL2023 as of 2026-05; use this instead.)
+sudo dnf install -y python3.11 python3.11-pip python3.11-devel
 
 # Rust toolchain (stable) — needed to build discogs-xml-converter
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
@@ -53,7 +57,7 @@ git clone https://github.com/WXYC/discogs-etl.git /opt/discogs-etl
 git clone https://github.com/WXYC/discogs-xml-converter.git /opt/discogs-xml-converter
 
 # Bootstrap the Python venv used by the cron script.
-python3.12 -m venv /opt/discogs-etl/.venv
+python3.11 -m venv /opt/discogs-etl/.venv
 source /opt/discogs-etl/.venv/bin/activate
 pip install -e "/opt/discogs-etl[dev]"
 
