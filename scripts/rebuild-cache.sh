@@ -149,6 +149,17 @@ if [ "${REBUILD_SMOKE:-}" = "1" ]; then
     exit 0
 fi
 
+# Pre-build library_artists.txt OUTSIDE the FIFO timing window. The Linux
+# pipe buffer is ~64 KB; if the pipeline does any pre-converter work (the
+# enrich step takes ~3 minutes), curl fills the buffer in <1s, blocks waiting
+# for a reader, and Cloudflare drops the idle TCP connection. Running enrich
+# here means the converter opens the FIFO seconds after curl starts.
+echo "[$(date -u +%H:%M:%SZ)] pre-build library_artists.txt (skips in-pipeline enrich)"
+wxyc-enrich-library-artists \
+    --library-db "$WORK_DIR/library.db" \
+    --output "$WORK_DIR/library_artists.txt"
+echo "    library_artists: $(wc -l < "$WORK_DIR/library_artists.txt") names"
+
 echo "[$(date -u +%H:%M:%SZ)] start streaming download → pipeline"
 curl -fL --retry 3 --retry-delay 30 \
     -o "$WORK_DIR/releases.xml.gz" \
@@ -157,6 +168,7 @@ CURL_PID=$!
 
 python "$REPO_DIR/scripts/run_pipeline.py" \
     --xml "$WORK_DIR/releases.xml.gz" \
+    --library-artists "$WORK_DIR/library_artists.txt" \
     --library-db "$WORK_DIR/library.db" \
     --pair-filter
 

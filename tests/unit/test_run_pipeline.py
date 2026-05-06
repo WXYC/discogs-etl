@@ -614,6 +614,54 @@ class TestXmlModeEnrichment:
             "library_artists path should be passed to convert_and_filter"
         )
 
+    def test_enrich_skipped_when_library_artists_explicit(self, tmp_path) -> None:
+        """When --library-artists is provided alongside --library-db, the pipeline
+        must skip enrich_library_artists and pass the operator-supplied file straight
+        to the converter. This lets the EC2 wrapper pre-build library_artists.txt
+        outside the FIFO timing window so curl→FIFO has an immediate reader."""
+        xml_file = tmp_path / "releases.xml.gz"
+        xml_file.touch()
+        library_db = tmp_path / "library.db"
+        library_db.touch()
+        prebuilt_artists = tmp_path / "library_artists.txt"
+        prebuilt_artists.write_text("Juana Molina\nStereolab\n")
+
+        args = run_pipeline.parse_args(
+            [
+                "--xml",
+                str(xml_file),
+                "--library-db",
+                str(library_db),
+                "--library-artists",
+                str(prebuilt_artists),
+            ]
+        )
+
+        enrich_calls = []
+        convert_calls = []
+
+        def fake_enrich(lib_db, output, wxyc_db_url=None, catalog_source=None, catalog_db_url=None):
+            enrich_calls.append((lib_db, output))
+
+        def fake_convert(xml, output_dir, converter, library_artists=None):
+            convert_calls.append((xml, output_dir, converter, library_artists))
+
+        with (
+            patch.object(run_pipeline, "enrich_library_artists", side_effect=fake_enrich),
+            patch.object(run_pipeline, "convert_and_filter", side_effect=fake_convert),
+            patch.object(run_pipeline, "_run_database_build"),
+            patch.object(run_pipeline, "parse_args", return_value=args),
+        ):
+            run_pipeline.main()
+
+        assert enrich_calls == [], (
+            "enrich must be skipped when the operator pre-supplies library_artists.txt"
+        )
+        assert len(convert_calls) == 1
+        assert convert_calls[0][3] == prebuilt_artists, (
+            "the operator-supplied artist list must be passed through to the converter"
+        )
+
 
 # ---------------------------------------------------------------------------
 # wait_for_postgres
