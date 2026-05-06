@@ -112,9 +112,10 @@ sudo chown ec2-user:ec2-user /var/log/discogs-rebuild
 
 `REBUILD_SMOKE=1` runs everything that can fail at host setup time —
 git pulls, venv refresh, cargo build, gh release download, dump URL
-resolution, FIFO + curl handshake — and exits 0 *before* writing anything
-to `$DATABASE_URL_DISCOGS`. Run this first so you can fix any host-side
-issue without touching prod:
+resolution, range-byte fetch, and disk-headroom check — and exits 0
+*before* writing anything to `$DATABASE_URL_DISCOGS` or downloading the
+full ~10 GB dump. Run this first so you can fix any host-side issue
+without touching prod:
 
 ```bash
 sudo -u ec2-user bash -c '
@@ -123,9 +124,9 @@ sudo -u ec2-user bash -c '
 '
 ```
 
-Expected: ~3-5 min, ends with `smoke OK: read NNNNN bytes from the
-streamed dump` and (if configured) a `🔍 smoke test passed (no DB
-write performed)` Slack message.
+Expected: ~30 seconds, ends with `smoke OK: read NNNNN bytes from URL;
+NN GB free at $WORK_DIR` and (if configured) a `🔍 smoke test passed
+(no DB write performed)` Slack message.
 
 ### 7. Test the full rebuild manually before scheduling
 
