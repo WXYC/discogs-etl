@@ -42,7 +42,7 @@ exec > >(tee -a "$LOG_FILE") 2>&1
 # Single-instance lock. Two cron ticks landing on a still-running rebuild
 # would clobber each other's COPY work.
 LOCK_FD=200
-LOCK_FILE="/var/run/discogs-rebuild.lock"
+LOCK_FILE="${LOCK_FILE:-$LOG_DIR/discogs-rebuild.lock}"
 exec 200>"$LOCK_FILE"
 if ! flock -n "$LOCK_FD"; then
     echo "[$(date -u +%H:%M:%SZ)] another rebuild is already running; exiting"
