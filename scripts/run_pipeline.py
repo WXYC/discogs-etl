@@ -742,7 +742,11 @@ def _run_xml_pipeline(
     def _run_with_dirs(tmp_dir: Path, csv_out: Path) -> None:
         # -- enrich_artists
         library_artists_path = args.library_artists
-        if args.library_db:
+        if args.library_db and not args.library_artists:
+            # Operator did not pre-supply library_artists.txt — derive it from
+            # library.db. Pre-supplying lets the EC2 wrapper run enrich outside
+            # the FIFO timing window so curl→FIFO has an immediate reader and
+            # Cloudflare doesn't drop the connection during a 3+ minute enrich.
             enriched_artists = tmp_dir / "library_artists.txt"
             enrich_library_artists(
                 args.library_db,
