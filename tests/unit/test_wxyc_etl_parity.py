@@ -3,6 +3,16 @@
 These tests ensure behavioral parity between the deleted lib/matching.py,
 lib/artist_splitting.py, and lib/pipeline_state.py and their replacements in
 the wxyc-etl package (Rust/PyO3).
+
+Note: as of wxyc-etl 0.2.0 the legacy normalizer (`normalize_artist_name`,
+`strip_diacritics`, `normalize_title`, `batch_normalize`) is deprecated in favor
+of the WX-2 Normalizer Charter forms (`to_match_form`, `to_storage_form`,
+`to_ascii_form`). These tests intentionally exercise the legacy normalizer to
+verify parity with the old `lib/matching.py:normalize_artist()` until WX-4.1.1
+removes the legacy API. The DeprecationWarnings are silenced module-wide so the
+parity suite stays a regression net rather than turning CI yellow. The parallel
+charter-vs-legacy parity test below documents whether the new and old forms
+agree on the same input matrix.
 """
 
 from __future__ import annotations
@@ -16,7 +26,10 @@ from wxyc_etl.text import (
     normalize_artist_name,
     split_artist_name,
     split_artist_name_contextual,
+    to_match_form,
 )
+
+pytestmark = pytest.mark.filterwarnings("ignore::DeprecationWarning")
 
 # ---------------------------------------------------------------------------
 # is_compilation_artist (was lib/matching.py)
@@ -83,6 +96,52 @@ class TestNormalizeArtistNameParity:
 
     def test_none_returns_empty(self) -> None:
         assert normalize_artist_name(None) == ""
+
+
+# ---------------------------------------------------------------------------
+# Charter parity: to_match_form vs legacy normalize_artist_name
+# ---------------------------------------------------------------------------
+#
+# WX-2 Normalizer Charter migration. The legacy `normalize_artist_name` will be
+# removed by WX-4.1.1; this test surfaces any behavioral drift between the
+# legacy form and the charter `to_match_form` over the same input matrix the
+# old `lib/matching.py:normalize_artist()` was characterized against. As long
+# as both forms agree, downstream consumers that still call the legacy API can
+# be migrated mechanically. If they diverge, this test fails loudly and the
+# diff has to be triaged before bumping wxyc-etl.
+
+
+class TestToMatchFormParityWithLegacy:
+    """Charter `to_match_form` matches legacy `normalize_artist_name` on the
+    same input matrix as `TestNormalizeArtistNameParity`."""
+
+    @pytest.mark.parametrize(
+        "input_name, expected",
+        [
+            ("Duke Ellington", "duke ellington"),
+            ("STEREOLAB", "stereolab"),
+            ("Nilüfer Yanya", "nilufer yanya"),
+            ("  Cat Power  ", "cat power"),
+            ("Chuquimamani-Condori", "chuquimamani-condori"),
+        ],
+        ids=["lowercase", "all-caps", "diacritics", "whitespace", "hyphen"],
+    )
+    def test_to_match_form_matches_legacy(self, input_name: str, expected: str) -> None:
+        # Charter form produces the same output as legacy form...
+        assert to_match_form(input_name) == expected
+        # ...and they agree element-wise on this input matrix.
+        assert to_match_form(input_name) == normalize_artist_name(input_name)
+
+    def test_none_handling_diverges(self) -> None:
+        """Documented divergence: legacy returns '' for None, charter raises.
+
+        Callers migrating from the legacy API must guard `None` themselves
+        (e.g. `to_match_form(name or "")`) — the charter form treats `None` as
+        a programmer error rather than silently coercing to empty string.
+        """
+        assert normalize_artist_name(None) == ""
+        with pytest.raises(TypeError):
+            to_match_form(None)  # type: ignore[arg-type]
 
 
 # ---------------------------------------------------------------------------
