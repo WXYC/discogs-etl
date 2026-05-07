@@ -543,7 +543,9 @@ class TestDirectPgUnloggedBeforeConverter:
         def track_set_unlogged(db_url):
             call_order.append("set_tables_unlogged")
 
-        def track_convert(xml, output_dir, converter, library_artists=None, database_url=None, **kwargs):
+        def track_convert(
+            xml, output_dir, converter, library_artists=None, database_url=None, **kwargs
+        ):
             call_order.append("convert_and_filter")
 
         with (
