@@ -307,6 +307,49 @@ class TestTsvToSqlite:
         conn.close()
         assert count == 2
 
+    def test_fts5_tokenizer_indexes_emoji(self, tmp_path: Path) -> None:
+        """FTS5 tokenizer must index supplementary-plane emoji rows.
+
+        The default unicode61 tokenizer drops 4-byte emoji (Symbol category)
+        and U+200D ZWJ; the production schema overrides it with
+        ``categories 'L* N* Co S*' tokenchars '\\u200d'`` so bare-emoji and
+        ZWJ-grapheme artist rows can be located by exact-string FTS MATCH.
+        See WXYC/discogs-etl#161 and WXYC/library-metadata-lookup#251.
+        """
+        # Bare emoji (U+1F44B WAVING HAND SIGN) -- fails the default unicode61.
+        # ZWJ family (man + ZWJ + woman + ZWJ + girl + ZWJ + boy) -- exercises
+        # the explicit U+200D tokenchars opt-in. Each ZWJ is written as the
+        # \\u200d escape so the source stays unambiguous in editors and diffs
+        # that render zero-width characters invisibly.
+        zwj = "\u200d"
+        zwj_family = f"\U0001f468{zwj}\U0001f469{zwj}\U0001f467{zwj}\U0001f466"
+        tsv = _make_tsv(
+            [
+                ["1", "Hello", "\U0001f44b", "EM", "100", "1", "Rock", "CD", "\\N", "\\N"],
+                ["2", "Family", zwj_family, "FA", "200", "2", "Rock", "CD", "\\N", "\\N"],
+            ]
+        )
+        tsv_file = tmp_path / "input.tsv"
+        tsv_file.write_text(tsv, encoding="utf-8")
+        db_path = tmp_path / "library.db"
+
+        tsv_to_sqlite(str(tsv_file), str(db_path))
+
+        conn = sqlite3.connect(str(db_path))
+        try:
+            hits = conn.execute(
+                "SELECT rowid FROM library_fts WHERE library_fts MATCH '\"\U0001f44b\"'"
+            ).fetchall()
+            assert hits == [(1,)], f"bare emoji row not findable via FTS MATCH: {hits!r}"
+
+            hits = conn.execute(
+                "SELECT rowid FROM library_fts WHERE library_fts MATCH ?",
+                (f'"{zwj_family}"',),
+            ).fetchall()
+            assert hits == [(2,)], f"ZWJ-grapheme row not findable via FTS MATCH: {hits!r}"
+        finally:
+            conn.close()
+
     def test_tab_in_field_value(self, tmp_path: Path) -> None:
         r"""MySQL escapes literal tabs in fields as \t; they should be unescaped."""
         # MySQL -B -N escapes real tabs inside data as the two-char sequence \t.
