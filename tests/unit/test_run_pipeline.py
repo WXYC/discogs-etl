@@ -543,7 +543,7 @@ class TestDirectPgUnloggedBeforeConverter:
         def track_set_unlogged(db_url):
             call_order.append("set_tables_unlogged")
 
-        def track_convert(xml, output_dir, converter, library_artists=None, database_url=None):
+        def track_convert(xml, output_dir, converter, library_artists=None, database_url=None, **kwargs):
             call_order.append("convert_and_filter")
 
         with (
@@ -596,7 +596,7 @@ class TestXmlModeEnrichment:
         def fake_enrich(lib_db, output, wxyc_db_url=None, catalog_source=None, catalog_db_url=None):
             enrich_calls.append((lib_db, output, catalog_source))
 
-        def fake_convert(xml, output_dir, converter, library_artists=None):
+        def fake_convert(xml, output_dir, converter, library_artists=None, **kwargs):
             convert_calls.append((xml, output_dir, converter, library_artists))
 
         with (
@@ -643,7 +643,7 @@ class TestXmlModeEnrichment:
         def fake_enrich(lib_db, output, wxyc_db_url=None, catalog_source=None, catalog_db_url=None):
             enrich_calls.append((lib_db, output))
 
-        def fake_convert(xml, output_dir, converter, library_artists=None):
+        def fake_convert(xml, output_dir, converter, library_artists=None, **kwargs):
             convert_calls.append((xml, output_dir, converter, library_artists))
 
         with (
@@ -887,6 +887,35 @@ class TestConvertAndFilter:
         assert "--database-url" not in cmd
         description = mock_run.call_args[0][0]
         assert "CSV" in description
+
+    def test_xml_type_forwarded_when_set(self) -> None:
+        """When xml_type is provided, --xml-type is forwarded to the converter
+        so it can skip per-file root-element auto-detection. Required for FIFO
+        inputs where the auto-detect open/close kills the upstream writer."""
+        with patch.object(run_pipeline, "run_step") as mock_run:
+            run_pipeline.convert_and_filter(
+                Path("/data/releases.xml.gz"),
+                Path("/tmp/csv"),
+                "discogs-xml-converter",
+                xml_type="releases",
+            )
+
+        cmd = mock_run.call_args[0][1]
+        assert "--xml-type" in cmd
+        assert "releases" in cmd
+
+    def test_xml_type_omitted_when_not_set(self) -> None:
+        """When xml_type is None, --xml-type is not forwarded; the converter
+        falls back to its default auto-detection."""
+        with patch.object(run_pipeline, "run_step") as mock_run:
+            run_pipeline.convert_and_filter(
+                Path("/data/releases.xml.gz"),
+                Path("/tmp/csv"),
+                "discogs-xml-converter",
+            )
+
+        cmd = mock_run.call_args[0][1]
+        assert "--xml-type" not in cmd
 
 
 # ---------------------------------------------------------------------------

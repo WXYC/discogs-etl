@@ -123,66 +123,72 @@ fi
 echo "    dump URL: $url"
 
 # ---------------------------------------------------------------------------
-# 5. Spool dump to disk, then run pipeline against the on-disk file
+# 5. Stream dump into converter via FIFO + run pipeline
 # ---------------------------------------------------------------------------
-# History: an earlier version of this wrapper streamed the dump through a
-# named pipe (mkfifo + curl -o FIFO &). The intent was to avoid materialising
-# ~10 GB of compressed XML on disk. In practice that produced two distinct
-# failure modes on EC2 (2026-05-06):
-#   1. Pipeline pre-work blocked the FIFO for minutes while the 64 KB pipe
-#      buffer filled, Cloudflare timed out the idle TCP connection.
-#   2. Even with the pre-work moved out, curl would fail with `curl: (23)
-#      Failure writing output to destination` within seconds of the converter
-#      opening the FIFO — the converter's read pattern (multi-threaded rayon
-#      workers, gzip header probe before bulk read) interacted poorly with
-#      curl's buffered fwrite to the FIFO.
-# Spool-to-disk decouples network I/O from converter timing entirely. The
-# Backend-Service EC2 host has ~14 GB free; the dump is ~10.2 GB compressed.
-# After the converter consumes it the spooled file is removed via the EXIT
-# trap.
+# Backend-Service EC2 only has ~14 GB free, so we cannot spool the ~10 GB
+# compressed dump to disk alongside the ~5–10 GB of intermediate filtered
+# CSVs the converter writes. Instead we stream curl through a named pipe
+# directly into the converter.
+#
+# Two prerequisites make this safe:
+#   1. library_artists.txt is pre-built BEFORE the curl-to-FIFO setup so
+#      enrich (~3 minutes) does not block the FIFO buffer and timeout
+#      Cloudflare's TCP idle.
+#   2. run_pipeline.py forwards --xml-type=releases to discogs-xml-converter,
+#      which skips the per-file root-element auto-detection that would
+#      otherwise open-and-close the FIFO once before the real scan,
+#      SIGPIPE-killing the upstream curl.
+# Both are required; either alone fails on EC2 (verified 2026-05-06).
 
 if [ "${REBUILD_SMOKE:-}" = "1" ]; then
-    # Smoke mode: prove the URL serves bytes and the local disk has headroom
-    # for the dump, then bail out before any DB write or full download. The
-    # range-byte fetch is enough to confirm DNS, TLS, Cloudflare reachability,
-    # and the gzip magic on the first 64 KB of the resource.
-    echo "[$(date -u +%H:%M:%SZ)] REBUILD_SMOKE=1 — validating dump URL + disk headroom"
-    head_bytes=$(curl -fL --max-time 30 -r 0-65535 "$url" -o - | wc -c)
+    # Smoke mode validates the URL is reachable and the FIFO machinery works.
+    # We read only ~64 KB from the FIFO, which is enough to confirm DNS, TLS,
+    # Cloudflare reachability, and the gzip magic in the first chunk. head
+    # closing its read end gives curl a SIGPIPE, which we silence.
+    echo "[$(date -u +%H:%M:%SZ)] REBUILD_SMOKE=1 — validating curl→FIFO handshake"
+    mkfifo "$WORK_DIR/releases.xml.gz"
+    curl -fL --max-time 30 \
+        -o "$WORK_DIR/releases.xml.gz" \
+        "$url" &
+    CURL_PID=$!
+    head_bytes=$(head -c 65536 "$WORK_DIR/releases.xml.gz" | wc -c)
+    wait "$CURL_PID" 2>/dev/null || true
     if [ "$head_bytes" -lt 1024 ]; then
-        echo "::error:: smoke mode read only ${head_bytes} bytes from $url" >&2
+        echo "::error:: smoke mode read only ${head_bytes} bytes from the FIFO" >&2
         exit 1
     fi
-    avail_kb=$(df --output=avail "$WORK_DIR" | tail -n1)
-    avail_gb=$(( avail_kb / 1024 / 1024 ))
-    if [ "$avail_gb" -lt 12 ]; then
-        echo "::error:: smoke mode: only ${avail_gb} GB free at $WORK_DIR (need ~12+ GB for the dump)" >&2
-        exit 1
-    fi
-    echo "    smoke OK: read ${head_bytes} bytes from URL; ${avail_gb} GB free at \$WORK_DIR"
+    echo "    smoke OK: read ${head_bytes} bytes from the streamed dump"
     notify_slack ":mag:" "smoke test passed (no DB write performed)"
     exit 0
 fi
 
-# Pre-build library_artists.txt before the long-running download so that
-# the converter doesn't have to wait on enrich after the dump arrives.
+# Pre-build library_artists.txt OUTSIDE the curl/FIFO timing window so the
+# converter has no slow pre-work to do once curl starts writing.
 echo "[$(date -u +%H:%M:%SZ)] pre-build library_artists.txt (skips in-pipeline enrich)"
 wxyc-enrich-library-artists \
     --library-db "$WORK_DIR/library.db" \
     --output "$WORK_DIR/library_artists.txt"
 echo "    library_artists: $(wc -l < "$WORK_DIR/library_artists.txt") names"
 
-echo "[$(date -u +%H:%M:%SZ)] download Discogs dump to $WORK_DIR/releases.xml.gz"
+mkfifo "$WORK_DIR/releases.xml.gz"
+
+echo "[$(date -u +%H:%M:%SZ)] start streaming download → pipeline"
 curl -fL --retry 3 --retry-delay 30 \
     -o "$WORK_DIR/releases.xml.gz" \
-    "$url"
-echo "    dump size: $(du -h "$WORK_DIR/releases.xml.gz" | cut -f1)"
+    "$url" &
+CURL_PID=$!
 
-echo "[$(date -u +%H:%M:%SZ)] run pipeline against on-disk dump"
 python "$REPO_DIR/scripts/run_pipeline.py" \
     --xml "$WORK_DIR/releases.xml.gz" \
+    --xml-type releases \
     --library-artists "$WORK_DIR/library_artists.txt" \
     --library-db "$WORK_DIR/library.db" \
     --pair-filter
+
+# Curl is normally already done by here. Wait surfaces any non-zero curl exit
+# so a streaming network failure isn't masked by the pipeline succeeding on
+# partial input.
+wait "$CURL_PID"
 
 # ---------------------------------------------------------------------------
 # 6. Drift watchdog — same library.db the pipeline just filtered against

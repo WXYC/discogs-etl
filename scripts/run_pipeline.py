@@ -147,6 +147,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "Used with --xml to filter during conversion.",
     )
     parser.add_argument(
+        "--xml-type",
+        choices=["releases", "artists", "labels", "masters"],
+        default=None,
+        help="Forwarded to discogs-xml-converter --xml-type. Skips per-file "
+        "root-element auto-detection. Required when --xml points at a FIFO "
+        "(named pipe) — auto-detection's open/close cycle would SIGPIPE the "
+        "upstream writer before the real scan starts.",
+    )
+    parser.add_argument(
         "--library-db",
         type=Path,
         metavar="FILE",
@@ -527,6 +536,7 @@ def convert_and_filter(
     converter: str,
     library_artists: Path | None = None,
     database_url: str | None = None,
+    xml_type: str | None = None,
 ) -> None:
     """Convert Discogs XML to CSV using discogs-xml-converter.
 
@@ -537,16 +547,20 @@ def convert_and_filter(
     PostgreSQL via COPY (`import` subcommand) instead of being written to
     CSV files (`build` subcommand). Supplementary CSVs (artist_alias.csv,
     label_hierarchy.csv) are still written to output_dir in either mode.
+
+    xml_type, when set, skips the converter's per-file root-element
+    auto-detection. Required for FIFO inputs (the rebuild-cache.sh
+    monthly path) where the auto-detect open/close pattern would
+    SIGPIPE the upstream curl writer before the real scan opens the file.
     """
-    # Converter CLI uses clap subcommands (`build` for CSV output, `import`
-    # for direct-to-PG). The old positional invocation surfaces as an
-    # `unrecognized subcommand` error against current main.
     subcommand = "import" if database_url else "build"
     cmd = [converter, subcommand, str(xml_file), "--data-dir", str(output_dir)]
     if library_artists:
         cmd.extend(["--library-artists", str(library_artists)])
     if database_url:
         cmd.extend(["--database-url", database_url])
+    if xml_type:
+        cmd.extend(["--xml-type", xml_type])
     description = (
         "Convert and import XML to PostgreSQL" if database_url else "Convert and filter XML to CSV"
     )
@@ -786,6 +800,7 @@ def _run_xml_pipeline(
                 args.converter,
                 library_artists_path,
                 database_url=db_url,
+                xml_type=args.xml_type,
             )
 
             # Auto-detect label_hierarchy.csv
@@ -810,7 +825,13 @@ def _run_xml_pipeline(
             )
         else:
             # Standard CSV mode
-            convert_and_filter(args.xml, csv_out, args.converter, library_artists_path)
+            convert_and_filter(
+                args.xml,
+                csv_out,
+                args.converter,
+                library_artists_path,
+                xml_type=args.xml_type,
+            )
 
             # Pair-wise filter narrows ~4M release rows to ~50K so the
             # downstream import fits on a small destination DB. In-place
