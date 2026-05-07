@@ -130,15 +130,17 @@ echo "    dump URL: $url"
 # CSVs the converter writes. Instead we stream curl through a named pipe
 # directly into the converter.
 #
-# Two prerequisites make this safe:
-#   1. library_artists.txt is pre-built BEFORE the curl-to-FIFO setup so
-#      enrich (~3 minutes) does not block the FIFO buffer and timeout
-#      Cloudflare's TCP idle.
-#   2. run_pipeline.py forwards --xml-type=releases to discogs-xml-converter,
-#      which skips the per-file root-element auto-detection that would
-#      otherwise open-and-close the FIFO once before the real scan,
-#      SIGPIPE-killing the upstream curl.
-# Both are required; either alone fails on EC2 (verified 2026-05-06).
+# run_pipeline.py forwards --xml-type=releases to discogs-xml-converter,
+# which skips the per-file root-element auto-detection that would
+# otherwise open-and-close the FIFO once before the real scan,
+# SIGPIPE-killing the upstream curl. Without this the EC2 path fails
+# (verified 2026-05-06).
+#
+# --library-db is forwarded straight to the converter; the converter does
+# its own pair-wise (artist, title) filter inside the streaming scanner,
+# so release output is ~50K rows from the start instead of ~4M. No
+# library_artists.txt pre-build is required (the converter no longer needs
+# it on this path). See WXYC/discogs-xml-converter#45.
 
 if [ "${REBUILD_SMOKE:-}" = "1" ]; then
     # Smoke mode validates the URL is reachable and the FIFO machinery works.
@@ -162,14 +164,6 @@ if [ "${REBUILD_SMOKE:-}" = "1" ]; then
     exit 0
 fi
 
-# Pre-build library_artists.txt OUTSIDE the curl/FIFO timing window so the
-# converter has no slow pre-work to do once curl starts writing.
-echo "[$(date -u +%H:%M:%SZ)] pre-build library_artists.txt (skips in-pipeline enrich)"
-wxyc-enrich-library-artists \
-    --library-db "$WORK_DIR/library.db" \
-    --output "$WORK_DIR/library_artists.txt"
-echo "    library_artists: $(wc -l < "$WORK_DIR/library_artists.txt") names"
-
 mkfifo "$WORK_DIR/releases.xml.gz"
 
 echo "[$(date -u +%H:%M:%SZ)] start streaming download → pipeline"
@@ -181,9 +175,7 @@ CURL_PID=$!
 python "$REPO_DIR/scripts/run_pipeline.py" \
     --xml "$WORK_DIR/releases.xml.gz" \
     --xml-type releases \
-    --library-artists "$WORK_DIR/library_artists.txt" \
-    --library-db "$WORK_DIR/library.db" \
-    --pair-filter
+    --library-db "$WORK_DIR/library.db"
 
 # Curl is normally already done by here. Wait surfaces any non-zero curl exit
 # so a streaming network failure isn't masked by the pipeline succeeding on

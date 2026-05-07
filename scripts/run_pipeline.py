@@ -6,9 +6,8 @@ Two modes of operation:
   Full pipeline from XML (steps 1-10):
     python scripts/run_pipeline.py \\
       --xml <releases.xml.gz> \\
-      --library-artists <library_artists.txt> \\
+      [--library-artists <library_artists.txt> | --library-db <library.db>] \\
       [--converter <path/to/discogs-xml-converter>] \\
-      [--library-db <library.db>] \\
       [--wxyc-db-url <mysql://user:pass@host:port/db>] \\
       [--database-url <url>]
 
@@ -256,17 +255,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "still written to the output directory.",
     )
     parser.add_argument(
-        "--pair-filter",
-        action="store_true",
-        default=False,
-        help="After the converter's artist-only filter, narrow the CSVs further "
-        "to releases whose (artist, title) pair matches a library entry. Cuts "
-        "the import payload from ~4M release rows to ~50K, which is what makes "
-        "the rebuild workflow fit on small destination DBs (Railway-sized; "
-        "see #128). Requires --library-db (or --generate-library-db). "
-        "Incompatible with --direct-pg (which bypasses CSVs entirely).",
-    )
-    parser.add_argument(
         "--resume",
         action="store_true",
         default=False,
@@ -331,17 +319,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     if args.target_db_url and not args.library_db and not args.generate_library_db:
         parser.error("--library-db or --generate-library-db is required when using --target-db-url")
 
-    if args.pair_filter:
-        if args.direct_pg:
-            parser.error(
-                "--pair-filter cannot be combined with --direct-pg "
-                "(--direct-pg bypasses the CSV staging that --pair-filter operates on)"
-            )
-        if not args.library_db and not args.generate_library_db:
-            parser.error(
-                "--pair-filter requires --library-db or --generate-library-db so the "
-                "(artist, title) pairs have a source to match against"
-            )
+    if args.library_artists and args.library_db:
+        parser.error(
+            "--library-artists and --library-db are mutually exclusive. "
+            "--library-artists yields a converter artist-only filter (~4M releases); "
+            "--library-db yields the converter's pair-wise (artist, title) filter (~50K)."
+        )
 
     return args
 
@@ -535,6 +518,7 @@ def convert_and_filter(
     output_dir: Path,
     converter: str,
     library_artists: Path | None = None,
+    library_db: Path | None = None,
     database_url: str | None = None,
     xml_type: str | None = None,
 ) -> None:
@@ -548,6 +532,11 @@ def convert_and_filter(
     CSV files (`build` subcommand). Supplementary CSVs (artist_alias.csv,
     label_hierarchy.csv) are still written to output_dir in either mode.
 
+    library_db, when set, is forwarded to the converter so the streaming
+    scanner narrows release output to (artist, title) pairs in the WXYC
+    library — ~50K releases instead of the artist-only ~4M. library_artists
+    and library_db are mutually exclusive (the converter rejects both).
+
     xml_type, when set, skips the converter's per-file root-element
     auto-detection. Required for FIFO inputs (the rebuild-cache.sh
     monthly path) where the auto-detect open/close pattern would
@@ -557,6 +546,8 @@ def convert_and_filter(
     cmd = [converter, subcommand, str(xml_file), "--data-dir", str(output_dir)]
     if library_artists:
         cmd.extend(["--library-artists", str(library_artists)])
+    if library_db:
+        cmd.extend(["--library-db", str(library_db)])
     if database_url:
         cmd.extend(["--database-url", database_url])
     if xml_type:
@@ -565,49 +556,6 @@ def convert_and_filter(
         "Convert and import XML to PostgreSQL" if database_url else "Convert and filter XML to CSV"
     )
     run_step(description, cmd)
-
-
-def pair_filter_csvs(library_db: Path, csv_dir: Path, python: str) -> None:
-    """Step 2.7: narrow the converter's artist-filtered CSVs to releases whose
-    (artist, title) pair matches a library entry.
-
-    Runs filter_csv.py --library-db in-place. Cuts release.csv from ~4M rows
-    (the converter's artist-only output) to ~50K — small enough for a
-    Railway-sized destination DB to import without overflowing the volume
-    (#128). The release_artist/label/track/etc. CSVs are filtered to the
-    same release_id set by the same call.
-    """
-    cmd = [
-        python,
-        str(SCRIPT_DIR / "filter_csv.py"),
-        "--library-db",
-        str(library_db),
-        str(csv_dir),
-        str(csv_dir),
-    ]
-    run_step("Pair-wise (artist, title) filter", cmd)
-
-
-def enrich_library_artists(
-    library_db: Path,
-    library_artists_out: Path,
-    wxyc_db_url: str | None = None,
-    catalog_source: str | None = None,
-    catalog_db_url: str | None = None,
-) -> None:
-    """Step 2.5: Enrich library_artists.txt with WXYC cross-reference data."""
-    cmd = [
-        "wxyc-enrich-library-artists",
-        "--library-db",
-        str(library_db),
-        "--output",
-        str(library_artists_out),
-    ]
-    if catalog_source and catalog_db_url:
-        cmd.extend(["--catalog-source", catalog_source, "--catalog-db-url", catalog_db_url])
-    elif wxyc_db_url:
-        cmd.extend(["--wxyc-db-url", wxyc_db_url])
-    run_step("Enrich library artists", cmd)
 
 
 def _infer_pipeline_state(db_url: str, csv_dir: str) -> PipelineState:
@@ -754,22 +702,6 @@ def _run_xml_pipeline(
         csv_dir = None
 
     def _run_with_dirs(tmp_dir: Path, csv_out: Path) -> None:
-        # -- enrich_artists
-        library_artists_path = args.library_artists
-        if args.library_db and not args.library_artists:
-            # Operator did not pre-supply library_artists.txt — derive it from
-            # library.db. Pre-supplying lets the EC2 wrapper run enrich outside
-            # the FIFO timing window so curl→FIFO has an immediate reader and
-            # Cloudflare doesn't drop the connection during a 3+ minute enrich.
-            enriched_artists = tmp_dir / "library_artists.txt"
-            enrich_library_artists(
-                args.library_db,
-                enriched_artists,
-                catalog_source=args.catalog_source,
-                catalog_db_url=args.catalog_db_url,
-            )
-            library_artists_path = enriched_artists
-
         if args.direct_pg:
             # Direct-to-PG mode: create schema first, then converter writes
             # releases directly into PostgreSQL via COPY.
@@ -798,7 +730,8 @@ def _run_xml_pipeline(
                 args.xml,
                 csv_out,
                 args.converter,
-                library_artists_path,
+                library_artists=args.library_artists,
+                library_db=args.library_db,
                 database_url=db_url,
                 xml_type=args.xml_type,
             )
@@ -824,21 +757,19 @@ def _run_xml_pipeline(
                 catalog_db_url=args.catalog_db_url,
             )
         else:
-            # Standard CSV mode
+            # Standard CSV mode. The converter applies whichever filter the
+            # operator picked: --library-artists for artist-only (~4M rows)
+            # or --library-db for the pair-wise (artist, title) filter
+            # (~50K rows). Both narrow the release.csv stream inside the
+            # streaming scanner before any disk write.
             convert_and_filter(
                 args.xml,
                 csv_out,
                 args.converter,
-                library_artists_path,
+                library_artists=args.library_artists,
+                library_db=args.library_db,
                 xml_type=args.xml_type,
             )
-
-            # Pair-wise filter narrows ~4M release rows to ~50K so the
-            # downstream import fits on a small destination DB. In-place
-            # rewrite over csv_out keeps runner disk small. Validated up
-            # front in parse_args() to require --library-db.
-            if args.pair_filter:
-                pair_filter_csvs(args.library_db, csv_out, python)
 
             # Auto-detect label_hierarchy.csv
             hierarchy_csv = args.label_hierarchy

@@ -217,11 +217,12 @@ rerunning the rebuild.
 
 ### Pipeline crashes with `psycopg.errors.DiskFull`
 
-The cache rebuild presumes `--pair-filter` is doing its job (~50K release
-rows, well inside Railway's volume). If a future change removes
-`--pair-filter` or the library expands meaningfully, the volume fills.
-Either restore the filter, expand the Railway volume, or move the cache
-off Railway.
+The cache rebuild presumes the converter's `--library-db` pair-wise filter
+is doing its job (~50K release rows, well inside Railway's volume). If a
+future change passes `--library-artists` instead (artist-only, ~4M rows),
+drops the filter altogether, or the library expands meaningfully, the
+volume fills. Either restore the filter, expand the Railway volume, or
+move the cache off Railway.
 
 ### Pipeline crashes with `relation "release" does not exist` early
 
