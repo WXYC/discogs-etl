@@ -44,10 +44,27 @@ def tsv_to_sqlite(tsv_path: str, db_path: str) -> int:
         genre TEXT, format TEXT, alternate_artist_name TEXT,
         album_artist TEXT, label TEXT
     )""")
-    cur.execute("""CREATE VIRTUAL TABLE library_fts USING fts5(
-        title, artist, alternate_artist_name, album_artist,
-        content='library', content_rowid='id'
-    )""")
+    # FTS5 tokenizer extends unicode61 with the Symbol category and U+200D ZWJ so
+    # bare-emoji rows (waving-hand, musical-note) and ZWJ graphemes (family,
+    # flag, person-with-profession) get tokenized. The default unicode61
+    # categories ('L* N* Co') drop everything else, leaving the FTS index with
+    # no token to anchor a supplementary-plane row on.
+    # Cf is NOT included wholesale -- that would merge tokens around
+    # zero-width-space, BOM, soft-hyphen, etc. ZWJ is opted in explicitly via
+    # tokenchars; the U+200D codepoint is written as the explicit \\u200d escape
+    # below so the source stays unambiguous in editors and diffs that render
+    # zero-width characters invisibly.
+    # Must stay in sync with `library.db.LIBRARY_FTS_CREATE_SQL` in
+    # WXYC/library-metadata-lookup. See WXYC/discogs-etl#161 and
+    # WXYC/library-metadata-lookup#251.
+    fts_tokenizer = "unicode61 categories 'L* N* Co S*' tokenchars '\u200d'"
+    cur.execute(
+        "CREATE VIRTUAL TABLE library_fts USING fts5("
+        "title, artist, alternate_artist_name, album_artist, "
+        f'tokenize="{fts_tokenizer}", '
+        "content='library', content_rowid='id'"
+        ")"
+    )
 
     count = 0
     with open(tsv_path, encoding="utf-8") as f:
