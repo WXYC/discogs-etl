@@ -28,6 +28,7 @@ except ImportError:
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from lib.format_normalization import normalize_format  # noqa: E402
 from lib.observability import init_logger  # noqa: E402
+from lib.pg_text import strip_pg_null_bytes  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -327,6 +328,10 @@ def import_csv(
                             skip = True
                             break
 
+                        # Strip U+0000 at PG TEXT boundary (WXYC/docs#18 policy).
+                        # PostgreSQL TEXT rejects NUL bytes; stripping is idempotent.
+                        val = strip_pg_null_bytes(val)
+
                         values.append(val)
 
                     if skip:
@@ -492,7 +497,7 @@ def import_artwork(conn, csv_dir: Path) -> int:
 
         with cur.copy("COPY _artwork (release_id, artwork_url) FROM STDIN") as copy:
             for release_id, uri in artwork.items():
-                copy.write_row((release_id, uri))
+                copy.write_row((release_id, strip_pg_null_bytes(uri)))
 
         cur.execute("""
             UPDATE release r
@@ -664,7 +669,7 @@ def import_artist_details(conn, csv_dir: Path) -> int:
                     if artist_id and profile:
                         cur.execute(
                             "UPDATE artist SET profile = %s WHERE id = %s",
-                            (profile, int(artist_id)),
+                            (strip_pg_null_bytes(profile), int(artist_id)),
                         )
                         profile_count += cur.rowcount
         conn.commit()
