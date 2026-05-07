@@ -132,16 +132,15 @@ class TestToMatchFormParityWithLegacy:
         # ...and they agree element-wise on this input matrix.
         assert to_match_form(input_name) == normalize_artist_name(input_name)
 
-    def test_none_handling_diverges(self) -> None:
-        """Documented divergence: legacy returns '' for None, charter raises.
+    def test_none_handling_agrees(self) -> None:
+        """Charter and legacy both return '' for None as of wxyc-etl 0.2.1.
 
-        Callers migrating from the legacy API must guard `None` themselves
-        (e.g. `to_match_form(name or "")`) — the charter form treats `None` as
-        a programmer error rather than silently coercing to empty string.
+        Earlier 0.2.0 charter forms raised TypeError on None while legacy returned
+        ''. The 0.2.1 PyO3 wrappers accept Option<&str> and return '' on None,
+        unifying the contract — this test guards against regression.
         """
         assert normalize_artist_name(None) == ""
-        with pytest.raises(TypeError):
-            to_match_form(None)  # type: ignore[arg-type]
+        assert to_match_form(None) == ""
 
 
 # ---------------------------------------------------------------------------
