@@ -572,12 +572,15 @@ class TestDirectPgUnloggedBeforeConverter:
         )
 
 
-class TestXmlModeEnrichment:
-    """In --xml mode, library_artists.txt is generated from library.db when not provided."""
+class TestXmlModeLibraryDbForwarding:
+    """In --xml mode, --library-db is forwarded straight to the converter so the
+    converter applies its own pair-wise (artist, title) filter. This replaced
+    the older auto-enrichment path (--library-db → library_artists.txt →
+    converter --library-artists) once the converter learned --library-db."""
 
-    def test_enrich_called_with_library_db_only(self, tmp_path) -> None:
-        """When --library-db is provided without --library-artists, the pipeline
-        generates library_artists.txt from library.db via enrich_library_artists."""
+    def test_library_db_forwarded_to_converter(self, tmp_path) -> None:
+        """When --library-db is provided, args.library_db lands in the
+        convert_and_filter call so the converter does the pair-filter itself."""
         xml_file = tmp_path / "releases.xml.gz"
         xml_file.touch()
         library_db = tmp_path / "library.db"
@@ -592,39 +595,29 @@ class TestXmlModeEnrichment:
             ]
         )
 
-        enrich_calls = []
         convert_calls = []
 
-        def fake_enrich(lib_db, output, wxyc_db_url=None, catalog_source=None, catalog_db_url=None):
-            enrich_calls.append((lib_db, output, catalog_source))
-
-        def fake_convert(xml, output_dir, converter, library_artists=None, **kwargs):
-            convert_calls.append((xml, output_dir, converter, library_artists))
+        def fake_convert(xml, output_dir, converter, **kwargs):
+            convert_calls.append(kwargs)
 
         with (
-            patch.object(run_pipeline, "enrich_library_artists", side_effect=fake_enrich),
             patch.object(run_pipeline, "convert_and_filter", side_effect=fake_convert),
             patch.object(run_pipeline, "_run_database_build"),
             patch.object(run_pipeline, "parse_args", return_value=args),
         ):
             run_pipeline.main()
 
-        assert len(enrich_calls) == 1, "enrich_library_artists should be called"
         assert len(convert_calls) == 1, "convert_and_filter should be called"
-        # The generated artist list path should be passed to the converter
-        assert convert_calls[0][3] is not None, (
-            "library_artists path should be passed to convert_and_filter"
+        assert convert_calls[0].get("library_db") == library_db, (
+            "library_db must be forwarded to convert_and_filter so the converter "
+            "applies its --library-db pair filter"
         )
 
-    def test_enrich_skipped_when_library_artists_explicit(self, tmp_path) -> None:
-        """When --library-artists is provided alongside --library-db, the pipeline
-        must skip enrich_library_artists and pass the operator-supplied file straight
-        to the converter. This lets the EC2 wrapper pre-build library_artists.txt
-        outside the FIFO timing window so curl→FIFO has an immediate reader."""
+    def test_library_artists_forwarded_when_no_library_db(self, tmp_path) -> None:
+        """When --library-artists is provided alone (no --library-db), the
+        operator-supplied artist list flows straight to the converter as before."""
         xml_file = tmp_path / "releases.xml.gz"
         xml_file.touch()
-        library_db = tmp_path / "library.db"
-        library_db.touch()
         prebuilt_artists = tmp_path / "library_artists.txt"
         prebuilt_artists.write_text("Juana Molina\nStereolab\n")
 
@@ -632,37 +625,26 @@ class TestXmlModeEnrichment:
             [
                 "--xml",
                 str(xml_file),
-                "--library-db",
-                str(library_db),
                 "--library-artists",
                 str(prebuilt_artists),
             ]
         )
 
-        enrich_calls = []
         convert_calls = []
 
-        def fake_enrich(lib_db, output, wxyc_db_url=None, catalog_source=None, catalog_db_url=None):
-            enrich_calls.append((lib_db, output))
-
-        def fake_convert(xml, output_dir, converter, library_artists=None, **kwargs):
-            convert_calls.append((xml, output_dir, converter, library_artists))
+        def fake_convert(xml, output_dir, converter, **kwargs):
+            convert_calls.append(kwargs)
 
         with (
-            patch.object(run_pipeline, "enrich_library_artists", side_effect=fake_enrich),
             patch.object(run_pipeline, "convert_and_filter", side_effect=fake_convert),
             patch.object(run_pipeline, "_run_database_build"),
             patch.object(run_pipeline, "parse_args", return_value=args),
         ):
             run_pipeline.main()
 
-        assert enrich_calls == [], (
-            "enrich must be skipped when the operator pre-supplies library_artists.txt"
-        )
         assert len(convert_calls) == 1
-        assert convert_calls[0][3] == prebuilt_artists, (
-            "the operator-supplied artist list must be passed through to the converter"
-        )
+        assert convert_calls[0].get("library_artists") == prebuilt_artists
+        assert convert_calls[0].get("library_db") is None
 
 
 # ---------------------------------------------------------------------------
@@ -919,44 +901,35 @@ class TestConvertAndFilter:
         cmd = mock_run.call_args[0][1]
         assert "--xml-type" not in cmd
 
-
-# ---------------------------------------------------------------------------
-# enrich_library_artists (orchestrator wrapper)
-# ---------------------------------------------------------------------------
-
-
-class TestEnrichLibraryArtists:
-    """enrich_library_artists() constructs the enrichment command."""
-
-    def test_command_with_wxyc_db_url(self) -> None:
-        """Command includes --wxyc-db-url when provided."""
+    def test_library_db_forwarded_when_set(self) -> None:
+        """library_db is forwarded as --library-db to the converter so it can
+        run its built-in pair-wise (artist, title) filter, narrowing release
+        output from ~4M to ~50K. Mirrors the --xml-type forwarding pattern.
+        Replaces the old run_pipeline-side pair_filter_csvs() post-pass."""
         with patch.object(run_pipeline, "run_step") as mock_run:
-            run_pipeline.enrich_library_artists(
-                Path("/data/library.db"),
-                Path("/tmp/library_artists.txt"),
-                wxyc_db_url="mysql://user:pass@host/db",
+            run_pipeline.convert_and_filter(
+                Path("/data/releases.xml.gz"),
+                Path("/tmp/csv"),
+                "discogs-xml-converter",
+                library_db=Path("/data/library.db"),
             )
 
         cmd = mock_run.call_args[0][1]
         assert "--library-db" in cmd
         assert "/data/library.db" in cmd
-        assert "--output" in cmd
-        assert "/tmp/library_artists.txt" in cmd
-        assert "--wxyc-db-url" in cmd
-        assert "mysql://user:pass@host/db" in cmd
+        assert "--library-artists" not in cmd
 
-    def test_command_without_wxyc_db_url(self) -> None:
-        """Command omits --wxyc-db-url when not provided."""
+    def test_library_db_omitted_when_not_set(self) -> None:
+        """library_db is None → no --library-db on the converter command."""
         with patch.object(run_pipeline, "run_step") as mock_run:
-            run_pipeline.enrich_library_artists(
-                Path("/data/library.db"),
-                Path("/tmp/library_artists.txt"),
+            run_pipeline.convert_and_filter(
+                Path("/data/releases.xml.gz"),
+                Path("/tmp/csv"),
+                "discogs-xml-converter",
             )
 
         cmd = mock_run.call_args[0][1]
-        assert "--library-db" in cmd
-        assert "--output" in cmd
-        assert "--wxyc-db-url" not in cmd
+        assert "--library-db" not in cmd
 
 
 # ---------------------------------------------------------------------------
@@ -1165,82 +1138,34 @@ class TestParseArgsValidation:
                 ]
             )
 
-    def test_pair_filter_without_library_db_exits(self) -> None:
-        """--pair-filter needs a library source to derive (artist, title) pairs from."""
-        with pytest.raises(SystemExit):
-            run_pipeline.parse_args(["--csv-dir", "/tmp/csv", "--pair-filter"])
-
-    def test_pair_filter_with_direct_pg_exits(self) -> None:
-        """--pair-filter operates on the CSV staging that --direct-pg bypasses."""
+    def test_library_artists_and_library_db_mutually_exclusive(self) -> None:
+        """--library-artists and --library-db pick different filter strategies on
+        the converter side (artist-only ~4M vs pair ~50K). The converter rejects
+        both at once, and so does run_pipeline so the operator gets the error
+        before the multi-GB dump download starts."""
         with pytest.raises(SystemExit):
             run_pipeline.parse_args(
                 [
                     "--xml",
                     "/tmp/dump.xml.gz",
-                    "--direct-pg",
-                    "--pair-filter",
+                    "--library-artists",
+                    "/tmp/library_artists.txt",
                     "--library-db",
                     "/tmp/library.db",
                 ]
             )
 
-    def test_pair_filter_with_library_db_accepted(self) -> None:
-        """--pair-filter + --library-db is the supported combination."""
-        args = run_pipeline.parse_args(
-            [
-                "--xml",
-                "/tmp/dump.xml.gz",
-                "--pair-filter",
-                "--library-db",
-                "/tmp/library.db",
-            ]
-        )
-        assert args.pair_filter is True
-        assert args.library_db == Path("/tmp/library.db")
-
-    def test_pair_filter_with_generate_library_db_accepted(self) -> None:
-        """--pair-filter + --generate-library-db (the rebuild-cache.yml shape)."""
-        args = run_pipeline.parse_args(
-            [
-                "--xml",
-                "/tmp/dump.xml.gz",
-                "--pair-filter",
-                "--generate-library-db",
-                "--catalog-source",
-                "tubafrenzy",
-                "--catalog-db-url",
-                "mysql://example/test",
-            ]
-        )
-        assert args.pair_filter is True
-        assert args.generate_library_db is True
-
-
-class TestPairFilterCsvs:
-    """The pair_filter_csvs helper invokes filter_csv.py with --library-db
-    and an in-place csv_dir."""
-
-    def test_invokes_filter_csv_in_place(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        recorded: dict[str, object] = {}
-
-        def fake_run_step(description: str, cmd: list[str], **kwargs) -> None:
-            recorded["description"] = description
-            recorded["cmd"] = cmd
-
-        monkeypatch.setattr(run_pipeline, "run_step", fake_run_step)
-
-        run_pipeline.pair_filter_csvs(
-            Path("/tmp/library.db"),
-            Path("/tmp/csv_out"),
-            "/usr/bin/python3",
-        )
-
-        cmd = recorded["cmd"]
-        assert cmd[0] == "/usr/bin/python3"
-        assert cmd[1].endswith("filter_csv.py")
-        assert "--library-db" in cmd
-        assert str(Path("/tmp/library.db")) in cmd
-        # Last two positional args are the input and output directories,
-        # which point at the same path so the rewrite is in-place.
-        assert cmd[-2] == str(Path("/tmp/csv_out"))
-        assert cmd[-1] == str(Path("/tmp/csv_out"))
+    def test_pair_filter_flag_is_gone(self) -> None:
+        """--pair-filter was removed when the converter learned --library-db.
+        The pair-wise narrowing now happens inside the converter's streaming
+        scanner; no separate post-CSV pass exists in run_pipeline."""
+        with pytest.raises(SystemExit):
+            run_pipeline.parse_args(
+                [
+                    "--xml",
+                    "/tmp/dump.xml.gz",
+                    "--library-db",
+                    "/tmp/library.db",
+                    "--pair-filter",
+                ]
+            )

@@ -5,11 +5,12 @@ name: Rebuild Discogs Cache
 # settle and to stagger against sister cache-builder repos (e.g. wikidata-cache,
 # musicbrainz-cache).
 #
-# The pipeline runs `--pair-filter`, which narrows the converter's
-# artist-only output (~4M release rows) to releases whose (artist, title)
-# pair matches the WXYC library (~50K) before the import step. Without
-# this, the import overflows small destination DBs (Railway-sized) at
-# `COPY release_artist` — see #128.
+# The pipeline forwards `--library-db` to discogs-xml-converter, which
+# applies its built-in pair-wise (artist, title) filter inside the
+# streaming scanner. That narrows release output from ~4M to ~50K rows
+# before the import step. Without it, the import overflows small
+# destination DBs (Railway-sized) at `COPY release_artist` — see
+# WXYC/discogs-etl#128 and WXYC/discogs-xml-converter#45.
 #
 # Library catalog: this workflow consumes the `library.db` produced daily by
 # `sync-library.yml` (uploaded as an asset on the `streaming-data-v1` release
@@ -177,8 +178,7 @@ jobs:
 
           python scripts/run_pipeline.py \
             --xml data/releases.xml.gz \
-            --library-db data/library.db \
-            --pair-filter
+            --library-db data/library.db
 
           # Curl should already be done by the time the pipeline returns;
           # wait surfaces any non-zero exit so a streaming failure is visible.
