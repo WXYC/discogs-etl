@@ -136,7 +136,7 @@ docker compose up db -d     # just the database (for tests)
 
 Functionality that was previously local to this repo has been extracted to shared packages:
 
-- **wxyc-etl** (Rust/PyO3) -- Artist name normalization (`normalize_artist_name`), compilation detection (`is_compilation_artist`), artist name splitting (`split_artist_name`, `split_artist_name_contextual`), pipeline state tracking (`PipelineState`), and database introspection.
+- **wxyc-etl** (Rust/PyO3) -- Artist name normalization (`to_match_form`; legacy `normalize_artist_name` is `#[deprecated]` per the WX-2 Normalizer Charter), compilation detection (`is_compilation_artist`), artist name splitting (`split_artist_name`, `split_artist_name_contextual`), pipeline state tracking (`PipelineState`), and database introspection.
 - **wxyc-catalog** -- Catalog source protocol (`CatalogSource`, `TubafrenzySource`, `BackendServiceSource`), library.db export (`wxyc-export-to-sqlite` CLI), library artist enrichment (`wxyc-enrich-library-artists` CLI), and label extraction (`wxyc-extract-library-labels` CLI).
 
 ### External Inputs
