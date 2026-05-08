@@ -22,28 +22,14 @@ The bootstrap script lives in this repo at [`scripts/rebuild-cache-bootstrap.sh`
 
 ### 1. Provision SSM parameters
 
-The stack does **not** create the SecureString parameters — bootstrap reads them, but they're operator-managed so the secret values aren't in CloudFormation drift history. Provision once before the first run:
+The stack does **not** create the SecureString parameters — bootstrap reads them, but they're operator-managed so the secret values aren't in CloudFormation drift history. Run `./provision-secrets.sh` from this directory; it prompts (with hidden input) for each value and writes them under `/wxyc/discogs-rebuild/`:
 
 ```bash
-aws ssm put-parameter --type SecureString \
-  --name /wxyc/discogs-rebuild/DATABASE_URL_DISCOGS \
-  --value 'postgresql://postgres:<pw>@<word>.proxy.rlwy.net:<port>/railway'
-
-aws ssm put-parameter --type SecureString \
-  --name /wxyc/discogs-rebuild/GH_TOKEN \
-  --value '<classic PAT or fine-grained token with read access on WXYC/library-metadata-lookup>'
-
-aws ssm put-parameter --type SecureString \
-  --name /wxyc/discogs-rebuild/SLACK_MONITORING_WEBHOOK \
-  --value 'https://hooks.slack.com/services/...'
-
-# Optional: Sentry DSN
-aws ssm put-parameter --type SecureString \
-  --name /wxyc/discogs-rebuild/SENTRY_DSN \
-  --value 'https://<key>@<org>.ingest.sentry.io/<project>'
+cd infra/ephemeral-rebuild
+./provision-secrets.sh
 ```
 
-If you change `SsmPrefix` away from the default, mirror the new prefix in every `put-parameter` call.
+The script confirms the AWS account before writing, uses `--overwrite` so it's safe to re-run for rotations, and prints a final summary table of the parameter names + types (never the decrypted values). Override the prefix via `SSM_PREFIX=/some/other/path ./provision-secrets.sh` if you deployed the stack with a non-default `SsmPrefix`.
 
 ### 2. Deploy the stack
 
