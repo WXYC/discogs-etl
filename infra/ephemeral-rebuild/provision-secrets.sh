@@ -8,10 +8,13 @@
 #     SSM_PREFIX=/some/other/path \
 #         ./provision-secrets.sh          # override the prefix (matches the
 #                                         # stack's SsmPrefix parameter)
+#     AWS_REGION=us-west-2 \
+#         ./provision-secrets.sh          # override the region (default
+#                                         # us-east-1, matches the stack)
 #
 # Prereqs:
 #     - AWS credentials configured for the rebuild account (503977661500).
-#     - aws CLI v2 on PATH.
+#     - aws CLI on PATH (v1 or v2; both support --overwrite + SecureString).
 #
 # What it writes:
 #     <prefix>/DATABASE_URL_DISCOGS         (required) — Railway public-proxy URL

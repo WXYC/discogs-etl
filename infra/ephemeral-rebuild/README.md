@@ -29,7 +29,7 @@ cd infra/ephemeral-rebuild
 ./provision-secrets.sh
 ```
 
-The script confirms the AWS account before writing, uses `--overwrite` so it's safe to re-run for rotations, and prints a final summary table of the parameter names + types (never the decrypted values). Override the prefix via `SSM_PREFIX=/some/other/path ./provision-secrets.sh` if you deployed the stack with a non-default `SsmPrefix`.
+The script confirms the AWS account before writing, uses `--overwrite` so it's safe to re-run for rotations, and prints a final summary table of the parameter names + types (never the decrypted values). Two env-var overrides are honored: `SSM_PREFIX=/some/other/path` if you deployed the stack with a non-default `SsmPrefix`, and `AWS_REGION=…` if you deployed it outside the default `us-east-1`.
 
 ### 2. Deploy the stack
 
