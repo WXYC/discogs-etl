@@ -1,25 +1,44 @@
 # EC2 monthly cache rebuild — operator runbook
 
-The Discogs cache rebuild runs monthly via cron on the WXYC EC2 host. This
-runbook covers the one-time setup, the recurring operator concerns, and the
-troubleshooting playbook.
+The Discogs cache rebuild runs monthly on AWS. This runbook covers two paths:
 
-## Why this lives on EC2
+1. **Current (recommended): ephemeral EC2** — a one-shot t3.medium spawned by
+   a CloudFormation-managed Lambda and terminated when the rebuild
+   finishes. Lives in `infra/ephemeral-rebuild/`. The operator runbook for
+   the stack itself is at
+   [`infra/ephemeral-rebuild/README.md`](../infra/ephemeral-rebuild/README.md);
+   the rest of this document is the legacy path.
+2. **Legacy: Backend-Service EC2 cron** — the same `scripts/rebuild-cache.sh`
+   running as a cron entry on the `wxyc-ec2` host that also serves the
+   Backend-Service API. The new path supersedes this; the section is
+   preserved here until two successful runs have landed via the
+   ephemeral path (see [discogs-etl#163](https://github.com/WXYC/discogs-etl/issues/163)).
 
-We tried running the rebuild as a GitHub Actions cron and it doesn't fit
-([discogs-etl#138](https://github.com/WXYC/discogs-etl/issues/138) and
-the disable-cron PR follow-up). Specifically:
+## Why we moved to ephemeral
+
+The legacy path was sized correctly for one rebuild but wrong for the
+host: the Backend-Service EC2 has ~14 GB free disk and serves live API
+traffic. Disk pressure or I/O saturation during the rebuild was a blast-radius
+concern, and any future schema growth would have overflowed. The ephemeral
+path right-sizes the rebuild (100 GB gp3, terminated after ~90 min) and
+leaves Backend-Service alone. Cost stays under $2/year (vs the previous
+~$0/month, but with a hard isolation boundary).
+
+We previously tried GitHub Actions cron and that didn't fit
+([discogs-etl#138](https://github.com/WXYC/discogs-etl/issues/138)):
 
 - Discogs's Cloudflare front (`data.discogs.com`) returns 403 from
   GitHub-hosted runner egress IPs. The same URL serves 200 from any
   residential or AWS-EC2-style IP.
-- The job's compute envelope (~30+ min wall, multi-tens-of-GB stream)
+- The job's compute envelope (multi-tens-of-GB stream + 60-90 min wall)
   burns Actions minutes for what should be a short job hosted close to
   the destination DB.
 
-EC2 fixes both: residential-class IP + colocation with cheaper egress to
-Railway. Cost is effectively $0/month — runs against the existing
-Backend-Service EC2 (the same `ssh wxyc-ec2` host the API uses).
+The ephemeral EC2 path keeps both wins (residential-class egress, AWS-Railway
+proximity) without the colocation drawback.
+
+> **Legacy path follows.** Skip to the bottom for the cron-removal procedure
+> if you've already cut over.
 
 ## One-time setup
 
@@ -228,3 +247,34 @@ move the cache off Railway.
 
 The destination DB hasn't been alembic-stamped. Apply the procedure in
 [`docs/migrations-runbook.md`](migrations-runbook.md) once.
+
+## Decommissioning the legacy cron
+
+After two successful rebuilds via the ephemeral path
+([`infra/ephemeral-rebuild/`](../infra/ephemeral-rebuild/README.md)), remove
+the cron from the Backend-Service EC2:
+
+```bash
+ssh wxyc-ec2
+crontab -l                        # confirm the discogs-rebuild line is present
+crontab -e                        # remove the `0 6 4 * *` line for rebuild-cache.sh
+sudo rm /etc/discogs-rebuild.env  # secrets now live in SSM Parameter Store
+```
+
+`/var/log/discogs-rebuild/` and `/opt/discogs-etl/` can stay — they cost nothing
+and the historical logs are useful for comparing pre/post-cutover runs. The
+new path archives its logs to `s3://wxyc-discogs-rebuild-logs-<account>/` so
+the legacy directory doesn't grow further once the cron is removed.
+
+If the new path needs to be temporarily disabled (e.g. while debugging an
+infra issue), re-add the cron before disabling the EventBridge schedule:
+
+```bash
+aws events disable-rule \
+  --name $(aws events list-rule-names-by-target \
+      --target-arn $(aws cloudformation describe-stacks \
+          --stack-name wxyc-discogs-rebuild \
+          --query 'Stacks[0].Outputs[?OutputKey==`LauncherFunctionArn`].OutputValue' \
+          --output text) \
+      --query 'RuleNames[0]' --output text)
+```
