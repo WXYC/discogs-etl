@@ -1,0 +1,340 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  WXYC monthly Discogs cache rebuild — ephemeral EC2. EventBridge schedule
+  fires a launcher Lambda once per month; the Lambda calls RunInstances
+  with a tiny user-data stub that clones discogs-etl and execs
+  scripts/rebuild-cache-bootstrap.sh. The instance terminates itself via
+  InstanceInitiatedShutdownBehavior=terminate when the bootstrap is done
+  (or panics into trap EXIT). A second Lambda sweeps any rebuild instance
+  still running >3h after launch as a failsafe.
+
+Parameters:
+  ScheduleExpression:
+    Type: String
+    Default: cron(0 6 4 * ? *)
+    Description: >
+      EventBridge schedule for the monthly rebuild. Default is 06:00 UTC on
+      the 4th of each month (Discogs publishes the new dump on the 1st;
+      a few days of slack lets the dump settle).
+
+  RepoBranch:
+    Type: String
+    Default: main
+    Description: Branch of WXYC/discogs-etl the spawned instance clones.
+
+  InstanceType:
+    Type: String
+    Default: t3.medium
+    Description: >
+      EC2 instance type. t3.medium (~$0.04/hr on-demand) clears the
+      90-minute rebuild comfortably. Bump to c6i.large or larger if a
+      future schema or library expansion pushes wall-clock past the budget.
+
+  RootVolumeSizeGb:
+    Type: Number
+    Default: 100
+    Description: >
+      gp3 root volume size. The streaming dump is multi-tens-of-GB and
+      filtered CSVs are ~5-10 GB; 100 GB clears the workload with
+      headroom. EBS billed only for the ~90 min the instance exists.
+
+  AmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+    Description: >
+      AMI ID for the spawned instance. The default resolves to the latest
+      Amazon Linux 2023 x86_64 image in this region via SSM Public
+      Parameters; pin to a specific AMI ID if you need reproducibility
+      across runs.
+
+  MaxInstanceAgeHours:
+    Type: Number
+    Default: 3
+    Description: >
+      Sweeper failsafe. Any rebuild instance older than this is force-
+      terminated and emits a StaleInstanceTerminated CloudWatch metric.
+
+  AlertEmail:
+    Type: String
+    Default: ''
+    Description: >
+      Optional email subscribed to the alert SNS topic. Leave empty to
+      manage subscriptions outside this stack (e.g., wire to a Slack
+      webhook via a separate subscription).
+
+  SsmPrefix:
+    Type: String
+    Default: /wxyc/discogs-rebuild
+    Description: >
+      SSM Parameter Store path prefix where the bootstrap reads
+      DATABASE_URL_DISCOGS, GH_TOKEN, SLACK_MONITORING_WEBHOOK, and
+      (optionally) SENTRY_DSN. SecureString parameters under this prefix
+      are NOT created by this stack — provision them out-of-band via the
+      AWS console or CLI before the first run (see infra/ephemeral-rebuild/README.md).
+
+Conditions:
+  HasAlertEmail: !Not [!Equals [!Ref AlertEmail, '']]
+
+Resources:
+  # ------------------------------------------------------------------
+  # Log archive bucket. Bootstrap's trap EXIT uploads the run log here
+  # before shutdown. Lifecycle expires logs after 180 days.
+  # ------------------------------------------------------------------
+  LogBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'wxyc-discogs-rebuild-logs-${AWS::AccountId}'
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-old-logs
+            Status: Enabled
+            ExpirationInDays: 180
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # ------------------------------------------------------------------
+  # Instance role + profile. Granted to the spawned EC2.
+  # ------------------------------------------------------------------
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ssm-secrets-read
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:GetParameters
+                Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${SsmPrefix}/*'
+              # SecureString parameters use the default aws/ssm KMS CMK
+              # for encryption; granting kms:Decrypt against any key with
+              # the SSM service condition is the AWS-recommended scope.
+              - Effect: Allow
+                Action: kms:Decrypt
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    kms:ViaService: !Sub 'ssm.${AWS::Region}.amazonaws.com'
+        - PolicyName: log-archive-write
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub '${LogBucket.Arn}/*'
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref InstanceRole]
+
+  # ------------------------------------------------------------------
+  # Launch template. Pinning EBS, AMI, instance type, and shutdown
+  # behaviour here means the launcher Lambda only has to pass user-data
+  # + tags at run-time.
+  # ------------------------------------------------------------------
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: discogs-rebuild
+      LaunchTemplateData:
+        ImageId: !Ref AmiId
+        InstanceType: !Ref InstanceType
+        IamInstanceProfile:
+          Arn: !GetAtt InstanceProfile.Arn
+        InstanceInitiatedShutdownBehavior: terminate
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              VolumeSize: !Ref RootVolumeSizeGb
+              VolumeType: gp3
+              DeleteOnTermination: true
+        MetadataOptions:
+          HttpTokens: required  # IMDSv2 only
+          HttpPutResponseHopLimit: 2
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Project
+                Value: discogs-rebuild
+
+  # ------------------------------------------------------------------
+  # Launcher Lambda. EventBridge fires it on ScheduleExpression.
+  # ------------------------------------------------------------------
+  LauncherFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: discogs-rebuild-launcher
+      Description: Monthly trigger that calls RunInstances for the rebuild EC2.
+      CodeUri: launcher/
+      Handler: handler.lambda_handler
+      Runtime: python3.12
+      Architectures: [arm64]
+      MemorySize: 256
+      Timeout: 60
+      Environment:
+        Variables:
+          LAUNCH_TEMPLATE_ID: !Ref LaunchTemplate
+          REPO_BRANCH: !Ref RepoBranch
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: ec2:RunInstances
+              Resource: '*'
+            - Effect: Allow
+              Action: ec2:CreateTags
+              Resource: '*'
+              # CreateTags is intentionally unrestricted: AWS evaluates this
+              # implicitly during RunInstances when the request includes
+              # TagSpecifications. The launcher needs the freedom to tag
+              # any new resource RunInstances creates (instance + EBS volume).
+            - Effect: Allow
+              Action: iam:PassRole
+              # PassRole is the only iam:* the launcher gets, and it's
+              # scoped to the single role the launch template attaches.
+              Resource: !GetAtt InstanceRole.Arn
+      Events:
+        Monthly:
+          Type: Schedule
+          Properties:
+            Schedule: !Ref ScheduleExpression
+            Description: Monthly Discogs cache rebuild.
+
+  LauncherLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${LauncherFunction}
+      RetentionInDays: 30
+
+  # ------------------------------------------------------------------
+  # Sweeper Lambda. Hourly. Terminates rebuild EC2s older than the
+  # MaxInstanceAgeHours threshold.
+  # ------------------------------------------------------------------
+  SweeperFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: discogs-rebuild-sweeper
+      Description: Failsafe — terminates rebuild EC2s past their wall-clock budget.
+      CodeUri: sweeper/
+      Handler: handler.lambda_handler
+      Runtime: python3.12
+      Architectures: [arm64]
+      MemorySize: 128
+      Timeout: 30
+      Environment:
+        Variables:
+          MAX_INSTANCE_AGE_HOURS: !Ref MaxInstanceAgeHours
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: ec2:DescribeInstances
+              Resource: '*'
+            - Effect: Allow
+              Action: ec2:TerminateInstances
+              # Terminate is scoped via tag-based ResourceTag condition so
+              # the sweeper can only kill rebuild EC2s — not any other
+              # workload that lands in the same account.
+              Resource: !Sub 'arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:instance/*'
+              Condition:
+                StringEquals:
+                  ec2:ResourceTag/Project: discogs-rebuild
+            - Effect: Allow
+              Action: cloudwatch:PutMetricData
+              Resource: '*'
+              Condition:
+                StringEquals:
+                  cloudwatch:namespace: WXYC/DiscogsRebuild
+      Events:
+        Hourly:
+          Type: Schedule
+          Properties:
+            Schedule: rate(1 hour)
+            Description: Sweep stale rebuild EC2s.
+
+  SweeperLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${SweeperFunction}
+      RetentionInDays: 30
+
+  # ------------------------------------------------------------------
+  # Alerting. SNS topic + alarms on (a) the launcher Lambda crashing
+  # before RunInstances, (b) the sweeper firing (= stuck rebuild).
+  # ------------------------------------------------------------------
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: discogs-rebuild-alerts
+      DisplayName: WXYC Discogs Rebuild Alerts
+
+  AlertEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlertEmail
+    Properties:
+      TopicArn: !Ref AlertTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  LauncherErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: discogs-rebuild-launcher-errors
+      AlarmDescription: Launcher Lambda crashed before RunInstances completed.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref LauncherFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+      OKActions: [!Ref AlertTopic]
+
+  StaleInstanceAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: discogs-rebuild-stale-instance
+      AlarmDescription: >
+        Sweeper had to force-terminate a rebuild instance — bootstrap
+        likely panicked before reaching shutdown -h now. Investigate the
+        rebuild log in s3://wxyc-discogs-rebuild-logs-<account>/<instance-id>/.
+      Namespace: WXYC/DiscogsRebuild
+      MetricName: StaleInstanceTerminated
+      Statistic: Sum
+      Period: 3600
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+
+Outputs:
+  LauncherFunctionArn:
+    Value: !GetAtt LauncherFunction.Arn
+  SweeperFunctionArn:
+    Value: !GetAtt SweeperFunction.Arn
+  LaunchTemplateId:
+    Value: !Ref LaunchTemplate
+  LogBucketName:
+    Value: !Ref LogBucket
+  AlertTopicArn:
+    Value: !Ref AlertTopic
+    Description: Subscribe additional endpoints (Slack webhook via Lambda, PagerDuty, etc.) to this topic.
+  InstanceRoleArn:
+    Value: !GetAtt InstanceRole.Arn

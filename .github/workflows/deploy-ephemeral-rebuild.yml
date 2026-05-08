@@ -1,0 +1,73 @@
+name: Deploy Ephemeral Rebuild Stack
+
+# Builds + deploys the wxyc-discogs-rebuild SAM stack to account 503977661500
+# us-east-1. Mirrors the pattern in WXYC/wxyc-canary's deploy.yml.
+#
+# The stack itself is the trigger (EventBridge schedule fires monthly); this
+# workflow only re-deploys the stack when the template, the Lambda handlers,
+# or this workflow file change.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "infra/ephemeral-rebuild/**"
+      - "scripts/rebuild-cache-bootstrap.sh"
+      - ".github/workflows/deploy-ephemeral-rebuild.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: aws-actions/setup-sam@v2
+        with:
+          use-installer: true
+      - name: SAM validate
+        run: sam validate --lint -t infra/ephemeral-rebuild/template.yaml
+      - name: pytest (Lambda unit tests)
+        run: |
+          pip install pytest
+          pytest tests/unit/test_ephemeral_rebuild_launcher.py \
+                 tests/unit/test_ephemeral_rebuild_sweeper.py -v
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: validate
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: aws-actions/setup-sam@v2
+        with:
+          use-installer: true
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+      - name: SAM build
+        working-directory: infra/ephemeral-rebuild
+        run: sam build
+      - name: SAM deploy
+        working-directory: infra/ephemeral-rebuild
+        run: |
+          sam deploy \
+            --no-confirm-changeset \
+            --no-fail-on-empty-changeset \
+            --stack-name wxyc-discogs-rebuild \
+            --capabilities CAPABILITY_IAM \
+            --resolve-s3 \
+            --parameter-overrides \
+              RepoBranch=main \
+              AlertEmail=${{ vars.REBUILD_ALERT_EMAIL }}
