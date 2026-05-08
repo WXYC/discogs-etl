@@ -29,7 +29,7 @@ cd infra/ephemeral-rebuild
 ./provision-secrets.sh
 ```
 
-The script confirms the AWS account before writing, uses `--overwrite` so it's safe to re-run for rotations, and prints a final summary table of the parameter names + types (never the decrypted values). Two env-var overrides are honored: `SSM_PREFIX=/some/other/path` if you deployed the stack with a non-default `SsmPrefix`, and `AWS_REGION=…` if you deployed it outside the default `us-east-1`.
+The script hard-fails before any write if the caller's AWS account isn't `503977661500` (the rebuild account), then displays account/region/prefix/caller-arn and asks for an explicit `y` confirmation as the second line of defence. `--overwrite` makes it safe to re-run for rotations. The final summary table lists parameter names + types only — never the decrypted values. Three env-var overrides are honored: `SSM_PREFIX=/some/other/path` if you deployed the stack with a non-default `SsmPrefix`, `AWS_REGION=…` if you deployed it outside the default `us-east-1`, and `EXPECTED_ACCOUNT=<id>` to deliberately target a sandbox/test account.
 
 ### 2. Deploy the stack
 
