@@ -31,6 +31,7 @@ import os
 from collections.abc import Sequence
 
 import psycopg
+from psycopg import sql
 
 from alembic import context
 
@@ -73,6 +74,13 @@ def _refuse_offline(direction: str) -> None:
         )
 
 
+_CREATE_INDEX = sql.SQL(
+    "CREATE INDEX CONCURRENTLY IF NOT EXISTS {index_name} "
+    "ON {table} USING GIN (lower(f_unaccent({column})) gin_trgm_ops)"
+)
+_DROP_INDEX = sql.SQL("DROP INDEX CONCURRENTLY IF EXISTS {index_name}")
+
+
 def upgrade() -> None:
     _refuse_offline("upgrade")
 
@@ -81,8 +89,11 @@ def upgrade() -> None:
         for index_name, table, column in _TRIGRAM_INDEXES:
             log.info("0002: building %s on %s(%s)", index_name, table, column)
             cur.execute(
-                f"CREATE INDEX CONCURRENTLY IF NOT EXISTS {index_name} "
-                f"ON {table} USING GIN (lower(f_unaccent({column})) gin_trgm_ops)"
+                _CREATE_INDEX.format(
+                    index_name=sql.Identifier(index_name),
+                    table=sql.Identifier(table),
+                    column=sql.Identifier(column),
+                )
             )
 
 
@@ -91,4 +102,4 @@ def downgrade() -> None:
 
     with psycopg.connect(_resolve_db_url(), autocommit=True) as conn, conn.cursor() as cur:
         for index_name, _, _ in _TRIGRAM_INDEXES:
-            cur.execute(f"DROP INDEX CONCURRENTLY IF EXISTS {index_name}")
+            cur.execute(_DROP_INDEX.format(index_name=sql.Identifier(index_name)))
