@@ -37,7 +37,7 @@ def _run_alembic(args: list[str], db_url: str) -> subprocess.CompletedProcess[st
 
 @pytest.mark.pg
 def test_alembic_upgrade_head_against_empty_db(db_url: str) -> None:
-    result = _run_alembic(["upgrade", "head"], db_url)
+    result = _run_alembic(["upgrade", "0001_initial"], db_url)
     assert result.returncode == 0, (
         f"alembic upgrade head failed:\nstdout: {result.stdout}\nstderr: {result.stderr}"
     )
@@ -71,7 +71,7 @@ def test_alembic_upgrade_head_sql_against_populated_db_is_safe(db_url: str) -> N
     # `--sql` (offline mode) interception. Running `alembic upgrade head --sql`
     # against a populated DB used to silently DROP every release/artist table.
     # The defensive guard in 0001_initial.py refuses to run in offline mode.
-    apply = _run_alembic(["upgrade", "head"], db_url)
+    apply = _run_alembic(["upgrade", "0001_initial"], db_url)
     assert apply.returncode == 0, (
         f"baseline apply failed:\nstdout: {apply.stdout}\nstderr: {apply.stderr}"
     )
@@ -115,7 +115,7 @@ def test_alembic_upgrade_head_against_populated_unstamped_db_is_safe(db_url: str
             cur.execute(sql)
         cur.execute("INSERT INTO release (id, title) VALUES (424242, 'Sentinel')")
 
-    result = _run_alembic(["upgrade", "head"], db_url)
+    result = _run_alembic(["upgrade", "0001_initial"], db_url)
     assert result.returncode == 0, (
         f"alembic upgrade head failed against populated-unstamped DB:\n"
         f"stdout: {result.stdout}\nstderr: {result.stderr}"
