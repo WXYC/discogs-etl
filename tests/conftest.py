@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import os
 import uuid
+from collections.abc import Iterator
 
 import pytest
 
@@ -43,11 +44,11 @@ def _postgres_available() -> bool:
         return False
 
 
-@pytest.fixture(scope="module")
-def db_url():
-    """Create a temporary test database, yield its URL, and drop it on teardown.
+def _ephemeral_database() -> Iterator[str]:
+    """Generator body for a temp-DB fixture.
 
-    Skips the entire module if Postgres is not reachable.
+    Wrap with ``@pytest.fixture(scope=...)`` to get module- or function-scoped
+    isolation. Skips the test if Postgres is unreachable.
     """
     if not _postgres_available():
         pytest.skip("PostgreSQL not available (set DATABASE_URL_TEST)")
@@ -60,25 +61,47 @@ def db_url():
 
     # Build the test database URL by replacing the database name in the admin URL.
     # Handle both postgresql://host/db and postgresql://user:pass@host:port/db forms.
-    if "@" in ADMIN_URL:
-        base = ADMIN_URL.rsplit("/", 1)[0]
-    else:
-        base = ADMIN_URL.rsplit("/", 1)[0]
+    base = ADMIN_URL.rsplit("/", 1)[0]
     test_url = f"{base}/{db_name}"
 
-    yield test_url
+    try:
+        yield test_url
+    finally:
+        # Teardown: drop the test database. Force-disconnect any remaining
+        # connections first.
+        with admin_conn.cursor() as cur:
+            cur.execute(
+                sql.SQL(
+                    "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                    "WHERE datname = {} AND pid <> pg_backend_pid()"
+                ).format(sql.Literal(db_name))
+            )
+            cur.execute(sql.SQL("DROP DATABASE IF EXISTS {}").format(sql.Identifier(db_name)))
+        admin_conn.close()
 
-    # Teardown: drop the test database
-    # Force-disconnect any remaining connections first.
-    with admin_conn.cursor() as cur:
-        cur.execute(
-            sql.SQL(
-                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
-                "WHERE datname = {} AND pid <> pg_backend_pid()"
-            ).format(sql.Literal(db_name))
-        )
-        cur.execute(sql.SQL("DROP DATABASE IF EXISTS {}").format(sql.Identifier(db_name)))
-    admin_conn.close()
+
+@pytest.fixture(scope="module")
+def db_url() -> Iterator[str]:
+    """Module-scoped temp DB shared across all tests in a module.
+
+    Cheap when the tests don't write to the DB (or all do equivalent setup),
+    but tests that mutate state can leak across each other in undefined
+    pytest execution order. Use ``fresh_db_url`` instead when each test
+    needs a guaranteed-clean DB.
+    """
+    yield from _ephemeral_database()
+
+
+@pytest.fixture()
+def fresh_db_url() -> Iterator[str]:
+    """Function-scoped temp DB — one fresh database per test.
+
+    Use this for tests that mutate schema/version state in ways that would
+    leak across the module (e.g. alembic migrations applied in different
+    sequences). Slower than ``db_url`` because each test pays the create+drop
+    cost, but worth it when correctness depends on a clean slate.
+    """
+    yield from _ephemeral_database()
 
 
 @pytest.fixture()
