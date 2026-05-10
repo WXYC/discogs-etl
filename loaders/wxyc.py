@@ -211,9 +211,7 @@ def populate_wxyc_library_v2(
     Returns the number of rows attempted (pre-conflict).
     """
     if snapshot_source not in ("backend", "tubafrenzy", "llm"):
-        raise ValueError(
-            f"snapshot_source must be backend|tubafrenzy|llm, got {snapshot_source!r}"
-        )
+        raise ValueError(f"snapshot_source must be backend|tubafrenzy|llm, got {snapshot_source!r}")
 
     rows = _read_library_db(library_db_path)
     if not rows:
@@ -254,8 +252,7 @@ def populate_wxyc_library_v2(
     pg_conn.commit()
 
     logger.info(
-        "populate_wxyc_library_v2: wrote %d rows to %s "
-        "(snapshot_source=%s, normalizer=%s)",
+        "populate_wxyc_library_v2: wrote %d rows to %s (snapshot_source=%s, normalizer=%s)",
         len(rows),
         table,
         snapshot_source,

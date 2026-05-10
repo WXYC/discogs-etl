@@ -52,8 +52,7 @@ def migrated_db(fresh_db_url: str) -> Iterator[str]:
     """Apply alembic upgrade head to a fresh DB; yield its URL."""
     result = _run_alembic(["upgrade", "head"], fresh_db_url)
     assert result.returncode == 0, (
-        f"alembic upgrade head failed:\n"
-        f"stdout: {result.stdout}\nstderr: {result.stderr}"
+        f"alembic upgrade head failed:\nstdout: {result.stdout}\nstderr: {result.stderr}"
     )
     yield fresh_db_url
 
@@ -132,9 +131,7 @@ def test_migration_creates_wxyc_library_with_indexes(migrated_db: str) -> None:
 
 
 @pytest.mark.pg
-def test_v2_loader_writes_every_fixture_row(
-    migrated_db: str, library_db: Path
-) -> None:
+def test_v2_loader_writes_every_fixture_row(migrated_db: str, library_db: Path) -> None:
     """Option B: every library.db row lands in wxyc_library, fully populated.
 
     This is the §4.1.1 verifier — fixture-based, not legacy-parity, since this
@@ -166,8 +163,7 @@ def test_v2_loader_writes_every_fixture_row(
         assert norm_artist, f"norm_artist empty for library_id={library_id}"
         assert norm_title, f"norm_title empty for library_id={library_id}"
         assert source == "backend", (
-            f"snapshot_source for library_id={library_id} was {source!r}, "
-            f"expected 'backend'"
+            f"snapshot_source for library_id={library_id} was {source!r}, expected 'backend'"
         )
 
 
@@ -187,9 +183,7 @@ def test_v2_loader_is_idempotent(migrated_db: str, library_db: Path) -> None:
 
 
 @pytest.mark.pg
-def test_v2_loader_rejects_invalid_snapshot_source(
-    migrated_db: str, library_db: Path
-) -> None:
+def test_v2_loader_rejects_invalid_snapshot_source(migrated_db: str, library_db: Path) -> None:
     """The CHECK constraint in §3.1 is mirrored in the loader's argument check."""
     with psycopg.connect(migrated_db) as conn:  # noqa: F841 (unused; ValueError raises before write)
         with pytest.raises(ValueError, match="snapshot_source"):
