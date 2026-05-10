@@ -59,10 +59,12 @@ def _present_trigram_indexes(db_url: str) -> set[str]:
 
 @pytest.mark.pg
 def test_upgrade_to_head_creates_all_four_trigram_indexes(fresh_db_url: str) -> None:
-    """Fresh DB → upgrade head → all four indexes exist + version stamped at 0002."""
-    result = _run_alembic(["upgrade", "head"], fresh_db_url)
+    """Fresh DB → upgrade through 0002 → all four indexes exist + version stamped at 0002."""
+    # Pin the upgrade to this specific revision so the assertion stays stable
+    # as later revisions land on top of head.
+    result = _run_alembic(["upgrade", "0002_backfill_trigram_indexes"], fresh_db_url)
     assert result.returncode == 0, (
-        f"alembic upgrade head failed:\nstdout: {result.stdout}\nstderr: {result.stderr}"
+        f"alembic upgrade 0002 failed:\nstdout: {result.stdout}\nstderr: {result.stderr}"
     )
 
     assert _present_trigram_indexes(fresh_db_url) == EXPECTED_INDEXES, (
@@ -107,10 +109,10 @@ def test_upgrade_is_idempotent_when_indexes_already_exist(fresh_db_url: str) -> 
 
 @pytest.mark.pg
 def test_downgrade_drops_the_four_trigram_indexes(fresh_db_url: str) -> None:
-    """Apply head, then downgrade -1, indexes should be gone and version backed off."""
-    apply = _run_alembic(["upgrade", "head"], fresh_db_url)
+    """Apply through 0002, then downgrade -1, indexes should be gone and version backed off."""
+    apply = _run_alembic(["upgrade", "0002_backfill_trigram_indexes"], fresh_db_url)
     assert apply.returncode == 0, (
-        f"upgrade head failed:\nstdout: {apply.stdout}\nstderr: {apply.stderr}"
+        f"upgrade 0002 failed:\nstdout: {apply.stdout}\nstderr: {apply.stderr}"
     )
 
     down = _run_alembic(["downgrade", "-1"], fresh_db_url)

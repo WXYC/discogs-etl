@@ -193,6 +193,35 @@ CREATE TABLE cache_metadata (
 );
 
 -- ============================================
+-- WXYC library hook (cross-cache-identity §3.1)
+-- ============================================
+-- One row per library release; library_id mirrors Backend wxyc_schema.library.id.
+-- Mirrored from alembic/versions/0003_wxyc_library_v2.py per the dual-write
+-- convention so a fresh rebuild produces the same end state as the alembic
+-- upgrade chain.
+DROP TABLE IF EXISTS wxyc_library CASCADE;
+CREATE TABLE wxyc_library (
+    library_id      integer PRIMARY KEY,
+    artist_id       integer,
+    artist_name     text NOT NULL,
+    album_title     text NOT NULL,
+    label_id        integer,
+    label_name      text,
+    format_id       integer,
+    format_name     text,
+    wxyc_genre      text,
+    call_letters    text,
+    call_numbers    integer,
+    release_year    smallint,
+    norm_artist     text NOT NULL,
+    norm_title      text NOT NULL,
+    norm_label      text,
+    snapshot_at     timestamptz NOT NULL,
+    snapshot_source text NOT NULL
+        CHECK (snapshot_source IN ('backend', 'tubafrenzy', 'llm'))
+);
+
+-- ============================================
 -- Indexes
 -- ============================================
 
