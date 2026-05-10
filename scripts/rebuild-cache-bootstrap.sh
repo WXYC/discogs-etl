@@ -31,6 +31,16 @@
 
 set -euo pipefail
 
+# cloud-init runs user-data with a stripped environment — HOME, USER, and
+# LOGNAME are not set, and `set -u` trips the moment the script references
+# any of them (e.g. the Rust-install `"$HOME/.cargo/bin/cargo"` line, or
+# `sudo chown "$USER:$USER" "$CONVERTER_DIR"`). Default to root-appropriate
+# values up front; an interactive shell inherits the existing values and
+# these no-op. See #176 (caught live on the 2026-05-10 run #2 attempt).
+export HOME="${HOME:-/root}"
+export USER="${USER:-root}"
+export LOGNAME="${LOGNAME:-root}"
+
 REPO_DIR="${REPO_DIR:-/opt/discogs-etl}"
 CONVERTER_DIR="${CONVERTER_DIR:-/opt/discogs-xml-converter}"
 LOG_DIR="${LOG_DIR:-/var/log/discogs-rebuild}"
