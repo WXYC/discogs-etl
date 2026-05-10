@@ -255,7 +255,13 @@ class TestCreateBaseIndexes:
         assert expected.issubset(indexes)
 
     def test_base_trigram_indexes_use_unaccent(self) -> None:
-        """Base trigram indexes use f_unaccent() for accent-insensitive matching."""
+        """Base trigram indexes use f_unaccent() for accent-insensitive matching.
+
+        ``wxyc_library_*_trgm_idx`` are excluded because their backing columns
+        (``norm_artist`` / ``norm_title``) are pre-normalized at write time by
+        ``wxyc_etl.text.to_identity_match_form{,_title}`` — already case-folded
+        and diacritic-folded — so ``f_unaccent`` would be redundant.
+        """
         conn = psycopg.connect(self.db_url, autocommit=True)
         with conn.cursor() as cur:
             sql = SCHEMA_DIR.joinpath("create_indexes.sql").read_text()
@@ -266,6 +272,7 @@ class TestCreateBaseIndexes:
                 SELECT indexname, indexdef FROM pg_indexes
                 WHERE schemaname = 'public'
                   AND indexname LIKE '%trgm%'
+                  AND indexname NOT LIKE 'wxyc_library_%'
             """)
             rows = cur.fetchall()
         conn.close()
