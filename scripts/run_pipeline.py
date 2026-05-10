@@ -447,7 +447,10 @@ def run_step(description: str, cmd: list[str], **kwargs) -> None:
     elapsed = time.monotonic() - start
     if proc.returncode != 0:
         logger.error("Step failed (exit %d) after %.1fs", proc.returncode, elapsed)
-        sys.exit(1)
+        # Raise rather than sys.exit so any logger plugin that captures
+        # SystemExit (Sentry-enabled run #3 swallowed it; #180) cannot
+        # mask the failure. Default exception handler still exits non-zero.
+        raise subprocess.CalledProcessError(proc.returncode, cmd)
     logger.info("  completed in %.1fs", elapsed)
 
 

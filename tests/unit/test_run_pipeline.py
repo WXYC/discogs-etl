@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import logging
+import subprocess
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -36,13 +37,52 @@ class TestRunStepStreaming:
         assert any("line1" in msg for msg in logged)
         assert any("line2" in msg for msg in logged)
 
-    def test_nonzero_exit_triggers_sys_exit(self) -> None:
-        """Non-zero exit code triggers sys.exit(1)."""
-        with pytest.raises(SystemExit, match="1"):
+    def test_nonzero_exit_raises_called_process_error(self) -> None:
+        """Non-zero exit code raises CalledProcessError (#180).
+
+        Earlier behavior was bare ``sys.exit(1)`` inside run_step, which is
+        catchable by ``except SystemExit`` and was observed live to *not*
+        terminate the process under Sentry-enabled logging on the 2026-05-10
+        ephemeral-rebuild run #3 (instance ``i-0af07e0f56910ab9a``). Raising
+        an exception propagates through ``main()``'s default handler, so a
+        misbehaving logger plugin can capture-and-rethrow but not silently
+        swallow the failure.
+        """
+        with pytest.raises(subprocess.CalledProcessError) as excinfo:
             run_pipeline.run_step(
                 "fail test",
                 [sys.executable, "-c", "import sys; sys.exit(42)"],
             )
+        assert excinfo.value.returncode == 42
+
+    def test_run_step_failure_propagates_to_process_exit_code(self, tmp_path) -> None:
+        """End-to-end pin: a failing child step yields a non-zero process exit.
+
+        Spawns a fresh Python interpreter, imports ``run_pipeline``, and
+        invokes ``run_step`` against a child that exits 42. The outer
+        subprocess must exit non-zero — this is the property that broke
+        on the 2026-05-10 run #3 incident (#180), where the ERROR log
+        fired but the process exited 0 anyway, and the ephemeral-rebuild
+        bootstrap reported success.
+        """
+        script_path = Path(__file__).parent.parent.parent / "scripts" / "run_pipeline.py"
+        driver = tmp_path / "driver.py"
+        driver.write_text(
+            "import importlib.util, sys\n"
+            f"spec = importlib.util.spec_from_file_location('rp', r'{script_path}')\n"
+            "mod = importlib.util.module_from_spec(spec)\n"
+            "spec.loader.exec_module(mod)\n"
+            "mod.run_step('boom', [sys.executable, '-c', 'import sys; sys.exit(42)'])\n"
+        )
+        result = subprocess.run(
+            [sys.executable, str(driver)],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode != 0, (
+            f"run_step's child failure was swallowed; parent exit was "
+            f"{result.returncode}. stderr:\n{result.stderr}"
+        )
 
     def test_elapsed_time_logged(self, caplog) -> None:
         """Elapsed time is logged on completion."""
