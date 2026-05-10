@@ -140,8 +140,7 @@ def _resolve_db_url() -> str:
     db_url = os.environ.get("DATABASE_URL_DISCOGS") or os.environ.get("DATABASE_URL")
     if not db_url:
         raise RuntimeError(
-            "DATABASE_URL_DISCOGS (or DATABASE_URL) must be set to apply "
-            "0003_wxyc_library_v2."
+            "DATABASE_URL_DISCOGS (or DATABASE_URL) must be set to apply 0003_wxyc_library_v2."
         )
     return db_url
 
@@ -200,7 +199,5 @@ def downgrade() -> None:
     # then the table itself (which cascades the remaining b-tree indexes).
     with psycopg.connect(db_url, autocommit=True) as conn, conn.cursor() as cur:
         for index_name, _ in _TRIGRAM_INDEXES:
-            cur.execute(
-                _DROP_TRGM_INDEX.format(index_name=sql.Identifier(index_name))
-            )
+            cur.execute(_DROP_TRGM_INDEX.format(index_name=sql.Identifier(index_name)))
         cur.execute("DROP TABLE IF EXISTS wxyc_library")
