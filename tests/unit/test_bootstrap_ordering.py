@@ -101,6 +101,37 @@ def test_s3_breadcrumb_written_before_trap_registration(script_lines: list[str])
     )
 
 
+def test_home_env_defaulted_before_any_home_reference(script_lines: list[str]) -> None:
+    """#176: cloud-init strips HOME/USER/LOGNAME from user-data's env.
+
+    Under ``set -u`` the bootstrap's first reference to ``$HOME`` (the
+    Rust-install ``"$HOME/.cargo/bin/cargo"`` block) trips with
+    'unbound variable' and exits before doing any real work. Confirmed
+    live on the 2026-05-10 run #2 attempt at instance
+    ``i-08acdffcd38db4906`` — caught precisely because the post-#175
+    trap+S3-archive chain landed the failing log in S3 within 80
+    seconds of launch.
+
+    Same applies to ``$USER`` (``sudo chown "$USER:$USER" ...``) — both
+    must be defaulted up-front.
+    """
+    home_default_line = first_line_index(script_lines, 'HOME="${HOME:-')
+    home_use_line = first_line_index(script_lines, '"$HOME/')
+    assert home_default_line < home_use_line, (
+        f"HOME default (line {home_default_line + 1}) must precede the first "
+        f'"$HOME/..." use (line {home_use_line + 1}). cloud-init starts user-'
+        f"data with HOME unset; under set -u the first reference dies. See #176."
+    )
+
+    user_default_line = first_line_index(script_lines, 'USER="${USER:-')
+    user_use_line = first_line_index(script_lines, '"$USER:$USER"')
+    assert user_default_line < user_use_line, (
+        f"USER default (line {user_default_line + 1}) must precede the first "
+        f'"$USER:$USER" use (line {user_use_line + 1}). Same cloud-init env-'
+        f"strip story as HOME. See #176."
+    )
+
+
 def test_s3_breadcrumb_uses_aws_s3_cp_with_or_true(script_lines: list[str]) -> None:
     """#174: marker write must not be set-e-fatal itself.
 
