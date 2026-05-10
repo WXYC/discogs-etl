@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Monthly Discogs cache rebuild — invoked by EC2 cron at 06:00 UTC on the
-# 4th of each month. Streams the dump from data.discogs.com directly into
-# the converter via a FIFO, runs the pipeline against $DATABASE_URL_DISCOGS,
-# notifies Slack on outcome.
+# 4th of each month. Spools the dump from data.discogs.com to disk (with
+# resumable retry on mid-stream errors), runs the pipeline against
+# $DATABASE_URL_DISCOGS, notifies Slack on outcome.
 #
 # Setup runbook: docs/ec2-rebuild-runbook.md
 #
@@ -21,11 +21,11 @@
 #   DRIFT_MIN_RATIO              watchdog threshold (default 0.7)
 #   REBUILD_SMOKE                when set to 1, exercise everything that can
 #                                fail at host setup (env, gh auth, git pulls,
-#                                cargo build, library.db download, dump URL,
-#                                FIFO + curl handshake) and exit 0 *before*
-#                                writing anything to $DATABASE_URL_DISCOGS.
-#                                Use to validate a fresh EC2 setup without
-#                                touching prod.
+#                                cargo build, library.db download, dump URL
+#                                reachability via a 64 KiB Range request) and
+#                                exit 0 *before* writing anything to
+#                                $DATABASE_URL_DISCOGS. Use to validate a
+#                                fresh EC2 setup without touching prod.
 
 set -euo pipefail
 
@@ -123,18 +123,18 @@ fi
 echo "    dump URL: $url"
 
 # ---------------------------------------------------------------------------
-# 5. Stream dump into converter via FIFO + run pipeline
+# 5. Spool dump to disk + run pipeline
 # ---------------------------------------------------------------------------
-# Backend-Service EC2 only has ~14 GB free, so we cannot spool the ~10 GB
-# compressed dump to disk alongside the ~5–10 GB of intermediate filtered
-# CSVs the converter writes. Instead we stream curl through a named pipe
-# directly into the converter.
-#
-# run_pipeline.py forwards --xml-type=releases to discogs-xml-converter,
-# which skips the per-file root-element auto-detection that would
-# otherwise open-and-close the FIFO once before the real scan,
-# SIGPIPE-killing the upstream curl. Without this the EC2 path fails
-# (verified 2026-05-06).
+# The compressed releases dump is ~10 GB. The ephemeral t3.medium has 100 GB
+# gp3, so we spool to a regular file and pass the path to the converter. An
+# earlier FIFO design was load-bearing on the Backend-Service EC2's ~14 GB
+# disk budget; that constraint no longer applies on the ephemeral host
+# (#181). FIFO was unrecoverable on a mid-stream HTTP/2 reset (run #3,
+# 2026-05-10, instance i-0af07e0f56910ab9a hit
+# 'curl: (92) HTTP/2 stream 1 was not closed cleanly: INTERNAL_ERROR')
+# because once the converter has consumed bytes 0..N from a FIFO, no resume
+# is possible. Disk-spool with --continue-at + --retry-all-errors recovers
+# from a CDN flake by resuming from the last byte already on disk.
 #
 # --library-db is forwarded straight to the converter; the converter does
 # its own pair-wise (artist, title) filter inside the streaming scanner,
@@ -143,44 +143,38 @@ echo "    dump URL: $url"
 # it on this path). See WXYC/discogs-xml-converter#45.
 
 if [ "${REBUILD_SMOKE:-}" = "1" ]; then
-    # Smoke mode validates the URL is reachable and the FIFO machinery works.
-    # We read only ~64 KB from the FIFO, which is enough to confirm DNS, TLS,
-    # Cloudflare reachability, and the gzip magic in the first chunk. head
-    # closing its read end gives curl a SIGPIPE, which we silence.
-    echo "[$(date -u +%H:%M:%SZ)] REBUILD_SMOKE=1 — validating curl→FIFO handshake"
-    mkfifo "$WORK_DIR/releases.xml.gz"
-    curl -fL --max-time 30 \
-        -o "$WORK_DIR/releases.xml.gz" \
-        "$url" &
-    CURL_PID=$!
-    head_bytes=$(head -c 65536 "$WORK_DIR/releases.xml.gz" | wc -c)
-    wait "$CURL_PID" 2>/dev/null || true
-    if [ "$head_bytes" -lt 1024 ]; then
-        echo "::error:: smoke mode read only ${head_bytes} bytes from the FIFO" >&2
+    # Smoke mode validates the URL is reachable. A 64 KiB Range request
+    # confirms DNS, TLS, Cloudflare reachability, and the gzip magic in
+    # the first chunk -- without paying the full 10 GB transfer.
+    echo "[$(date -u +%H:%M:%SZ)] REBUILD_SMOKE=1 — validating dump URL reachability"
+    smoke_file="$WORK_DIR/releases.xml.gz.smoke"
+    curl -fL --max-time 30 -r 0-65535 -o "$smoke_file" "$url"
+    smoke_bytes=$(wc -c < "$smoke_file" | tr -d ' ')
+    if [ "$smoke_bytes" -lt 1024 ]; then
+        echo "::error:: smoke mode read only ${smoke_bytes} bytes" >&2
         exit 1
     fi
-    echo "    smoke OK: read ${head_bytes} bytes from the streamed dump"
+    echo "    smoke OK: read ${smoke_bytes} bytes from the dump URL"
     notify_slack ":mag:" "smoke test passed (no DB write performed)"
     exit 0
 fi
 
-mkfifo "$WORK_DIR/releases.xml.gz"
-
-echo "[$(date -u +%H:%M:%SZ)] start streaming download → pipeline"
-curl -fL --retry 3 --retry-delay 30 \
+# --continue-at - resumes from the size already on disk if a prior attempt
+# left a partial. --retry-all-errors widens curl's retry-on matrix to any
+# non-zero exit, including the mid-stream HTTP/2 INTERNAL_ERROR (exit 92)
+# that plain --retry refuses to retry. Five attempts at 30s spacing covers
+# a transient CDN incident without unbounded re-cost.
+echo "[$(date -u +%H:%M:%SZ)] download dump → $WORK_DIR/releases.xml.gz"
+curl -fL --continue-at - --retry 5 --retry-delay 30 --retry-all-errors \
     -o "$WORK_DIR/releases.xml.gz" \
-    "$url" &
-CURL_PID=$!
+    "$url"
+echo "    download complete ($(du -h "$WORK_DIR/releases.xml.gz" | cut -f1))"
 
+echo "[$(date -u +%H:%M:%SZ)] start pipeline"
 python "$REPO_DIR/scripts/run_pipeline.py" \
     --xml "$WORK_DIR/releases.xml.gz" \
     --xml-type releases \
     --library-db "$WORK_DIR/library.db"
-
-# Curl is normally already done by here. Wait surfaces any non-zero curl exit
-# so a streaming network failure isn't masked by the pipeline succeeding on
-# partial input.
-wait "$CURL_PID"
 
 # ---------------------------------------------------------------------------
 # 6. Drift watchdog — same library.db the pipeline just filtered against

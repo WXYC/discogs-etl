@@ -144,7 +144,21 @@ Total: well under $2/year.
 
 - **Default VPC** is required. The launch template doesn't set `SubnetId`, so RunInstances picks the default subnet of the default VPC. If the operator deletes the default VPC for compliance reasons, parameterize `SubnetId` and `SecurityGroupId`.
 - **AMI drift.** The default for `AmiId` resolves to the latest AL2023 image at deploy time. If a future AL2023 base AMI breaks the bootstrap (e.g., dnf rename, default partition layout change), pin `AmiId` to a known-good ID via `--parameter-overrides`.
-- **No spot.** The rebuild's curl→FIFO→converter pipeline isn't resumable from arbitrary positions, so spot interruptions would corrupt a partial run. Stick with on-demand.
+- **No spot.** A spot reclaim mid-rebuild would discard the partial dump (the spool file lives on the instance's gp3 volume, which is destroyed on terminate) and force a full re-download on the replacement instance. Stick with on-demand.
+
+## Dump-download retry behavior
+
+`scripts/rebuild-cache.sh` spools `releases.xml.gz` to `$WORK_DIR/releases.xml.gz` via a single `curl` invocation:
+
+```
+curl -fL --continue-at - --retry 5 --retry-delay 30 --retry-all-errors -o "$WORK_DIR/releases.xml.gz" "$url"
+```
+
+- `--continue-at -` resumes from the on-disk size on each retry, so a 9-minute partial isn't re-paid from byte 0.
+- `--retry-all-errors` retries on any non-zero curl exit, including the mid-stream HTTP/2 `INTERNAL_ERROR` (curl exit 92) that plain `--retry` ignores.
+- 5 attempts × 30 s delay covers a ~few-minute CDN incident. If all 5 attempts fail, curl exits non-zero, the script's `ERR` trap fires `notify_slack ":warning:"`, and the trap-EXIT chain in `rebuild-cache-bootstrap.sh` archives the log to S3 before terminate.
+
+When triaging an alarm: check the per-instance log in `s3://wxyc-discogs-rebuild-logs-503977661500/<instance-id>/` for the curl line. If it shows multiple "Trying again" / "Resuming with..." messages before failing, the CDN was unhealthy through the entire window. If it shows a clean exit-0 followed by a converter failure, the issue is downstream of curl. (#181)
 
 ## Related
 
