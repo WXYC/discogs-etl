@@ -70,6 +70,10 @@ _FIXTURE_ROWS = [
         "Jazz",
     ),
     (5, "Stereolab", "Aluminum Tunes", "CD", "Duophonic", "Rock"),
+    # Diacritic-bearing canonical name from wxyc-shared's wxycCanonicalArtistNames.
+    # Exercises the diacritic-fold path through the storage layer end-to-end —
+    # the normalizer pin test below asserts ü is folded.
+    (6, "Nilüfer Yanya", "Painless", "LP", "ATO Records", "Rock"),
 ]
 
 
@@ -224,3 +228,24 @@ def test_normalizer_is_to_identity_match_form(migrated_db: str, library_db: Path
         assert norm_a == to_identity_match_form(artist)
         assert norm_t == to_identity_match_form_title(title)
         assert norm_l == to_identity_match_form(label)
+
+        # Hard-coded value pin: catches algorithm drift in wxyc-etl (the
+        # equality assertions above pass even if both sides change). Library
+        # row 1 is "Juana Molina" / "DOGA" / "Sonamos" — no diacritics, no
+        # leading articles, just lowercasing.
+        assert norm_a == "juana molina"
+        assert norm_t == "doga"
+        assert norm_l == "sonamos"
+
+        # Diacritic-fold pin: row 6 has ü which must fold to u in storage.
+        # Property assertion (not a hard-coded value) so the test is robust
+        # to other normalization changes that don't affect diacritic folding.
+        with conn.cursor() as cur:
+            cur.execute("SELECT norm_artist FROM wxyc_library WHERE library_id = 6")
+            (norm_a_diacritic,) = cur.fetchone()
+        assert "ü" not in norm_a_diacritic, (
+            f"diacritic survived normalization: {norm_a_diacritic!r}"
+        )
+        assert norm_a_diacritic.lower() == norm_a_diacritic, (
+            f"normalization should lowercase: {norm_a_diacritic!r}"
+        )
