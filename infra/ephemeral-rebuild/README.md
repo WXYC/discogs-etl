@@ -154,11 +154,13 @@ Total: well under $2/year.
 curl -fL --continue-at - --retry 5 --retry-delay 30 --retry-all-errors -o "$WORK_DIR/releases.xml.gz" "$url"
 ```
 
-- `--continue-at -` resumes from the on-disk size on each retry, so a 9-minute partial isn't re-paid from byte 0.
-- `--retry-all-errors` retries on any non-zero curl exit, including the mid-stream HTTP/2 `INTERNAL_ERROR` (curl exit 92) that plain `--retry` ignores.
+- `--continue-at -` resumes from the on-disk size across curl's own `--retry` attempts within a single invocation. It does *not* survive across script invocations: `WORK_DIR` is `mktemp -d` per run and the EXIT trap deletes it, so a manual re-run of `rebuild-cache.sh` always starts from byte 0. The resume is what saves us when a single curl invocation hits a mid-stream reset; whole-script retries are still full re-downloads.
+- `--retry-all-errors` retries on any non-zero curl exit, including the mid-stream HTTP/2 `INTERNAL_ERROR` (curl exit 92) that plain `--retry` ignores. The widened matrix also retries on 4xx/5xx HTTP statuses, so a Discogs URL flip mid-window would burn 5 × 30 s before failing — the earlier `curl -sIfL` HEAD probe in the URL-resolution step is what actually catches "URL doesn't exist" up front.
 - 5 attempts × 30 s delay covers a ~few-minute CDN incident. If all 5 attempts fail, curl exits non-zero, the script's `ERR` trap fires `notify_slack ":warning:"`, and the trap-EXIT chain in `rebuild-cache-bootstrap.sh` archives the log to S3 before terminate.
 
-When triaging an alarm: check the per-instance log in `s3://wxyc-discogs-rebuild-logs-503977661500/<instance-id>/` for the curl line. If it shows multiple "Trying again" / "Resuming with..." messages before failing, the CDN was unhealthy through the entire window. If it shows a clean exit-0 followed by a converter failure, the issue is downstream of curl. (#181)
+The download is sequential with the converter — curl finishes, *then* `run_pipeline.py` starts. The earlier FIFO design overlapped the two; sequential adds roughly +14 min worst-case to a 60–90 min run, which is the cost of resumability.
+
+When triaging an alarm: check the per-instance log in `s3://wxyc-discogs-rebuild-logs-503977661500/<instance-id>/` for the curl line. Without `--verbose`, curl's retry messages look like `Warning: Transient problem: ... Will retry in 30 seconds. N retries left.` Multiple of those before a final non-zero exit means the CDN was unhealthy through the whole window. A clean curl exit-0 followed by a converter failure means the issue is downstream of curl. (#181)
 
 ## Related
 

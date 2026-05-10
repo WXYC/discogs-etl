@@ -147,7 +147,7 @@ if [ "${REBUILD_SMOKE:-}" = "1" ]; then
     # confirms DNS, TLS, Cloudflare reachability, and the gzip magic in
     # the first chunk -- without paying the full 10 GB transfer.
     echo "[$(date -u +%H:%M:%SZ)] REBUILD_SMOKE=1 — validating dump URL reachability"
-    smoke_file="$WORK_DIR/releases.xml.gz.smoke"
+    smoke_file="$WORK_DIR/releases-smoke.xml.gz"
     curl -fL --max-time 30 -r 0-65535 -o "$smoke_file" "$url"
     smoke_bytes=$(wc -c < "$smoke_file" | tr -d ' ')
     if [ "$smoke_bytes" -lt 1024 ]; then
