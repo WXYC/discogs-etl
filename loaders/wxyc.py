@@ -82,7 +82,11 @@ class LibraryRow:
     Mirrors §3.1's column list. ``artist_id`` / ``label_id`` / ``format_id``
     / ``release_year`` are nullable: per-cache loaders populate what their
     source exposes, and library.db (the SQLite catalog export this loader
-    reads) does not carry Backend's integer IDs.
+    reads) does not carry Backend's integer IDs. **For this cache today,
+    every row stamps NULL on those four columns** — there's no follow-up
+    path that backfills them; they exist for forward compatibility with a
+    future Backend-direct loader (or a wxyc-catalog ``BackendServiceSource``
+    SELECT extension that exposes the IDs).
     """
 
     library_id: int
@@ -247,6 +251,10 @@ def populate_wxyc_library_v2(
     ]
 
     stmt = _INSERT_V2.format(table=sql.Identifier(table))
+    # NOTE: psycopg3's executemany is essentially a Python-side loop; for the
+    # ≤64K-row prod load this completes in seconds. If load times become an
+    # issue (e.g. on the full discogs cache once §4.1.4 lands), switch to
+    # `psycopg.copy()` or a single multi-VALUES INSERT.
     with pg_conn.cursor() as cur:
         cur.executemany(stmt, payload)
     pg_conn.commit()
