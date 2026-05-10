@@ -17,32 +17,61 @@ prints the plan + observed wall time, and exits ``0`` regardless. The
 operator interprets the results — automated thresholds belong in CI for
 fixture-sized data, not against the live 62 GB Homebrew cache.
 
-Query selection
-================
+Query selection — IMPORTANT CAVEAT
+==================================
 
-The §4.1.4 spec says the canonical query inventory comes from Sentry traces
-captured during the dual-run. Until those traces exist, this harness ships
-five representative query patterns derived from the existing LML hot paths
-in `library-metadata-lookup`:
+The §4.1.4 spec calls for the canonical query inventory to come from
+Sentry traces captured during the dual-run. **Those traces don't exist
+yet**, and as of this PR no LML code path reads ``wxyc_library`` —
+- ``discogs/cache_service.py:search_artists_by_name`` queries ``artist``
+  + ``artist_name_variation`` with ``f_unaccent(a.name)``, not
+  ``wxyc_library.norm_artist``.
+- ``discogs/cache_service.py:search_releases_by_title`` queries
+  ``release`` + ``release_artist`` with ``f_unaccent(r.title)``, not
+  ``wxyc_library.norm_title``.
+- ``lookup/external_search.py`` and ``lookup/orchestrator.py`` don't
+  reference ``wxyc_library`` or ``wxyc_release_match`` at all today.
+- Only ``scripts/canonicalize_albums.py`` Phase 2a touches ``wxyc_release_match``,
+  and even then it's the legacy hook — the §4.1.4 cutover replaces that
+  reference with ``wxyc_library``.
 
-1. **Exact ``norm_artist`` lookup** — confirms a candidate artist is in the
-   WXYC library. B-tree index on ``norm_artist``. Source pattern:
-   `lookup/external_search.py` artist gating.
-2. **Trigram ``norm_artist`` fuzzy match** — the mojibake-recovery / fuzzy
-   artist path. GIN trigram index on
-   ``norm_artist gin_trgm_ops``. Source pattern:
-   `discogs/cache_service.py:search_artists_by_name`.
-3. **Exact ``norm_title`` lookup** — exact-album hits during the
-   canonicalization-driven match. Source pattern:
-   `scripts/canonicalize_albums.py` Phase 2a (currently against
-   ``wxyc_release_match``; will move to ``wxyc_library`` post-cutover).
-4. **Trigram ``norm_title`` fuzzy match** — fuzzy album recovery. GIN
-   trigram on ``norm_title gin_trgm_ops``. Source pattern:
-   `discogs/cache_service.py:search_releases_by_title`.
-5. **Composite ``(norm_artist, norm_title)`` exact hit** — LML's "is this
-   exact (artist, album) pair in the WXYC library?" gate. Hits the
-   ``norm_artist`` B-tree first, then narrows on ``norm_title``. Source
-   pattern: `lookup/orchestrator.py` library-membership check.
+So the five queries below are **speculative patterns the new hook is
+intended to support post-cutover**, not a faithful replay of LML's
+current hot path. The §4.1.4 cutover gate criteria the docstring quotes
+("each query uses the new index", "no seq-scan regression", "p95 within
+1.5×") only become meaningful once dual-run Sentry traces give us a real
+inventory. Until then, the operator value of this harness is:
+
+1. Confirm the new indexes exist and are reachable (no missing extension,
+   no typo'd index name).
+2. Sanity-check plans on a representative cache size before opening the
+   floodgates.
+
+Once the dual-run produces a Sentry-derived query inventory, replace
+these patterns with the real ones and treat the §4.1.4 thresholds as
+hard gates.
+
+The five speculative patterns:
+
+1. **Exact ``norm_artist`` lookup** — B-tree index on ``norm_artist``.
+   Speculative origin: candidate-artist gating once a future LML path
+   reads ``wxyc_library`` (no current equivalent).
+2. **Trigram ``norm_artist`` fuzzy match** — GIN trigram on
+   ``norm_artist gin_trgm_ops``. Speculative post-cutover analog of
+   ``discogs/cache_service.py:search_artists_by_name`` (currently on
+   ``artist.name`` via ``f_unaccent``).
+3. **Exact ``norm_title`` lookup** — B-tree on ``norm_title``.
+   Post-cutover analog of ``scripts/canonicalize_albums.py`` Phase 2a
+   (currently against ``wxyc_release_match.discogs_artist`` /
+   ``norm_title``).
+4. **Trigram ``norm_title`` fuzzy match** — GIN trigram on
+   ``norm_title gin_trgm_ops``. Speculative post-cutover analog of
+   ``discogs/cache_service.py:search_releases_by_title`` (currently on
+   ``release.title`` via ``f_unaccent``).
+5. **Composite ``(norm_artist, norm_title)`` exact hit** — speculative
+   "is this exact (artist, album) pair in the WXYC library?" gate.
+   Hits the ``norm_artist`` B-tree first, then narrows on ``norm_title``.
+   No current LML caller; this is a pattern the hook is built to support.
 
 Each query is parameterised with a placeholder bound at runtime. Use
 ``--artist`` / ``--title`` to override the defaults; the defaults are
@@ -125,18 +154,22 @@ class ExplainResult:
     summary: dict[str, Any] = field(default_factory=dict)
 
 
-# Five representative LML query patterns. Each comment block names the
-# code path the query represents. Update this list once dual-run Sentry
-# traces are available — the mechanism below is generic.
+# Five SPECULATIVE query patterns the v2 wxyc_library hook is built to
+# support. As of this PR, no LML code path actually issues these queries
+# — the docstring's "Query selection — IMPORTANT CAVEAT" block explains
+# why. Replace this list with the real Sentry-derived inventory once
+# dual-run traces exist; the mechanism below is generic.
 QUERY_PATTERNS: tuple[QueryPattern, ...] = (
     QueryPattern(
         name="exact_norm_artist",
         sql="SELECT library_id, artist_name FROM wxyc_library WHERE norm_artist = %s",
         params=(DEFAULT_ARTIST,),
         expected_index="wxyc_library_norm_artist_idx (B-tree)",
-        # library-metadata-lookup/lookup/external_search.py — gates whether
-        # a discogs / mb fuzzy hit corresponds to a WXYC library artist.
-        origin="lookup/external_search.py — artist gating after fuzzy match",
+        # No current LML caller. Speculative analog of any future
+        # candidate-artist gating that reads wxyc_library — today, the
+        # closest equivalent (lookup/external_search.py) does not touch
+        # the hook table.
+        origin="speculative — future candidate-artist gating (no current caller)",
     ),
     QueryPattern(
         name="trgm_norm_artist",
@@ -149,19 +182,23 @@ QUERY_PATTERNS: tuple[QueryPattern, ...] = (
         ),
         params=(DEFAULT_ARTIST, DEFAULT_ARTIST),
         expected_index="wxyc_library_norm_artist_trgm_idx (GIN trgm)",
-        # library-metadata-lookup/discogs/cache_service.py:search_artists_by_name
-        # — fuzzy artist recovery for the mojibake bucket.
-        origin="discogs/cache_service.py:search_artists_by_name",
+        # discogs/cache_service.py:search_artists_by_name today queries
+        # `artist` + `artist_name_variation` via `f_unaccent(a.name)`.
+        # This pattern is the post-cutover analog against the consolidated
+        # hook — currently no LML code issues it.
+        origin="speculative post-cutover analog of discogs/cache_service.py:search_artists_by_name",
     ),
     QueryPattern(
         name="exact_norm_title",
         sql="SELECT library_id, album_title FROM wxyc_library WHERE norm_title = %s",
         params=(DEFAULT_TITLE,),
         expected_index="wxyc_library_norm_title_idx (B-tree)",
-        # library-metadata-lookup/scripts/canonicalize_albums.py — Phase 2a
-        # currently runs `WHERE norm_title = lower($1)` against
-        # ``wxyc_release_match``; the post-cutover analog is this query.
-        origin="scripts/canonicalize_albums.py Phase 2a (post-cutover analog)",
+        # scripts/canonicalize_albums.py Phase 2a currently runs an
+        # equivalent against `wxyc_release_match` (the legacy hook). Of
+        # the five queries in this list, this one has the closest real
+        # LML caller — but the read site still moves to wxyc_library only
+        # post-cutover.
+        origin="post-cutover analog of scripts/canonicalize_albums.py Phase 2a (real legacy caller)",
     ),
     QueryPattern(
         name="trgm_norm_title",
@@ -174,8 +211,10 @@ QUERY_PATTERNS: tuple[QueryPattern, ...] = (
         ),
         params=(DEFAULT_TITLE, DEFAULT_TITLE),
         expected_index="wxyc_library_norm_title_trgm_idx (GIN trgm)",
-        # library-metadata-lookup/discogs/cache_service.py:search_releases_by_title
-        origin="discogs/cache_service.py:search_releases_by_title",
+        # discogs/cache_service.py:search_releases_by_title today queries
+        # `release.title` + `release_artist` via f_unaccent. The hook
+        # equivalent — this pattern — has no current caller.
+        origin="speculative post-cutover analog of discogs/cache_service.py:search_releases_by_title",
     ),
     QueryPattern(
         name="composite_artist_title",
@@ -184,13 +223,19 @@ QUERY_PATTERNS: tuple[QueryPattern, ...] = (
             "WHERE norm_artist = %s AND norm_title = %s"
         ),
         params=(DEFAULT_ARTIST, DEFAULT_TITLE),
+        # Acceptable without a composite index on the present cache size.
+        # Revisit if the hook crosses ~250K rows or if Sentry shows p95
+        # > 50ms in the hot path; at that point a composite
+        # (norm_artist, norm_title) B-tree is the right move.
         expected_index=(
-            "wxyc_library_norm_artist_idx (B-tree) — narrows on norm_title "
-            "after; <=64K rows so this is acceptable without a composite idx"
+            "wxyc_library_norm_artist_idx (B-tree) — narrows on norm_title after. "
+            "Acceptable on the current ≤64K-row hook; revisit composite index when "
+            "row count > ~250K or Sentry traces show p95 > 50ms."
         ),
-        # library-metadata-lookup/lookup/orchestrator.py — "is this exact
-        # (artist, album) pair in the WXYC library?" gate.
-        origin="lookup/orchestrator.py — library-membership check",
+        # No current LML caller. Speculative "is this exact (artist,
+        # album) pair in WXYC's library?" gate that the hook is built
+        # for. lookup/orchestrator.py does not issue this today.
+        origin="speculative — exact (artist, title) library-membership gate (no current caller)",
     ),
 )
 
