@@ -119,3 +119,39 @@ def test_lambda_handler_raises_without_launch_template(handler_module, fake_ec2,
 
     with pytest.raises(KeyError):
         handler_module.lambda_handler({}, None, ec2_client=fake_ec2)
+
+
+def test_user_data_injects_log_bucket_env_var(handler_module):
+    """#174 prerequisite: REBUILD_LOG_BUCKET must reach the spawned EC2.
+
+    Without this plumbing, both the bootstrap's S3 breadcrumb (#174) and
+    the trap-EXIT log upload (#173) silently no-op — they gate on
+    ``${REBUILD_LOG_BUCKET:-}`` and skip when it's empty.
+    """
+    rendered = handler_module.build_user_data(
+        "main", log_bucket="wxyc-discogs-rebuild-logs-503977661500"
+    )
+    assert "export REBUILD_LOG_BUCKET=wxyc-discogs-rebuild-logs-503977661500" in rendered
+
+
+def test_lambda_handler_pipes_log_bucket_from_env(handler_module, fake_ec2, monkeypatch):
+    monkeypatch.setenv("LAUNCH_TEMPLATE_ID", "lt-0fab0123456789ab0")
+    monkeypatch.setenv("LOG_BUCKET_NAME", "wxyc-discogs-rebuild-logs-503977661500")
+
+    handler_module.lambda_handler({}, None, ec2_client=fake_ec2)
+
+    user_data = fake_ec2.run_instances.call_args.kwargs["UserData"]
+    assert "export REBUILD_LOG_BUCKET=wxyc-discogs-rebuild-logs-503977661500" in user_data
+
+
+def test_lambda_handler_tolerates_missing_log_bucket(handler_module, fake_ec2, monkeypatch):
+    """Missing LOG_BUCKET_NAME shouldn't crash the launcher; the bootstrap
+    is designed to skip its breadcrumb when REBUILD_LOG_BUCKET is empty
+    (with a logged warning) rather than fail."""
+    monkeypatch.setenv("LAUNCH_TEMPLATE_ID", "lt-0fab0123456789ab0")
+    monkeypatch.delenv("LOG_BUCKET_NAME", raising=False)
+
+    handler_module.lambda_handler({}, None, ec2_client=fake_ec2)
+
+    user_data = fake_ec2.run_instances.call_args.kwargs["UserData"]
+    assert "export REBUILD_LOG_BUCKET=" in user_data  # empty value, but key is present

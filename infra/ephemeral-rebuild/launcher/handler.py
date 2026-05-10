@@ -10,10 +10,12 @@ sets InstanceInitiatedShutdownBehavior=terminate so the instance releases
 itself when bootstrap finishes (or panics into trap EXIT and runs
 ``shutdown -h now``).
 
-Env vars (all required, set by template.yaml):
-    LAUNCH_TEMPLATE_ID    LaunchTemplate id (lt-...)
+Env vars (set by template.yaml):
+    LAUNCH_TEMPLATE_ID    LaunchTemplate id (lt-...) — required
     REPO_BRANCH           branch of WXYC/discogs-etl to clone (default: main)
-    LOG_GROUP_NAME        ignored (CloudWatch Lambda log group is implicit)
+    LOG_BUCKET_NAME       S3 bucket where the bootstrap uploads its log
+                          archive + breadcrumb. Injected as
+                          REBUILD_LOG_BUCKET in the user-data stub.
 
 Tags applied to the spawned instance:
     Project=discogs-rebuild
@@ -37,24 +39,33 @@ USER_DATA_TEMPLATE = """#!/usr/bin/env bash
 set -euxo pipefail
 exec > >(tee /var/log/cloud-init-bootstrap.log | logger -t bootstrap) 2>&1
 
+# Plumbed from the launcher Lambda's env. The bootstrap reads
+# REBUILD_LOG_BUCKET to know where to drop its breadcrumb (#174) and the
+# trap-EXIT log archive (#173). Empty value falls through to the
+# script's "WARN: REBUILD_LOG_BUCKET unset; skipping S3 breadcrumb" path.
+export REBUILD_LOG_BUCKET={log_bucket}
+
 dnf install -y --quiet git
 git clone --depth 1 --branch {branch} https://github.com/WXYC/discogs-etl.git /opt/discogs-etl
 exec /opt/discogs-etl/scripts/rebuild-cache-bootstrap.sh
 """
 
 
-def build_user_data(branch: str) -> str:
+def build_user_data(branch: str, log_bucket: str = "") -> str:
     """Render the user-data stub. Kept tiny so changes to the heavy
-    bootstrap don't require redeploying the Lambda."""
-    return USER_DATA_TEMPLATE.format(branch=branch)
+    bootstrap don't require redeploying the Lambda. ``log_bucket`` is
+    injected as ``REBUILD_LOG_BUCKET``; empty string is allowed and lets
+    the bootstrap fall through to its skip-breadcrumb path."""
+    return USER_DATA_TEMPLATE.format(branch=branch, log_bucket=log_bucket)
 
 
 def lambda_handler(event, context, ec2_client=None):
     """Entry point. Boto3 client is injectable for unit tests."""
     branch = os.environ.get("REPO_BRANCH", "main")
     launch_template_id = os.environ["LAUNCH_TEMPLATE_ID"]
+    log_bucket = os.environ.get("LOG_BUCKET_NAME", "")
 
-    user_data = build_user_data(branch)
+    user_data = build_user_data(branch, log_bucket=log_bucket)
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H%MZ")
     name_tag = f"discogs-rebuild-{timestamp}"
 

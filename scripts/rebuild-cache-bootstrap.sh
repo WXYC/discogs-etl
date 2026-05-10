@@ -34,30 +34,43 @@ set -euo pipefail
 REPO_DIR="${REPO_DIR:-/opt/discogs-etl}"
 CONVERTER_DIR="${CONVERTER_DIR:-/opt/discogs-xml-converter}"
 LOG_DIR="${LOG_DIR:-/var/log/discogs-rebuild}"
+LAUNCH_ID="bootstrap-$(date -u +%Y-%m-%dT%H%MZ)-pid$$"
 BOOTSTRAP_LOG="${LOG_DIR}/bootstrap-$(date -u +%Y-%m-%dT%H%MZ).log"
+# INSTANCE_ID is replaced by the IMDS-derived value once IMDSv2 is reachable.
+# Until then the trap and breadcrumb use $LAUNCH_ID as the S3 prefix, so a
+# crash before IMDS still leaves a per-launch trace findable by timestamp +
+# CloudTrail RunInstances correlation.
+INSTANCE_ID="$LAUNCH_ID"
+# AWS_REGION needs a default before the breadcrumb's `aws s3 cp` runs —
+# aws CLI on EC2 does not auto-resolve region from IMDS without it. The
+# launch template lives in us-east-1 so this default is correct in
+# practice; IMDS overrides it below for posterity.
+AWS_REGION="${AWS_REGION:-us-east-1}"
+export AWS_REGION
 
 mkdir -p "$LOG_DIR"
 exec > >(tee -a "$BOOTSTRAP_LOG") 2>&1
 
 log() { echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $*"; }
 
-# IMDSv2: get a session token, then read instance id + region. Required
-# regardless of whether the script runs interactively or as user-data.
-imds_token() {
-    curl -fsS -X PUT 'http://169.254.169.254/latest/api/token' \
-        -H 'X-aws-ec2-metadata-token-ttl-seconds: 300' --max-time 5
-}
-imds_get() {
-    local token="$1" path="$2"
-    curl -fsS "http://169.254.169.254/latest/${path}" \
-        -H "X-aws-ec2-metadata-token: ${token}" --max-time 5
-}
-
-TOKEN="$(imds_token)"
-INSTANCE_ID="$(imds_get "$TOKEN" meta-data/instance-id)"
-AWS_REGION="${AWS_REGION:-$(imds_get "$TOKEN" meta-data/placement/region)}"
-export AWS_REGION
-log "instance ${INSTANCE_ID} region ${AWS_REGION}"
+# Drop a "bootstrap started" breadcrumb into S3 before any set-e-fatal
+# call. Even if everything below this line dies before the trap can run,
+# the operator at least sees a marker proving the script began executing.
+# Best-effort — `|| log WARN` keeps a credentials/network failure on the
+# breadcrumb itself from killing the script. See #174.
+{
+    echo "launch_id=${LAUNCH_ID}"
+    echo "pid=$$"
+    echo "utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+} > "$LOG_DIR/00-started.txt"
+if [ -n "${REBUILD_LOG_BUCKET:-}" ]; then
+    aws s3 cp --only-show-errors \
+        "$LOG_DIR/00-started.txt" \
+        "s3://${REBUILD_LOG_BUCKET}/${LAUNCH_ID}/00-started.txt" \
+        || true
+else
+    log "WARN: REBUILD_LOG_BUCKET unset; skipping S3 breadcrumb"
+fi
 
 # Slack helper. Reads SLACK_MONITORING_WEBHOOK from env once it is sourced.
 notify_slack() {
@@ -74,6 +87,8 @@ notify_slack() {
 # trap EXIT runs on every exit path — clean or panic. It uploads the log
 # and calls shutdown unconditionally so a crashed bootstrap can't leak the
 # instance past the InstanceInitiatedShutdownBehavior=terminate window.
+# Registered before any IMDS / SSM / dnf / git / curl call so an early
+# failure still triggers the upload-and-shutdown chain. See #173.
 on_exit() {
     local exit_code=$?
     set +e
@@ -90,6 +105,24 @@ on_exit() {
     /usr/sbin/shutdown -h now || true
 }
 trap on_exit EXIT
+
+# IMDSv2: get a session token, then read instance id + region. Required
+# regardless of whether the script runs interactively or as user-data.
+imds_token() {
+    curl -fsS -X PUT 'http://169.254.169.254/latest/api/token' \
+        -H 'X-aws-ec2-metadata-token-ttl-seconds: 300' --max-time 5
+}
+imds_get() {
+    local token="$1" path="$2"
+    curl -fsS "http://169.254.169.254/latest/${path}" \
+        -H "X-aws-ec2-metadata-token: ${token}" --max-time 5
+}
+
+TOKEN="$(imds_token)"
+INSTANCE_ID="$(imds_get "$TOKEN" meta-data/instance-id)"
+AWS_REGION="$(imds_get "$TOKEN" meta-data/placement/region)"
+export AWS_REGION
+log "instance ${INSTANCE_ID} region ${AWS_REGION}"
 
 # ---------------------------------------------------------------------------
 # 1. System packages (Amazon Linux 2023). Idempotent — re-running this

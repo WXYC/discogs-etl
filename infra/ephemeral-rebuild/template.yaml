@@ -108,6 +108,15 @@ Resources:
           - Effect: Allow
             Principal: { Service: ec2.amazonaws.com }
             Action: sts:AssumeRole
+      # AmazonSSMManagedInstanceCore lets the SSM Agent on the spawned
+      # instance register with Systems Manager, which is what makes
+      # `aws ssm start-session --target <i-...>` work for live debugging
+      # mid-rebuild. Without it the instance is operator-blind for the
+      # ~90 min rebuild window — see #170 (filed after the 2026-05-09 first
+      # manual run, where the bootstrap died early and we couldn't tail
+      # /var/log/cloud-init-bootstrap.log to diagnose).
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
       Policies:
         - PolicyName: ssm-secrets-read
           PolicyDocument:
@@ -188,6 +197,12 @@ Resources:
         Variables:
           LAUNCH_TEMPLATE_ID: !Ref LaunchTemplate
           REPO_BRANCH: !Ref RepoBranch
+          # The bootstrap reads REBUILD_LOG_BUCKET from env to know where
+          # to upload its log archive + the S3 breadcrumb. Plumbed through
+          # here so the launcher can inject `export REBUILD_LOG_BUCKET=...`
+          # into the user-data stub. Without this both the breadcrumb
+          # (#174) and the trap-EXIT upload (#173) silently no-op.
+          LOG_BUCKET_NAME: !Ref LogBucket
       Policies:
         - Statement:
             - Effect: Allow
