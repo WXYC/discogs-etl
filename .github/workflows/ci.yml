@@ -54,6 +54,20 @@ jobs:
         run: |
           PGPASSWORD=discogs psql -h localhost -p 5433 -U discogs -d postgres \
             -c "CREATE EXTENSION IF NOT EXISTS pg_trgm;"
+      - name: Install wxyc_unaccent rules into the PG service container
+        # Required by alembic migration 0004 before
+        # `CREATE TEXT SEARCH DICTIONARY wxyc_unaccent (... RULES = 'wxyc_unaccent')`.
+        # Alpine layout: /usr/local/share/postgresql/tsearch_data (no version subdir).
+        run: |
+          PG_CID=$(docker ps -q --filter ancestor=postgres:16-alpine)
+          if [ -z "$PG_CID" ]; then
+            echo "no postgres:16-alpine service container running" >&2
+            exit 1
+          fi
+          docker cp vendor/wxyc-etl/wxyc_unaccent.rules \
+            "$PG_CID:/usr/local/share/postgresql/tsearch_data/wxyc_unaccent.rules"
+          docker cp vendor/wxyc-etl/wxyc_unaccent.version \
+            "$PG_CID:/usr/local/share/postgresql/tsearch_data/wxyc_unaccent.version"
       - name: Run pg-marked + default tests with coverage
         env:
           DATABASE_URL_TEST: postgresql://discogs:discogs@localhost:5433/postgres
