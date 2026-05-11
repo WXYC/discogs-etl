@@ -32,4 +32,14 @@ COPY scripts/ scripts/
 COPY schema/ schema/
 COPY lib/ lib/
 
+# Alembic migrations + vendored wxyc-etl bytes + pin file. The cross-cache-
+# identity migration 0004_wxyc_identity_match_fns reads the canonical SQL
+# from `vendor/wxyc-etl/` at apply time (single source of truth, no body
+# duplication), so the in-container `alembic upgrade head` path needs both
+# trees present.
+COPY alembic.ini ./
+COPY alembic/ alembic/
+COPY vendor/ vendor/
+COPY wxyc-etl-pin.txt ./
+
 CMD ["python", "scripts/run_pipeline.py"]
