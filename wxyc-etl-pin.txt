@@ -2,7 +2,7 @@
 #
 # Pins the canonical bytes from WXYC/wxyc-etl@v0.4.0 (`data/`), vendored
 # here under `vendor/wxyc-etl/`. The alembic migration at
-# `alembic/versions/0004_wxyc_identity_match_functions.py` reads
+# `alembic/versions/0004_wxyc_identity_match_fns.py` reads
 # `vendor/wxyc-etl/wxyc_identity_match_functions.sql` at apply time, so
 # the SQL itself is not copied into the migration body — the canonical
 # bytes are the source of truth and the parity test in

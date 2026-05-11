@@ -89,9 +89,24 @@ def _run_alembic_upgrade(db_url: str) -> None:
     )
 
 
-@pytest.mark.pg
-def test_functions_deploy_after_migration_0004(db_url: str) -> None:
+@pytest.fixture(scope="module")
+def migrated_db_url(db_url: str) -> str:
+    """Module-scoped: upgrade to 0004 once, reuse across the three PG tests.
+
+    The `db_url` fixture from `tests/conftest.py` is module-scoped, so this
+    just amortizes the one-shot alembic apply (`subprocess.run`, ~2s) across
+    every test in this module. Re-running per-test would triple that cost.
+    The migration is idempotent (CREATE OR REPLACE FUNCTION), so the
+    `migration_double_apply_*` invariant still holds — that property is
+    exercised separately by the `idempotence` test below.
+    """
     _run_alembic_upgrade(db_url)
+    return db_url
+
+
+@pytest.mark.pg
+def test_functions_deploy_after_migration_0004(migrated_db_url: str) -> None:
+    db_url = migrated_db_url
     with psycopg.connect(db_url) as conn, conn.cursor() as cur:
         cur.execute(
             """
@@ -149,8 +164,8 @@ def _fixture_rows() -> list[dict[str, str]]:
 
 
 @pytest.mark.pg
-def test_postgres_functions_match_fixture_row_for_row(db_url: str) -> None:
-    _run_alembic_upgrade(db_url)
+def test_postgres_functions_match_fixture_row_for_row(migrated_db_url: str) -> None:
+    db_url = migrated_db_url
     rows = _fixture_rows()
     assert len(rows) >= 250, f"fixture row count {len(rows)} < 250"
 
@@ -177,8 +192,8 @@ def test_postgres_functions_match_fixture_row_for_row(db_url: str) -> None:
 
 
 @pytest.mark.pg
-def test_postgres_functions_idempotent(db_url: str) -> None:
-    _run_alembic_upgrade(db_url)
+def test_postgres_functions_idempotent(migrated_db_url: str) -> None:
+    db_url = migrated_db_url
     probe = "   The Foo Fighters (1995)   "
     with psycopg.connect(db_url) as conn, conn.cursor() as cur:
         for fn in _VARIANT_TO_FN.values():
@@ -187,3 +202,23 @@ def test_postgres_functions_idempotent(db_url: str) -> None:
             cur.execute(f"SELECT {fn}(%s)", (once,))
             twice = (cur.fetchone() or (None,))[0] or ""
             assert once == twice, f"{fn} not idempotent: once={once!r} twice={twice!r}"
+
+
+@pytest.mark.pg
+def test_migration_double_apply_is_a_no_op(db_url: str) -> None:
+    """Re-applying migration 0004 must not throw and must leave the deploy
+    intact. Verifies the contract `CREATE OR REPLACE FUNCTION` +
+    `DROP TEXT SEARCH DICTIONARY IF EXISTS` + `CREATE TEXT SEARCH DICTIONARY`
+    compose cleanly when alembic re-runs end-to-end (a `--resume` after a
+    crash, or a re-stamp scenario).
+
+    Uses the function-scoped `db_url` directly (not the module-scoped
+    `migrated_db_url`) so this test exercises both calls itself.
+    """
+    _run_alembic_upgrade(db_url)
+    _run_alembic_upgrade(db_url)
+    with psycopg.connect(db_url) as conn, conn.cursor() as cur:
+        cur.execute("SELECT wxyc_identity_match_artist('Stereolab')")
+        row = cur.fetchone()
+        assert row is not None
+        assert row[0] == "stereolab"
