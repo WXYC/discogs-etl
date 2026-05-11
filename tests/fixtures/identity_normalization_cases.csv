@@ -1,0 +1,274 @@
+input,expected,variant,category,notes
+# Categorical parity matrix for plan §3.3.2 steps 4-6 + 8.
+# Variant column: which function to call.
+#   base     → to_identity_match_form
+#   title    → to_identity_match_form_title
+#   punct    → to_identity_match_form_with_punctuation
+#   disamb   → to_identity_match_form_with_disambiguator_strip
+# Category column: which §3.3.2 step or behavior is exercised. Empty notes
+# column is allowed; lowercase ASCII expected (to_match_form pre-pass).
+# Steps 1-3 + 7 coverage delegated to charset-torture.json (WX-1).
+
+# ===== trailing-parens-artist (50) =====
+Stereolab (Live),stereolab,base,trailing-parens-artist,
+Cat Power (Remastered),cat power,base,trailing-parens-artist,
+Animal Collective (Live at Lincoln Hall),animal collective,base,trailing-parens-artist,
+Beach House (Demo),beach house,base,trailing-parens-artist,
+Big Thief (Acoustic),big thief,base,trailing-parens-artist,
+Aphex Twin (1992),aphex twin,base,trailing-parens-artist,
+Autechre (Reissue),autechre,base,trailing-parens-artist,
+Boards of Canada (Original Mix),boards of canada,base,trailing-parens-artist,
+Broadcast (Live),broadcast,base,trailing-parens-artist,
+Brian Eno (Ambient),brian eno,base,trailing-parens-artist,
+Burial (12 Inch),burial,base,trailing-parens-artist,
+Cocteau Twins (1984),cocteau twins,base,trailing-parens-artist,
+Colin Stetson (Live),colin stetson,base,trailing-parens-artist,
+Damien Jurado (Demo),damien jurado,base,trailing-parens-artist,
+Deerhoof (Live in Tokyo),deerhoof,base,trailing-parens-artist,
+Elliott Smith (Posthumous),elliott smith,base,trailing-parens-artist,
+Father John Misty (Solo),father john misty,base,trailing-parens-artist,
+Flying Lotus (Brainfeeder),flying lotus,base,trailing-parens-artist,
+Four Tet (Remix),four tet,base,trailing-parens-artist,
+Gil Scott-Heron (Live),gil scott-heron,base,trailing-parens-artist,
+Hermanos Gutiérrez (En Vivo),hermanos gutierrez,base,trailing-parens-artist,
+Jessica Pratt (Live in LA),jessica pratt,base,trailing-parens-artist,
+Juana Molina (Acoustic),juana molina,base,trailing-parens-artist,
+Stereolab [Live],stereolab,base,trailing-parens-artist,square brackets
+Cat Power [Remastered],cat power,base,trailing-parens-artist,square brackets
+Animal Collective [Demos],animal collective,base,trailing-parens-artist,square brackets
+Beach House [Acoustic],beach house,base,trailing-parens-artist,square brackets
+Big Thief [Live],big thief,base,trailing-parens-artist,square brackets
+Aphex Twin [1992],aphex twin,base,trailing-parens-artist,square brackets
+Autechre [Bonus],autechre,base,trailing-parens-artist,square brackets
+Boards of Canada [Original Mix],boards of canada,base,trailing-parens-artist,square brackets
+Broadcast [Live],broadcast,base,trailing-parens-artist,square brackets
+Brian Eno [Ambient],brian eno,base,trailing-parens-artist,square brackets
+Stereolab  (Live),stereolab,base,trailing-parens-artist,doubled space before group → match-form collapses to single
+Cat Power   (1995),cat power,base,trailing-parens-artist,triple space before group
+Stereolab(),stereolab,base,trailing-parens-artist,no space before parens
+Cat Power(Live),cat power,base,trailing-parens-artist,no space before parens
+Aphex Twin (selected ambient works),aphex twin,base,trailing-parens-artist,multi-word inside parens
+Autechre (lp5),autechre,base,trailing-parens-artist,
+Beach House (b-sides and rarities),beach house,base,trailing-parens-artist,
+Big Thief (live at the brooklyn academy),big thief,base,trailing-parens-artist,
+Stereolab (mars audiac quintet),stereolab,base,trailing-parens-artist,
+Stereolab (Live (1999) Edition),stereolab,base,trailing-parens-artist,nested parens balanced
+Cat Power (Sun (Remastered)),cat power,base,trailing-parens-artist,nested parens balanced
+Beach House (Bloom (10th)),beach house,base,trailing-parens-artist,nested parens balanced
+Stereolab ((Live)),stereolab,base,trailing-parens-artist,double-open
+(Cat Power),(cat power),base,trailing-parens-artist,only-parens negative — preserved
+[Stereolab],[stereolab],base,trailing-parens-artist,only-brackets negative — preserved
+Autechre ),autechre ),base,trailing-parens-artist,unbalanced close — passes through
+Stereolab (Live (1999),stereolab (live,base,trailing-parens-artist,unbalanced inner-open: outer scan strips only the (1999)
+Broadcast (Live) [2003],broadcast (live),base,trailing-parens-artist,one pass — only outermost stripped
+
+# ===== trailing-parens-title (50) =====
+"What Time Is It, Mr. Fox? (Live)","what time is it, mr. fox?",title,trailing-parens-title,strip outer paren only — comma preserved
+Sugar Hill (Acoustic),sugar hill,title,trailing-parens-title,
+La Paradoja (Single Edit),la paradoja,title,trailing-parens-title,
+"Back, Baby (Demo)","back, baby",title,trailing-parens-title,comma in title preserved
+Call Your Name (Edits),call your name,title,trailing-parens-title,
+In a Sentimental Mood (Live),in a sentimental mood,title,trailing-parens-title,
+Aluminum Tunes (Vol 1),aluminum tunes,title,trailing-parens-title,
+DOGA (Album Version),doga,title,trailing-parens-title,
+On Your Own Love Again (Reissue),on your own love again,title,trailing-parens-title,
+Edits (Bonus),edits,title,trailing-parens-title,
+Wedding Song (Live),wedding song,title,trailing-parens-title,
+Saturday (Acoustic),saturday,title,trailing-parens-title,
+Blue Moon (1956),blue moon,title,trailing-parens-title,
+The Birthday Party (1973),birthday party,title,trailing-parens-title,title variant runs full baseline (paren strip + article drop)
+"Track 1, Side A (Live)","track 1, side a",title,trailing-parens-title,comma preserved
+Sugar Hill [Demo],sugar hill,title,trailing-parens-title,square
+La Paradoja [Reissue],la paradoja,title,trailing-parens-title,square
+"Back, Baby [Acoustic]","back, baby",title,trailing-parens-title,square + comma
+Call Your Name [Bonus],call your name,title,trailing-parens-title,square
+In a Sentimental Mood [Live 1962],in a sentimental mood,title,trailing-parens-title,square
+Sugar Hill (),sugar hill,title,trailing-parens-title,empty parens stripped
+Sugar Hill ( ),sugar hill,title,trailing-parens-title,whitespace-only inside parens
+DOGA   (Edit),doga,title,trailing-parens-title,multi-space before parens collapsed by match-form
+DOGA(Edit),doga,title,trailing-parens-title,no leading space
+Edits (Vol 1) [2025],edits (vol 1),title,trailing-parens-title,one-pass — outermost only
+Saturday (Take 1) (Take 2),saturday (take 1),title,trailing-parens-title,one-pass
+(Sugar Hill),(sugar hill),title,trailing-parens-title,only-parens preserved
+[Sugar Hill],[sugar hill],title,trailing-parens-title,only-brackets preserved
+Sugar Hill ),sugar hill ),title,trailing-parens-title,unbalanced close
+Sugar Hill (Live (1999) Edition),sugar hill,title,trailing-parens-title,nested
+Wedding Song (1971),wedding song,title,trailing-parens-title,
+Wedding Song [1971],wedding song,title,trailing-parens-title,
+Saturday Morning (Edit),saturday morning,title,trailing-parens-title,
+Blue (Live in Berlin),blue,title,trailing-parens-title,
+Blue [Live in Berlin],blue,title,trailing-parens-title,
+Suite for Solo Cello (Bach),suite for solo cello,title,trailing-parens-title,
+For Free (Joni Mitchell Cover),for free,title,trailing-parens-title,
+For Free [Joni Mitchell Cover],for free,title,trailing-parens-title,
+La Paradoja (Vol 2),la paradoja,title,trailing-parens-title,
+La Paradoja II (Live),la paradoja ii,title,trailing-parens-title,
+Edits (Compilation),edits,title,trailing-parens-title,
+Edits Vol. 2 (Mini),edits vol. 2,title,trailing-parens-title,
+Edits Vol. 2 [Mini],edits vol. 2,title,trailing-parens-title,
+First Light (Take 1),first light,title,trailing-parens-title,
+First Light [Take 1],first light,title,trailing-parens-title,
+First Light (Take 1) (Take 2),first light (take 1),title,trailing-parens-title,
+First Light [Take 1] [Take 2],first light [take 1],title,trailing-parens-title,
+The Cat in the Hat (Original),cat in the hat,title,trailing-parens-title,title runs full baseline — article dropped
+The Sun Also Rises (Edit),sun also rises,title,trailing-parens-title,title runs full baseline — article dropped
+The Goldberg Variations (Bach),goldberg variations,title,trailing-parens-title,title runs full baseline — article dropped
+
+# ===== leading-article (25) =====
+The Field,field,base,leading-article,canonical WXYC artist
+A Tribe Called Quest,tribe called quest,base,leading-article,canonical WXYC artist
+The Beatles,beatles,base,leading-article,classic example
+A Place to Bury Strangers,place to bury strangers,base,leading-article,
+An Albatross,albatross,base,leading-article,
+The Microphones,microphones,base,leading-article,
+A Silver Mt. Zion,silver mt. zion,base,leading-article,
+The The,the,base,leading-article,only first article dropped
+The Sun Also Rises,sun also rises,base,leading-article,
+The Field (Live),field,base,leading-article,article + paren strip composed
+A Tribe Called Quest (Demos),tribe called quest,base,leading-article,article + paren strip composed
+The Microphones [1999],microphones,base,leading-article,bracket variant
+"Field, The",field,base,leading-article,Discogs comma form
+"Tribe Called Quest, A",tribe called quest,base,leading-article,Discogs comma form
+"Albatross, An",albatross,base,leading-article,Discogs comma form
+"Microphones, The",microphones,base,leading-article,Discogs comma form
+"Sun Also Rises, The",sun also rises,base,leading-article,Discogs comma form
+"Field, The (1995)",field,base,leading-article,comma + paren strip composed
+"Tribe Called Quest, A [Demos]",tribe called quest,base,leading-article,comma + bracket strip composed
+Theater of Tragedy,theater of tragedy,base,leading-article,prefix substring negative
+Animal Collective,animal collective,base,leading-article,no article negative
+Andy Human and the Reptoids,andy human and the reptoids,base,leading-article,article in middle preserved
+"Beatles, the Best Of","beatles, the best of",base,leading-article,trailing comma not at end-of-string
+Aphex Twin,aphex twin,base,leading-article,no article negative
+"Stereolab, The",stereolab,base,leading-article,Discogs comma form
+
+# ===== punct (50) — to_identity_match_form_with_punctuation =====
+M.I.A.,m i a,punct,punct,classic dotted abbreviation
+R.E.M.,r e m,punct,punct,
+O.D.B.,o d b,punct,punct,
++/-,,punct,punct,reduces to empty
+!!!,,punct,punct,reduces to empty
+"10,000 Maniacs",10 000 maniacs,punct,punct,comma collapses
+Godspeed You! Black Emperor,godspeed you black emperor,punct,punct,
+Of Montreal,of montreal,punct,punct,no punctuation passthrough
+Sigur Rós,sigur ros,punct,punct,no punctuation passthrough
+Big Thief,big thief,punct,punct,
+Dam-Funk,dam funk,punct,punct,hyphen collapses
+Gil Scott-Heron,gil scott heron,punct,punct,hyphen collapses
+"Crosby, Stills & Nash",crosby stills nash,punct,punct,
+"Earth, Wind & Fire",earth wind fire,punct,punct,
+"Tyler, the Creator",tyler the creator,punct,punct,
+"Jay-Z",jay z,punct,punct,
+"Diiv",diiv,punct,punct,
+A.A. Bondy,a a bondy,punct,punct,
+A.S.A.P. Rocky,a s a p rocky,punct,punct,
+Cluster & Eno,cluster eno,punct,punct,ampersand collapses
+"Tortoise & Bonnie 'Prince' Billy",tortoise bonnie prince billy,punct,punct,straight quotes collapse
+Bonnie 'Prince' Billy,bonnie prince billy,punct,punct,
+"D'Angelo",d angelo,punct,punct,apostrophe collapses
+Don't Be a Stranger,don t be a stranger,punct,punct,apostrophe collapses
+Sun O))),sun o,punct,punct,reduces to letters only — paren strip first removes nothing because no balanced group
+Foo!Bar (Live),foo bar,punct,punct,paren strip then punct collapse
+Foo!Bar [Demo],foo bar,punct,punct,paren strip then punct collapse
+The M.I.A.,m i a,punct,punct,article drop then punct
+"M.I.A., The",m i a,punct,punct,Discogs comma + punct collapse
+Black Midi,black midi,punct,punct,no punctuation passthrough
+Mount Eerie,mount eerie,punct,punct,
+Aphex Twin,aphex twin,punct,punct,
+Stereolab,stereolab,punct,punct,
+Cat Power,cat power,punct,punct,
+Beach House,beach house,punct,punct,
+Big Thief,big thief,punct,punct,
+Animal Collective,animal collective,punct,punct,
+Boards of Canada,boards of canada,punct,punct,
+Brian Eno,brian eno,punct,punct,
+Broadcast,broadcast,punct,punct,
+Burial,burial,punct,punct,
+Cocteau Twins,cocteau twins,punct,punct,
+Colin Stetson,colin stetson,punct,punct,
+Csillagrablók,csillagrablok,punct,punct,Unicode letter survives
+Στελλάς,στελλασ,punct,punct,Greek letter survives
+Молчат Дома,молчат дома,punct,punct,Cyrillic letter survives
+細野晴臣,細野晴臣,punct,punct,Han letters survive
+Sigur Rós,sigur ros,punct,punct,
+Hermanos Gutiérrez,hermanos gutierrez,punct,punct,
+Aşıq Altay,asıq altay,punct,punct,Turkish dotless i survives
+
+# ===== disamb (50) — to_identity_match_form_with_disambiguator_strip =====
+John Smith /1,john smith,disamb,disamb,
+John Smith /2,john smith,disamb,disamb,
+Various /17,various,disamb,disamb,
+Stereolab /1,stereolab,disamb,disamb,
+Stereolab /17,stereolab,disamb,disamb,
+Cat Power /3,cat power,disamb,disamb,
+Big Thief /2,big thief,disamb,disamb,
+Beach House /1,beach house,disamb,disamb,
+Aphex Twin /1,aphex twin,disamb,disamb,
+Autechre /2,autechre,disamb,disamb,
+Boards of Canada /1,boards of canada,disamb,disamb,
+Broadcast /2,broadcast,disamb,disamb,
+Brian Eno /1,brian eno,disamb,disamb,
+Burial /1,burial,disamb,disamb,
+Cocteau Twins /1,cocteau twins,disamb,disamb,
+Colin Stetson /1,colin stetson,disamb,disamb,
+Damien Jurado /1,damien jurado,disamb,disamb,
+Deerhoof /1,deerhoof,disamb,disamb,
+Elliott Smith /1,elliott smith,disamb,disamb,
+Father John Misty /1,father john misty,disamb,disamb,
+Flying Lotus /1,flying lotus,disamb,disamb,
+Four Tet /1,four tet,disamb,disamb,
+Gil Scott-Heron /1,gil scott-heron,disamb,disamb,
+Hermanos Gutiérrez /1,hermanos gutierrez,disamb,disamb,
+Jessica Pratt /1,jessica pratt,disamb,disamb,
+Juana Molina /1,juana molina,disamb,disamb,
+The Beatles /1,beatles,disamb,disamb,article drop + disamb composed
+A Tribe Called Quest /1,tribe called quest,disamb,disamb,article + disamb composed
+"Beatles, The /1","beatles, the",disamb,disamb,Discogs comma form is masked by /1 in baseline; only /1 strips at the disamb step (comma form does not re-fire)
+The Field /2 (Live),field,disamb,disamb,article + paren + disamb composed
+The Microphones /3,microphones,disamb,disamb,
+Track 1/12,track 1/12,disamb,disamb,no whitespace before slash — preserved
+Side A/B,side a/b,disamb,disamb,trailing letter — preserved
+Track 1/12345,track 1/12345,disamb,disamb,no whitespace
+Section 4/5,section 4/5,disamb,disamb,no whitespace
+1/4,1/4,disamb,disamb,bare digits
+"Stereolab /17 (Live)",stereolab,disamb,disamb,paren first then disamb
+Cat Power /3 [Live],cat power,disamb,disamb,bracket then disamb
+"Cat Power /3 (Demo)",cat power,disamb,disamb,paren then disamb
+Stereolab,stereolab,disamb,disamb,no disambiguator passthrough
+Cat Power,cat power,disamb,disamb,no disambiguator passthrough
+Beach House,beach house,disamb,disamb,no disambiguator passthrough
+M /1,m,disamb,disamb,single-letter stem
+M.I.A. /1,m.i.a.,disamb,disamb,disamb strips trailing /N; dotted abbreviation survives because disamb does not punct-collapse
+"Stereolab /1, The",stereolab,disamb,disamb,trailing comma form before disamb digits — wait this has /1 first
+Various Artists /1,various artists,disamb,disamb,
+Various Artists /99,various artists,disamb,disamb,
+Compilation /1,compilation,disamb,disamb,
+Compilation /5,compilation,disamb,disamb,
+Various /999,various,disamb,disamb,three-digit
+Bach /1,bach,disamb,disamb,
+
+# ===== disamb-title-negative (25) — title variant must NOT strip /N =====
+Track 1/12,track 1/12,title,disamb-title-negative,
+Side A/B,side a/b,title,disamb-title-negative,
+Track 2/12,track 2/12,title,disamb-title-negative,
+Track 11/12,track 11/12,title,disamb-title-negative,
+Section 4/5,section 4/5,title,disamb-title-negative,
+1/4,1/4,title,disamb-title-negative,
+Wedding Song /1,wedding song /1,title,disamb-title-negative,title variant preserves /N
+Sugar Hill /2,sugar hill /2,title,disamb-title-negative,
+La Paradoja /3,la paradoja /3,title,disamb-title-negative,
+"Back, Baby /1","back, baby /1",title,disamb-title-negative,
+Call Your Name /4,call your name /4,title,disamb-title-negative,
+In a Sentimental Mood /1,in a sentimental mood /1,title,disamb-title-negative,
+Suite No. 1/2,suite no. 1/2,title,disamb-title-negative,no whitespace
+Side 1/2,side 1/2,title,disamb-title-negative,
+Movement 4/4,movement 4/4,title,disamb-title-negative,
+Variation 1/30,variation 1/30,title,disamb-title-negative,
+"Symphony No. 9, Mvmt. 4/4","symphony no. 9, mvmt. 4/4",title,disamb-title-negative,
+Bagatelle 11/11,bagatelle 11/11,title,disamb-title-negative,
+Etude 24/24,etude 24/24,title,disamb-title-negative,
+Prelude 1/24,prelude 1/24,title,disamb-title-negative,
+Concerto 5/6,concerto 5/6,title,disamb-title-negative,
+Mass 1/4,mass 1/4,title,disamb-title-negative,
+Volume 1/3,volume 1/3,title,disamb-title-negative,
+Disc 1/2,disc 1/2,title,disamb-title-negative,
+CD 1/2,cd 1/2,title,disamb-title-negative,
