@@ -430,24 +430,32 @@ def import_csv(
 
 
 def populate_cache_metadata(conn) -> int:
-    """Populate cache_metadata for all releases via COPY.
+    """Populate cache_metadata for all releases.
 
-    Much faster than INSERT...SELECT with ON CONFLICT for large tables.
-    Assumes cache_metadata is empty (schema freshly created).
+    Uses INSERT ... SELECT ... ON CONFLICT DO NOTHING rather than COPY
+    because cache_metadata is concurrently written by the live
+    library-metadata-lookup service: on every Discogs API miss, LML's
+    ``discogs/cache_service.py`` inserts a row with source='api_fetch'.
+    During a rebuild, those concurrent writes race the bulk populate
+    and cause duplicate-key violations on COPY (which has no upsert
+    semantics). See WXYC/discogs-etl#188 (2026-05-13 21:32 UTC run, 52
+    'api_fetch' rows appeared in the 34-second window between TRUNCATE
+    and the populate step).
 
-    Returns the number of rows inserted.
+    Returns the number of rows actually inserted; ON CONFLICT skips
+    are excluded, which is the right denominator for "how much did this
+    populate step add?". Rows already present from concurrent
+    'api_fetch' writes keep their original source.
     """
     with conn.cursor() as cur:
-        cur.execute("SELECT id FROM release")
-        release_ids = [row[0] for row in cur.fetchall()]
-
-    count = len(release_ids)
-    with conn.cursor() as cur:
-        with cur.copy("COPY cache_metadata (release_id, source) FROM STDIN") as copy:
-            for rid in release_ids:
-                copy.write_row((rid, "bulk_import"))
+        cur.execute("""
+            INSERT INTO cache_metadata (release_id, source)
+            SELECT id, 'bulk_import' FROM release
+            ON CONFLICT (release_id) DO NOTHING
+        """)
+        count = cur.rowcount
     conn.commit()
-    logger.info(f"  Populated cache_metadata with {count:,} rows")
+    logger.info(f"  Populated cache_metadata with {count:,} rows (ON CONFLICT skips excluded)")
     return count
 
 
