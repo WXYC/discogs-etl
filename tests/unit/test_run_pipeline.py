@@ -137,6 +137,19 @@ class TestArgParsing:
         args = run_pipeline.parse_args(["--csv-dir", "/tmp/csv"])
         assert args.state_file == Path(".pipeline_state.json")
 
+    def test_truncate_existing_flag_parsed(self) -> None:
+        """--truncate-existing flows through to import_csv subprocess to
+        wipe stale rows before COPY. Use when re-running against a DB with
+        partial state from a prior failed rebuild."""
+        args = run_pipeline.parse_args(["--csv-dir", "/tmp/csv", "--truncate-existing"])
+        assert args.truncate_existing is True
+
+    def test_truncate_existing_default_false(self) -> None:
+        """Default is False — a fresh-DB rebuild doesn't need it and the
+        wasted TRUNCATE DDL would slow the empty case."""
+        args = run_pipeline.parse_args(["--csv-dir", "/tmp/csv"])
+        assert args.truncate_existing is False
+
     def test_converter_default(self) -> None:
         args = run_pipeline.parse_args(["--xml", "/tmp/releases.xml.gz"])
         assert args.converter == "discogs-xml-converter"

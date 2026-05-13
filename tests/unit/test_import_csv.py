@@ -538,6 +538,202 @@ class TestMainArgParsing:
 
 
 # ---------------------------------------------------------------------------
+# --truncate-existing flag
+# ---------------------------------------------------------------------------
+
+
+class TestTruncateExisting:
+    """``--truncate-existing`` wipes the cache tables before COPY so a partial
+    state from a prior failed rebuild doesn't fail the import with a
+    duplicate-key violation. Excludes entity.identity (WXYC-side data) and
+    alembic_version (migration history).
+    """
+
+    def test_cache_tables_list_excludes_entity_schema(self) -> None:
+        """The entity schema holds the WXYC-side identity records — they must
+        survive a rebuild. None of CACHE_TABLES_TO_TRUNCATE may target them."""
+        for name in _ic.CACHE_TABLES_TO_TRUNCATE:
+            assert not name.startswith("entity."), (
+                f"entity-schema table {name!r} must not be in CACHE_TABLES_TO_TRUNCATE"
+            )
+
+    def test_cache_tables_list_excludes_alembic_version(self) -> None:
+        """alembic_version tracks migration history and must persist across
+        rebuilds. Truncating it would break the dual-write convention."""
+        assert "alembic_version" not in _ic.CACHE_TABLES_TO_TRUNCATE
+
+    def test_cache_tables_list_covers_base_track_video_artist_master_sets(self) -> None:
+        """Every public table that --base-only or --tracks-only writes to
+        must appear in CACHE_TABLES_TO_TRUNCATE, plus cache_metadata which
+        populate_cache_metadata fills after import."""
+        expected_tables = {
+            # BASE_TABLES
+            "release",
+            "release_artist",
+            "release_label",
+            "release_genre",
+            "release_style",
+            # TRACK_TABLES + VIDEO_TABLES
+            "release_track",
+            "release_track_artist",
+            "release_video",
+            # ARTIST_TABLES + import_artist_details stub-row target
+            "artist",
+            "artist_alias",
+            "artist_member",
+            "artist_name_variation",
+            "artist_url",
+            # MASTER_TABLES
+            "master",
+            "master_artist",
+            # populate_cache_metadata target
+            "cache_metadata",
+        }
+        actual = set(_ic.CACHE_TABLES_TO_TRUNCATE)
+        assert actual == expected_tables, (
+            f"missing: {expected_tables - actual}, extra: {actual - expected_tables}"
+        )
+
+    def test_truncate_tables_issues_single_cascade_statement(self) -> None:
+        """_truncate_tables emits one TRUNCATE ... CASCADE statement. One
+        statement keeps the operation atomic and CASCADE handles FK
+        dependencies for any table not in the explicit list."""
+        from unittest.mock import MagicMock
+
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
+        mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+
+        _ic._truncate_tables(mock_conn, ["release", "release_artist"])
+
+        mock_cursor.execute.assert_called_once()
+        sql = mock_cursor.execute.call_args[0][0]
+        assert "TRUNCATE" in sql.upper()
+        assert "CASCADE" in sql.upper()
+        assert "release" in sql
+        assert "release_artist" in sql
+
+    def test_truncate_tables_commits_immediately(self) -> None:
+        """The truncate must commit on its own conn before any parallel
+        workers open new conns — otherwise MVCC isolation would let workers
+        still see the pre-TRUNCATE rows and the COPY would still fail."""
+        from unittest.mock import MagicMock
+
+        mock_conn = MagicMock()
+        _ic._truncate_tables(mock_conn, ["release"])
+
+        mock_conn.commit.assert_called_once()
+
+    def test_truncate_tables_empty_list_is_noop(self) -> None:
+        """Defensive: empty table list short-circuits without issuing SQL."""
+        from unittest.mock import MagicMock
+
+        mock_conn = MagicMock()
+        _ic._truncate_tables(mock_conn, [])
+
+        mock_conn.cursor.assert_not_called()
+        mock_conn.commit.assert_not_called()
+
+    def test_flag_invokes_truncate_before_import_in_base_only(self, tmp_path) -> None:
+        """--base-only --truncate-existing calls _truncate_tables(conn,
+        CACHE_TABLES_TO_TRUNCATE) before any import work happens."""
+        from unittest.mock import MagicMock, patch
+
+        csv_dir = tmp_path / "csv"
+        csv_dir.mkdir()
+        mock_conn = MagicMock()
+
+        with (
+            patch(
+                "sys.argv",
+                [
+                    "import_csv.py",
+                    "--base-only",
+                    "--truncate-existing",
+                    str(csv_dir),
+                    "postgresql:///test",
+                ],
+            ),
+            patch.object(_ic.psycopg, "connect", return_value=mock_conn),
+            patch.object(_ic, "_truncate_tables") as mock_truncate,
+            patch.object(_ic, "_import_tables_parallel", return_value=100),
+            patch.object(_ic, "import_artwork", return_value=10),
+            patch.object(_ic, "populate_release_year", return_value=50),
+            patch.object(_ic, "populate_cache_metadata", return_value=50),
+            patch.object(_ic, "create_track_count_table", return_value=20),
+            patch.object(_ic, "import_artist_details", return_value=20),
+        ):
+            _ic.main()
+
+        mock_truncate.assert_called_once()
+        call_args = mock_truncate.call_args
+        assert call_args[0][0] is mock_conn
+        assert call_args[0][1] == _ic.CACHE_TABLES_TO_TRUNCATE
+
+    def test_flag_invokes_truncate_in_tracks_only(self, tmp_path) -> None:
+        """--tracks-only --truncate-existing wipes the same cache-table set.
+        The list is mode-agnostic: stale data in any of these tables can
+        fail a future rebuild regardless of which mode is running."""
+        from unittest.mock import MagicMock, patch
+
+        csv_dir = tmp_path / "csv"
+        csv_dir.mkdir()
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_cursor.fetchall.return_value = [(5001,)]
+        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
+        mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+
+        with (
+            patch(
+                "sys.argv",
+                [
+                    "import_csv.py",
+                    "--tracks-only",
+                    "--truncate-existing",
+                    str(csv_dir),
+                    "postgresql:///test",
+                ],
+            ),
+            patch.object(_ic.psycopg, "connect", return_value=mock_conn),
+            patch.object(_ic, "_truncate_tables") as mock_truncate,
+            patch.object(_ic, "_import_tables_parallel", return_value=200),
+        ):
+            _ic.main()
+
+        mock_truncate.assert_called_once()
+
+    def test_flag_omitted_does_not_truncate(self, tmp_path) -> None:
+        """Default (flag absent) preserves prior behavior — no TRUNCATE on
+        a fresh-DB rebuild, where the schema-create step yields empty tables
+        and TRUNCATE would be wasted DDL."""
+        from unittest.mock import MagicMock, patch
+
+        csv_dir = tmp_path / "csv"
+        csv_dir.mkdir()
+        mock_conn = MagicMock()
+
+        with (
+            patch(
+                "sys.argv",
+                ["import_csv.py", "--base-only", str(csv_dir), "postgresql:///test"],
+            ),
+            patch.object(_ic.psycopg, "connect", return_value=mock_conn),
+            patch.object(_ic, "_truncate_tables") as mock_truncate,
+            patch.object(_ic, "_import_tables_parallel", return_value=100),
+            patch.object(_ic, "import_artwork", return_value=10),
+            patch.object(_ic, "populate_release_year", return_value=50),
+            patch.object(_ic, "populate_cache_metadata", return_value=50),
+            patch.object(_ic, "create_track_count_table", return_value=20),
+            patch.object(_ic, "import_artist_details", return_value=20),
+        ):
+            _ic.main()
+
+        mock_truncate.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
 # Artist table dedup and filtering
 # ---------------------------------------------------------------------------
 

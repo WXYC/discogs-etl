@@ -208,6 +208,60 @@ MASTER_TABLES: list[TableConfig] = [
 TABLES: list[TableConfig] = BASE_TABLES + TRACK_TABLES + VIDEO_TABLES
 
 
+# Cache tables wiped by --truncate-existing. Matches the operator-level
+# manual TRUNCATE SQL used when re-running a rebuild against a destination
+# DB that holds stale rows from a prior failed attempt. Two exclusions:
+#
+#   - entity.identity / entity.reconciliation_log — WXYC-side identity
+#     records the rebuild must NOT touch.
+#   - alembic_version — migration history must persist across rebuilds.
+#
+# The list is mode-agnostic. --base-only and --tracks-only both share it
+# because stale data in any of these tables can fail a future rebuild
+# regardless of which mode is running first.
+CACHE_TABLES_TO_TRUNCATE: list[str] = [
+    "release",
+    "release_artist",
+    "release_label",
+    "release_genre",
+    "release_style",
+    "release_track",
+    "release_track_artist",
+    "release_video",
+    "artist",
+    "artist_alias",
+    "artist_member",
+    "artist_name_variation",
+    "artist_url",
+    "master",
+    "master_artist",
+    "cache_metadata",
+]
+
+
+def _truncate_tables(conn, table_names: list[str]) -> None:
+    """Wipe the named tables with a single TRUNCATE ... CASCADE.
+
+    One statement keeps the operation atomic (either all empty or none).
+    CASCADE handles FK dependencies for any table not in the explicit list
+    (e.g., release_image's FK to release if release_image is ever added to
+    the schema but not yet to CACHE_TABLES_TO_TRUNCATE).
+
+    Commits immediately. Otherwise parallel workers — which open fresh
+    connections via ``_import_tables_parallel`` — would still see the
+    pre-TRUNCATE rows under MVCC isolation and the COPY would fail with
+    the same duplicate-key violation we're trying to avoid.
+    """
+    if not table_names:
+        return
+    quoted = ", ".join(f'"{t}"' for t in table_names)
+    sql = f"TRUNCATE {quoted} CASCADE"
+    logger.warning(f"--truncate-existing: TRUNCATE {len(table_names)} cache tables")
+    with conn.cursor() as cur:
+        cur.execute(sql)
+    conn.commit()
+
+
 def import_csv(
     conn,
     csv_path: Path,
@@ -723,6 +777,14 @@ def main():
         action="store_true",
         help="Import only track tables, filtered to surviving release IDs",
     )
+    parser.add_argument(
+        "--truncate-existing",
+        action="store_true",
+        help="TRUNCATE the cache tables before COPY. Use when re-running a "
+        "rebuild against a DB with stale rows from a prior failed attempt. "
+        "Preserves entity.identity and alembic_version. Without this flag, "
+        "a duplicate-key violation on the first table aborts the pipeline.",
+    )
 
     args = parser.parse_args()
     csv_dir = args.csv_dir
@@ -734,6 +796,9 @@ def main():
 
     logger.info(f"Connecting to {db_url}")
     conn = psycopg.connect(db_url)
+
+    if args.truncate_existing:
+        _truncate_tables(conn, CACHE_TABLES_TO_TRUNCATE)
 
     if args.tracks_only:
         # Query surviving release IDs from the database

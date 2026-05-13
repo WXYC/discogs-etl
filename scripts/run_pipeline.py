@@ -269,6 +269,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Path to pipeline state file for tracking/resuming progress "
         "(default: .pipeline_state.json).",
     )
+    parser.add_argument(
+        "--truncate-existing",
+        action="store_true",
+        help="Pass --truncate-existing to scripts/import_csv.py so the cache "
+        "tables are wiped before COPY. Use when re-running a rebuild against "
+        "a DB with stale rows from a prior failed attempt. Preserves "
+        "entity.identity and alembic_version.",
+    )
 
     args = parser.parse_args(argv)
 
@@ -792,6 +800,7 @@ def _run_xml_pipeline(
                 label_hierarchy=hierarchy_csv,
                 catalog_source=args.catalog_source,
                 catalog_db_url=args.catalog_db_url,
+                truncate_existing=args.truncate_existing,
             )
 
     if keep_csv_dir is not None:
@@ -856,6 +865,7 @@ def main() -> None:
             catalog_db_url=args.catalog_db_url,
             state=state,
             state_file=args.state_file,
+            truncate_existing=args.truncate_existing,
         )
 
     total = time.monotonic() - pipeline_start
@@ -986,6 +996,7 @@ def _run_database_build(
     catalog_db_url: str | None = None,
     state: PipelineState | None = None,
     state_file: Path | None = None,
+    truncate_existing: bool = False,
 ) -> None:
     """Database build: create_schema through vacuum.
 
@@ -1027,10 +1038,11 @@ def _run_database_build(
     if state and state.is_completed("import_csv"):
         logger.info("Skipping import_csv (already completed)")
     else:
-        run_step(
-            "Import base CSVs",
-            [python, str(SCRIPT_DIR / "import_csv.py"), "--base-only", str(csv_dir), db_url],
-        )
+        import_cmd = [python, str(SCRIPT_DIR / "import_csv.py"), "--base-only"]
+        if truncate_existing:
+            import_cmd.append("--truncate-existing")
+        import_cmd.extend([str(csv_dir), db_url])
+        run_step("Import base CSVs", import_cmd)
         if state:
             state.mark_completed("import_csv")
             _save_state()
@@ -1097,10 +1109,11 @@ def _run_database_build(
     if state and state.is_completed("import_tracks"):
         logger.info("Skipping import_tracks (already completed)")
     else:
-        run_step(
-            "Import tracks",
-            [python, str(SCRIPT_DIR / "import_csv.py"), "--tracks-only", str(csv_dir), db_url],
-        )
+        tracks_cmd = [python, str(SCRIPT_DIR / "import_csv.py"), "--tracks-only"]
+        if truncate_existing:
+            tracks_cmd.append("--truncate-existing")
+        tracks_cmd.extend([str(csv_dir), db_url])
+        run_step("Import tracks", tracks_cmd)
         if state:
             state.mark_completed("import_tracks")
             _save_state()
