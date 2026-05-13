@@ -31,6 +31,110 @@ CSV_DIR = FIXTURES_DIR / "csv"
 
 
 # ---------------------------------------------------------------------------
+# populate_cache_metadata race-tolerance
+# ---------------------------------------------------------------------------
+
+
+class TestPopulateCacheMetadataRaceTolerance:
+    """``cache_metadata`` is concurrently written by the live LML service:
+    on every Discogs API miss, LML's ``discogs/cache_service.py`` inserts an
+    ``'api_fetch'`` row. During a rebuild, those concurrent writes race the
+    bulk populate and cause duplicate-key violations on COPY.
+
+    The fix uses INSERT ... ON CONFLICT DO NOTHING so the bulk populate
+    skips rows LML has already inserted. Surfaced in the 2026-05-13
+    21:32 UTC rebuild run (#188), where 52 ``'api_fetch'`` rows appeared
+    in the 34-second window between TRUNCATE and ``populate_cache_metadata``.
+    """
+
+    def test_uses_insert_on_conflict_not_copy(self) -> None:
+        """The function emits an INSERT ... ON CONFLICT DO NOTHING statement,
+        not a COPY. The race with LML's runtime cache writes requires the
+        ON CONFLICT semantics that COPY can't provide."""
+        from unittest.mock import MagicMock
+
+        mock_cursor = MagicMock()
+        mock_cursor.rowcount = 50
+        mock_conn = MagicMock()
+        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
+        mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+
+        _ic.populate_cache_metadata(mock_conn)
+
+        # cur.copy should NEVER be called — that's the failure mode we're fixing.
+        mock_cursor.copy.assert_not_called()
+        # cur.execute should be called with an INSERT ... ON CONFLICT statement.
+        mock_cursor.execute.assert_called_once()
+        sql = mock_cursor.execute.call_args[0][0]
+        assert "INSERT INTO cache_metadata" in sql
+        assert "ON CONFLICT" in sql
+        assert "DO NOTHING" in sql
+
+    def test_insert_uses_bulk_import_source(self) -> None:
+        """The bulk populate's source column must be 'bulk_import' so
+        post-rebuild analytics can distinguish bulk-loaded rows from
+        LML's runtime ``'api_fetch'`` writes."""
+        from unittest.mock import MagicMock
+
+        mock_cursor = MagicMock()
+        mock_cursor.rowcount = 0
+        mock_conn = MagicMock()
+        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
+        mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+
+        _ic.populate_cache_metadata(mock_conn)
+
+        sql = mock_cursor.execute.call_args[0][0]
+        assert "'bulk_import'" in sql
+
+    def test_targets_release_id_conflict(self) -> None:
+        """ON CONFLICT must reference (release_id), the cache_metadata pkey."""
+        from unittest.mock import MagicMock
+
+        mock_cursor = MagicMock()
+        mock_cursor.rowcount = 0
+        mock_conn = MagicMock()
+        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
+        mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+
+        _ic.populate_cache_metadata(mock_conn)
+
+        sql = mock_cursor.execute.call_args[0][0]
+        # The ON CONFLICT target is the primary key (release_id).
+        assert "ON CONFLICT (release_id)" in sql
+
+    def test_commits_on_success(self) -> None:
+        """The function commits the transaction so the inserted rows are
+        durable before the next pipeline step starts."""
+        from unittest.mock import MagicMock
+
+        mock_cursor = MagicMock()
+        mock_cursor.rowcount = 0
+        mock_conn = MagicMock()
+        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
+        mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+
+        _ic.populate_cache_metadata(mock_conn)
+
+        mock_conn.commit.assert_called_once()
+
+    def test_returns_rowcount(self) -> None:
+        """The return value is the number of rows actually inserted
+        (cur.rowcount after INSERT). ON CONFLICT skips don't count, which is
+        the right denominator for the log line that reports the populate's
+        effect."""
+        from unittest.mock import MagicMock
+
+        mock_cursor = MagicMock()
+        mock_cursor.rowcount = 677_934
+        mock_conn = MagicMock()
+        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
+        mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+
+        assert _ic.populate_cache_metadata(mock_conn) == 677_934
+
+
+# ---------------------------------------------------------------------------
 # extract_year
 # ---------------------------------------------------------------------------
 
