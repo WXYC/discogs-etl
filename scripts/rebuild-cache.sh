@@ -88,8 +88,40 @@ echo "[$(date -u +%H:%M:%SZ)] refresh Python venv + Rust converter binary"
 # shellcheck disable=SC1091
 source "$REPO_DIR/.venv/bin/activate"
 pip install --quiet -e "${REPO_DIR}[dev]"
-(cd "$CONVERTER_DIR" && cargo build --release --quiet)
-export PATH="$CONVERTER_DIR/target/release:$PATH"
+
+# Try the prebuilt converter binary published by WXYC/discogs-xml-converter's
+# Release Binary workflow. Skips the ~20-30 min cargo build on EC2. Falls back
+# to source build on any failure (release not published yet, asset missing,
+# checksum mismatch, network error) so the rebuild stays resilient against
+# converter-side publishing problems. The function returns non-zero on any
+# step that fails; the caller decides whether to fall back.
+download_prebuilt_converter() {
+    local target_dir="$1"
+    mkdir -p "$target_dir"
+    # gh works against public repos without auth and honors GH_TOKEN when set.
+    if ! gh release download \
+            --repo WXYC/discogs-xml-converter \
+            --pattern 'discogs-xml-converter-linux-x86_64.tar.gz' \
+            --pattern 'discogs-xml-converter-linux-x86_64.tar.gz.sha256' \
+            --dir "$target_dir" \
+            --clobber; then
+        return 1
+    fi
+    (cd "$target_dir" && sha256sum -c discogs-xml-converter-linux-x86_64.tar.gz.sha256) || return 1
+    tar -xzf "$target_dir/discogs-xml-converter-linux-x86_64.tar.gz" -C "$target_dir" || return 1
+    test -x "$target_dir/discogs-xml-converter" || return 1
+    return 0
+}
+
+PREBUILT_DIR="$REPO_DIR/.prebuilt-converter"
+if download_prebuilt_converter "$PREBUILT_DIR"; then
+    echo "    using prebuilt converter from WXYC/discogs-xml-converter latest release"
+    export PATH="$PREBUILT_DIR:$PATH"
+else
+    echo "    prebuilt binary unavailable; falling back to cargo build"
+    (cd "$CONVERTER_DIR" && cargo build --release --quiet)
+    export PATH="$CONVERTER_DIR/target/release:$PATH"
+fi
 
 # ---------------------------------------------------------------------------
 # 3. Pull daily-fresh library.db produced by sync-library workflow
@@ -171,10 +203,17 @@ curl -fL --continue-at - --retry 5 --retry-delay 30 --retry-all-errors \
 echo "    download complete ($(du -h "$WORK_DIR/releases.xml.gz" | cut -f1))"
 
 echo "[$(date -u +%H:%M:%SZ)] start pipeline"
+# --truncate-existing wipes the cache tables before COPY so a rerun after a
+# prior failed rebuild doesn't hit a duplicate-key violation on the first
+# table (the failure mode from WXYC/discogs-etl#188's 2026-05-13 run). The
+# flag is a no-op on a freshly-stamped DB, so it's safe to keep on
+# unconditionally — the only cost is ~1s of TRUNCATE DDL on empty tables.
+# Preserves entity.identity and alembic_version.
 python "$REPO_DIR/scripts/run_pipeline.py" \
     --xml "$WORK_DIR/releases.xml.gz" \
     --xml-type releases \
-    --library-db "$WORK_DIR/library.db"
+    --library-db "$WORK_DIR/library.db" \
+    --truncate-existing
 
 # ---------------------------------------------------------------------------
 # 6. Drift watchdog — same library.db the pipeline just filtered against
