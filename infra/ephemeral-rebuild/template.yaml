@@ -25,11 +25,13 @@ Parameters:
 
   InstanceType:
     Type: String
-    Default: t3.medium
+    Default: c6i.large
     Description: >
-      EC2 instance type. t3.medium (~$0.04/hr on-demand) clears the
-      90-minute rebuild comfortably. Bump to c6i.large or larger if a
-      future schema or library expansion pushes wall-clock past the budget.
+      EC2 instance type. c6i.large (~$0.10/hr on-demand) is roughly 2x
+      faster than t3.medium on the converter scan (CPU-bound) and the
+      cargo build, at ~$0.06 marginal cost per monthly run (1.5 hr).
+      Use t3.medium (~$0.04/hr) via --parameter-overrides for non-critical
+      reruns where time matters less than cost.
 
   RootVolumeSizeGb:
     Type: Number

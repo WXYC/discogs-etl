@@ -150,6 +150,90 @@ class TestArgParsing:
         args = run_pipeline.parse_args(["--csv-dir", "/tmp/csv"])
         assert args.truncate_existing is False
 
+
+class TestTruncateExistingPropagation:
+    """``run_pipeline.py --truncate-existing`` plumbs into the base step
+    only — never into the tracks step. In a full pipeline the tracks step
+    runs AFTER base+dedup, so propagating the flag would erase the
+    deduped base rows and the ``SELECT id FROM release`` filter inside
+    the tracks step would return zero IDs.
+
+    Regression: caught by the pre-PR-review hook on 2026-05-13 when an
+    earlier draft propagated the flag to both subprocess invocations.
+    """
+
+    def _invoke_database_build_capturing_run_step(
+        self, *, truncate_existing: bool
+    ) -> list[list[str]]:
+        """Run ``_run_database_build`` with all DB-touching helpers stubbed
+        out, and capture the argv each ``run_step`` was given. Every other
+        helper that would normally hit Postgres is patched to a no-op."""
+        from unittest.mock import MagicMock, patch
+
+        import psycopg
+
+        captured_cmds: list[list[str]] = []
+
+        def fake_run_step(step_name, cmd, *args, **kwargs):
+            captured_cmds.append(cmd)
+
+        mock_cursor = MagicMock()
+        mock_cursor.fetchone.return_value = [True]
+        mock_cursor.fetchall.return_value = [
+            ("idx_release_artist_name_trgm",),
+            ("idx_release_title_trgm",),
+        ]
+        mock_conn = MagicMock()
+        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
+        mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+
+        with (
+            patch.object(run_pipeline, "run_step", side_effect=fake_run_step),
+            patch.object(run_pipeline, "wait_for_postgres"),
+            patch.object(run_pipeline, "run_sql_file"),
+            patch.object(run_pipeline, "run_sql_statements_parallel"),
+            patch.object(run_pipeline, "set_tables_unlogged"),
+            patch.object(run_pipeline, "report_sizes"),
+            patch.object(psycopg, "connect", return_value=mock_conn),
+        ):
+            run_pipeline._run_database_build(
+                "postgresql:///test",
+                Path("/tmp/csv"),
+                None,
+                sys.executable,
+                truncate_existing=truncate_existing,
+            )
+
+        return captured_cmds
+
+    def test_flag_propagates_to_base_step(self) -> None:
+        """With --truncate-existing, the base subprocess invocation carries
+        the flag so stale rows are wiped before COPY."""
+        cmds = self._invoke_database_build_capturing_run_step(truncate_existing=True)
+        base_cmds = [c for c in cmds if "--base-only" in c]
+        assert len(base_cmds) == 1
+        assert "--truncate-existing" in base_cmds[0]
+
+    def test_flag_does_not_propagate_to_tracks_step(self) -> None:
+        """Even with --truncate-existing set on the orchestrator, the tracks
+        subprocess does NOT carry the flag. The tracks step runs AFTER
+        dedup; truncating now would just wipe what we want to filter against.
+        """
+        cmds = self._invoke_database_build_capturing_run_step(truncate_existing=True)
+        tracks_cmds = [c for c in cmds if "--tracks-only" in c]
+        assert len(tracks_cmds) == 1
+        assert "--truncate-existing" not in tracks_cmds[0], (
+            "Propagating --truncate-existing to the tracks step would wipe the "
+            "deduped base data and leave the cache with empty release_track tables."
+        )
+
+    def test_flag_absent_does_not_appear_in_any_invocation(self) -> None:
+        """Default behavior: neither subprocess gets --truncate-existing.
+        Preserves the prior fresh-DB rebuild path."""
+        cmds = self._invoke_database_build_capturing_run_step(truncate_existing=False)
+        for cmd in cmds:
+            assert "--truncate-existing" not in cmd
+
     def test_converter_default(self) -> None:
         args = run_pipeline.parse_args(["--xml", "/tmp/releases.xml.gz"])
         assert args.converter == "discogs-xml-converter"

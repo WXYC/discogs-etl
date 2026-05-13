@@ -208,18 +208,21 @@ MASTER_TABLES: list[TableConfig] = [
 TABLES: list[TableConfig] = BASE_TABLES + TRACK_TABLES + VIDEO_TABLES
 
 
-# Cache tables wiped by --truncate-existing. Matches the operator-level
-# manual TRUNCATE SQL used when re-running a rebuild against a destination
-# DB that holds stale rows from a prior failed attempt. Two exclusions:
+# Cache tables wiped by --truncate-existing, partitioned by mode. The base
+# set wipes the full cache; the tracks set wipes only the tables that
+# --tracks-only writes to. Two exclusions in either set:
 #
 #   - entity.identity / entity.reconciliation_log — WXYC-side identity
 #     records the rebuild must NOT touch.
 #   - alembic_version — migration history must persist across rebuilds.
 #
-# The list is mode-agnostic. --base-only and --tracks-only both share it
-# because stale data in any of these tables can fail a future rebuild
-# regardless of which mode is running first.
-CACHE_TABLES_TO_TRUNCATE: list[str] = [
+# Mode-awareness matters: in a full run_pipeline.py invocation the base
+# step runs first, then dedup, then the tracks step. If --tracks-only
+# wiped base tables, the tracks step would erase the just-deduped data
+# and find zero release IDs to filter against. The tracks subset only
+# touches track-domain tables, so a tracks-only rerun against an
+# already-populated cache only refreshes the tracks.
+CACHE_TABLES_TO_TRUNCATE_BASE: list[str] = [
     "release",
     "release_artist",
     "release_label",
@@ -236,6 +239,12 @@ CACHE_TABLES_TO_TRUNCATE: list[str] = [
     "master",
     "master_artist",
     "cache_metadata",
+]
+
+CACHE_TABLES_TO_TRUNCATE_TRACKS: list[str] = [
+    "release_track",
+    "release_track_artist",
+    "release_video",
 ]
 
 
@@ -798,7 +807,10 @@ def main():
     conn = psycopg.connect(db_url)
 
     if args.truncate_existing:
-        _truncate_tables(conn, CACHE_TABLES_TO_TRUNCATE)
+        truncate_set = (
+            CACHE_TABLES_TO_TRUNCATE_TRACKS if args.tracks_only else CACHE_TABLES_TO_TRUNCATE_BASE
+        )
+        _truncate_tables(conn, truncate_set)
 
     if args.tracks_only:
         # Query surviving release IDs from the database

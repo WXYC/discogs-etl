@@ -549,23 +549,27 @@ class TestTruncateExisting:
     alembic_version (migration history).
     """
 
-    def test_cache_tables_list_excludes_entity_schema(self) -> None:
+    def test_base_truncate_list_excludes_entity_schema(self) -> None:
         """The entity schema holds the WXYC-side identity records — they must
-        survive a rebuild. None of CACHE_TABLES_TO_TRUNCATE may target them."""
-        for name in _ic.CACHE_TABLES_TO_TRUNCATE:
+        survive a rebuild. Neither truncate set may target it."""
+        for name in _ic.CACHE_TABLES_TO_TRUNCATE_BASE:
             assert not name.startswith("entity."), (
-                f"entity-schema table {name!r} must not be in CACHE_TABLES_TO_TRUNCATE"
+                f"entity-schema table {name!r} must not be in CACHE_TABLES_TO_TRUNCATE_BASE"
+            )
+        for name in _ic.CACHE_TABLES_TO_TRUNCATE_TRACKS:
+            assert not name.startswith("entity."), (
+                f"entity-schema table {name!r} must not be in CACHE_TABLES_TO_TRUNCATE_TRACKS"
             )
 
-    def test_cache_tables_list_excludes_alembic_version(self) -> None:
+    def test_truncate_lists_exclude_alembic_version(self) -> None:
         """alembic_version tracks migration history and must persist across
         rebuilds. Truncating it would break the dual-write convention."""
-        assert "alembic_version" not in _ic.CACHE_TABLES_TO_TRUNCATE
+        assert "alembic_version" not in _ic.CACHE_TABLES_TO_TRUNCATE_BASE
+        assert "alembic_version" not in _ic.CACHE_TABLES_TO_TRUNCATE_TRACKS
 
-    def test_cache_tables_list_covers_base_track_video_artist_master_sets(self) -> None:
-        """Every public table that --base-only or --tracks-only writes to
-        must appear in CACHE_TABLES_TO_TRUNCATE, plus cache_metadata which
-        populate_cache_metadata fills after import."""
+    def test_base_truncate_list_covers_full_cache(self) -> None:
+        """The base set wipes the FULL cache so a rerun after a partial
+        failed --base-only attempt clears everything from any prior state."""
         expected_tables = {
             # BASE_TABLES
             "release",
@@ -573,7 +577,7 @@ class TestTruncateExisting:
             "release_label",
             "release_genre",
             "release_style",
-            # TRACK_TABLES + VIDEO_TABLES
+            # TRACK_TABLES + VIDEO_TABLES (cleared because partial prior tracks would conflict too)
             "release_track",
             "release_track_artist",
             "release_video",
@@ -589,10 +593,47 @@ class TestTruncateExisting:
             # populate_cache_metadata target
             "cache_metadata",
         }
-        actual = set(_ic.CACHE_TABLES_TO_TRUNCATE)
+        actual = set(_ic.CACHE_TABLES_TO_TRUNCATE_BASE)
         assert actual == expected_tables, (
             f"missing: {expected_tables - actual}, extra: {actual - expected_tables}"
         )
+
+    def test_tracks_truncate_list_is_tracks_subset_only(self) -> None:
+        """The tracks set wipes ONLY track-domain tables. In a full pipeline
+        run the tracks step runs AFTER base+dedup; wiping base tables here
+        would erase the deduped data and the SELECT id FROM release filter
+        would find zero rows."""
+        expected_tables = {
+            "release_track",
+            "release_track_artist",
+            "release_video",
+        }
+        actual = set(_ic.CACHE_TABLES_TO_TRUNCATE_TRACKS)
+        assert actual == expected_tables, (
+            f"missing: {expected_tables - actual}, extra: {actual - expected_tables}"
+        )
+
+    def test_tracks_truncate_list_does_not_include_base_tables(self) -> None:
+        """Explicit guard: the tracks set must not include any base table,
+        because the orchestrator runs tracks AFTER base+dedup. This is the
+        regression that the pre-PR-review hook caught on 2026-05-13."""
+        base_only_tables = {
+            "release",
+            "release_artist",
+            "release_label",
+            "release_genre",
+            "release_style",
+            "artist",
+            "artist_alias",
+            "artist_member",
+            "artist_name_variation",
+            "artist_url",
+            "master",
+            "master_artist",
+            "cache_metadata",
+        }
+        leaked = base_only_tables & set(_ic.CACHE_TABLES_TO_TRUNCATE_TRACKS)
+        assert not leaked, f"--tracks-only --truncate-existing must not wipe base tables: {leaked}"
 
     def test_truncate_tables_issues_single_cascade_statement(self) -> None:
         """_truncate_tables emits one TRUNCATE ... CASCADE statement. One
@@ -635,9 +676,9 @@ class TestTruncateExisting:
         mock_conn.cursor.assert_not_called()
         mock_conn.commit.assert_not_called()
 
-    def test_flag_invokes_truncate_before_import_in_base_only(self, tmp_path) -> None:
-        """--base-only --truncate-existing calls _truncate_tables(conn,
-        CACHE_TABLES_TO_TRUNCATE) before any import work happens."""
+    def test_flag_with_base_only_truncates_full_cache_set(self, tmp_path) -> None:
+        """--base-only --truncate-existing wipes the FULL cache (the BASE
+        set) so a partial failed run is fully cleared before reimport."""
         from unittest.mock import MagicMock, patch
 
         csv_dir = tmp_path / "csv"
@@ -669,12 +710,14 @@ class TestTruncateExisting:
         mock_truncate.assert_called_once()
         call_args = mock_truncate.call_args
         assert call_args[0][0] is mock_conn
-        assert call_args[0][1] == _ic.CACHE_TABLES_TO_TRUNCATE
+        assert call_args[0][1] == _ic.CACHE_TABLES_TO_TRUNCATE_BASE
 
-    def test_flag_invokes_truncate_in_tracks_only(self, tmp_path) -> None:
-        """--tracks-only --truncate-existing wipes the same cache-table set.
-        The list is mode-agnostic: stale data in any of these tables can
-        fail a future rebuild regardless of which mode is running."""
+    def test_flag_with_tracks_only_truncates_tracks_subset(self, tmp_path) -> None:
+        """--tracks-only --truncate-existing wipes ONLY the track-domain
+        tables, preserving base+dedup output. This is the bug the
+        pre-PR-review hook caught: an earlier draft passed the full cache
+        set unconditionally, so a tracks rerun erased the deduped base
+        data and tracks ended up empty."""
         from unittest.mock import MagicMock, patch
 
         csv_dir = tmp_path / "csv"
@@ -703,6 +746,8 @@ class TestTruncateExisting:
             _ic.main()
 
         mock_truncate.assert_called_once()
+        call_args = mock_truncate.call_args
+        assert call_args[0][1] == _ic.CACHE_TABLES_TO_TRUNCATE_TRACKS
 
     def test_flag_omitted_does_not_truncate(self, tmp_path) -> None:
         """Default (flag absent) preserves prior behavior — no TRUNCATE on
