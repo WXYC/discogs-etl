@@ -1109,9 +1109,15 @@ def _run_database_build(
     if state and state.is_completed("import_tracks"):
         logger.info("Skipping import_tracks (already completed)")
     else:
+        # --truncate-existing is intentionally NOT forwarded here. In a full
+        # pipeline run the base step already truncated + repopulated; the
+        # tracks step runs AFTER dedup against that data. Truncating the
+        # tracks subset again now would just wipe and rebuild empty track
+        # tables. (import_csv's --tracks-only --truncate-existing is mode-
+        # aware and only touches track tables for standalone callers — see
+        # CACHE_TABLES_TO_TRUNCATE_TRACKS — but the orchestrator skips it
+        # to make the no-op explicit.)
         tracks_cmd = [python, str(SCRIPT_DIR / "import_csv.py"), "--tracks-only"]
-        if truncate_existing:
-            tracks_cmd.append("--truncate-existing")
         tracks_cmd.extend([str(csv_dir), db_url])
         run_step("Import tracks", tracks_cmd)
         if state:
