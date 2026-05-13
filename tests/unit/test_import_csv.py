@@ -35,6 +35,32 @@ CSV_DIR = FIXTURES_DIR / "csv"
 # ---------------------------------------------------------------------------
 
 
+class TestReleaseArtistColumnsMatchConverterOutput:
+    """The ``release_artist`` table config must NOT include a column the
+    converter doesn't emit.
+
+    WXYC/discogs-xml-converter v0.1.0 writes release_artist.csv with
+    ``release_id, artist_id, artist_name, extra, anv, position, join_field``.
+    Any column listed in ``csv_columns`` that's missing from the CSV header
+    causes ``import_csv`` to bail out at line 257 with ``return 0`` — the
+    failure mode that left release_artist empty in the 2026-05-13 rebuild
+    (#204). The schema's ``role`` column stays nullable; this test pins
+    that the importer doesn't try to read it.
+    """
+
+    def test_release_artist_csv_columns_exclude_role(self) -> None:
+        ra_config = next(t for t in BASE_TABLES if t["table"] == "release_artist")
+        assert "role" not in ra_config["csv_columns"], (
+            "'role' must not appear in csv_columns until the converter writes it; see #204"
+        )
+
+    def test_release_artist_db_columns_exclude_role(self) -> None:
+        """db_columns must mirror csv_columns (positional mapping). The schema's
+        ``role`` column accepts NULL so the import succeeds without it."""
+        ra_config = next(t for t in BASE_TABLES if t["table"] == "release_artist")
+        assert "role" not in ra_config["db_columns"]
+
+
 class TestPopulateCacheMetadataRaceTolerance:
     """``cache_metadata`` is concurrently written by the live LML service:
     on every Discogs API miss, LML's ``discogs/cache_service.py`` inserts an
