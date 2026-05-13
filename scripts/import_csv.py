@@ -95,8 +95,15 @@ BASE_TABLES: list[TableConfig] = [
     {
         "csv_file": "release_artist.csv",
         "table": "release_artist",
-        "csv_columns": ["release_id", "artist_id", "artist_name", "extra", "role"],
-        "db_columns": ["release_id", "artist_id", "artist_name", "extra", "role"],
+        # The schema has a ``role`` column for extra-credit attribution
+        # ("Producer", "Mixed By", etc.), but the converter
+        # (WXYC/discogs-xml-converter v0.1.0) doesn't emit it. Listing
+        # ``role`` here caused the import to bail out with "Missing
+        # columns" and write zero release_artist rows (see #204). Keep
+        # the schema column nullable so a future converter version can
+        # populate it without a schema migration.
+        "csv_columns": ["release_id", "artist_id", "artist_name", "extra"],
+        "db_columns": ["release_id", "artist_id", "artist_name", "extra"],
         "required": ["release_id", "artist_name"],
         "transforms": {},
         "unique_key": ["release_id", "artist_name"],
