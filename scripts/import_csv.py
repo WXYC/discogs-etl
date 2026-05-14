@@ -80,6 +80,13 @@ class TableConfig(TypedDict, total=False):
     required: list[str]
     transforms: dict[str, Callable[[str | None], str | None]]
     unique_key: list[str]
+    # ``optional_csv_columns``: column names that the loader includes in
+    # the COPY if (and only if) they appear in the CSV header. Their DB
+    # column names must match the CSV column names. Used for forward-
+    # compatibility with new converter columns whose absence in older
+    # CSVs should fall through to the DB-side default — e.g. ``extra``
+    # and ``role`` on ``release_track_artist`` per WXYC/discogs-etl#218.
+    optional_csv_columns: list[str]
 
 
 BASE_TABLES: list[TableConfig] = [
@@ -155,6 +162,15 @@ TRACK_TABLES: list[TableConfig] = [
         "required": ["release_id", "track_sequence"],
         "transforms": {},
         "unique_key": ["release_id", "track_sequence", "artist_name"],
+        # ``extra`` and ``role`` were added per WXYC/discogs-etl#218 so
+        # downstream consumers can filter to main-artist credits
+        # (``WHERE extra = 0``) and inspect the source-side role string.
+        # Listed as optional so the loader tolerates both the new 5-col
+        # converter output and pre-#55 3-col CSVs without bouncing the
+        # import. PG defaults (``extra=0``, ``role=NULL``) cover absent
+        # columns, which matches the legacy "everything was main credits"
+        # interpretation under which existing consumers were operating.
+        "optional_csv_columns": ["extra", "role"],
     },
 ]
 
@@ -303,6 +319,7 @@ def import_csv(
     release_id_filter: set[int] | None = None,
     id_filter: set[int] | None = None,
     id_filter_column: str | None = None,
+    optional_csv_columns: list[str] | None = None,
 ) -> int:
     """Import a CSV file into a table, selecting only needed columns.
 
@@ -318,15 +335,15 @@ def import_csv(
 
     If id_filter and id_filter_column are provided, only rows where the
     specified column's integer value is in id_filter are imported.
+
+    If ``optional_csv_columns`` is provided, those column names are
+    included in the COPY only when they appear in the CSV header. The DB
+    column name is assumed to match the CSV column name. Absent columns
+    fall through to the DB-side default (``DEFAULT`` clause / NULL). Used
+    for forward-compatibility with new converter columns (e.g. ``extra``
+    / ``role`` on ``release_track_artist`` per WXYC/discogs-etl#218).
     """
     logger.info(f"Importing {csv_path.name} into {table}...")
-
-    db_col_list = ", ".join(db_columns)
-
-    # Build unique key column indices for dedup
-    unique_key_indices: list[int] | None = None
-    if unique_key:
-        unique_key_indices = [csv_columns.index(col) for col in unique_key]
 
     with open(csv_path, encoding="utf-8", errors="replace") as f:
         reader = csv.reader(f)
@@ -340,6 +357,24 @@ def import_csv(
         if missing:
             logger.error(f"  Missing columns in {csv_path.name}: {missing}")
             return 0
+
+        # Detect which optional columns are present in this CSV header.
+        # When the producer (discogs-xml-converter) ships the new
+        # columns, they're appended to csv_columns / db_columns for
+        # the duration of this call. Older converters that don't emit
+        # them get the legacy behavior (PG defaults populate the
+        # absent columns).
+        present_optional = [col for col in (optional_csv_columns or []) if col in header]
+        if present_optional:
+            csv_columns = list(csv_columns) + present_optional
+            db_columns = list(db_columns) + present_optional
+
+        db_col_list = ", ".join(db_columns)
+
+        # Build unique key column indices for dedup
+        unique_key_indices: list[int] | None = None
+        if unique_key:
+            unique_key_indices = [csv_columns.index(col) for col in unique_key]
 
         # Build column index mapping for positional access
         col_idx = {col: header.index(col) for col in csv_columns}
@@ -646,6 +681,7 @@ def _import_tables(
             release_id_filter=release_id_filter,
             id_filter=id_filter,
             id_filter_column=id_filter_column,
+            optional_csv_columns=table_config.get("optional_csv_columns"),
         )
         total += count
     return total
@@ -686,6 +722,7 @@ def _import_tables_parallel(
             table_config["transforms"],
             unique_key=table_config.get("unique_key"),
             release_id_filter=release_id_filter,
+            optional_csv_columns=table_config.get("optional_csv_columns"),
         )
         total += count
     conn.close()
@@ -707,6 +744,7 @@ def _import_tables_parallel(
             table_config["transforms"],
             unique_key=table_config.get("unique_key"),
             release_id_filter=release_id_filter,
+            optional_csv_columns=table_config.get("optional_csv_columns"),
         )
         child_conn.close()
         return count

@@ -510,6 +510,128 @@ class TestTableSplit:
 # ---------------------------------------------------------------------------
 
 
+class TestImportCsvOptionalColumns:
+    """``optional_csv_columns`` lets the loader tolerate both old and new
+    converter output for ``release_track_artist`` (WXYC/discogs-etl#218).
+
+    When the converter ships the new ``extra`` / ``role`` columns, they
+    appear in the CSV header and the loader appends them to the COPY
+    column list. When the converter omits them (pre-#55 output), the
+    loader drops them silently and lets the DB-side defaults populate.
+    """
+
+    def test_new_csv_with_optional_columns_appends_them_to_copy(self, tmp_path) -> None:
+        """When the CSV header carries the optional columns, they are
+        appended to the COPY column list and the values are written."""
+        from unittest.mock import MagicMock
+
+        csv_path = tmp_path / "release_track_artist.csv"
+        csv_path.write_text(
+            "release_id,track_sequence,artist_name,extra,role\n"
+            "674529,5,The Orb,0,\n"
+            "674529,5,Alex Paterson,1,Producer\n"
+        )
+
+        captured_columns: dict[str, str] = {}
+        captured_rows: list[tuple] = []
+
+        class _RecordingCopy:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def write_row(self, row):
+                captured_rows.append(tuple(row))
+
+        def _cur_copy(sql, *_):
+            captured_columns["sql"] = sql
+            return _RecordingCopy()
+
+        mock_cursor = MagicMock()
+        mock_cursor.copy.side_effect = _cur_copy
+        mock_conn = MagicMock()
+        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
+        mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+
+        count = import_csv(
+            mock_conn,
+            csv_path,
+            table="release_track_artist",
+            csv_columns=["release_id", "track_sequence", "artist_name"],
+            db_columns=["release_id", "track_sequence", "artist_name"],
+            required_columns=["release_id", "track_sequence"],
+            transforms={},
+            optional_csv_columns=["extra", "role"],
+        )
+
+        assert count == 2
+        # COPY SQL lists the optional columns
+        assert "release_id, track_sequence, artist_name, extra, role" in captured_columns["sql"]
+        # Row values include the extra/role data
+        assert captured_rows[0] == ("674529", "5", "The Orb", "0", None)
+        assert captured_rows[1] == ("674529", "5", "Alex Paterson", "1", "Producer")
+
+    def test_legacy_csv_without_optional_columns_still_imports(self, tmp_path) -> None:
+        """A 3-column CSV from a pre-#55 converter must still load. The
+        loader drops the optional columns from the COPY so the PG defaults
+        (``extra=0``, ``role=NULL``) take over for absent values."""
+        from unittest.mock import MagicMock
+
+        csv_path = tmp_path / "release_track_artist.csv"
+        csv_path.write_text("release_id,track_sequence,artist_name\n674529,5,Alex Paterson\n")
+
+        captured_columns: dict[str, str] = {}
+        captured_rows: list[tuple] = []
+
+        class _RecordingCopy:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def write_row(self, row):
+                captured_rows.append(tuple(row))
+
+        def _cur_copy(sql, *_):
+            captured_columns["sql"] = sql
+            return _RecordingCopy()
+
+        mock_cursor = MagicMock()
+        mock_cursor.copy.side_effect = _cur_copy
+        mock_conn = MagicMock()
+        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
+        mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+
+        count = import_csv(
+            mock_conn,
+            csv_path,
+            table="release_track_artist",
+            csv_columns=["release_id", "track_sequence", "artist_name"],
+            db_columns=["release_id", "track_sequence", "artist_name"],
+            required_columns=["release_id", "track_sequence"],
+            transforms={},
+            optional_csv_columns=["extra", "role"],
+        )
+
+        assert count == 1
+        # COPY SQL omits the optional columns; PG defaults take over.
+        assert "extra" not in captured_columns["sql"]
+        assert "role" not in captured_columns["sql"]
+        # Row has only the 3 base columns.
+        assert captured_rows[0] == ("674529", "5", "Alex Paterson")
+
+    def test_release_track_artist_table_config_declares_extra_and_role(self) -> None:
+        """Pin that the table config opts into the optional columns. If a
+        future change drops ``optional_csv_columns`` here, the loader will
+        silently stop populating ``extra`` / ``role`` from new converter
+        output — a regression of WXYC/discogs-etl#218."""
+        rta_config = next(t for t in TRACK_TABLES if t["table"] == "release_track_artist")
+        assert rta_config.get("optional_csv_columns") == ["extra", "role"]
+
+
 class TestImportCsvMissingColumns:
     """import_csv reports clear errors when CSV header is missing expected columns."""
 
