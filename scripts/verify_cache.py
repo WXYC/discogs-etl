@@ -829,34 +829,54 @@ def prune_releases_copy_swap(
             # PK on release
             cur.execute("ALTER TABLE release ADD PRIMARY KEY (id)")
 
-            # FK constraints
+            # Clean orphan child rows before FK validation. The live LML
+            # service writes child rows for releases NOT in the post-prune
+            # subset; deleting them now keeps the ADD CONSTRAINT step below
+            # from failing on validation. NOT VALID on the constraint itself
+            # tolerates new orphans landing between cleanup and ADD. See
+            # #211 + #188 for the parallel fix in dedup_releases.py.
+            for child_table in (
+                "release_artist",
+                "release_label",
+                "release_genre",
+                "release_style",
+                "release_track",
+                "release_track_artist",
+                "cache_metadata",
+            ):
+                cur.execute(
+                    f"DELETE FROM {child_table} WHERE NOT EXISTS "
+                    f"(SELECT 1 FROM release r WHERE r.id = {child_table}.release_id)"
+                )
+
+            # FK constraints (NOT VALID for race tolerance).
             cur.execute(
                 "ALTER TABLE release_artist ADD CONSTRAINT fk_release_artist_release "
-                "FOREIGN KEY (release_id) REFERENCES release(id) ON DELETE CASCADE"
+                "FOREIGN KEY (release_id) REFERENCES release(id) ON DELETE CASCADE NOT VALID"
             )
             cur.execute(
                 "ALTER TABLE release_label ADD CONSTRAINT fk_release_label_release "
-                "FOREIGN KEY (release_id) REFERENCES release(id) ON DELETE CASCADE"
+                "FOREIGN KEY (release_id) REFERENCES release(id) ON DELETE CASCADE NOT VALID"
             )
             cur.execute(
                 "ALTER TABLE release_genre ADD CONSTRAINT fk_release_genre_release "
-                "FOREIGN KEY (release_id) REFERENCES release(id) ON DELETE CASCADE"
+                "FOREIGN KEY (release_id) REFERENCES release(id) ON DELETE CASCADE NOT VALID"
             )
             cur.execute(
                 "ALTER TABLE release_style ADD CONSTRAINT fk_release_style_release "
-                "FOREIGN KEY (release_id) REFERENCES release(id) ON DELETE CASCADE"
+                "FOREIGN KEY (release_id) REFERENCES release(id) ON DELETE CASCADE NOT VALID"
             )
             cur.execute(
                 "ALTER TABLE release_track ADD CONSTRAINT fk_release_track_release "
-                "FOREIGN KEY (release_id) REFERENCES release(id) ON DELETE CASCADE"
+                "FOREIGN KEY (release_id) REFERENCES release(id) ON DELETE CASCADE NOT VALID"
             )
             cur.execute(
                 "ALTER TABLE release_track_artist ADD CONSTRAINT fk_release_track_artist_release "
-                "FOREIGN KEY (release_id) REFERENCES release(id) ON DELETE CASCADE"
+                "FOREIGN KEY (release_id) REFERENCES release(id) ON DELETE CASCADE NOT VALID"
             )
             cur.execute(
                 "ALTER TABLE cache_metadata ADD CONSTRAINT fk_cache_metadata_release "
-                "FOREIGN KEY (release_id) REFERENCES release(id) ON DELETE CASCADE"
+                "FOREIGN KEY (release_id) REFERENCES release(id) ON DELETE CASCADE NOT VALID"
             )
             cur.execute("ALTER TABLE cache_metadata ADD PRIMARY KEY (release_id)")
 
