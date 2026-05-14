@@ -928,6 +928,28 @@ class TestArtistTablesConfig:
         assert "unique_key" in config
         assert config["unique_key"] == ["group_artist_id", "member_artist_id"]
 
+    def test_artist_name_variation_entry_exists(self) -> None:
+        """ARTIST_TABLES must include artist_name_variation.
+
+        Pre-#215 the table was never populated by the rebuild (the converter
+        folded namevariations into artist_alias.csv). With the converter
+        emitting a separate artist_name_variation.csv, the importer needs a
+        matching config or the file would silently drop on the floor.
+        """
+        config = next(
+            (t for t in ARTIST_TABLES if t["table"] == "artist_name_variation"), None
+        )
+        assert config is not None, (
+            "ARTIST_TABLES is missing an entry for artist_name_variation — "
+            "see WXYC/discogs-etl#215 + WXYC/discogs-xml-converter#54"
+        )
+        assert config["csv_file"] == "artist_name_variation.csv"
+        assert config["csv_columns"] == ["artist_id", "name"]
+        assert config["db_columns"] == ["artist_id", "name"]
+        assert "artist_id" in config["required"]
+        assert "name" in config["required"]
+        assert config["unique_key"] == ["artist_id", "name"]
+
 
 class TestReleaseTrackUniqueKey:
     """release_track must have unique_key for dedup."""
