@@ -181,6 +181,19 @@ ARTIST_TABLES: list[TableConfig] = [
         "unique_key": ["artist_id", "alias_name"],
     },
     {
+        # WXYC/discogs-xml-converter#54 splits Discogs `<namevariations>`
+        # (spelling variants) out of artist_alias.csv into their own file.
+        # Without this entry the table would stay empty after every rebuild
+        # and LML's fuzzy-name path would query an empty table; see #215.
+        "csv_file": "artist_name_variation.csv",
+        "table": "artist_name_variation",
+        "csv_columns": ["artist_id", "name"],
+        "db_columns": ["artist_id", "name"],
+        "required": ["artist_id", "name"],
+        "transforms": {},
+        "unique_key": ["artist_id", "name"],
+    },
+    {
         "csv_file": "artist_member.csv",
         "table": "artist_member",
         "csv_columns": ["group_artist_id", "member_artist_id", "member_name"],
