@@ -934,17 +934,38 @@ def _run_database_build_post_import(
     run_step("Deduplicate releases", dedup_cmd)
 
     # -- create_track_indexes (FK constraints, FK indexes, trigram indexes)
-    # Level 1: FK constraints (parallel)
+    # Level 0: Clean orphan track rows before FK validation (parallel).
+    # The live library-metadata-lookup service inserts release_track +
+    # release_track_artist rows on every Discogs API miss; during the dedup
+    # swap window those land as orphans relative to the post-dedup release
+    # table. The base-side parallel fix lives in dedup_releases.py and was
+    # shipped in #211; this is the track-side parallel — surfaced by the
+    # 2026-05-14 02:20 UTC failure on instance i-03a3040c5367faaf1 (#188).
+    run_sql_statements_parallel(
+        db_url,
+        [
+            "DELETE FROM release_track WHERE NOT EXISTS "
+            "(SELECT 1 FROM release r WHERE r.id = release_track.release_id)",
+            "DELETE FROM release_track_artist WHERE NOT EXISTS "
+            "(SELECT 1 FROM release r WHERE r.id = release_track_artist.release_id)",
+        ],
+        description="clean orphan track rows before FK",
+    )
+    # Level 1: FK constraints (parallel, NOT VALID for race tolerance).
+    # NOT VALID skips re-validation of existing rows so the ADD step can't
+    # race-fail on orphans created between cleanup and constraint creation.
+    # See dedup_releases.py::add_base_constraints_and_indexes for the
+    # equivalent base-side pattern with full reasoning.
     run_sql_statements_parallel(
         db_url,
         [
             "DO $$ BEGIN "
             "ALTER TABLE release_track ADD CONSTRAINT fk_release_track_release "
-            "FOREIGN KEY (release_id) REFERENCES release(id) ON DELETE CASCADE; "
+            "FOREIGN KEY (release_id) REFERENCES release(id) ON DELETE CASCADE NOT VALID; "
             "EXCEPTION WHEN duplicate_object THEN NULL; END $$",
             "DO $$ BEGIN "
             "ALTER TABLE release_track_artist ADD CONSTRAINT fk_release_track_artist_release "
-            "FOREIGN KEY (release_id) REFERENCES release(id) ON DELETE CASCADE; "
+            "FOREIGN KEY (release_id) REFERENCES release(id) ON DELETE CASCADE NOT VALID; "
             "EXCEPTION WHEN duplicate_object THEN NULL; END $$",
         ],
         description="track FK constraints",
@@ -1128,17 +1149,29 @@ def _run_database_build(
     if state and state.is_completed("create_track_indexes"):
         logger.info("Skipping create_track_indexes (already completed)")
     else:
-        # Level 1: FK constraints (parallel)
+        # Level 0: Clean orphan track rows before FK validation. Same race
+        # as in the resumable path above; see comment there for details.
+        run_sql_statements_parallel(
+            db_url,
+            [
+                "DELETE FROM release_track WHERE NOT EXISTS "
+                "(SELECT 1 FROM release r WHERE r.id = release_track.release_id)",
+                "DELETE FROM release_track_artist WHERE NOT EXISTS "
+                "(SELECT 1 FROM release r WHERE r.id = release_track_artist.release_id)",
+            ],
+            description="clean orphan track rows before FK",
+        )
+        # Level 1: FK constraints (parallel, NOT VALID for race tolerance).
         run_sql_statements_parallel(
             db_url,
             [
                 "DO $$ BEGIN "
                 "ALTER TABLE release_track ADD CONSTRAINT fk_release_track_release "
-                "FOREIGN KEY (release_id) REFERENCES release(id) ON DELETE CASCADE; "
+                "FOREIGN KEY (release_id) REFERENCES release(id) ON DELETE CASCADE NOT VALID; "
                 "EXCEPTION WHEN duplicate_object THEN NULL; END $$",
                 "DO $$ BEGIN "
                 "ALTER TABLE release_track_artist ADD CONSTRAINT fk_release_track_artist_release "
-                "FOREIGN KEY (release_id) REFERENCES release(id) ON DELETE CASCADE; "
+                "FOREIGN KEY (release_id) REFERENCES release(id) ON DELETE CASCADE NOT VALID; "
                 "EXCEPTION WHEN duplicate_object THEN NULL; END $$",
             ],
             description="track FK constraints",

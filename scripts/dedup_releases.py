@@ -553,13 +553,28 @@ def add_track_constraints_and_indexes(conn, db_url: str | None = None) -> None:
                 future.result()
         logger.info(f"    done in {time.time() - level_start:.1f}s")
 
-    # Level 1: FK constraints (parallel)
+    # Level 0: Clean orphan track rows (parallel). LML writes release_track
+    # + release_track_artist rows on every Discogs API miss; during the dedup
+    # swap window those land as orphans. Parallel to the base-side cleanup
+    # in add_base_constraints_and_indexes. See #211 for the original fix
+    # and #188 for the 2026-05-14 02:20 UTC failure that surfaced this site.
+    _exec_parallel(
+        [
+            "DELETE FROM release_track WHERE NOT EXISTS "
+            "(SELECT 1 FROM release r WHERE r.id = release_track.release_id)",
+            "DELETE FROM release_track_artist WHERE NOT EXISTS "
+            "(SELECT 1 FROM release r WHERE r.id = release_track_artist.release_id)",
+        ],
+        "Level 0: Clean orphan track rows before FK validation",
+    )
+
+    # Level 1: FK constraints (parallel, NOT VALID for race tolerance).
     _exec_parallel(
         [
             "ALTER TABLE release_track ADD CONSTRAINT fk_release_track_release "
-            "FOREIGN KEY (release_id) REFERENCES release(id) ON DELETE CASCADE",
+            "FOREIGN KEY (release_id) REFERENCES release(id) ON DELETE CASCADE NOT VALID",
             "ALTER TABLE release_track_artist ADD CONSTRAINT fk_release_track_artist_release "
-            "FOREIGN KEY (release_id) REFERENCES release(id) ON DELETE CASCADE",
+            "FOREIGN KEY (release_id) REFERENCES release(id) ON DELETE CASCADE NOT VALID",
         ],
         "Level 1: FK constraints",
     )
