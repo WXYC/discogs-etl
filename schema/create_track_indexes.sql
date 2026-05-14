@@ -8,20 +8,40 @@
 CREATE EXTENSION IF NOT EXISTS pg_trgm;
 
 -- ============================================
+-- Orphan cleanup before FK validation
+-- ============================================
+-- The live library-metadata-lookup service inserts release_track +
+-- release_track_artist rows for every Discogs API miss. During the dedup
+-- swap window, LML can produce track rows referencing release ids that
+-- aren't in the post-dedup release table. Deleting those orphans before
+-- the FK ADD step prevents the validation from failing on the race window
+-- (the dedup-side base FK fix uses the same pattern; see
+-- scripts/dedup_releases.py::add_base_constraints_and_indexes).
+
+DELETE FROM release_track
+WHERE NOT EXISTS (SELECT 1 FROM release r WHERE r.id = release_track.release_id);
+
+DELETE FROM release_track_artist
+WHERE NOT EXISTS (SELECT 1 FROM release r WHERE r.id = release_track_artist.release_id);
+
+-- ============================================
 -- FK constraints (idempotent via DO blocks)
 -- ============================================
+-- NOT VALID skips re-validation of existing rows so the ADD step itself
+-- can't race-fail on orphans from LML's writes between the cleanup above
+-- and this constraint creation. Future INSERTs still enforce the FK.
 
 DO $$
 BEGIN
     ALTER TABLE release_track ADD CONSTRAINT fk_release_track_release
-        FOREIGN KEY (release_id) REFERENCES release(id) ON DELETE CASCADE;
+        FOREIGN KEY (release_id) REFERENCES release(id) ON DELETE CASCADE NOT VALID;
 EXCEPTION WHEN duplicate_object THEN NULL;
 END $$;
 
 DO $$
 BEGIN
     ALTER TABLE release_track_artist ADD CONSTRAINT fk_release_track_artist_release
-        FOREIGN KEY (release_id) REFERENCES release(id) ON DELETE CASCADE;
+        FOREIGN KEY (release_id) REFERENCES release(id) ON DELETE CASCADE NOT VALID;
 EXCEPTION WHEN duplicate_object THEN NULL;
 END $$;
 
