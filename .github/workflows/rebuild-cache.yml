@@ -137,17 +137,18 @@ jobs:
       # curl 403 followed by `unrecognized subcommand` from the converter
       # reading an empty FIFO — see #219 root-cause analysis).
       #
-      # HEAD-only (no payload bytes), no retry (an egress-IP block won't
+      # HEAD-only (no payload bytes), follows redirects with -L so the final
+      # status matches what the streaming GET (curl -fL) will see — without
+      # -L, a 302 to S3 would either falsely fail the preflight or hide a
+      # final 403 on the redirect target. No retry (an egress-IP block won't
       # recover within the retry window; a transient outage will recover on
       # the next scheduled tick rather than benefit from in-step retries).
-      # Single curl captures both the status code and the connection outcome
-      # so we don't double-request when the URL is unreachable.
       - name: Verify dump URL is reachable
         env:
           DUMP_URL: ${{ steps.dump.outputs.url }}
         run: |
           set -euo pipefail
-          status=$(curl -sI --retry 0 --max-time 30 -o /dev/null -w "%{http_code}" "$DUMP_URL" || echo "000")
+          status=$(curl -sIL --retry 0 --max-time 30 -o /dev/null -w "%{http_code}" "$DUMP_URL" || echo "000")
           if [ "$status" != "200" ]; then
             echo "::error::HEAD $DUMP_URL returned HTTP $status (expected 200). Common cases: (a) 403 — data.discogs.com Cloudflare blocks GitHub-hosted runner egress IPs; this workflow is a manual escape hatch and production rebuilds run on the wxyc-discogs-rebuild SAM stack (infra/ephemeral-rebuild/) from a non-blocked EC2 IP. (b) 503 / 5xx — Discogs CDN is rate-limiting or having an outage; retry on the next scheduled tick or after status.discogs.com clears. (c) 000 / connection error — DNS or TLS handshake failure (rare; check runner network). To override the URL, dispatch with an explicit dump_url pointing at an asset you've mirrored to a runner-reachable host."
             exit 1
