@@ -936,9 +936,7 @@ class TestArtistTablesConfig:
         emitting a separate artist_name_variation.csv, the importer needs a
         matching config or the file would silently drop on the floor.
         """
-        config = next(
-            (t for t in ARTIST_TABLES if t["table"] == "artist_name_variation"), None
-        )
+        config = next((t for t in ARTIST_TABLES if t["table"] == "artist_name_variation"), None)
         assert config is not None, (
             "ARTIST_TABLES is missing an entry for artist_name_variation — "
             "see WXYC/discogs-etl#215 + WXYC/discogs-xml-converter#54"
