@@ -129,6 +129,28 @@ jobs:
             echo "url=https://data.discogs.com/?download=data%2F${year}%2Fdiscogs_${stamp}_releases.xml.gz" >> "$GITHUB_OUTPUT"
           fi
 
+      # Pre-flight: HEAD the dump URL so a 403 (the known GH-runner-egress block
+      # at data.discogs.com's Cloudflare front, see header comment) fails inside
+      # ~1 second with a named error, instead of being buried 100 lines into the
+      # streaming-pipeline step where the backgrounded curl's exit code can be
+      # masked by a downstream tool's own failure (the 2026-05-05 pattern: a
+      # curl 403 followed by `unrecognized subcommand` from the converter
+      # reading an empty FIFO — see #219 root-cause analysis).
+      #
+      # Uses `curl -sIf --retry 0`: HEAD-only (no payload bytes), fail on HTTP
+      # error, no retry (an egress-IP block won't recover within retry window).
+      - name: Verify dump URL is reachable
+        env:
+          DUMP_URL: ${{ steps.dump.outputs.url }}
+        run: |
+          set -euo pipefail
+          if ! curl -sIf --retry 0 --max-time 30 "$DUMP_URL" >/dev/null; then
+            status=$(curl -sI --retry 0 --max-time 30 -o /dev/null -w "%{http_code}" "$DUMP_URL" || echo "0")
+            echo "::error::HEAD $DUMP_URL returned HTTP $status. data.discogs.com Cloudflare blocks GitHub-hosted runner egress IPs; this workflow is a manual escape hatch only. Production rebuilds run on the wxyc-discogs-rebuild SAM stack (infra/ephemeral-rebuild/) from an EC2 IP that Discogs does not block. To override, dispatch with an explicit dump_url that points at an asset you have already mirrored to a runner-reachable host."
+            exit 1
+          fi
+          echo "Dump URL reachable: HTTP 200"
+
       # Pull the daily-fresh library.db from sync-library.yml's release artifact
       # rather than regenerating it here from MySQL. Kattare's MySQL is reachable
       # only through an SSH tunnel; sync-library.yml owns that tunnel + handles
@@ -162,13 +184,20 @@ jobs:
       #
       # Layout: curl runs in the background writing into the FIFO; the pipeline
       # invocation runs the converter against that FIFO. Kernel pipe buffer
-      # backpressures curl when the converter falls behind. We `wait` on the
-      # curl PID afterwards so a network-side failure mid-stream doesn't get
-      # masked by the pipeline succeeding on partial input.
+      # backpressures curl when the converter falls behind.
+      #
+      # Curl-failure handling (#219): the backgrounded curl writes its exit
+      # status to data/curl.status when it terminates. If curl exits non-zero
+      # before the pipeline opens the FIFO, the FIFO sees EOF immediately and
+      # the python script fails for a *different* reason (e.g. converter
+      # rejecting empty input), masking the real network failure. By checking
+      # the status file before propagating the python exit code, we surface
+      # the curl failure with priority over the masked downstream error.
       - name: Run pipeline (with streamed dump)
         env:
           DATABASE_URL_DISCOGS: ${{ secrets.DATABASE_URL_DISCOGS }}
           DISCOGS_TOKEN: ${{ secrets.DISCOGS_TOKEN }}
+          DUMP_URL: ${{ steps.dump.outputs.url }}
           # When SENTRY_DSN is set as a repo secret, wxyc_etl.logger.init_logger
           # hands exception events to the Sentry SDK. Unset → Sentry stays
           # inactive, JSON logging still emits to stderr.
@@ -177,18 +206,38 @@ jobs:
           set -euo pipefail
           mkdir -p data
           mkfifo data/releases.xml.gz
-          curl -fL --retry 3 --retry-delay 30 \
-            -o data/releases.xml.gz \
-            "${{ steps.dump.outputs.url }}" &
+          rm -f data/curl.status
+          (
+            curl -fL --retry 3 --retry-delay 30 \
+              -o data/releases.xml.gz \
+              "$DUMP_URL"
+            echo "$?" > data/curl.status
+          ) &
           CURL_PID=$!
 
+          # Run the pipeline; capture exit code so we can decide whether the
+          # network side or the python side failed first.
+          set +e
           python scripts/run_pipeline.py \
             --xml data/releases.xml.gz \
             --library-db data/library.db
+          PY_RC=$?
+          set -e
 
-          # Curl should already be done by the time the pipeline returns;
-          # wait surfaces any non-zero exit so a streaming failure is visible.
-          wait "$CURL_PID"
+          # Wait for curl to finish writing curl.status. `wait` returns curl's
+          # own exit code; we also read the status file in case curl was killed
+          # by SIGPIPE (downstream reader closed early -- python crash) which
+          # bash reports as a generic non-zero rather than the underlying HTTP
+          # error.
+          wait "$CURL_PID" || true
+          CURL_RC=$(cat data/curl.status 2>/dev/null || echo "unknown")
+          if [ "$CURL_RC" != "0" ]; then
+            echo "::error::curl exited $CURL_RC while streaming $DUMP_URL. Pipeline python exited $PY_RC (likely a downstream symptom of empty FIFO input)."
+            exit 1
+          fi
+          if [ "$PY_RC" -ne 0 ]; then
+            exit "$PY_RC"
+          fi
 
       # Watchdog: cache_distinct_artists / library_distinct_artists ratio
       # exposes drift between the just-rebuilt cache and the WXYC library
@@ -215,6 +264,12 @@ jobs:
       # Mirrors the --notify pattern in scripts/sync-library.sh; posts only
       # when SLACK_MONITORING_WEBHOOK is set as a repo secret. Issue #125,
       # second acceptance criterion.
+      #
+      # When the secret is unset the step emits an `::error::` annotation
+      # rather than the previous quiet "skipping Slack post" line. That
+      # surfaces on the workflow summary page and on the dispatcher's
+      # notification, so the missing-secret state can't itself fall silent —
+      # which is what allowed two 2026-05-05 runs to fail unnoticed (#219).
       - name: Notify Slack on failure
         if: failure()
         env:
@@ -222,8 +277,8 @@ jobs:
           RUN_URL: "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
         run: |
           if [ -z "${SLACK_WEBHOOK_URL:-}" ]; then
-            echo "SLACK_MONITORING_WEBHOOK unset; skipping Slack post."
-            exit 0
+            echo "::error::SLACK_MONITORING_WEBHOOK is not set in repo secrets. The workflow failed but no Slack alert was posted. Configure the secret per CLAUDE.md 'Monthly Cache Rebuild' -> 'Required GitHub secrets' so future failures alert. Failing this notifier step so the workflow's overall status remains red and the dispatcher's GitHub notification reflects it."
+            exit 1
           fi
           curl -s -X POST "$SLACK_WEBHOOK_URL" \
             -H "Content-Type: application/json" \

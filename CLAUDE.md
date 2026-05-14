@@ -227,9 +227,18 @@ After the pipeline succeeds, the workflow runs `scripts/check_cache_drift.py` ag
 | `DATABASE_URL_DISCOGS` | PostgreSQL URL for the destination cache database |
 | `DISCOGS_TOKEN` | Discogs API token (optional; only matters if rate limits are hit) |
 | `SENTRY_DSN` | Sentry DSN for error reporting (optional; JSON logging still works without it) |
-| `SLACK_MONITORING_WEBHOOK` | Slack incoming webhook for failure + drift alerts (optional; without it failures still fail the workflow but only Sentry sees them) |
+| `SLACK_MONITORING_WEBHOOK` | Slack incoming webhook for failure + drift alerts. **Required for production-grade alerting**: when this secret is unset the `Notify Slack on failure` step *itself* fails (with an `::error::` annotation explaining the missing-secret state) instead of silently skipping, so a workflow-level failure can't fall silent the way the 2026-05-05 runs did (#219). The dispatcher's GitHub failure-notification email is the sole signal in that degraded state. |
 
 **Upstream dependency**: a successful `sync-library.yml` run must have uploaded `library.db` to the `streaming-data-v1` release on `WXYC/library-metadata-lookup` before this workflow fires, or the `Download library.db from LML release artifact` step fails with `release asset not found`. The default `${{ github.token }}` has read scope on the public LML repo; no extra PAT required.
+
+**Interpreting a failed run** (#219):
+
+1. **`Verify dump URL is reachable` returns HTTP 403**: this is the expected outcome on a GitHub-hosted runner — Discogs's Cloudflare front blocks runner egress IPs (see "Why EC2" above). The preflight fails inside ~1 second so the operator doesn't burn 5+ minutes of pipeline work on a dump-host they can't reach. *Fix*: don't dispatch this workflow against the default `data.discogs.com` URL from a GH runner; either kick the rebuild on the `wxyc-discogs-rebuild` SAM stack (see `infra/ephemeral-rebuild/README.md`) or dispatch with an explicit `dump_url` input pointing at an asset mirrored to a runner-reachable host.
+2. **`Verify alembic baseline is stamped` fails with "alembic_version table missing or empty"**: the destination DB was rebuilt without the one-time `alembic stamp head` per `docs/migrations-runbook.md`. *Fix*: run the stamp procedure, then redispatch.
+3. **`Run pipeline (with streamed dump)` exits with "curl exited N while streaming"**: a network-side failure mid-stream (transient HTTP/2 reset, etc.). Bash now surfaces the curl exit code with priority over any downstream symptom (the converter complaining about an empty FIFO). *Fix*: redispatch; if it keeps recurring, escalate to a self-hosted runner.
+4. **`Notify Slack on failure` is the only red step**: this means a prior step failed *and* `SLACK_MONITORING_WEBHOOK` is unset. Configure the secret, then redispatch.
+
+**Manual fallback** when the workflow is unavailable or refuses to reach `data.discogs.com`: ssh into the Backend-Service EC2 box and run `scripts/rebuild-cache.sh` directly. The script's failure-path Slack `--notify` is the same surface as the workflow's. The detailed legacy-EC2-cron runbook is in [`docs/ec2-rebuild-runbook.md`](docs/ec2-rebuild-runbook.md).
 
 ### Library Sync (`sync-library.yml`)
 
