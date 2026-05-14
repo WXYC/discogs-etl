@@ -443,19 +443,56 @@ def add_base_constraints_and_indexes(conn, db_url: str | None = None) -> None:
     conn.commit()
     logger.info(f"    done in {time.time() - pk_start:.1f}s")
 
-    # Level 2: FK constraints + PK on cache_metadata + FK indexes (parallel)
+    # Level 1.5: Clean orphan child rows (parallel).
+    #
+    # The live library-metadata-lookup service inserts release + release_label
+    # + release_artist + cache_metadata rows for every Discogs API miss. During
+    # the dedup copy-swap window, LML can produce child rows referencing
+    # release ids that are NOT in the post-dedup release table. Those orphans
+    # would cause the FK constraint validation at Level 2 to fail with
+    # ``ForeignKeyViolation``, aborting the entire rebuild — exactly what
+    # happened in the 2026-05-13 23:42 UTC run (instance i-03e2afe2410ad43f8,
+    # see WXYC/discogs-etl#188 comment thread).
+    #
+    # Combined with the NOT VALID modifier in Level 2 below, this gives a
+    # race-tolerant constraint creation: existing orphans are removed here,
+    # and the small window of new orphans landing between this cleanup and
+    # the NOT VALID constraint creation is tolerated because NOT VALID skips
+    # re-validation of existing rows. Future LML inserts are blocked by the
+    # FK at INSERT time, which is the durable correct behavior.
+    _exec_parallel(
+        [
+            "DELETE FROM release_artist "
+            "WHERE NOT EXISTS (SELECT 1 FROM release r WHERE r.id = release_artist.release_id)",
+            "DELETE FROM release_label "
+            "WHERE NOT EXISTS (SELECT 1 FROM release r WHERE r.id = release_label.release_id)",
+            "DELETE FROM release_genre "
+            "WHERE NOT EXISTS (SELECT 1 FROM release r WHERE r.id = release_genre.release_id)",
+            "DELETE FROM release_style "
+            "WHERE NOT EXISTS (SELECT 1 FROM release r WHERE r.id = release_style.release_id)",
+            "DELETE FROM cache_metadata "
+            "WHERE NOT EXISTS (SELECT 1 FROM release r WHERE r.id = cache_metadata.release_id)",
+        ],
+        "Level 1.5: Clean orphan child rows before FK validation",
+    )
+
+    # Level 2: FK constraints + PK on cache_metadata + FK indexes (parallel).
+    # FK constraints use NOT VALID so the ADD step itself can't race-fail
+    # on orphans created by LML during the brief Level-1.5 → Level-2 window.
+    # Postgres still enforces the FK on new inserts after the constraint is
+    # added, so the durable behavior is identical to a validated constraint.
     _exec_parallel(
         [
             "ALTER TABLE release_artist ADD CONSTRAINT fk_release_artist_release "
-            "FOREIGN KEY (release_id) REFERENCES release(id) ON DELETE CASCADE",
+            "FOREIGN KEY (release_id) REFERENCES release(id) ON DELETE CASCADE NOT VALID",
             "ALTER TABLE release_label ADD CONSTRAINT fk_release_label_release "
-            "FOREIGN KEY (release_id) REFERENCES release(id) ON DELETE CASCADE",
+            "FOREIGN KEY (release_id) REFERENCES release(id) ON DELETE CASCADE NOT VALID",
             "ALTER TABLE release_genre ADD CONSTRAINT fk_release_genre_release "
-            "FOREIGN KEY (release_id) REFERENCES release(id) ON DELETE CASCADE",
+            "FOREIGN KEY (release_id) REFERENCES release(id) ON DELETE CASCADE NOT VALID",
             "ALTER TABLE release_style ADD CONSTRAINT fk_release_style_release "
-            "FOREIGN KEY (release_id) REFERENCES release(id) ON DELETE CASCADE",
+            "FOREIGN KEY (release_id) REFERENCES release(id) ON DELETE CASCADE NOT VALID",
             "ALTER TABLE cache_metadata ADD CONSTRAINT fk_cache_metadata_release "
-            "FOREIGN KEY (release_id) REFERENCES release(id) ON DELETE CASCADE",
+            "FOREIGN KEY (release_id) REFERENCES release(id) ON DELETE CASCADE NOT VALID",
             "ALTER TABLE cache_metadata ADD PRIMARY KEY (release_id)",
             "CREATE INDEX idx_release_artist_release_id ON release_artist(release_id)",
             "CREATE INDEX idx_release_label_release_id ON release_label(release_id)",
