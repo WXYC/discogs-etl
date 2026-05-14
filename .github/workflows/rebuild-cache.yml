@@ -137,16 +137,19 @@ jobs:
       # curl 403 followed by `unrecognized subcommand` from the converter
       # reading an empty FIFO — see #219 root-cause analysis).
       #
-      # Uses `curl -sIf --retry 0`: HEAD-only (no payload bytes), fail on HTTP
-      # error, no retry (an egress-IP block won't recover within retry window).
+      # HEAD-only (no payload bytes), no retry (an egress-IP block won't
+      # recover within the retry window; a transient outage will recover on
+      # the next scheduled tick rather than benefit from in-step retries).
+      # Single curl captures both the status code and the connection outcome
+      # so we don't double-request when the URL is unreachable.
       - name: Verify dump URL is reachable
         env:
           DUMP_URL: ${{ steps.dump.outputs.url }}
         run: |
           set -euo pipefail
-          if ! curl -sIf --retry 0 --max-time 30 "$DUMP_URL" >/dev/null; then
-            status=$(curl -sI --retry 0 --max-time 30 -o /dev/null -w "%{http_code}" "$DUMP_URL" || echo "0")
-            echo "::error::HEAD $DUMP_URL returned HTTP $status. data.discogs.com Cloudflare blocks GitHub-hosted runner egress IPs; this workflow is a manual escape hatch only. Production rebuilds run on the wxyc-discogs-rebuild SAM stack (infra/ephemeral-rebuild/) from an EC2 IP that Discogs does not block. To override, dispatch with an explicit dump_url that points at an asset you have already mirrored to a runner-reachable host."
+          status=$(curl -sI --retry 0 --max-time 30 -o /dev/null -w "%{http_code}" "$DUMP_URL" || echo "000")
+          if [ "$status" != "200" ]; then
+            echo "::error::HEAD $DUMP_URL returned HTTP $status (expected 200). Common cases: (a) 403 — data.discogs.com Cloudflare blocks GitHub-hosted runner egress IPs; this workflow is a manual escape hatch and production rebuilds run on the wxyc-discogs-rebuild SAM stack (infra/ephemeral-rebuild/) from a non-blocked EC2 IP. (b) 503 / 5xx — Discogs CDN is rate-limiting or having an outage; retry on the next scheduled tick or after status.discogs.com clears. (c) 000 / connection error — DNS or TLS handshake failure (rare; check runner network). To override the URL, dispatch with an explicit dump_url pointing at an asset you've mirrored to a runner-reachable host."
             exit 1
           fi
           echo "Dump URL reachable: HTTP 200"
