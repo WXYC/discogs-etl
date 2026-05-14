@@ -123,10 +123,25 @@ CREATE TABLE release_video (
 );
 
 -- Artists on specific tracks (for compilations)
+--
+-- ``extra`` and ``role`` (WXYC/discogs-etl#218) distinguish main-artist
+-- credits (``<artists>``) from extra-artist credits (``<extraartists>``).
+-- Downstream consumers filter to main credits with ``WHERE extra = 0``.
+-- Mirrors the column shape on ``release_artist`` for consistency.
+--
+-- Both columns are additive / NULL-tolerant so older (3-column) CSVs
+-- and pre-migration cache rows continue to import and read correctly:
+--   * ``extra`` defaults to 0, matching the legacy "everything was main"
+--     interpretation under which existing consumers were already
+--     operating.
+--   * ``role`` is NULL for main credits and may be NULL for extra
+--     credits when the XML omitted the ``<role>`` element.
 CREATE TABLE release_track_artist (
     release_id      integer NOT NULL REFERENCES release(id) ON DELETE CASCADE,
     track_sequence  integer NOT NULL,
-    artist_name     text NOT NULL
+    artist_name     text NOT NULL,
+    extra           integer DEFAULT 0,
+    role            text
 );
 
 -- ============================================

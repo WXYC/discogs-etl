@@ -75,7 +75,12 @@ class TestCreateDatabase:
             ("release_artist", {"release_id", "artist_name", "extra"}),
             ("release_label", {"release_id", "label_name"}),
             ("release_track", {"release_id", "sequence", "position", "title", "duration"}),
-            ("release_track_artist", {"release_id", "track_sequence", "artist_name"}),
+            # ``extra`` and ``role`` added per WXYC/discogs-etl#218 so
+            # downstream consumers can filter to main-artist credits.
+            (
+                "release_track_artist",
+                {"release_id", "track_sequence", "artist_name", "extra", "role"},
+            ),
             ("cache_metadata", {"release_id", "cached_at", "source", "last_validated"}),
         ],
         ids=[

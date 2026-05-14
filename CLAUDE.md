@@ -77,6 +77,7 @@ Layout:
 - `alembic/env.py` -- resolves the URL from `DATABASE_URL_DISCOGS` (canonical) or `DATABASE_URL` (deprecated, warns to stderr); rewrites `postgresql://` to `postgresql+psycopg://` so SQLAlchemy uses psycopg3 instead of pulling in psycopg2.
 - `alembic/versions/0001_initial.py` -- baseline migration. Hand-written; its `upgrade()` opens an autocommit psycopg connection and replays `schema/create_functions.sql`, `schema/create_database.sql`, `schema/create_indexes.sql`, `schema/create_track_indexes.sql` in pipeline order. CONCURRENTLY is stripped because the baseline only ever runs against an empty database (mirrors the `strip_concurrently=True` path in `scripts/run_pipeline.py`).
 - `alembic/versions/0004_wxyc_identity_match_fns.py` -- deploys the `wxyc_identity_match_{artist,title,with_punctuation,with_disambiguator_strip}` plpgsql function family per wiki §3.3.5. Vendors canonical artifacts from WXYC/wxyc-etl@v0.4.0 (`data/`) under `vendor/wxyc-etl/`; SHA-pinned in `wxyc-etl-pin.txt`. The migration reads the canonical SQL at apply time and short-circuits in alembic offline mode (same pattern as `0003_wxyc_library_v2`). Index + cache-load flips from `lower(f_unaccent(col))` to `wxyc_identity_match_artist(col)` ship in a follow-on PR (the LML#280 deferred-swap doesn't need them to flip — just the functions). Parity test at `tests/integration/test_wxyc_identity_match_parity.py` covers the 252-row fixture from wxyc-etl plus pin freshness + idempotence.
+- `alembic/versions/0005_release_track_artist_role.py` -- adds `extra integer DEFAULT 0` + `role text` columns to `release_track_artist` per [#218](https://github.com/WXYC/discogs-etl/issues/218) so downstream consumers (notably library-metadata-lookup) can filter to main-artist credits (`WHERE extra = 0`) and inspect the source-side `<role>` text on extra credits. Additive: pre-#55 converter CSVs continue to import (the loader treats `extra` / `role` as optional CSV columns) and pre-migration rows default to `extra=0` / `role=NULL`. Re-ETL of the three deployments is required to populate the new columns against existing rows; the LML consumer change in `discogs/cache_service.py:validate_track_on_release` is a separate follow-up.
 
 Apply against an empty Postgres:
 
@@ -330,6 +331,13 @@ When writing inline test data or new fixture rows, use these defaults matching t
 5004,Drag City,DC575
 5006,Impulse Records,A-30
 ```
+
+**`release_track_artist` table** (release_id, track_sequence, artist_name, extra, role):
+```
+5006,1,Duke Ellington,0,
+5006,1,Billy Strayhorn,1,Written-By
+```
+Columns `extra` and `role` were added per [#218](https://github.com/WXYC/discogs-etl/issues/218) to distinguish main-artist credits (`<artists>` in the source XML, `extra=0`, `role` NULL) from extra-artist credits (`<extraartists>`, `extra=1`, `role` holds the source `<role>` text). Both are additive and NULL-tolerant: pre-#55 converter CSVs (3 columns) continue to import, and pre-migration rows default to `extra=0` / `role=NULL`. Downstream consumers filter to main credits with `WHERE extra = 0`. Mirrors the `release_artist.(extra, role)` pair. Re-ETL of the three deployments is required to populate the new columns against existing rows.
 
 **`release_track` table** (release_id, sequence, position, title, duration):
 ```
