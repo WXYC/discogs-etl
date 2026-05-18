@@ -208,6 +208,25 @@ CREATE TABLE cache_metadata (
 );
 
 -- ============================================
+-- Negative-result cache for Discogs lookups
+-- ============================================
+-- Mirrors alembic/versions/0006_lookup_negative.py per the dual-write
+-- convention. Persists "we asked Discogs and got nothing" verdicts across
+-- LML process restarts. LML's read path consults this table after the
+-- in-memory + positive PG caches and before the Discogs API. TTL is
+-- enforced by the LML query inline (now() < attempted_at + ttl_seconds *
+-- interval '1 second'); a future cron may sweep expired rows.
+DROP TABLE IF EXISTS lookup_negative CASCADE;
+CREATE TABLE lookup_negative (
+    key_hash          bytea PRIMARY KEY,
+    artist            text,
+    track             text,
+    artist_as_keyword boolean,
+    attempted_at      timestamptz NOT NULL DEFAULT now(),
+    ttl_seconds       integer NOT NULL DEFAULT 604800
+);
+
+-- ============================================
 -- WXYC library hook (cross-cache-identity §3.1)
 -- ============================================
 -- One row per library release; library_id mirrors Backend wxyc_schema.library.id.
@@ -266,3 +285,6 @@ CREATE INDEX IF NOT EXISTS idx_master_title_trgm ON master USING GIN (lower(f_un
 -- Cache metadata indexes
 CREATE INDEX IF NOT EXISTS idx_cache_metadata_cached_at ON cache_metadata(cached_at);
 CREATE INDEX IF NOT EXISTS idx_cache_metadata_source ON cache_metadata(source);
+
+-- Negative-cache TTL-sweep index (mirrors 0006_lookup_negative.py)
+CREATE INDEX IF NOT EXISTS idx_lookup_negative_attempted_at ON lookup_negative(attempted_at);
