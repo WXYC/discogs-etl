@@ -60,8 +60,9 @@ def parse_rules_file(path: Path) -> list[tuple[str, str]]:
     """Parse a Postgres unaccent ``.rules`` file into ``(src, dst)`` pairs.
 
     Tab-separated, one rule per line. Blank lines and lines starting with
-    ``#`` are skipped. Any line that does not contain exactly one tab raises
-    ``ValueError`` so corruption surfaces at codegen time, not at deploy.
+    ``#`` are skipped. Any line that does not split into exactly two
+    non-empty fields on a single tab raises ``ValueError`` so corruption
+    surfaces at codegen time, not at deploy.
     """
     rules: list[tuple[str, str]] = []
     for line_no, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):

@@ -37,10 +37,12 @@ def _run_alembic(args: list[str], db_url: str) -> subprocess.CompletedProcess[st
 
 @pytest.mark.pg
 def test_lookup_negative_table_created_at_head(db_url: str) -> None:
-    # Stamp at 0005 to skip 0001–0005 (they require the production cache
-    # image's wxyc_unaccent.rules tsearch_data file, which isn't present on
-    # a base postgres test container). 0006 is self-contained — no FK to
-    # any earlier table — so the standalone apply is valid coverage.
+    # Stamp at 0005 to keep this test minimal — 0006 is self-contained
+    # (no FK to any earlier table) so a standalone apply is valid coverage.
+    # Historically this also avoided 0004's `$SHAREDIR/tsearch_data/`
+    # dependency on the base test container; post-#223 0004 is filesystem-
+    # independent and the full chain would also work, but collapsing the
+    # test setup is deferred (see CLAUDE.md's 0006 entry).
     stamp = _run_alembic(["stamp", "0005_release_track_artist_role"], db_url)
     assert stamp.returncode == 0, (
         f"alembic stamp failed:\nstdout: {stamp.stdout}\nstderr: {stamp.stderr}"

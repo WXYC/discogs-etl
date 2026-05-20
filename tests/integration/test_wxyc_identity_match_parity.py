@@ -207,10 +207,12 @@ def test_postgres_functions_idempotent(migrated_db_url: str) -> None:
 @pytest.mark.pg
 def test_migration_double_apply_is_a_no_op(db_url: str) -> None:
     """Re-applying migration 0004 must not throw and must leave the deploy
-    intact. Verifies the contract `CREATE OR REPLACE FUNCTION` +
-    `DROP TEXT SEARCH DICTIONARY IF EXISTS` + `CREATE TEXT SEARCH DICTIONARY`
-    compose cleanly when alembic re-runs end-to-end (a `--resume` after a
-    crash, or a re-stamp scenario).
+    intact. Verifies the post-#223 contract: `CREATE EXTENSION IF NOT EXISTS
+    unaccent` + `CREATE OR REPLACE FUNCTION wxyc_unaccent_text` + the
+    canonical `CREATE OR REPLACE FUNCTION` family (with the
+    `unaccent('wxyc_unaccent', r)` call site substituted to
+    `wxyc_unaccent_text(r)`) all compose cleanly when alembic re-runs
+    end-to-end (a `--resume` after a crash, or a re-stamp scenario).
 
     Uses the function-scoped `db_url` directly (not the module-scoped
     `migrated_db_url`) so this test exercises both calls itself.
