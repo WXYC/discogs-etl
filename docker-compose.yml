@@ -1,6 +1,9 @@
 services:
   db:
-    image: postgres:16-alpine
+    # Custom image overlaying wxyc_unaccent.rules onto railwayapp-templates/postgres-ssl
+    # so the F0000 precheck in alembic 0007 finds the rules file. Build pinned in
+    # WXYC/wxyc-etl#127. See docs/wxyc-postgres-image.md for the operator runbook.
+    image: ghcr.io/wxyc/wxyc-postgres:pg16
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-discogs}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-discogs}
