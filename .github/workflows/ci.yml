@@ -38,7 +38,11 @@ jobs:
     runs-on: ubuntu-latest
     services:
       postgres:
-        image: postgres:16-alpine
+        # Custom image overlaying wxyc_unaccent.rules onto railwayapp-templates/postgres-ssl
+        # so the F0000 precheck in alembic 0007 finds the rules file at
+        # $SHAREDIR/tsearch_data/. Built + published by WXYC/wxyc-etl#127. See
+        # docs/wxyc-postgres-image.md for the operator runbook.
+        image: ghcr.io/wxyc/wxyc-postgres:pg16
         env:
           POSTGRES_USER: discogs
           POSTGRES_PASSWORD: discogs
@@ -60,14 +64,10 @@ jobs:
         run: |
           PGPASSWORD=discogs psql -h localhost -p 5433 -U discogs -d postgres \
             -c "CREATE EXTENSION IF NOT EXISTS pg_trgm;"
-      # Note: prior to #223 this job staged
-      # ``vendor/wxyc-etl/wxyc_unaccent.rules`` into the service container's
-      # ``$SHAREDIR/tsearch_data/`` so 0004's ``CREATE TEXT SEARCH DICTIONARY
-      # wxyc_unaccent`` could find it. The post-#223 0004 deploys
-      # ``wxyc_unaccent_text(text)`` (codegen from the same vendored file)
-      # instead, with no server-side filesystem dependency — so this step
-      # is gone and CI now exercises the Railway-equivalent "no rules file
-      # in tsearch_data" condition end-to-end.
+      # The wxyc-postgres image (above) ships wxyc_unaccent.rules at
+      # /usr/local/share/postgresql/tsearch_data/wxyc_unaccent.rules so
+      # alembic 0007's CREATE TEXT SEARCH DICTIONARY precheck finds it. No
+      # docker-cp staging step needed — that's the whole point of Option B.
       - name: Run pg-marked + default tests with coverage
         env:
           DATABASE_URL_TEST: postgresql://discogs:discogs@localhost:5433/postgres
