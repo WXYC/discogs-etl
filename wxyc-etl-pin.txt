@@ -13,6 +13,14 @@
 # the SHAs + version below, run the parity test against a live PG.
 # See WXYC/wxyc-etl/docs/postgres-analog-vendoring.md.
 
+# Re-vendoring this rules file: rerun
+# `pytest tests/unit/test_wxyc_unaccent_function_codegen.py` before bumping
+# the SHA. That suite asserts the two-pass codegen invariant (REPLACE-then-
+# translate equivalence with PG's single-pass unaccent) over the new rules.
+# If an upstream rule introduces a multi-char destination whose output chars
+# overlap with the single-char-src set, the invariant fails and
+# `lib/unaccent_codegen.py` must be reworked before the pin can move
+# (see WXYC/discogs-etl#223).
 unaccent_rules_version = 0.1.0
 unaccent_rules_sha256  = fc51eceb722904fa0d80734d4b2f4bbcffb0fcfecc133450f774210a067b9d26
 functions_sql_sha256   = 4beb7db2b44d479a4878a386e4d1b626d26fd3738e34371b23abe1ab4ccdc21a

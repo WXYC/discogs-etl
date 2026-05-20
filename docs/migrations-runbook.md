@@ -143,3 +143,34 @@ This is what wiped the WXYC prod discogs-cache on 2026-04-28 (~14,667 release ro
 - Two pg-marked integration tests pin both guards: `tests/integration/test_alembic_baseline.py::test_alembic_upgrade_head_sql_against_populated_db_is_safe` and `::test_alembic_upgrade_head_against_populated_unstamped_db_is_safe`.
 
 If a future migration needs autocommit DDL (e.g., `CREATE INDEX CONCURRENTLY`, extension creation), keep the guards: either follow the same `is_offline_mode()` check, or write the migration with `op.execute(..., execution_options={"isolation_level": "AUTOCOMMIT"})` so alembic's offline mode can intercept it.
+
+## One-time recovery: dev/EC2 systems on the dict-based 0004 (post-#223)
+
+`alembic/versions/0004_wxyc_identity_match_fns.py` was rewritten in [#223](https://github.com/WXYC/discogs-etl/issues/223) to deploy `wxyc_unaccent` via a pure-SQL `wxyc_unaccent_text(text)` function instead of a `$SHAREDIR/tsearch_data/`-backed text-search dictionary. Railway-managed Postgres can't host the rules file (the path is root-owned and unwritable even with `pg_write_server_files`), and that's where the rebuild target lives going forward.
+
+Systems where the *old* dict-based 0004 has already been applied (Jake's Homebrew dev cache, the EC2 legacy cache) still have a `wxyc_unaccent` text-search dictionary plus `wxyc_match_form` etc. bodies that call `unaccent('wxyc_unaccent', r)`. Alembic won't re-run 0004 on those because `version_num` already says `0004_wxyc_identity_match_fns`. Force-converge each system once:
+
+```bash
+source .venv/bin/activate
+export DATABASE_URL_DISCOGS="<dev or ec2 url>"
+
+# Confirm we're on 0004 with the dict-based bodies (i.e. pre-#223 deploy).
+psql "$DATABASE_URL_DISCOGS" -c "SELECT version_num FROM alembic_version"
+# → version_num = '0004_wxyc_identity_match_fns'
+psql "$DATABASE_URL_DISCOGS" -c "SELECT dictname FROM pg_ts_dict WHERE dictname='wxyc_unaccent'"
+# → 1 row means dict-based 0004 is deployed.
+
+# Downgrade through 0004, then upgrade back. The downgrade drops the dict
+# (DROP TEXT SEARCH DICTIONARY IF EXISTS wxyc_unaccent) along with the
+# function family; the upgrade re-deploys the new function-based path.
+alembic downgrade 0003_wxyc_library_v2
+alembic upgrade head
+
+# Verify the post-#223 surface.
+psql "$DATABASE_URL_DISCOGS" -c "SELECT dictname FROM pg_ts_dict WHERE dictname='wxyc_unaccent'"
+# → 0 rows
+psql "$DATABASE_URL_DISCOGS" -c "SELECT proname FROM pg_proc WHERE proname='wxyc_unaccent_text'"
+# → wxyc_unaccent_text  (1 row)
+```
+
+Production (the Railway destination) doesn't need this recipe — it sat at `0003_wxyc_library_v2` waiting for #223 to land, so the first `alembic upgrade head` against the new 0004 deploys the function-based path directly.
