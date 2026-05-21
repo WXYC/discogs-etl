@@ -99,11 +99,15 @@ BEGIN
     );
 EXCEPTION
     WHEN SQLSTATE 'F0000' THEN
+        -- Preserve the original SQLERRM (which Postgres populates with the
+        -- specific path it tried) in DETAIL so an unexpected F0000 cause
+        -- isn't hidden behind the runbook pointer.
         RAISE EXCEPTION USING
             MESSAGE = 'wxyc_unaccent.rules is missing from $SHAREDIR/tsearch_data/. '
                       'The destination PG must run the wxyc-postgres image '
                       '(ghcr.io/wxyc/wxyc-postgres:pg17 or :pg16). Runbook: '
                       '{RUNBOOK_URL}',
+            DETAIL = SQLERRM,
             ERRCODE = 'F0000';
 END;
 $$;
