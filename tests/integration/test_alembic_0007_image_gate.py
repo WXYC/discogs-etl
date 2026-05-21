@@ -124,11 +124,17 @@ def test_0007_applies_cleanly_against_wxyc_postgres_image(db_url: str) -> None:
 
 
 @pytest.mark.pg
-def test_0007_idempotent(db_url: str) -> None:
+def test_0007_idempotent(fresh_db_url: str) -> None:
     """Re-running the upgrade pathway must not throw — the DROP IF EXISTS +
     CREATE pair in 0007 is the explicit guard. Verifies the alembic re-stamp
     / downgrade-then-upgrade flow stays clean.
+
+    Uses ``fresh_db_url`` (function-scoped) so the stamp + downgrade + upgrade
+    cycle exercises against a clean DB regardless of pytest's chosen test
+    order. The module-scoped ``db_url`` would couple state across the other
+    pg tests in this file in a way that's fragile under future reordering.
     """
+    db_url = fresh_db_url
     _run_alembic(["stamp", "0006_lookup_negative"], db_url)
     first = _run_alembic(["upgrade", "0007_wxyc_postgres_image_gate"], db_url)
     assert first.returncode == 0
