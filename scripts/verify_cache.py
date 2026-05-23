@@ -750,42 +750,7 @@ def prune_releases_copy_swap(
                 for rid in all_ids:
                     copy.write_row((rid,))
 
-        # Tables to copy-swap: (old_table, new_table, columns, id_column)
-        tables = [
-            (
-                "release",
-                "new_release",
-                "id, title, release_year, country, artwork_url, format",
-                "id",
-            ),
-            (
-                "release_artist",
-                "new_release_artist",
-                "release_id, artist_id, artist_name, extra",
-                "release_id",
-            ),
-            ("release_label", "new_release_label", "release_id, label_name", "release_id"),
-            ("release_genre", "new_release_genre", "release_id, genre", "release_id"),
-            ("release_style", "new_release_style", "release_id, style", "release_id"),
-            (
-                "release_track",
-                "new_release_track",
-                "release_id, sequence, position, title, duration",
-                "release_id",
-            ),
-            (
-                "release_track_artist",
-                "new_release_track_artist",
-                "release_id, track_sequence, artist_name",
-                "release_id",
-            ),
-            (
-                "cache_metadata",
-                "new_cache_metadata",
-                "release_id, cached_at, source, last_validated",
-                "release_id",
-            ),
-        ]
+        tables = PRUNE_COPY_TABLES
 
         # Copy keeper rows into new tables
         for old_table, new_table, columns, id_col in tables:
@@ -930,19 +895,94 @@ def prune_releases_copy_swap(
 SCRIPT_DIR = Path(__file__).parent
 SCHEMA_DIR = SCRIPT_DIR.parent / "schema"
 
-# Tables and their columns to copy (post-dedup: no master_id).
-# Each entry: (table_name, filter_column, columns_list)
+# Tables and their column lists for the two copy-swap paths in this module.
+#
+# Both PRUNE_COPY_TABLES and COPY_TABLE_SPEC drive ``CREATE TABLE new_X AS SELECT
+# {cols} FROM X`` operations. Any column missing from a list is silently dropped
+# from the live table after the RENAME swap (CTAS inherits only what the SELECT
+# names, and no relic remains in pg_attribute). For that reason the column lists
+# must stay in sync with ``schema/create_database.sql`` — every column declared
+# in the canonical CREATE TABLE for these tables MUST appear here, or the next
+# rebuild will drop it.
+#
+# Parallel guard: ``dedup_releases.DEDUP_TABLES`` (the upstream copy-swap that
+# happens just before the prune step). Pin tests for both live in
+# ``tests/integration/test_dedup.py`` and
+# ``tests/integration/test_verify_cache_columns.py``.
+
+# Used by prune_releases_copy_swap (default --prune path; the monthly rebuild
+# fires this on EVERY run).
+PRUNE_COPY_TABLES = [
+    (
+        "release",
+        "new_release",
+        "id, title, release_year, country, artwork_url, released, format, master_id",
+        "id",
+    ),
+    (
+        "release_artist",
+        "new_release_artist",
+        "release_id, artist_id, artist_name, extra, role",
+        "release_id",
+    ),
+    (
+        "release_label",
+        "new_release_label",
+        "release_id, label_id, label_name, catno",
+        "release_id",
+    ),
+    ("release_genre", "new_release_genre", "release_id, genre", "release_id"),
+    ("release_style", "new_release_style", "release_id, style", "release_id"),
+    (
+        "release_track",
+        "new_release_track",
+        "release_id, sequence, position, title, duration",
+        "release_id",
+    ),
+    (
+        "release_track_artist",
+        "new_release_track_artist",
+        "release_id, track_sequence, artist_name, extra, role",
+        "release_id",
+    ),
+    (
+        "cache_metadata",
+        "new_cache_metadata",
+        "release_id, cached_at, source, last_validated",
+        "release_id",
+    ),
+]
+
+# Used by --copy-to (deprecated alongside --target-db-url, but still functional).
+# Each entry: (table_name, filter_column, columns_list).
 COPY_TABLE_SPEC = [
-    ("release", "id", ["id", "title", "release_year", "country", "artwork_url", "format"]),
-    ("release_artist", "release_id", ["release_id", "artist_name", "extra"]),
-    ("release_label", "release_id", ["release_id", "label_name"]),
+    (
+        "release",
+        "id",
+        [
+            "id",
+            "title",
+            "release_year",
+            "country",
+            "artwork_url",
+            "released",
+            "format",
+            "master_id",
+        ],
+    ),
+    (
+        "release_artist",
+        "release_id",
+        ["release_id", "artist_id", "artist_name", "extra", "role"],
+    ),
+    ("release_label", "release_id", ["release_id", "label_id", "label_name", "catno"]),
     ("release_genre", "release_id", ["release_id", "genre"]),
     ("release_style", "release_id", ["release_id", "style"]),
     ("release_track", "release_id", ["release_id", "sequence", "position", "title", "duration"]),
     (
         "release_track_artist",
         "release_id",
-        ["release_id", "track_sequence", "artist_name"],
+        ["release_id", "track_sequence", "artist_name", "extra", "role"],
     ),
     (
         "release_video",
