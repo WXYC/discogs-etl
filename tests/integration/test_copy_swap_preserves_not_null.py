@@ -1,0 +1,372 @@
+"""Pin: NOT NULL constraints survive the copy-swap step.
+
+Sibling regression to ``tests/integration/test_dedup.py::TestDedupCopySwapPreservesMasterId``
+(WXYC/discogs-etl#129, master_id column drop) and the verify_cache column drift
+fixed in WXYC/discogs-etl#233. PostgreSQL's ``CREATE TABLE AS SELECT`` preserves
+only column types, not constraints — so NOT NULL on data columns is silently
+stripped on every monthly rebuild unless the copy-swap path re-applies it
+explicitly.
+
+The schema in ``schema/create_database.sql`` is the source of truth for which
+columns are required. This test runs the two copy-swap entrypoints
+(``dedup_releases.add_base_constraints_and_indexes`` and
+``verify_cache.prune_releases_copy_swap``) against a minimal fixture and
+asserts the post-swap tables still report ``is_nullable = 'NO'`` on every
+column the schema declared ``NOT NULL``.
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import sys
+from pathlib import Path
+
+import psycopg
+import pytest
+
+pytestmark = pytest.mark.pg
+
+SCHEMA_DIR = Path(__file__).parent.parent.parent / "schema"
+
+# Load production modules using sys.modules guard (mirrors test_verify_cache_columns.py).
+# Registering in sys.modules before exec_module so dataclasses / typing introspection
+# inside the loaded module can resolve their own __module__ name.
+_DEDUP_PATH = Path(__file__).parent.parent.parent / "scripts" / "dedup_releases.py"
+if "dedup_releases" in sys.modules:
+    _dd = sys.modules["dedup_releases"]
+else:
+    _dspec = importlib.util.spec_from_file_location("dedup_releases", _DEDUP_PATH)
+    assert _dspec is not None and _dspec.loader is not None
+    _dd = importlib.util.module_from_spec(_dspec)
+    sys.modules["dedup_releases"] = _dd
+    _dspec.loader.exec_module(_dd)
+
+_VERIFY_CACHE_PATH = Path(__file__).parent.parent.parent / "scripts" / "verify_cache.py"
+if "verify_cache" in sys.modules:
+    _vc = sys.modules["verify_cache"]
+else:
+    _vcspec = importlib.util.spec_from_file_location("verify_cache", _VERIFY_CACHE_PATH)
+    assert _vcspec is not None and _vcspec.loader is not None
+    _vc = importlib.util.module_from_spec(_vcspec)
+    sys.modules["verify_cache"] = _vc
+    _vcspec.loader.exec_module(_vc)
+
+
+# Columns expected NOT NULL on each post-swap table, transcribed by hand from
+# schema/create_database.sql. ``id`` is omitted from the ``release`` entry
+# because ALTER TABLE ADD PRIMARY KEY (id) already re-asserts NOT NULL.
+# ``cache_metadata.release_id`` similarly is the PK and excluded.
+#
+# This list is the test contract; when schema/create_database.sql changes the
+# NOT NULL set on these tables, update both this dict and the production
+# ALTER statements at the same time. The TestNotNullPinExpectationsMatchSchema
+# class below catches drift between the schema and this expectation.
+_EXPECTED_NOT_NULL: dict[str, tuple[str, ...]] = {
+    "release": ("title",),
+    "release_artist": ("release_id", "artist_name"),
+    "release_label": ("release_id", "label_name"),
+    "release_genre": ("release_id", "genre"),
+    "release_style": ("release_id", "style"),
+    "release_track": ("release_id", "sequence", "title"),
+    "release_track_artist": ("release_id", "track_sequence", "artist_name"),
+    "cache_metadata": ("cached_at", "source"),
+}
+
+# Tables that flow through each copy-swap entrypoint.
+_DEDUP_TABLES_TO_CHECK = (
+    "release",
+    "release_artist",
+    "release_label",
+    "release_genre",
+    "release_style",
+    "cache_metadata",
+)
+_PRUNE_TABLES_TO_CHECK = (
+    "release",
+    "release_artist",
+    "release_label",
+    "release_genre",
+    "release_style",
+    "release_track",
+    "release_track_artist",
+    "cache_metadata",
+)
+
+
+def _drop_all_tables(conn) -> None:
+    """Clear pipeline tables and any leftover ``new_`` copy-swap artifacts."""
+    base = (
+        "cache_metadata",
+        "release_track_artist",
+        "release_track",
+        "release_style",
+        "release_genre",
+        "release_label",
+        "release_artist",
+        "release",
+    )
+    with conn.cursor() as cur:
+        for t in base:
+            cur.execute(f"DROP TABLE IF EXISTS {t} CASCADE")
+            cur.execute(f"DROP TABLE IF EXISTS new_{t} CASCADE")
+            cur.execute(f"DROP TABLE IF EXISTS {t}_old CASCADE")
+        cur.execute("DROP TABLE IF EXISTS dedup_delete_ids CASCADE")
+        cur.execute("DROP TABLE IF EXISTS _keep_ids CASCADE")
+
+
+def _seed_minimal_fixture(db_url: str) -> None:
+    """Apply schema + insert representative rows for all 8 swap-tracked tables.
+
+    Three releases (1, 2, 3) with child rows on each table so the copy-swap
+    actually touches every table. Compositions chosen from WXYC's canonical
+    example data per the org's CLAUDE.md fixture guidance.
+    """
+    conn = psycopg.connect(db_url, autocommit=True)
+    try:
+        _drop_all_tables(conn)
+        with conn.cursor() as cur:
+            cur.execute(SCHEMA_DIR.joinpath("create_database.sql").read_text())
+            cur.execute(SCHEMA_DIR.joinpath("create_functions.sql").read_text())
+
+            cur.executemany(
+                "INSERT INTO release (id, title, master_id, format, country) "
+                "VALUES (%s, %s, %s, %s, %s)",
+                [
+                    (1, "DOGA", 200, "LP", "AR"),
+                    (2, "Aluminum Tunes", 100, "CD", "UK"),
+                    (3, "Edits", None, "CD", "US"),
+                ],
+            )
+            cur.executemany(
+                "INSERT INTO release_artist (release_id, artist_name) VALUES (%s, %s)",
+                [
+                    (1, "Juana Molina"),
+                    (2, "Stereolab"),
+                    (3, "Chuquimamani-Condori"),
+                ],
+            )
+            cur.executemany(
+                "INSERT INTO release_label (release_id, label_name) VALUES (%s, %s)",
+                [(1, "Sonamos"), (2, "Duophonic")],
+            )
+            cur.executemany(
+                "INSERT INTO release_genre (release_id, genre) VALUES (%s, %s)",
+                [(1, "Folk"), (2, "Electronic")],
+            )
+            cur.executemany(
+                "INSERT INTO release_style (release_id, style) VALUES (%s, %s)",
+                [(1, "Folk Rock"), (2, "Indie Pop")],
+            )
+            cur.executemany(
+                "INSERT INTO release_track (release_id, sequence, title) VALUES (%s, %s, %s)",
+                [(1, 1, "Cosoco"), (2, 1, "Fuses")],
+            )
+            cur.executemany(
+                "INSERT INTO release_track_artist "
+                "(release_id, track_sequence, artist_name) VALUES (%s, %s, %s)",
+                [(1, 1, "Juana Molina"), (2, 1, "Stereolab")],
+            )
+            cur.executemany(
+                "INSERT INTO cache_metadata (release_id, source) VALUES (%s, %s)",
+                [(1, "bulk_import"), (2, "bulk_import"), (3, "bulk_import")],
+            )
+    finally:
+        conn.close()
+
+
+def _not_null_columns(conn, table: str) -> set[str]:
+    """Return columns marked ``NOT NULL`` on a given table in the public schema."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_schema = 'public' AND table_name = %s "
+            "AND is_nullable = 'NO'",
+            (table,),
+        )
+        return {row[0] for row in cur.fetchall()}
+
+
+def _run_dedup_swap(db_url: str) -> None:
+    """Exercise dedup's copy-swap path end-to-end (single deletion case).
+
+    Mirrors the production main() flow but trims it to copy_table → drop FKs →
+    swap_tables → add_base_constraints_and_indexes. Marks release 3 for deletion
+    so all 6 DEDUP_TABLES go through CTAS.
+    """
+    conn = psycopg.connect(db_url, autocommit=True)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("CREATE UNLOGGED TABLE dedup_delete_ids (release_id integer PRIMARY KEY)")
+            cur.execute("INSERT INTO dedup_delete_ids VALUES (3)")
+
+        for old, new, cols, id_col in _dd.DEDUP_TABLES:
+            _dd.copy_table(conn, old, new, cols, id_col)
+
+        with conn.cursor() as cur:
+            for stmt in (
+                "ALTER TABLE release_artist DROP CONSTRAINT IF EXISTS fk_release_artist_release",
+                "ALTER TABLE release_label DROP CONSTRAINT IF EXISTS fk_release_label_release",
+                "ALTER TABLE release_genre DROP CONSTRAINT IF EXISTS fk_release_genre_release",
+                "ALTER TABLE release_style DROP CONSTRAINT IF EXISTS fk_release_style_release",
+                "ALTER TABLE cache_metadata DROP CONSTRAINT IF EXISTS fk_cache_metadata_release",
+            ):
+                cur.execute(stmt)
+
+        for old, new, _, _ in _dd.DEDUP_TABLES:
+            _dd.swap_tables(conn, old, new)
+
+        _dd.add_base_constraints_and_indexes(conn, db_url=db_url)
+    finally:
+        conn.close()
+
+
+class TestDedupCopySwapPreservesNotNull:
+    """add_base_constraints_and_indexes re-applies NOT NULL on schema-required columns."""
+
+    @pytest.fixture(autouse=True, scope="class")
+    def _set_up_and_dedup(self, db_url):
+        self.__class__._db_url = db_url
+        _seed_minimal_fixture(db_url)
+        _run_dedup_swap(db_url)
+
+    @pytest.fixture(autouse=True)
+    def _store_url(self):
+        self.db_url = self.__class__._db_url
+
+    @pytest.mark.parametrize("table", _DEDUP_TABLES_TO_CHECK)
+    def test_required_columns_remain_not_null(self, table):
+        conn = psycopg.connect(self.db_url, autocommit=True)
+        try:
+            actual = _not_null_columns(conn, table)
+        finally:
+            conn.close()
+
+        expected = set(_EXPECTED_NOT_NULL[table])
+        missing = expected - actual
+        assert not missing, (
+            f"After dedup copy-swap, NOT NULL was stripped from "
+            f"{table}.{sorted(missing)}. CTAS preserves column types but not "
+            f"constraints; scripts/dedup_releases.py:add_base_constraints_and_indexes "
+            f"must re-apply SET NOT NULL on these columns."
+        )
+
+
+class TestPruneCopySwapPreservesNotNull:
+    """verify_cache.prune_releases_copy_swap re-applies NOT NULL on schema-required columns."""
+
+    @pytest.fixture(autouse=True, scope="class")
+    def _set_up_and_prune(self, db_url):
+        self.__class__._db_url = db_url
+        _seed_minimal_fixture(db_url)
+        # Keep releases 1, 2; prune release 3. All 8 PRUNE_COPY_TABLES go through CTAS.
+        _vc.prune_releases_copy_swap(db_url, keep_ids={1, 2}, review_ids=set())
+
+    @pytest.fixture(autouse=True)
+    def _store_url(self):
+        self.db_url = self.__class__._db_url
+
+    @pytest.mark.parametrize("table", _PRUNE_TABLES_TO_CHECK)
+    def test_required_columns_remain_not_null(self, table):
+        conn = psycopg.connect(self.db_url, autocommit=True)
+        try:
+            actual = _not_null_columns(conn, table)
+        finally:
+            conn.close()
+
+        expected = set(_EXPECTED_NOT_NULL[table])
+        missing = expected - actual
+        assert not missing, (
+            f"After verify_cache prune copy-swap, NOT NULL was stripped from "
+            f"{table}.{sorted(missing)}. CTAS preserves column types but not "
+            f"constraints; scripts/verify_cache.py:prune_releases_copy_swap "
+            f"must re-apply SET NOT NULL on these columns."
+        )
+
+
+class TestNotNullPinExpectationsMatchSchema:
+    """Catch drift between _EXPECTED_NOT_NULL and schema/create_database.sql.
+
+    Without this, a future schema change that adds a new ``NOT NULL`` column
+    on one of the swap-tracked tables would not appear in this test file's
+    expectation, and the corresponding copy-swap fix could silently lag.
+    """
+
+    def test_every_schema_not_null_column_is_pinned(self, tmp_path) -> None:
+        """Every NOT NULL on a swap-tracked table appears in _EXPECTED_NOT_NULL."""
+        schema_text = SCHEMA_DIR.joinpath("create_database.sql").read_text()
+        # Naive but sufficient for this schema: scan column-definition lines
+        # inside each CREATE TABLE body. We accept some over-match (column
+        # comments etc.) because the assertion is a superset check.
+        for table, expected in _EXPECTED_NOT_NULL.items():
+            schema_cols = _parse_not_null_columns(schema_text, table)
+            # PK columns (implicit NOT NULL via PRIMARY KEY) are excluded from
+            # the test expectation because PK re-creation reasserts NOT NULL.
+            pk_cols = _parse_primary_key_columns(schema_text, table)
+            schema_data_cols = schema_cols - pk_cols
+            missing = schema_data_cols - set(expected)
+            assert not missing, (
+                f"Schema declares NOT NULL on {table}.{sorted(missing)} "
+                f"but the pin in _EXPECTED_NOT_NULL doesn't cover them. "
+                f"Update _EXPECTED_NOT_NULL and the corresponding production "
+                f"ALTER statements in dedup_releases.py + verify_cache.py."
+            )
+
+
+def _parse_not_null_columns(schema_text: str, table: str) -> set[str]:
+    """Return columns declared NOT NULL in ``CREATE TABLE <table>``."""
+    cols: set[str] = set()
+    for line in _iter_column_lines(schema_text, table):
+        if "NOT NULL" in line:
+            cols.add(line.split()[0])
+    return cols
+
+
+def _parse_primary_key_columns(schema_text: str, table: str) -> set[str]:
+    """Return columns declared as PRIMARY KEY in ``CREATE TABLE <table>``."""
+    cols: set[str] = set()
+    for line in _iter_column_lines(schema_text, table):
+        if "PRIMARY KEY" in line.upper():
+            cols.add(line.split()[0])
+    return cols
+
+
+def _iter_column_lines(schema_text: str, table: str):
+    """Yield individual column declarations from a ``CREATE TABLE`` body.
+
+    Strips ``-- ...`` end-of-line comments before splitting on column
+    separators so embedded commas inside comments (e.g. ``-- "A1", "B2"``)
+    don't cross over into the next declaration.
+    """
+    marker = f"CREATE TABLE {table} ("
+    start = schema_text.index(marker) + len(marker)
+    body = _extract_paren_body(schema_text, start)
+    # Strip end-of-line SQL comments so commas inside comments don't bleed
+    # into the next column declaration when we split on ``,``.
+    cleaned = "\n".join(raw.split("--", 1)[0] for raw in body.splitlines())
+    for raw in cleaned.split(","):
+        line = raw.strip()
+        if line:
+            yield line
+
+
+def _extract_paren_body(text: str, start: int) -> str:
+    """Return the contents of a parenthesised body starting at ``start``.
+
+    Walks character by character tracking paren depth so nested ``()`` (e.g.
+    ``CHECK (...)`` expressions) don't terminate the body early.
+    """
+    depth = 1
+    i = start
+    while i < len(text) and depth > 0:
+        ch = text[i]
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return text[start:i]
+        i += 1
+    raise AssertionError(
+        "Could not find matching close paren for CREATE TABLE body — the body "
+        "extractor walked off the end of the schema. Rewrite _extract_paren_body."
+    )
