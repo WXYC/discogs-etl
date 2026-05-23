@@ -519,8 +519,16 @@ def add_base_constraints_and_indexes(conn, db_url: str | None = None) -> None:
             "ALTER TABLE release_style ALTER COLUMN style SET NOT NULL",
             "ALTER TABLE cache_metadata ALTER COLUMN cached_at SET NOT NULL",
             "ALTER TABLE cache_metadata ALTER COLUMN source SET NOT NULL",
+            # ``cache_metadata.cached_at`` DEFAULT is load-bearing: LML's
+            # cache-miss INSERT omits the column and relies on the DEFAULT
+            # to avoid the NOT NULL re-applied above. Without restoration,
+            # the next cache miss after a rebuild would fail with a NOT
+            # NULL violation. ``release_artist.extra`` DEFAULT is schema
+            # invariant (nullable column) but restored for consistency.
+            "ALTER TABLE cache_metadata ALTER COLUMN cached_at SET DEFAULT now()",
+            "ALTER TABLE release_artist ALTER COLUMN extra SET DEFAULT 0",
         ],
-        "Level 2: FK constraints + FK indexes + NOT NULL restoration",
+        "Level 2: FK constraints + FK indexes + NOT NULL + DEFAULT restoration",
     )
 
     # Level 3: GIN trigram indexes + cache metadata indexes (parallel)
