@@ -28,13 +28,19 @@ REPO_ROOT = Path(__file__).parent.parent.parent
 SCHEMA_DIR = REPO_ROOT / "schema"
 
 _VERIFY_CACHE_PATH = REPO_ROOT / "scripts" / "verify_cache.py"
-_spec = importlib.util.spec_from_file_location("verify_cache", _VERIFY_CACHE_PATH)
-assert _spec is not None and _spec.loader is not None
-_vc = importlib.util.module_from_spec(_spec)
-# Register before exec_module so @dataclass and similar decorators can resolve
-# cls.__module__ back to the module object during class construction.
-sys.modules["verify_cache"] = _vc
-_spec.loader.exec_module(_vc)
+# Guarded so multiple test files share one module object — otherwise the
+# second-loaded copy shadows the first and breaks ProcessPool pickling for
+# any worker holding references to symbols from the original load (see #109).
+# Must register in sys.modules BEFORE exec_module so that @dataclass can
+# resolve cls.__module__ back to the module object during class construction.
+if "verify_cache" in sys.modules:
+    _vc = sys.modules["verify_cache"]
+else:
+    _spec = importlib.util.spec_from_file_location("verify_cache", _VERIFY_CACHE_PATH)
+    assert _spec is not None and _spec.loader is not None
+    _vc = importlib.util.module_from_spec(_spec)
+    sys.modules["verify_cache"] = _vc
+    _spec.loader.exec_module(_vc)
 
 PRUNE_COPY_TABLES = _vc.PRUNE_COPY_TABLES
 COPY_TABLE_SPEC = _vc.COPY_TABLE_SPEC
@@ -45,6 +51,11 @@ def _parse_create_table_columns(table_name: str) -> list[str]:
 
     The schema file is the source of truth. Parsing it keeps these tests
     automatically in sync with future ADD COLUMN additions to create_database.sql.
+
+    Limitation: the body extractor uses non-greedy ``.*?\\)\\s*;`` and is not
+    paren-balanced — it works only as long as no column-level ``CHECK (...)``
+    constraints appear inside the CREATE TABLE body. The defensive guard below
+    catches that case as a loud failure instead of a silently-wrong column list.
     """
     sql = SCHEMA_DIR.joinpath("create_database.sql").read_text()
     pattern = re.compile(
@@ -54,6 +65,13 @@ def _parse_create_table_columns(table_name: str) -> list[str]:
     match = pattern.search(sql)
     assert match is not None, f"CREATE TABLE {table_name} not found in create_database.sql"
     body = match.group(1)
+    # Guard against nested-paren constructs the non-greedy regex can't handle.
+    # If the matched body has unbalanced parens, the regex stopped early.
+    assert body.count("(") == body.count(")"), (
+        f"CREATE TABLE {table_name} body has unbalanced parens — the body extractor "
+        f"is not paren-balanced and likely terminated at a nested ``)``. "
+        f"Rewrite _parse_create_table_columns with a depth-aware matcher."
+    )
     columns: list[str] = []
     for raw_line in body.splitlines():
         line = raw_line.strip()
@@ -82,11 +100,11 @@ def _columns_in_copy_list(table_name: str, copy_list: list) -> list[str]:
 
 
 # Tables whose CTAS column list must stay in sync with create_database.sql.
-# release_genre / release_style / release_video / cache_metadata / release_track
-# / release_track_artist are not parameterized here because they have no
-# columns beyond release_id + the value, and parameterizing them adds nothing
-# but is harmless to leave out.
-_TABLES_UNDER_TEST = ("release", "release_artist", "release_label")
+# Includes every table where this PR's column-drop bug actually surfaced
+# (release, release_artist, release_label, release_track_artist). release_genre
+# and release_style are 2-col release_id + value tables with no scope for
+# drift and are intentionally omitted.
+_TABLES_UNDER_TEST = ("release", "release_artist", "release_label", "release_track_artist")
 
 
 class TestPruneCopyTablesCoversSchema:
@@ -125,6 +143,12 @@ class TestPruneCopyTablesCoversSchema:
         cols = set(_columns_in_copy_list("release_label", PRUNE_COPY_TABLES))
         assert "label_id" in cols, "release_label.label_id dropped from copy-swap"
         assert "catno" in cols, "release_label.catno dropped from copy-swap"
+
+    def test_release_track_artist_keeps_extra_and_role(self) -> None:
+        """Regression pin for #218: extra + role on release_track_artist."""
+        cols = set(_columns_in_copy_list("release_track_artist", PRUNE_COPY_TABLES))
+        assert "extra" in cols, "release_track_artist.extra dropped — see WXYC/discogs-etl#218"
+        assert "role" in cols, "release_track_artist.role dropped — see WXYC/discogs-etl#218"
 
 
 class TestCopyToTargetSpecCoversSchema:
