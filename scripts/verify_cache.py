@@ -878,6 +878,35 @@ def prune_releases_copy_swap(
             cur.execute("CREATE INDEX idx_cache_metadata_cached_at ON cache_metadata(cached_at)")
             cur.execute("CREATE INDEX idx_cache_metadata_source ON cache_metadata(source)")
 
+            # Re-apply NOT NULL constraints stripped by ``CREATE TABLE AS
+            # SELECT`` above. CTAS carries column types forward but not
+            # NOT NULL / DEFAULT / CHECK; the schema in
+            # ``schema/create_database.sql`` declares these columns as
+            # NOT NULL, and without explicit re-application every prune
+            # run ships a discogs-cache where those constraints are gone.
+            # Pinned by
+            # ``tests/integration/test_copy_swap_preserves_not_null.py``.
+            for stmt in (
+                "ALTER TABLE release ALTER COLUMN title SET NOT NULL",
+                "ALTER TABLE release_artist ALTER COLUMN release_id SET NOT NULL",
+                "ALTER TABLE release_artist ALTER COLUMN artist_name SET NOT NULL",
+                "ALTER TABLE release_label ALTER COLUMN release_id SET NOT NULL",
+                "ALTER TABLE release_label ALTER COLUMN label_name SET NOT NULL",
+                "ALTER TABLE release_genre ALTER COLUMN release_id SET NOT NULL",
+                "ALTER TABLE release_genre ALTER COLUMN genre SET NOT NULL",
+                "ALTER TABLE release_style ALTER COLUMN release_id SET NOT NULL",
+                "ALTER TABLE release_style ALTER COLUMN style SET NOT NULL",
+                "ALTER TABLE release_track ALTER COLUMN release_id SET NOT NULL",
+                "ALTER TABLE release_track ALTER COLUMN sequence SET NOT NULL",
+                "ALTER TABLE release_track ALTER COLUMN title SET NOT NULL",
+                "ALTER TABLE release_track_artist ALTER COLUMN release_id SET NOT NULL",
+                "ALTER TABLE release_track_artist ALTER COLUMN track_sequence SET NOT NULL",
+                "ALTER TABLE release_track_artist ALTER COLUMN artist_name SET NOT NULL",
+                "ALTER TABLE cache_metadata ALTER COLUMN cached_at SET NOT NULL",
+                "ALTER TABLE cache_metadata ALTER COLUMN source SET NOT NULL",
+            ):
+                cur.execute(stmt)
+
             # Cleanup
             cur.execute("DROP TABLE IF EXISTS _keep_ids")
 

@@ -476,11 +476,21 @@ def add_base_constraints_and_indexes(conn, db_url: str | None = None) -> None:
         "Level 1.5: Clean orphan child rows before FK validation",
     )
 
-    # Level 2: FK constraints + PK on cache_metadata + FK indexes (parallel).
+    # Level 2: FK constraints + PK on cache_metadata + FK indexes + NOT NULL
+    # restoration (parallel).
+    #
     # FK constraints use NOT VALID so the ADD step itself can't race-fail
     # on orphans created by LML during the brief Level-1.5 → Level-2 window.
     # Postgres still enforces the FK on new inserts after the constraint is
     # added, so the durable behavior is identical to a validated constraint.
+    #
+    # The ``SET NOT NULL`` statements re-assert the constraints that the
+    # ``CREATE TABLE new_X AS SELECT ...`` step strips silently — CTAS
+    # carries column types forward but not NOT NULL / DEFAULT / CHECK. The
+    # schema in ``schema/create_database.sql`` declares the data columns
+    # below as NOT NULL; without explicit re-application every monthly
+    # rebuild ships a discogs-cache where those constraints are gone. Pinned
+    # by ``tests/integration/test_copy_swap_preserves_not_null.py``.
     _exec_parallel(
         [
             "ALTER TABLE release_artist ADD CONSTRAINT fk_release_artist_release "
@@ -498,8 +508,19 @@ def add_base_constraints_and_indexes(conn, db_url: str | None = None) -> None:
             "CREATE INDEX idx_release_label_release_id ON release_label(release_id)",
             "CREATE INDEX idx_release_genre_release_id ON release_genre(release_id)",
             "CREATE INDEX idx_release_style_release_id ON release_style(release_id)",
+            "ALTER TABLE release ALTER COLUMN title SET NOT NULL",
+            "ALTER TABLE release_artist ALTER COLUMN release_id SET NOT NULL",
+            "ALTER TABLE release_artist ALTER COLUMN artist_name SET NOT NULL",
+            "ALTER TABLE release_label ALTER COLUMN release_id SET NOT NULL",
+            "ALTER TABLE release_label ALTER COLUMN label_name SET NOT NULL",
+            "ALTER TABLE release_genre ALTER COLUMN release_id SET NOT NULL",
+            "ALTER TABLE release_genre ALTER COLUMN genre SET NOT NULL",
+            "ALTER TABLE release_style ALTER COLUMN release_id SET NOT NULL",
+            "ALTER TABLE release_style ALTER COLUMN style SET NOT NULL",
+            "ALTER TABLE cache_metadata ALTER COLUMN cached_at SET NOT NULL",
+            "ALTER TABLE cache_metadata ALTER COLUMN source SET NOT NULL",
         ],
-        "Level 2: FK constraints + FK indexes",
+        "Level 2: FK constraints + FK indexes + NOT NULL restoration",
     )
 
     # Level 3: GIN trigram indexes + cache metadata indexes (parallel)
