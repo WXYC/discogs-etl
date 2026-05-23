@@ -878,13 +878,21 @@ def prune_releases_copy_swap(
             cur.execute("CREATE INDEX idx_cache_metadata_cached_at ON cache_metadata(cached_at)")
             cur.execute("CREATE INDEX idx_cache_metadata_source ON cache_metadata(source)")
 
-            # Re-apply NOT NULL constraints stripped by ``CREATE TABLE AS
-            # SELECT`` above. CTAS carries column types forward but not
-            # NOT NULL / DEFAULT / CHECK; the schema in
+            # Re-apply NOT NULL and DEFAULT constraints stripped by
+            # ``CREATE TABLE AS SELECT`` above. CTAS carries column types
+            # forward but not NOT NULL / DEFAULT / CHECK; the schema in
             # ``schema/create_database.sql`` declares these columns as
-            # NOT NULL, and without explicit re-application every prune
-            # run ships a discogs-cache where those constraints are gone.
-            # Pinned by
+            # NOT NULL (and a few as DEFAULT now() / DEFAULT 0), and
+            # without explicit re-application every prune run ships a
+            # discogs-cache where those constraints are gone.
+            #
+            # The ``cache_metadata.cached_at`` DEFAULT is load-bearing:
+            # LML's cache-miss INSERT omits the column and relies on the
+            # DEFAULT to avoid the NOT NULL constraint applied here.
+            # Without DEFAULT restoration, the next cache miss after a
+            # rebuild would fail with a NOT NULL violation. The ``extra``
+            # DEFAULTs are schema invariant (nullable columns) but
+            # restored for consistency. Pinned by
             # ``tests/integration/test_copy_swap_preserves_not_null.py``.
             for stmt in (
                 "ALTER TABLE release ALTER COLUMN title SET NOT NULL",
@@ -904,6 +912,9 @@ def prune_releases_copy_swap(
                 "ALTER TABLE release_track_artist ALTER COLUMN artist_name SET NOT NULL",
                 "ALTER TABLE cache_metadata ALTER COLUMN cached_at SET NOT NULL",
                 "ALTER TABLE cache_metadata ALTER COLUMN source SET NOT NULL",
+                "ALTER TABLE cache_metadata ALTER COLUMN cached_at SET DEFAULT now()",
+                "ALTER TABLE release_artist ALTER COLUMN extra SET DEFAULT 0",
+                "ALTER TABLE release_track_artist ALTER COLUMN extra SET DEFAULT 0",
             ):
                 cur.execute(stmt)
 

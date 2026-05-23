@@ -72,6 +72,18 @@ _EXPECTED_NOT_NULL: dict[str, tuple[str, ...]] = {
     "cache_metadata": ("cached_at", "source"),
 }
 
+# Columns whose schema DEFAULT must survive the copy-swap. CTAS strips
+# DEFAULTs along with NOT NULL; restoring the DEFAULT is load-bearing for
+# ``cache_metadata.cached_at`` in particular — without it, LML's cache-miss
+# INSERT (which omits cached_at) would violate the NOT NULL constraint we
+# re-apply above. The ``extra`` columns are nullable so the DEFAULT is
+# defense-in-depth, not load-bearing, but the schema specifies it.
+_EXPECTED_DEFAULTS: dict[tuple[str, str], str] = {
+    ("cache_metadata", "cached_at"): "now()",
+    ("release_artist", "extra"): "0",
+    ("release_track_artist", "extra"): "0",
+}
+
 # Tables that flow through each copy-swap entrypoint.
 _DEDUP_TABLES_TO_CHECK = (
     "release",
@@ -186,6 +198,18 @@ def _not_null_columns(conn, table: str) -> set[str]:
         return {row[0] for row in cur.fetchall()}
 
 
+def _column_default(conn, table: str, column: str) -> str | None:
+    """Return the DEFAULT expression on ``table.column`` (or None if unset)."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT column_default FROM information_schema.columns "
+            "WHERE table_schema = 'public' AND table_name = %s AND column_name = %s",
+            (table, column),
+        )
+        row = cur.fetchone()
+        return row[0] if row else None
+
+
 def _run_dedup_swap(db_url: str) -> None:
     """Exercise dedup's copy-swap path end-to-end (single deletion case).
 
@@ -250,6 +274,34 @@ class TestDedupCopySwapPreservesNotNull:
             f"must re-apply SET NOT NULL on these columns."
         )
 
+    # Dedup swaps the 6 DEDUP_TABLES; release_track_artist is re-imported
+    # post-dedup (not copy-swapped) so its DEFAULT is preserved by the
+    # schema-driven import. Only the in-DEDUP_TABLES defaults are pinned here.
+    @pytest.mark.parametrize(
+        "table, column, expected",
+        [
+            ("cache_metadata", "cached_at", "now()"),
+            ("release_artist", "extra", "0"),
+        ],
+    )
+    def test_required_columns_keep_their_default(self, table, column, expected):
+        conn = psycopg.connect(self.db_url, autocommit=True)
+        try:
+            actual = _column_default(conn, table, column)
+        finally:
+            conn.close()
+
+        assert actual == expected, (
+            f"After dedup copy-swap, DEFAULT on {table}.{column} is {actual!r} "
+            f"but the schema declares {expected!r}. CTAS strips DEFAULTs along "
+            f"with NOT NULL; "
+            f"scripts/dedup_releases.py:add_base_constraints_and_indexes must "
+            f"re-apply SET DEFAULT on these columns. "
+            f"(cache_metadata.cached_at is load-bearing — LML's cache-miss "
+            f"INSERT omits the column and relies on the DEFAULT to avoid a "
+            f"NOT NULL violation.)"
+        )
+
 
 class TestPruneCopySwapPreservesNotNull:
     """verify_cache.prune_releases_copy_swap re-applies NOT NULL on schema-required columns."""
@@ -280,6 +332,33 @@ class TestPruneCopySwapPreservesNotNull:
             f"{table}.{sorted(missing)}. CTAS preserves column types but not "
             f"constraints; scripts/verify_cache.py:prune_releases_copy_swap "
             f"must re-apply SET NOT NULL on these columns."
+        )
+
+    # Verify_cache prune copy-swaps all 8 PRUNE_COPY_TABLES including the track
+    # tables, so all three CTAS-stripped DEFAULTs are pinned here.
+    @pytest.mark.parametrize(
+        "table, column, expected",
+        [
+            ("cache_metadata", "cached_at", "now()"),
+            ("release_artist", "extra", "0"),
+            ("release_track_artist", "extra", "0"),
+        ],
+    )
+    def test_required_columns_keep_their_default(self, table, column, expected):
+        conn = psycopg.connect(self.db_url, autocommit=True)
+        try:
+            actual = _column_default(conn, table, column)
+        finally:
+            conn.close()
+
+        assert actual == expected, (
+            f"After verify_cache prune copy-swap, DEFAULT on {table}.{column} "
+            f"is {actual!r} but the schema declares {expected!r}. CTAS strips "
+            f"DEFAULTs along with NOT NULL; "
+            f"scripts/verify_cache.py:prune_releases_copy_swap must re-apply "
+            f"SET DEFAULT on these columns. (cache_metadata.cached_at is "
+            f"load-bearing — LML's cache-miss INSERT omits the column and "
+            f"relies on the DEFAULT to avoid a NOT NULL violation.)"
         )
 
 
