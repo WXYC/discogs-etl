@@ -433,7 +433,8 @@ def create_library_db() -> None:
         # production WXYC catalog (tubafrenzy + staging Postgres dump):
         #   bare, genre + alphabetical sub-bucket, single-segment genre,
         #   bracketed group form. All trigger is_compilation_artist() via
-        #   the substring match on "various".
+        #   the leading "various artists" prefix rule (terminated by EOS
+        #   or a non-alphanumeric boundary; see WXYC/wxyc-etl#129/#130).
         ("Various Artists", "Nordic Roots: A Northside Collection", "CD"),
         ("Various Artists - Rock - A", "All Tomorrow's Parties 5.0", "LP"),
         ("Various Artists - Hiphop", "Stones Throw Ten Years", "CD"),

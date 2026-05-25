@@ -37,18 +37,43 @@ pytestmark = pytest.mark.filterwarnings("ignore::DeprecationWarning")
 
 
 class TestIsCompilationArtistParity:
-    """Same cases as the deleted test_matching.py TestIsCompilationArtist."""
+    """Cases for the anchored `is_compilation_artist` contract.
+
+    wxyc-etl 0.5.0 (WXYC/wxyc-etl#129/#130) tightened the matcher from a
+    substring scan to two rules:
+
+    - LEADING prefix terminated by end-of-string or a non-alphanumeric
+      boundary: "various artists", "v/a", "v.a", "soundtracks".
+    - EXACT match (case-insensitive equality): "various", "soundtrack",
+      "compilation".
+
+    The "Original Motion Picture Soundtrack" / "Compilation Hits" cases
+    that the old substring rule routed to True now classify as real
+    artists; the test matrix locks that in alongside the WXYC false-
+    positive regressions ("The Soundtrack of Our Lives", "Various
+    Production") flagged in the PR.
+    """
 
     @pytest.mark.parametrize(
         "artist, expected",
         [
+            # Leading-prefix matches (the WXYC catalog V/A shapes)
             ("Various Artists", True),
-            ("various", True),
-            ("Soundtrack", True),
-            ("Original Motion Picture Soundtrack", True),
+            ("Various Artists - Hiphop", True),
             ("V/A", True),
             ("v.a.", True),
-            ("Compilation Hits", True),
+            ("Soundtracks", True),
+            # Exact-only matches
+            ("various", True),
+            ("Various", True),
+            ("Soundtrack", True),
+            ("Compilation", True),
+            # Old substring-rule false positives that are now real artists
+            ("Original Motion Picture Soundtrack", False),
+            ("Compilation Hits", False),
+            ("The Soundtrack of Our Lives", False),
+            ("Various Production", False),
+            # Plain real artists
             ("Stereolab", False),
             ("Juana Molina", False),
             ("Cat Power", False),
@@ -56,12 +81,18 @@ class TestIsCompilationArtistParity:
         ],
         ids=[
             "various-artists",
-            "various-lowercase",
-            "soundtrack",
-            "soundtrack-in-phrase",
+            "various-artists-genre-suffix",
             "v-slash-a",
             "v-dot-a",
-            "compilation-keyword",
+            "soundtracks-prefix",
+            "various-lowercase",
+            "various-titlecase",
+            "soundtrack-exact",
+            "compilation-exact",
+            "soundtrack-in-phrase-now-false",
+            "compilation-keyword-now-false",
+            "the-soundtrack-of-our-lives",
+            "various-production",
             "stereolab",
             "juana-molina",
             "cat-power",
