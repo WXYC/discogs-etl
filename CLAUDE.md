@@ -66,6 +66,26 @@ The column survives the dedup + prune-copy-swap paths via the SELECT lists in `s
 
 Partial index `release_artwork_null_idx ON release (id) WHERE artwork_url IS NULL AND artwork_checked_at IS NULL` covers the never-asked tail for [WXYC/library-metadata-lookup#221](https://github.com/WXYC/library-metadata-lookup/issues/221)'s top-up drain — without the index that scan would seq-scan the full `release` table (~82K rows in prod as of 2026-05-29).
 
+### Artwork Preservation Across Rebuilds
+
+The monthly rebuild is incremental by default: `release.artwork_url` and `release.artwork_checked_at` that LML's runtime back-patched between rebuilds (see [WXYC/library-metadata-lookup#423](https://github.com/WXYC/library-metadata-lookup/issues/423)) survive the next rebuild. The plumbing is two structural changes (per [#242](https://github.com/WXYC/discogs-etl/issues/242)):
+
+1. `schema/create_database.sql` is `CREATE TABLE IF NOT EXISTS`-only — safe to apply against a populated DB. The destructive `DROP TABLE … CASCADE` block moved to `schema/drop_core_tables.sql`, invoked only by `--fresh-rebuild`.
+2. `scripts/import_csv.py:import_release_via_upsert` reloads `release` via staging-table COPY + UPSERT with `artwork_url` + `artwork_checked_at` excluded from the SET list. Releases that fall out of the new dump are pruned via `DELETE … WHERE id NOT IN staging`; FK `ON DELETE CASCADE` removes their child rows. Child tables of `release` (`release_artist` + siblings, plus `cache_metadata`) are TRUNCATEd before re-COPY so duplicates don't accumulate.
+3. `scripts/import_csv.py:import_artwork` also stamps `artwork_checked_at = now()` whenever it sets `artwork_url` from the dump — matches the semantics LML's runtime `write_release` applies (LML#423) so freshly-imported rows aren't treated as "never asked" on the first lookup.
+
+Semantics matrix for `scripts/run_pipeline.py`:
+
+| Flag | Schema | Data | LML back-patches |
+| --- | --- | --- | --- |
+| (default) | preserved (`CREATE TABLE IF NOT EXISTS` no-ops) | upserted; children TRUNCATE+re-COPY | preserved |
+| `--truncate-existing` | preserved | wiped via `TRUNCATE CACHE_TABLES_TO_TRUNCATE_BASE` | wiped (re-COPY into empty tables) |
+| `--fresh-rebuild` | dropped + recreated via `drop_core_tables.sql` | wiped via `DROP CASCADE` | wiped |
+
+**Dead-URL edge case the issue calls out**: if a release's image is taken down on Discogs between rebuilds, `release_image.csv` omits the row, the `import_artwork` UPDATE skips the release, and the prior LML-back-patched URL is preserved (potentially a dead URL). LML's runtime path will eventually 404 on the URL and re-fetch, back-patching with the new state. Strictly better than today's "wipe to NULL → serve placeholder" behavior.
+
+**Plan**: [`WXYC/wiki/plans/discogs-etl-242-rebuild-coalesce.md`](https://github.com/WXYC/wiki/blob/main/plans/discogs-etl-242-rebuild-coalesce.md) (PR [wiki#75](https://github.com/WXYC/wiki/pull/75)). Regression coverage: `tests/integration/test_import.py::TestImportArtworkPreservation` (the 5-case acceptance grid), `tests/integration/test_rebuild_idempotent.py` (--truncate-existing + --fresh-rebuild semantics), `tests/integration/test_schema.py::TestSchemaIdempotenceDriftGuards` (drift guards on the schema split).
+
 ### format Column Lifecycle
 
 The `format` column stores the normalized format category (Vinyl, CD, Cassette, 7", Digital). Unlike `master_id`, `format` persists after dedup and is available to consumers. During import, raw Discogs format strings are normalized via `lib/format_normalization.py` (e.g., "2xLP" → "Vinyl", "CD-R" → "CD"). During dedup, releases are partitioned by `(master_id, format)`, so a CD and Vinyl pressing of the same album both survive. During verify/prune, format-aware matching ensures only releases whose format matches the library's are kept (for exact artist+title matches). NULL format on either side is treated as "match anything" for backward compatibility.

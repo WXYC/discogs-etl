@@ -277,6 +277,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "a DB with stale rows from a prior failed attempt. Preserves "
         "entity.identity and alembic_version.",
     )
+    parser.add_argument(
+        "--fresh-rebuild",
+        action="store_true",
+        help="Drop and recreate the discogs-cache schema before importing "
+        "(applies schema/drop_core_tables.sql + create_database.sql). "
+        "Use when the intent is a from-scratch rebuild, e.g. recovering "
+        "from cache corruption. Default is incremental: schema is "
+        "preserved and LML-back-patched release.artwork_url + "
+        "release.artwork_checked_at survive the rebuild via the "
+        "staging-table UPSERT path (WXYC/discogs-etl#242).",
+    )
 
     args = parser.parse_args(argv)
 
@@ -801,6 +812,7 @@ def _run_xml_pipeline(
                 catalog_source=args.catalog_source,
                 catalog_db_url=args.catalog_db_url,
                 truncate_existing=args.truncate_existing,
+                fresh_rebuild=args.fresh_rebuild,
             )
 
     if keep_csv_dir is not None:
@@ -866,6 +878,7 @@ def main() -> None:
             state=state,
             state_file=args.state_file,
             truncate_existing=args.truncate_existing,
+            fresh_rebuild=args.fresh_rebuild,
         )
 
     total = time.monotonic() - pipeline_start
@@ -1018,6 +1031,7 @@ def _run_database_build(
     state: PipelineState | None = None,
     state_file: Path | None = None,
     truncate_existing: bool = False,
+    fresh_rebuild: bool = False,
 ) -> None:
     """Database build: create_schema through vacuum.
 
@@ -1046,6 +1060,15 @@ def _run_database_build(
         # create_functions.sql must run BEFORE create_database.sql:
         # create_database.sql's idx_master_title_trgm index expression
         # references f_unaccent (see #104).
+        if fresh_rebuild:
+            # --fresh-rebuild: wipe the core-table subgraph before recreate
+            # (WXYC/discogs-etl#242). Without this step create_database.sql
+            # is a no-op against a populated DB (every CREATE is IF NOT
+            # EXISTS), which is the incremental default that preserves
+            # LML-back-patched artwork. drop_core_tables.sql does NOT drop
+            # alembic_version, entity.identity, etc.
+            logger.warning("--fresh-rebuild: dropping core-table subgraph")
+            run_sql_file(db_url, SCHEMA_DIR / "drop_core_tables.sql")
         run_sql_file(db_url, SCHEMA_DIR / "create_functions.sql")
         run_sql_file(db_url, SCHEMA_DIR / "create_database.sql")
         if state:

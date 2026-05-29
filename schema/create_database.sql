@@ -41,29 +41,19 @@ CREATE OR REPLACE FUNCTION f_unaccent(text) RETURNS text AS $$
 $$ LANGUAGE sql IMMUTABLE PARALLEL SAFE STRICT;
 
 -- ============================================
--- Core tables (drop + recreate for clean ETL)
+-- Core tables (idempotent — safe to apply against a populated DB)
 -- ============================================
-
--- Drop in FK order: children first, then parent
-DROP TABLE IF EXISTS cache_metadata CASCADE;
-DROP TABLE IF EXISTS master_artist CASCADE;
-DROP TABLE IF EXISTS master CASCADE;
-DROP TABLE IF EXISTS artist_url CASCADE;
-DROP TABLE IF EXISTS artist_member CASCADE;
-DROP TABLE IF EXISTS artist_name_variation CASCADE;
-DROP TABLE IF EXISTS artist_alias CASCADE;
-DROP TABLE IF EXISTS artist CASCADE;
-DROP TABLE IF EXISTS release_video CASCADE;
-DROP TABLE IF EXISTS release_track_artist CASCADE;
-DROP TABLE IF EXISTS release_track CASCADE;
-DROP TABLE IF EXISTS release_style CASCADE;
-DROP TABLE IF EXISTS release_genre CASCADE;
-DROP TABLE IF EXISTS release_label CASCADE;
-DROP TABLE IF EXISTS release_artist CASCADE;
-DROP TABLE IF EXISTS release CASCADE;
+--
+-- Every CREATE here is `IF NOT EXISTS`. On a fresh DB every statement
+-- fires; on a populated cache every statement is a no-op and existing
+-- rows (including LML-back-patched `release.artwork_url` /
+-- `release.artwork_checked_at`) are left alone. The explicit wipe path
+-- lives in `schema/drop_core_tables.sql`, invoked only by the
+-- `--fresh-rebuild` flag on `scripts/run_pipeline.py`
+-- (WXYC/discogs-etl#242).
 
 -- Releases
-CREATE TABLE release (
+CREATE TABLE IF NOT EXISTS release (
     id                  integer PRIMARY KEY,
     title               text NOT NULL,
     release_year        smallint,
@@ -84,7 +74,7 @@ CREATE INDEX IF NOT EXISTS release_artwork_null_idx
     WHERE artwork_url IS NULL AND artwork_checked_at IS NULL;
 
 -- Artists on releases
-CREATE TABLE release_artist (
+CREATE TABLE IF NOT EXISTS release_artist (
     release_id      integer NOT NULL REFERENCES release(id) ON DELETE CASCADE,
     artist_id       integer,             -- Discogs artist ID (nullable for API-fetched releases)
     artist_name     text NOT NULL,
@@ -93,7 +83,7 @@ CREATE TABLE release_artist (
 );
 
 -- Labels on releases
-CREATE TABLE release_label (
+CREATE TABLE IF NOT EXISTS release_label (
     release_id      integer NOT NULL REFERENCES release(id) ON DELETE CASCADE,
     label_id        integer,
     label_name      text NOT NULL,
@@ -101,19 +91,19 @@ CREATE TABLE release_label (
 );
 
 -- Genres on releases
-CREATE TABLE release_genre (
+CREATE TABLE IF NOT EXISTS release_genre (
     release_id      integer NOT NULL REFERENCES release(id) ON DELETE CASCADE,
     genre           text NOT NULL
 );
 
 -- Styles on releases (more specific than genres)
-CREATE TABLE release_style (
+CREATE TABLE IF NOT EXISTS release_style (
     release_id      integer NOT NULL REFERENCES release(id) ON DELETE CASCADE,
     style           text NOT NULL
 );
 
 -- Tracks on releases
-CREATE TABLE release_track (
+CREATE TABLE IF NOT EXISTS release_track (
     release_id      integer NOT NULL REFERENCES release(id) ON DELETE CASCADE,
     sequence        integer NOT NULL,
     position        text,              -- "A1", "B2", etc.
@@ -122,7 +112,7 @@ CREATE TABLE release_track (
 );
 
 -- Videos on releases
-CREATE TABLE release_video (
+CREATE TABLE IF NOT EXISTS release_video (
     release_id integer NOT NULL REFERENCES release(id) ON DELETE CASCADE,
     sequence   integer NOT NULL,
     src        text NOT NULL,
@@ -145,7 +135,7 @@ CREATE TABLE release_video (
 --     operating.
 --   * ``role`` is NULL for main credits and may be NULL for extra
 --     credits when the XML omitted the ``<role>`` element.
-CREATE TABLE release_track_artist (
+CREATE TABLE IF NOT EXISTS release_track_artist (
     release_id      integer NOT NULL REFERENCES release(id) ON DELETE CASCADE,
     track_sequence  integer NOT NULL,
     artist_name     text NOT NULL,
@@ -157,7 +147,7 @@ CREATE TABLE release_track_artist (
 -- Artist detail tables
 -- ============================================
 
-CREATE TABLE artist (
+CREATE TABLE IF NOT EXISTS artist (
     id              integer PRIMARY KEY,
     name            text NOT NULL,
     profile         text,
@@ -165,25 +155,25 @@ CREATE TABLE artist (
     fetched_at      timestamptz NOT NULL DEFAULT now()
 );
 
-CREATE TABLE artist_alias (
+CREATE TABLE IF NOT EXISTS artist_alias (
     artist_id       integer NOT NULL REFERENCES artist(id) ON DELETE CASCADE,
     alias_id        integer,
     alias_name      text NOT NULL
 );
 
-CREATE TABLE artist_name_variation (
+CREATE TABLE IF NOT EXISTS artist_name_variation (
     artist_id       integer NOT NULL REFERENCES artist(id) ON DELETE CASCADE,
     name            text NOT NULL
 );
 
-CREATE TABLE artist_member (
+CREATE TABLE IF NOT EXISTS artist_member (
     artist_id       integer NOT NULL REFERENCES artist(id) ON DELETE CASCADE,
     member_id       integer NOT NULL,
     member_name     text NOT NULL,
     active          boolean DEFAULT true
 );
 
-CREATE TABLE artist_url (
+CREATE TABLE IF NOT EXISTS artist_url (
     artist_id       integer NOT NULL REFERENCES artist(id) ON DELETE CASCADE,
     url             text NOT NULL
 );
@@ -192,14 +182,14 @@ CREATE TABLE artist_url (
 -- Masters (canonical album groupings)
 -- ============================================
 
-CREATE TABLE master (
+CREATE TABLE IF NOT EXISTS master (
     id              integer PRIMARY KEY,
     title           text NOT NULL,
     main_release_id integer,
     year            smallint
 );
 
-CREATE TABLE master_artist (
+CREATE TABLE IF NOT EXISTS master_artist (
     master_id       integer NOT NULL REFERENCES master(id) ON DELETE CASCADE,
     artist_id       integer,
     artist_name     text NOT NULL
@@ -209,7 +199,7 @@ CREATE TABLE master_artist (
 -- Cache metadata (for tracking data freshness)
 -- ============================================
 
-CREATE TABLE cache_metadata (
+CREATE TABLE IF NOT EXISTS cache_metadata (
     release_id      integer PRIMARY KEY REFERENCES release(id) ON DELETE CASCADE,
     cached_at       timestamptz NOT NULL DEFAULT now(),
     source          text NOT NULL,  -- 'bulk_import' or 'api_fetch'
@@ -225,8 +215,7 @@ CREATE TABLE cache_metadata (
 -- in-memory + positive PG caches and before the Discogs API. TTL is
 -- enforced by the LML query inline (now() < attempted_at + ttl_seconds *
 -- interval '1 second'); a future cron may sweep expired rows.
-DROP TABLE IF EXISTS lookup_negative CASCADE;
-CREATE TABLE lookup_negative (
+CREATE TABLE IF NOT EXISTS lookup_negative (
     key_hash          bytea PRIMARY KEY,
     artist            text,
     track             text,
@@ -242,8 +231,7 @@ CREATE TABLE lookup_negative (
 -- Mirrored from alembic/versions/0003_wxyc_library_v2.py per the dual-write
 -- convention so a fresh rebuild produces the same end state as the alembic
 -- upgrade chain.
-DROP TABLE IF EXISTS wxyc_library CASCADE;
-CREATE TABLE wxyc_library (
+CREATE TABLE IF NOT EXISTS wxyc_library (
     library_id      integer PRIMARY KEY,
     artist_id       integer,
     artist_name     text NOT NULL,
