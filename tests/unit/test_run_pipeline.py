@@ -544,11 +544,12 @@ class TestPipelineTables:
         schema_sql = (
             Path(__file__).parent.parent.parent / "schema" / "create_database.sql"
         ).read_text()
-        # Find every "CREATE TABLE <name> (" header followed by a body
-        # containing "REFERENCES release(id)". This is intentionally
-        # forgiving of whitespace.
+        # Find every "CREATE TABLE [IF NOT EXISTS] <name> (" header
+        # followed by a body containing "REFERENCES release(id)". The
+        # ``IF NOT EXISTS`` form is required by WXYC/discogs-etl#242.
+        # Forgiving of whitespace.
         table_pattern = re.compile(
-            r"CREATE\s+TABLE\s+(\w+)\s*\((.*?)\n\);",
+            r"CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(\w+)\s*\((.*?)\n\);",
             re.DOTALL | re.IGNORECASE,
         )
         referrers: set[str] = set()

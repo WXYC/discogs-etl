@@ -111,17 +111,29 @@ def _apply_schema(db_url: str) -> None:
     a multi-statement execute, so we must order setup as:
       1. Create the unaccent + pg_trgm extensions.
       2. Define f_unaccent() (depends on unaccent).
-      3. Run create_database.sql (depends on f_unaccent).
+      3. Drop the core-table subgraph (clean-slate semantic this helper
+         contractually offers — tests in this module share a module-
+         scoped db_url and rely on _apply_schema to wipe between
+         classes).
+      4. Run create_database.sql (depends on f_unaccent).
     psql tolerates out-of-order setup because it continues past per-
     statement errors; psycopg does not, so this ordering is mandatory
     for the integration tests even if production gets away with running
     create_database.sql first.
+
+    Post-WXYC/discogs-etl#242, ``schema/create_database.sql`` is
+    ``CREATE TABLE IF NOT EXISTS``-only (preserves LML-back-patched
+    artwork across rebuilds). The explicit wipe lives in
+    ``drop_core_tables.sql``. This helper composes both — restoring
+    the pre-#242 destructive semantic for tests that need a clean slate
+    between classes sharing the module-scoped ``db_url`` fixture.
     """
     conn = psycopg.connect(db_url, autocommit=True)
     with conn.cursor() as cur:
         cur.execute("CREATE EXTENSION IF NOT EXISTS unaccent")
         cur.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm")
         cur.execute(SCHEMA_DIR.joinpath("create_functions.sql").read_text())
+        cur.execute(SCHEMA_DIR.joinpath("drop_core_tables.sql").read_text())
         cur.execute(SCHEMA_DIR.joinpath("create_database.sql").read_text())
     conn.close()
 

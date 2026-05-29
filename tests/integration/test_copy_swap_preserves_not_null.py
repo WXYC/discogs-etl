@@ -416,8 +416,14 @@ def _iter_column_lines(schema_text: str, table: str):
     separators so embedded commas inside comments (e.g. ``-- "A1", "B2"``)
     don't cross over into the next declaration.
     """
-    marker = f"CREATE TABLE {table} ("
-    start = schema_text.index(marker) + len(marker)
+    # Tolerate both bare and ``IF NOT EXISTS`` forms — the file flipped to
+    # the latter for the WXYC/discogs-etl#242 schema split.
+    for marker in (f"CREATE TABLE {table} (", f"CREATE TABLE IF NOT EXISTS {table} ("):
+        if marker in schema_text:
+            start = schema_text.index(marker) + len(marker)
+            break
+    else:
+        raise AssertionError(f"CREATE TABLE marker for {table!r} not found in schema")
     body = _extract_paren_body(schema_text, start)
     # Strip end-of-line SQL comments so commas inside comments don't bleed
     # into the next column declaration when we split on ``,``.

@@ -727,7 +727,12 @@ class TestMainArgParsing:
         assert call_args[0][2] == TABLES
 
     def test_base_only_mode_calls_parallel(self, tmp_path) -> None:
-        """--base-only mode calls _import_tables_parallel with base tables."""
+        """``--base-only`` (default, no --truncate-existing): the release
+        parent is loaded via ``import_release_via_upsert`` to preserve
+        LML-back-patched artwork columns (WXYC/discogs-etl#242), then
+        children are COPYed via ``_import_tables_parallel`` with empty
+        ``parent_tables`` (release is already in place from the upsert).
+        """
         from unittest.mock import MagicMock, patch
 
         csv_dir = tmp_path / "csv"
@@ -742,6 +747,7 @@ class TestMainArgParsing:
             ),
             patch.object(_ic.psycopg, "connect", return_value=mock_conn),
             patch.object(_ic, "_import_tables_parallel", return_value=100) as mock_parallel,
+            patch.object(_ic, "import_release_via_upsert", return_value=50) as mock_upsert,
             patch.object(_ic, "import_artwork", return_value=10),
             patch.object(_ic, "populate_release_year", return_value=50),
             patch.object(_ic, "populate_cache_metadata", return_value=50),
@@ -750,11 +756,59 @@ class TestMainArgParsing:
         ):
             _ic.main()
 
+        mock_upsert.assert_called_once()
+        upsert_args = mock_upsert.call_args
+        assert upsert_args[0][1] == csv_dir
+
         mock_parallel.assert_called_once()
         call_args = mock_parallel.call_args
         assert call_args[0][0] == "postgresql:///test"
         assert call_args[0][1] == csv_dir
-        # Parent tables are BASE_TABLES[:1], child tables are BASE_TABLES[1:]
+        # Default incremental path: release is loaded by import_release_via_upsert
+        # (so parent_tables is empty); children COPY in parallel as before.
+        assert call_args[1]["parent_tables"] == []
+        assert call_args[1]["child_tables"] == BASE_TABLES[1:]
+
+    def test_base_only_with_truncate_existing_uses_legacy_parallel(self, tmp_path) -> None:
+        """``--base-only --truncate-existing`` (operator-visible escape
+        hatch): TRUNCATE wiped release, so the legacy straight-COPY path
+        runs — release goes through ``_import_tables_parallel`` as the
+        sole parent, and ``import_release_via_upsert`` is NOT called.
+        Pins the contract that --truncate-existing's wipe-and-reload
+        semantics survive Option B."""
+        from unittest.mock import MagicMock, patch
+
+        csv_dir = tmp_path / "csv"
+        csv_dir.mkdir()
+
+        mock_conn = MagicMock()
+
+        with (
+            patch(
+                "sys.argv",
+                [
+                    "import_csv.py",
+                    "--base-only",
+                    "--truncate-existing",
+                    str(csv_dir),
+                    "postgresql:///test",
+                ],
+            ),
+            patch.object(_ic.psycopg, "connect", return_value=mock_conn),
+            patch.object(_ic, "_import_tables_parallel", return_value=100) as mock_parallel,
+            patch.object(_ic, "import_release_via_upsert") as mock_upsert,
+            patch.object(_ic, "_truncate_tables"),
+            patch.object(_ic, "import_artwork", return_value=10),
+            patch.object(_ic, "populate_release_year", return_value=50),
+            patch.object(_ic, "populate_cache_metadata", return_value=50),
+            patch.object(_ic, "create_track_count_table", return_value=20),
+            patch.object(_ic, "import_artist_details", return_value=20),
+        ):
+            _ic.main()
+
+        mock_upsert.assert_not_called()
+        mock_parallel.assert_called_once()
+        call_args = mock_parallel.call_args
         assert call_args[1]["parent_tables"] == BASE_TABLES[:1]
         assert call_args[1]["child_tables"] == BASE_TABLES[1:]
 

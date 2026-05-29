@@ -21,6 +21,7 @@ _spec.loader.exec_module(_ic)
 
 import_csv_func = _ic.import_csv
 import_artwork = _ic.import_artwork
+import_release_via_upsert = _ic.import_release_via_upsert
 create_track_count_table = _ic.create_track_count_table
 populate_cache_metadata = _ic.populate_cache_metadata
 populate_release_year = _ic.populate_release_year
@@ -683,6 +684,211 @@ class TestImportArtwork:
             "must stay NULL after import_artwork. If this regresses, the "
             "loader is writing speculative URIs to unrelated releases."
         )
+
+
+class TestImportArtworkPreservation:
+    """Verify the rebuild path preserves LML-back-patched artwork across runs
+    (WXYC/discogs-etl#242).
+
+    The five tests pin the acceptance grid the issue calls out:
+      1. `release_image.csv` lacks an entry for X → prior LML back-patch
+         (artwork_url + artwork_checked_at) is preserved.
+      2. `release_image.csv` HAS an entry for X → dump wins (EXCLUDED-first).
+      3. Freshly imported release with image in dump → artwork_checked_at
+         stamped at import time (matches LML's runtime stamping semantics).
+      4. Freshly imported release with NO image in dump → both columns
+         stay NULL ("never asked" — the partial index covers this case for
+         LML#221's drain).
+      5. Release present in last rebuild but not in the new dump → pruned
+         along with its FK-cascaded child rows.
+
+    These exercise ``import_release_via_upsert`` (the staging-table + UPSERT
+    that replaces today's drop+recreate-then-COPY for ``release``) plus
+    ``import_artwork``'s new ``artwork_checked_at = now()`` stamp.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _fresh_schema(self, fresh_db_url):
+        """Each test gets its own DB so seeded back-patches + CSV state are
+        isolated. Cheaper schema-apply than the full ETL setup other classes
+        use, and the per-test isolation is necessary because tests 1, 2, 5
+        mutate the same release_id."""
+        self.db_url = fresh_db_url
+        conn = psycopg.connect(fresh_db_url, autocommit=True)
+        with conn.cursor() as cur:
+            cur.execute(SCHEMA_DIR.joinpath("create_database.sql").read_text())
+        conn.close()
+
+    def _write_release_csv(self, tmp_path: Path, rows: list[tuple]) -> None:
+        """Write a minimal release.csv covering the columns BASE_TABLES['release']
+        expects. Each row: (id, title, country, released, format, master_id)."""
+        lines = ["id,title,country,released,format,master_id"]
+        for row in rows:
+            lines.append(",".join("" if v is None else str(v) for v in row))
+        (tmp_path / "release.csv").write_text("\n".join(lines) + "\n")
+
+    def _write_release_image_csv(self, tmp_path: Path, rows: list[tuple]) -> None:
+        """Write release_image.csv. Each row: (release_id, type, uri)."""
+        lines = ["release_id,type,width,height,uri"]
+        for release_id, img_type, uri in rows:
+            lines.append(f"{release_id},{img_type},600,600,{uri}")
+        (tmp_path / "release_image.csv").write_text("\n".join(lines) + "\n")
+
+    def _rebuild(self, tmp_path: Path) -> None:
+        """Run the post-Option-B base import flow against tmp_path's CSVs:
+        upsert from release_staging, then back-patch artwork."""
+        conn = psycopg.connect(self.db_url)
+        import_release_via_upsert(conn, tmp_path)
+        import_artwork(conn, tmp_path)
+        conn.close()
+
+    def _read_artwork(self, release_id: int) -> tuple:
+        conn = psycopg.connect(self.db_url)
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT artwork_url, artwork_checked_at FROM release WHERE id = %s",
+                (release_id,),
+            )
+            row = cur.fetchone()
+        conn.close()
+        return row
+
+    def test_rebuild_preserves_artwork_when_dump_missing_image(self, tmp_path) -> None:
+        """The issue's verbatim acceptance criterion: a release whose
+        ``release_image.csv`` row is absent retains the prior LML
+        back-patched ``artwork_url`` + ``artwork_checked_at``."""
+        conn = psycopg.connect(self.db_url)
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO release (id, title, artwork_url, artwork_checked_at) "
+                "VALUES (501, 'Seed', 'lml-backpatched', '2026-04-01 00:00:00+00')"
+            )
+        conn.commit()
+        conn.close()
+
+        self._write_release_csv(tmp_path, [(501, "Seed", "US", "2024", "LP", None)])
+        # No release_image.csv row for 501.
+        self._write_release_image_csv(tmp_path, [])
+        self._rebuild(tmp_path)
+
+        url, checked_at = self._read_artwork(501)
+        assert url == "lml-backpatched", (
+            "rebuild wiped the prior LML back-patch — Option B's UPSERT must "
+            "exclude artwork_url from the SET list so prior back-patches survive."
+        )
+        assert checked_at is not None
+        assert checked_at.year == 2026 and checked_at.month == 4
+
+    def test_rebuild_overwrites_artwork_when_dump_has_image(self, tmp_path) -> None:
+        """When the bulk dump has a real artwork URL for a previously
+        back-patched release, the dump wins (EXCLUDED-first precedence)
+        and ``artwork_checked_at`` is restamped at rebuild time."""
+        conn = psycopg.connect(self.db_url)
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO release (id, title, artwork_url, artwork_checked_at) "
+                "VALUES (502, 'Seed', 'lml-backpatched', '2026-04-01 00:00:00+00')"
+            )
+        conn.commit()
+        conn.close()
+
+        self._write_release_csv(tmp_path, [(502, "Seed", "US", "2024", "LP", None)])
+        self._write_release_image_csv(tmp_path, [(502, "primary", "dump-uri")])
+        # Capture a lower bound for the post-rebuild artwork_checked_at.
+        conn = psycopg.connect(self.db_url)
+        with conn.cursor() as cur:
+            cur.execute("SELECT now()")
+            rebuild_lower_bound = cur.fetchone()[0]
+        conn.close()
+        self._rebuild(tmp_path)
+
+        url, checked_at = self._read_artwork(502)
+        assert url == "dump-uri"
+        assert checked_at is not None and checked_at >= rebuild_lower_bound
+
+    def test_rebuild_stamps_checked_at_for_freshly_imported_release(self, tmp_path) -> None:
+        """A first-time-imported release whose dump carries an image gets
+        ``artwork_checked_at`` stamped at import time. Matches the semantics
+        LML's runtime ``write_release`` already applies (LML#423)."""
+        self._write_release_csv(tmp_path, [(503, "Fresh", "US", "2024", "LP", None)])
+        self._write_release_image_csv(tmp_path, [(503, "primary", "dump-uri")])
+        self._rebuild(tmp_path)
+
+        url, checked_at = self._read_artwork(503)
+        assert url == "dump-uri"
+        assert checked_at is not None, (
+            "import_artwork must stamp artwork_checked_at = now() when it "
+            "sets artwork_url from the dump — otherwise LML's predicate "
+            "(LML#423) treats the row as 'never asked' and burns API quota."
+        )
+
+    def test_rebuild_leaves_checked_at_null_when_no_dump_image_on_fresh_release(
+        self, tmp_path
+    ) -> None:
+        """A first-time-imported release with no dump image stays in the
+        'never asked' state (both columns NULL). LML#221's partial index
+        ``release_artwork_null_idx`` is what covers this case for the
+        drain."""
+        self._write_release_csv(tmp_path, [(504, "Imageless", "US", "2024", "LP", None)])
+        self._write_release_image_csv(tmp_path, [])
+        self._rebuild(tmp_path)
+
+        url, checked_at = self._read_artwork(504)
+        assert url is None
+        assert checked_at is None
+
+    def test_rebuild_purges_releases_not_in_dump(self, tmp_path) -> None:
+        """When a release falls out of the new dump (artist removed from
+        the library, etc.), the rebuild path removes it and its child
+        rows. With Option B, child cleanup is via the §3a TRUNCATE step
+        (TRUNCATE release_artist + siblings before re-COPY); the parent
+        is removed by ``DELETE FROM release WHERE id NOT IN staging``.
+        End state: 506 absent from release; absent from release_artist
+        (was wiped by TRUNCATE and never re-COPYed because its row isn't
+        in the new dump's release_artist.csv); 505 present in both."""
+        conn = psycopg.connect(self.db_url)
+        with conn.cursor() as cur:
+            cur.execute("INSERT INTO release (id, title) VALUES (505, 'Stays'), (506, 'Goes')")
+            cur.execute(
+                "INSERT INTO release_artist (release_id, artist_name, extra) "
+                "VALUES (505, 'Old Artist A', 0), (506, 'Old Artist B', 0)"
+            )
+        conn.commit()
+        conn.close()
+
+        # Only 505 in the new dump.
+        self._write_release_csv(tmp_path, [(505, "Stays", "US", "2024", "LP", None)])
+        self._write_release_image_csv(tmp_path, [])
+        (tmp_path / "release_artist.csv").write_text(
+            "release_id,artist_id,artist_name,extra\n505,,Artist A,0\n"
+        )
+        self._rebuild(tmp_path)
+        # Re-COPY the children the way the full base step would. The
+        # rebuild's TRUNCATE has already cleared them.
+        conn = psycopg.connect(self.db_url)
+        artist_cfg = next(t for t in BASE_TABLES if t["table"] == "release_artist")
+        import_csv_func(
+            conn,
+            tmp_path / artist_cfg["csv_file"],
+            artist_cfg["table"],
+            artist_cfg["csv_columns"],
+            artist_cfg["db_columns"],
+            artist_cfg["required"],
+            artist_cfg["transforms"],
+            unique_key=artist_cfg.get("unique_key"),
+        )
+        conn.commit()
+        conn.close()
+
+        conn = psycopg.connect(self.db_url)
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM release ORDER BY id")
+            release_ids = [r[0] for r in cur.fetchall()]
+            cur.execute("SELECT release_id FROM release_artist ORDER BY release_id")
+            artist_release_ids = [r[0] for r in cur.fetchall()]
+        conn.close()
+        assert release_ids == [505]
+        assert artist_release_ids == [505]
 
 
 class TestImportArtworkMissing:

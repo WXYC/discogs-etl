@@ -193,8 +193,13 @@ class TestCreateDatabase:
             cur.execute(SCHEMA_DIR.joinpath("create_database.sql").read_text())
         conn.close()
 
-    def test_schema_clears_stale_data_on_rerun(self) -> None:
-        """Re-running the schema drops old data so import doesn't hit UniqueViolation."""
+    def test_schema_preserves_data_on_rerun(self) -> None:
+        """Re-running ``create_database.sql`` against a populated DB must
+        be a no-op on existing rows. Pre-#242 the file had a DROP block
+        that wiped everything; Option B moved the DROPs to
+        ``drop_core_tables.sql`` (invoked only by ``--fresh-rebuild``) so
+        LML-back-patched ``release.artwork_url`` survives across rebuilds.
+        Drift here would silently re-break preservation."""
         conn = psycopg.connect(self.db_url, autocommit=True)
 
         # Insert data as if a previous pipeline run completed
@@ -207,16 +212,17 @@ class TestCreateDatabase:
             cur.execute("SELECT count(*) FROM release")
             assert cur.fetchone()[0] == 1
 
-        # Re-run schema (simulates a fresh pipeline run)
+        # Re-run create_database.sql (simulates the default incremental
+        # rebuild path — every CREATE is IF NOT EXISTS).
         with conn.cursor() as cur:
             cur.execute(SCHEMA_DIR.joinpath("create_database.sql").read_text())
 
-        # Tables should be empty — no stale data to conflict with new imports
+        # Tables should still have the seeded rows — the file is idempotent.
         with conn.cursor() as cur:
             cur.execute("SELECT count(*) FROM release")
-            assert cur.fetchone()[0] == 0
+            assert cur.fetchone()[0] == 1
             cur.execute("SELECT count(*) FROM release_artist")
-            assert cur.fetchone()[0] == 0
+            assert cur.fetchone()[0] == 1
 
         conn.close()
 
@@ -589,3 +595,78 @@ class TestSchemaProductionOrdering:
                 assert cur.fetchone()[0] == "Nilufer Yanya"
         finally:
             conn.close()
+
+
+class TestSchemaIdempotenceDriftGuards:
+    """Pure-text drift guards for the WXYC/discogs-etl#242 schema split.
+
+    ``schema/create_database.sql`` must be idempotent (safe to apply against
+    a populated DB) so the default rebuild path preserves LML-back-patched
+    artwork. ``schema/drop_core_tables.sql`` exists as the explicit-wipe
+    escape hatch invoked only by ``--fresh-rebuild``. Both files are
+    operator-visible and silent reverts would re-break artwork
+    preservation, so we pin their contents."""
+
+    def test_create_database_sql_uses_if_not_exists(self) -> None:
+        """Every ``CREATE TABLE`` in ``schema/create_database.sql`` must be
+        ``CREATE TABLE IF NOT EXISTS``. A bare ``CREATE TABLE`` would
+        fail on second-and-later rebuilds (table already exists) — but
+        more importantly it signals the file has been reverted toward
+        the pre-#242 drop-and-recreate convention, which silently
+        wipes ``release.artwork_url`` + ``release.artwork_checked_at``
+        on every rebuild and re-breaks the LML#221 preservation
+        guarantee."""
+        sql_text = SCHEMA_DIR.joinpath("create_database.sql").read_text()
+        bare_creates: list[str] = []
+        for raw in sql_text.splitlines():
+            line = raw.strip()
+            if line.startswith("CREATE TABLE ") and not line.startswith(
+                "CREATE TABLE IF NOT EXISTS"
+            ):
+                bare_creates.append(raw)
+        assert bare_creates == [], (
+            "create_database.sql has bare CREATE TABLE statements: "
+            f"{bare_creates}. WXYC/discogs-etl#242 requires every CREATE "
+            "TABLE here to be IF NOT EXISTS so the file is safe to apply "
+            "against a populated DB. The explicit-wipe path lives in "
+            "schema/drop_core_tables.sql."
+        )
+
+    def test_drop_core_tables_sql_covers_full_release_subgraph(self) -> None:
+        """Every table that the pre-#242 ``create_database.sql`` dropped
+        must have a DROP TABLE entry in ``schema/drop_core_tables.sql``.
+        Without this, ``--fresh-rebuild`` would silently leave stale
+        rows under the freshly-CREATE-IF-NOT-EXISTS tables and operators
+        relying on the flag for cache-corruption recovery would see
+        unexpected data."""
+        drop_sql = SCHEMA_DIR.joinpath("drop_core_tables.sql").read_text()
+        expected_dropped = [
+            "cache_metadata",
+            "master_artist",
+            "master",
+            "artist_url",
+            "artist_member",
+            "artist_name_variation",
+            "artist_alias",
+            "artist",
+            "release_video",
+            "release_track_artist",
+            "release_track",
+            "release_style",
+            "release_genre",
+            "release_label",
+            "release_artist",
+            "release",
+            "lookup_negative",
+            "wxyc_library",
+        ]
+        missing = [
+            table
+            for table in expected_dropped
+            if f"DROP TABLE IF EXISTS {table} CASCADE" not in drop_sql
+        ]
+        assert missing == [], (
+            f"drop_core_tables.sql is missing DROPs for: {missing}. These "
+            "tables were dropped by pre-#242 create_database.sql and must "
+            "still be dropped under --fresh-rebuild for parity."
+        )
