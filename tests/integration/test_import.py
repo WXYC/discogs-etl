@@ -539,7 +539,15 @@ class TestPopulateCacheMetadata:
 
 
 class TestImportArtwork:
-    """Verify import_artwork() populates artwork_url from release_image.csv."""
+    """Verify ``import_artwork()`` populates ``artwork_url`` from
+    ``release_image.csv``. Parity coverage for WXYC/discogs-etl#240 —
+    the four cases the issue mandates are pinned across this class
+    (primary preferred, fallback when no primary, empty URI skipped) +
+    ``TestImportArtworkMissing`` (CSV file absent) + the gap case
+    ``test_no_row_for_release_leaves_artwork_null`` below (CSV present
+    but no row for the target release). A deliberate breakage of
+    ``import_artwork``'s primary-preference branch fails
+    ``test_primary_image_preferred``."""
 
     @pytest.fixture(autouse=True, scope="class")
     def _set_up_database(self, db_url):
@@ -642,6 +650,39 @@ class TestImportArtwork:
         conn.close()
         assert url is None
         assert count == 0
+
+    def test_no_row_for_release_leaves_artwork_null(self, tmp_path) -> None:
+        """A release with no row in ``release_image.csv`` keeps
+        ``artwork_url IS NULL`` after the import — the "never asked" path
+        downstream. Distinct from ``TestImportArtworkMissing`` (whole CSV
+        absent) and ``test_empty_uri_skipped`` (row exists, URI empty);
+        this is the silent-not-mentioned case the bulk loader has to
+        leave untouched. Closing the WXYC/discogs-etl#240 acceptance
+        matrix."""
+        csv_path = tmp_path / "release_image.csv"
+        # Image row exists for 101, NOT for 102 — even though release 102 is
+        # present in the table from the class fixture.
+        csv_path.write_text(
+            "release_id,type,width,height,uri\n"
+            "101,primary,600,600,https://img.discogs.com/no-row-101.jpg\n"
+        )
+        conn = psycopg.connect(self.db_url)
+        with conn.cursor() as cur:
+            cur.execute("UPDATE release SET artwork_url = NULL WHERE id = 102")
+        conn.commit()
+        import_artwork(conn, tmp_path)
+        conn.close()
+
+        conn = self._connect()
+        with conn.cursor() as cur:
+            cur.execute("SELECT artwork_url FROM release WHERE id = 102")
+            url = cur.fetchone()[0]
+        conn.close()
+        assert url is None, (
+            "release 102 has no row in release_image.csv — its artwork_url "
+            "must stay NULL after import_artwork. If this regresses, the "
+            "loader is writing speculative URIs to unrelated releases."
+        )
 
 
 class TestImportArtworkMissing:
