@@ -1294,3 +1294,25 @@ class TestDedupCopySwapPreservesMasterId:
         conn.close()
         # Release 1 lost the dedup; release 2 (US) won; release 3 untouched.
         assert rows == [(2, 100), (3, 200)], f"master_id values not preserved post-dedup: {rows}"
+
+    def test_artwork_checked_at_column_persists_after_copy_swap(self) -> None:
+        """Regression for WXYC/discogs-etl#239: artwork_checked_at must survive
+        the same copy-swap path that already preserves master_id.
+
+        ``artwork_checked_at`` is the schema-level signal LML uses to
+        distinguish "never asked" from "asked, no image". Dropping it from
+        the dedup SELECT list would silently reintroduce the LML#414
+        ambiguity on every monthly rebuild — exactly the failure mode #129
+        already caught for master_id, applied to a fresh column.
+        """
+        conn = self._connect()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_name = 'release' AND column_name = 'artwork_checked_at'"
+            )
+            assert cur.fetchone() is not None, (
+                "artwork_checked_at column dropped by copy-swap — see "
+                "WXYC/discogs-etl#239 / WXYC/library-metadata-lookup#423"
+            )
+        conn.close()

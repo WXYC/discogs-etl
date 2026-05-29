@@ -71,7 +71,20 @@ class TestCreateDatabase:
     @pytest.mark.parametrize(
         "table, expected_columns",
         [
-            ("release", {"id", "title", "release_year", "country", "artwork_url", "master_id"}),
+            # ``artwork_checked_at`` added per WXYC/discogs-etl#239 — the
+            # dual-write parity pin against alembic 0008.
+            (
+                "release",
+                {
+                    "id",
+                    "title",
+                    "release_year",
+                    "country",
+                    "artwork_url",
+                    "master_id",
+                    "artwork_checked_at",
+                },
+            ),
             ("release_artist", {"release_id", "artist_name", "extra"}),
             ("release_label", {"release_id", "label_name"}),
             ("release_track", {"release_id", "sequence", "position", "title", "duration"}),

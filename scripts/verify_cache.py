@@ -956,7 +956,7 @@ PRUNE_COPY_TABLES = [
     (
         "release",
         "new_release",
-        "id, title, release_year, country, artwork_url, released, format, master_id",
+        "id, title, release_year, country, artwork_url, released, format, master_id, artwork_checked_at",
         "id",
     ),
     (
@@ -1008,6 +1008,7 @@ COPY_TABLE_SPEC = [
             "released",
             "format",
             "master_id",
+            "artwork_checked_at",
         ],
     ),
     (
