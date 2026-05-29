@@ -23,6 +23,16 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
+SCHEMA_DIR = REPO_ROOT / "schema"
+
+
+def _apply_create_database_sql(db_url: str) -> None:
+    """Apply the canonical schema so later migrations that ALTER the base
+    tables (e.g. 0008's release.artwork_checked_at) have a target."""
+    with psycopg.connect(db_url, autocommit=True) as conn, conn.cursor() as cur:
+        cur.execute(SCHEMA_DIR.joinpath("create_database.sql").read_text())
+
+
 def _run_alembic(args: list[str], db_url: str) -> subprocess.CompletedProcess[str]:
     env = {**os.environ, "DATABASE_URL_DISCOGS": db_url}
     env.pop("DATABASE_URL", None)
@@ -37,12 +47,12 @@ def _run_alembic(args: list[str], db_url: str) -> subprocess.CompletedProcess[st
 
 @pytest.mark.pg
 def test_lookup_negative_table_created_at_head(db_url: str) -> None:
-    # Stamp at 0005 to keep this test minimal — 0006 is self-contained
-    # (no FK to any earlier table) so a standalone apply is valid coverage.
-    # Historically this also avoided 0004's `$SHAREDIR/tsearch_data/`
-    # dependency on the base test container; post-#223 0004 is filesystem-
-    # independent and the full chain would also work, but collapsing the
-    # test setup is deferred (see CLAUDE.md's 0006 entry).
+    # Apply the canonical schema first so later migrations (0008) that
+    # ALTER existing tables have a target. Then stamp at 0005 to skip the
+    # earlier chain — 0006 is self-contained (no FK to any other table) and
+    # 0007 needs the wxyc-postgres image's `$SHAREDIR/tsearch_data/`
+    # rules file, both of which the docker compose `db` container provides.
+    _apply_create_database_sql(db_url)
     stamp = _run_alembic(["stamp", "0005_release_track_artist_role"], db_url)
     assert stamp.returncode == 0, (
         f"alembic stamp failed:\nstdout: {stamp.stdout}\nstderr: {stamp.stderr}"
@@ -125,6 +135,7 @@ def test_lookup_negative_round_trip_insert_then_query(db_url: str) -> None:
     # documented shape and reads it back. Catches DDL-vs-DML drift if e.g.
     # the migration ever flips key_hash to non-PK or makes attempted_at
     # nullable.
+    _apply_create_database_sql(db_url)
     stamp = _run_alembic(["stamp", "0005_release_track_artist_role"], db_url)
     assert stamp.returncode == 0, f"alembic stamp failed: {stamp.stderr}"
     result = _run_alembic(["upgrade", "head"], db_url)

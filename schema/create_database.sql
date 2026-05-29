@@ -64,15 +64,24 @@ DROP TABLE IF EXISTS release CASCADE;
 
 -- Releases
 CREATE TABLE release (
-    id              integer PRIMARY KEY,
-    title           text NOT NULL,
-    release_year    smallint,
-    country         text,
-    artwork_url     text,
-    released        text,              -- full date string, e.g. "2024-03-15"
-    format          text,              -- normalized format category: 'Vinyl', 'CD', etc.
-    master_id       integer          -- Discogs master ID; used by dedup partitioning, persists post-swap (see DEDUP_TABLES in scripts/dedup_releases.py)
+    id                  integer PRIMARY KEY,
+    title               text NOT NULL,
+    release_year        smallint,
+    country             text,
+    artwork_url         text,
+    released            text,              -- full date string, e.g. "2024-03-15"
+    format              text,              -- normalized format category: 'Vinyl', 'CD', etc.
+    master_id           integer,           -- Discogs master ID; used by dedup partitioning, persists post-swap (see DEDUP_TABLES in scripts/dedup_releases.py)
+    artwork_checked_at  timestamptz        -- WXYC/discogs-etl#239. NULL = never asked, set = LML asked Discogs at lookup time. LML's predicate honors this so genuinely-imageless releases aren't refetched. Index below covers LML#221's never-asked drain.
 );
+
+-- Partial index for LML#221's never-asked top-up drain (WXYC/discogs-etl#239).
+-- Mirrored in alembic/versions/0008_release_artwork_checked_at.py; the
+-- dual-write convention keeps the fresh-rebuild and alembic-upgrade paths
+-- in parity.
+CREATE INDEX IF NOT EXISTS release_artwork_null_idx
+    ON release (id)
+    WHERE artwork_url IS NULL AND artwork_checked_at IS NULL;
 
 -- Artists on releases
 CREATE TABLE release_artist (

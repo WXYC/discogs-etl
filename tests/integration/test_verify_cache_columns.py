@@ -135,6 +135,20 @@ class TestPruneCopyTablesCoversSchema:
         assert "released" in cols, "release.released dropped — see WXYC/discogs-etl outage 2026-05"
         assert "master_id" in cols, "release.master_id dropped — see WXYC/discogs-etl#129"
 
+    def test_release_keeps_artwork_checked_at(self) -> None:
+        """Regression pin for WXYC/discogs-etl#239.
+
+        ``artwork_checked_at`` is set by LML's live-API path on every cache
+        write_release. Dropping it from the prune copy-swap re-introduces
+        the never-asked / asked-but-empty ambiguity that LML#414's runtime
+        repair and LML#423's predicate update were designed to resolve.
+        """
+        cols = set(_columns_in_copy_list("release", PRUNE_COPY_TABLES))
+        assert "artwork_checked_at" in cols, (
+            "release.artwork_checked_at dropped from PRUNE_COPY_TABLES — "
+            "see WXYC/discogs-etl#239 / WXYC/library-metadata-lookup#423"
+        )
+
     def test_release_artist_keeps_role(self) -> None:
         cols = set(_columns_in_copy_list("release_artist", PRUNE_COPY_TABLES))
         assert "role" in cols, "release_artist.role dropped — see WXYC/discogs-etl#218"
