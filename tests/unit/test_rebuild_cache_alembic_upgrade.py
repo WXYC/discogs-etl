@@ -25,17 +25,8 @@ SCRIPT_PATH = REPO_ROOT / "scripts" / "rebuild-cache.sh"
 
 
 @pytest.fixture(scope="module")
-def script_text() -> str:
-    return SCRIPT_PATH.read_text()
-
-
-@pytest.fixture(scope="module")
 def script_lines() -> list[str]:
     return SCRIPT_PATH.read_text().splitlines()
-
-
-def _non_comment_lines(lines: list[str]) -> list[str]:
-    return [line for line in lines if not line.lstrip().startswith("#")]
 
 
 def _first_index(lines: list[str], needle: str) -> int:
@@ -49,7 +40,7 @@ def _first_index(lines: list[str], needle: str) -> int:
     raise AssertionError(f"{needle!r} not found in non-comment lines of {SCRIPT_PATH}")
 
 
-def test_runs_alembic_upgrade_head(script_text: str) -> None:
+def test_runs_alembic_upgrade_head(script_lines: list[str]) -> None:
     """#222: the script must invoke ``alembic upgrade head`` before the pipeline.
 
     Without this, a new column added in a migration between rebuilds is not
@@ -58,8 +49,8 @@ def test_runs_alembic_upgrade_head(script_text: str) -> None:
     rebuild applies pending migrations automatically becomes true again
     only when this command is on the active script path.
     """
-    code = "\n".join(_non_comment_lines(script_text.splitlines()))
-    assert "alembic upgrade head" in code, (
+    non_comment = [line for line in script_lines if not line.lstrip().startswith("#")]
+    assert any("alembic upgrade head" in line for line in non_comment), (
         "rebuild-cache.sh must invoke 'alembic upgrade head' between dep "
         "refresh and the pipeline so destination-DB schema drift can't "
         "surface as a COPY error. See #222."
@@ -82,51 +73,42 @@ def test_alembic_upgrade_runs_before_pipeline(script_lines: list[str]) -> None:
     )
 
 
-def test_alembic_upgrade_skipped_under_smoke(script_text: str) -> None:
+def test_alembic_upgrade_skipped_under_smoke(script_lines: list[str]) -> None:
     """#222: ``REBUILD_SMOKE=1`` must not write to prod.
 
-    The smoke mode exits before any DB writes (validated by the existing
-    ``REBUILD_SMOKE=1`` short-circuit at the curl Range-request step).
-    ``alembic upgrade head`` is a DB write -- gate it behind the same
-    smoke check so a smoke run stays read-only against the destination.
-    The suggested-approach guard is ``[ "${REBUILD_SMOKE:-}" != "1" ]``;
-    any equivalent (e.g. inverted ``if [ ... = "1" ]`` early exit on the
-    block) is fine, but the upgrade line itself must be reachable only
-    when ``REBUILD_SMOKE`` is unset or not ``1``.
+    Smoke mode is read-only by contract — the existing curl Range-request
+    smoke block exits before any DB writes. ``alembic upgrade head`` is a
+    DB write, so the upgrade line must only be reachable when
+    ``REBUILD_SMOKE`` is unset or not ``1``. Pin by requiring a
+    ``REBUILD_SMOKE`` reference on one of the few non-comment lines
+    immediately preceding the upgrade call.
     """
-    code = "\n".join(_non_comment_lines(script_text.splitlines()))
-    upgrade_idx = code.find("alembic upgrade head")
-    assert upgrade_idx >= 0, "alembic upgrade head not present"
-    # Look at the ~400 chars preceding the upgrade for the smoke guard. This
-    # is a structural proxy: a guard close to the call site documents intent
-    # and survives ordinary refactors. The smoke mode's existing curl-Range
-    # block lives much further down the file, so this window won't match
-    # that unrelated guard.
-    window_start = max(0, upgrade_idx - 400)
-    window = code[window_start:upgrade_idx]
-    assert "REBUILD_SMOKE" in window, (
+    upgrade_idx = _first_index(script_lines, "alembic upgrade head")
+    # Walk back through non-comment lines until we find a REBUILD_SMOKE
+    # guard, allowing a short blank-line gap. 8 non-comment lines is more
+    # than enough for an `if` + `echo` + `(cd ... && ...)` shape and small
+    # enough that the existing smoke block 60+ lines below can't match.
+    preceding_non_comment = [
+        line
+        for line in script_lines[:upgrade_idx]
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    assert any("REBUILD_SMOKE" in line for line in preceding_non_comment[-8:]), (
         "The 'alembic upgrade head' call must be guarded by a REBUILD_SMOKE "
         "check so a smoke run does not write to the destination DB. See #222."
     )
 
 
-def test_alembic_upgrade_runs_in_repo_dir(script_text: str) -> None:
+def test_alembic_upgrade_runs_in_repo_dir(script_lines: list[str]) -> None:
     """#222: alembic must run from ``$REPO_DIR`` so it picks up ``alembic.ini``.
 
     Without ``cd "$REPO_DIR"`` (or its subshell equivalent), alembic
-    resolves ``alembic.ini`` against the cwd of the cron invocation,
-    which is not guaranteed to be the repo root. The dep-refresh step
-    just above already shows the convention: operate inside ``$REPO_DIR``
-    rather than relying on cron's cwd.
+    resolves ``alembic.ini`` against cron's cwd, which is not guaranteed
+    to be the repo root.
     """
-    code = "\n".join(_non_comment_lines(script_text.splitlines()))
-    upgrade_idx = code.find("alembic upgrade head")
-    assert upgrade_idx >= 0, "alembic upgrade head not present"
-    # The call site must mention $REPO_DIR within a small window -- either as
-    # a leading 'cd "$REPO_DIR" &&' or wrapped in a subshell '(cd "$REPO_DIR" && ...)'.
-    window_start = max(0, upgrade_idx - 200)
-    window = code[window_start : upgrade_idx + len("alembic upgrade head")]
-    assert "$REPO_DIR" in window, (
-        "The 'alembic upgrade head' call must run inside $REPO_DIR so it "
+    upgrade_idx = _first_index(script_lines, "alembic upgrade head")
+    assert "$REPO_DIR" in script_lines[upgrade_idx], (
+        "The 'alembic upgrade head' line must mention $REPO_DIR (e.g. "
+        "via 'cd \"$REPO_DIR\" && alembic upgrade head') so alembic "
         "picks up the repo's alembic.ini. See #222."
     )

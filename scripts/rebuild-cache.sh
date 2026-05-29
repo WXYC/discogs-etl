@@ -125,22 +125,13 @@ fi
 
 # ---------------------------------------------------------------------------
 # 2b. Apply any pending alembic migrations against the destination DB.
-#     Required so that schema changes added between rebuilds (new columns,
-#     new tables) are present before the converter starts emitting CSVs
-#     that reference them. Without this, the next monthly tick after a
-#     migration merges to main fails at the COPY for the affected table
-#     (Railway's schema is one revision behind; the GH Actions cron that
-#     used to run this step was disabled 2026-05-05). See #222.
-#
-#     A no-op when the DB is already at head, so it is safe to keep on
-#     unconditionally — same posture as --truncate-existing below.
-#     Preserves entity.identity + alembic_version (the migrations chain
-#     only edits its own audit table; --truncate-existing's allowlist
-#     already excludes both).
-#
-#     Skipped under REBUILD_SMOKE=1 — smoke mode is read-only by contract
-#     (see the curl Range-request smoke block at step 5) and an alembic
-#     upgrade is a DB write.
+#     Without this, the next monthly tick after a migration merges to main
+#     fails at the COPY for the affected table (Railway's schema is one
+#     revision behind; the GH Actions cron that used to apply migrations
+#     was disabled 2026-05-05). No-op when the DB is already at head, so
+#     safe to keep on unconditionally — same posture as --truncate-existing.
+#     Skipped under REBUILD_SMOKE=1 because the upgrade is a DB write and
+#     smoke mode is read-only by contract (see step 5). See #222.
 # ---------------------------------------------------------------------------
 if [ "${REBUILD_SMOKE:-}" != "1" ]; then
     echo "[$(date -u +%H:%M:%SZ)] apply pending alembic migrations against \$DATABASE_URL_DISCOGS"
