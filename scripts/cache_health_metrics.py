@@ -180,9 +180,13 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
 
+    # Skip boto3 client construction on --dry-run so the script stays
+    # runnable in environments without boto3 (a [dev]-only dep) or AWS
+    # credentials — matches the "skip the CloudWatch publish" semantic.
+    cloudwatch_client = None if args.dry_run else _build_cloudwatch_client()
     return run(
         database_url=database_url,
-        cloudwatch_client=_build_cloudwatch_client(),
+        cloudwatch_client=cloudwatch_client,
         namespace=args.namespace,
         dry_run=args.dry_run,
     )
