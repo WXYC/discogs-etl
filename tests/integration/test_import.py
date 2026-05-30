@@ -886,9 +886,7 @@ class TestImportArtworkPreservation:
 
         # Header-only release.csv (no rows). import_csv will COPY 0 rows
         # into release_staging, tripping the safety floor.
-        (tmp_path / "release.csv").write_text(
-            "id,title,country,released,format,master_id\n"
-        )
+        (tmp_path / "release.csv").write_text("id,title,country,released,format,master_id\n")
         (tmp_path / "release_image.csv").write_text("release_id,type,width,height,uri\n")
 
         upsert_conn = psycopg.connect(self.db_url)
