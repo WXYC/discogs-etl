@@ -687,25 +687,8 @@ class TestImportArtwork:
 
 
 class TestImportArtworkPreservation:
-    """Verify the rebuild path preserves LML-back-patched artwork across runs
-    (WXYC/discogs-etl#242).
-
-    The five tests pin the acceptance grid the issue calls out:
-      1. `release_image.csv` lacks an entry for X → prior LML back-patch
-         (artwork_url + artwork_checked_at) is preserved.
-      2. `release_image.csv` HAS an entry for X → dump wins (EXCLUDED-first).
-      3. Freshly imported release with image in dump → artwork_checked_at
-         stamped at import time (matches LML's runtime stamping semantics).
-      4. Freshly imported release with NO image in dump → both columns
-         stay NULL ("never asked" — the partial index covers this case for
-         LML#221's drain).
-      5. Release present in last rebuild but not in the new dump → pruned
-         along with its FK-cascaded child rows.
-
-    These exercise ``import_release_via_upsert`` (the staging-table + UPSERT
-    that replaces today's drop+recreate-then-COPY for ``release``) plus
-    ``import_artwork``'s new ``artwork_checked_at = now()`` stamp.
-    """
+    """Acceptance grid for WXYC/discogs-etl#242 — the rebuild preserves
+    LML-back-patched ``(artwork_url, artwork_checked_at)`` across runs."""
 
     @pytest.fixture(autouse=True)
     def _fresh_schema(self, fresh_db_url):
@@ -889,6 +872,37 @@ class TestImportArtworkPreservation:
         conn.close()
         assert release_ids == [505]
         assert artist_release_ids == [505]
+
+    def test_rebuild_refuses_empty_staging(self, tmp_path) -> None:
+        """A truncated / mid-write ``release.csv`` (0 rows after the COPY
+        skip-on-required-null path) would otherwise let the DELETE step
+        wipe every release. Safety floor in
+        ``import_release_via_upsert`` raises instead."""
+        conn = psycopg.connect(self.db_url)
+        with conn.cursor() as cur:
+            cur.execute("INSERT INTO release (id, title) VALUES (507, 'Stays')")
+        conn.commit()
+        conn.close()
+
+        # Header-only release.csv (no rows). import_csv will COPY 0 rows
+        # into release_staging, tripping the safety floor.
+        (tmp_path / "release.csv").write_text(
+            "id,title,country,released,format,master_id\n"
+        )
+        (tmp_path / "release_image.csv").write_text("release_id,type,width,height,uri\n")
+
+        upsert_conn = psycopg.connect(self.db_url)
+        with pytest.raises(RuntimeError, match="release_staging is empty"):
+            import_release_via_upsert(upsert_conn, tmp_path)
+        upsert_conn.close()
+
+        # Pre-existing release survived; nothing was DELETEd.
+        conn = psycopg.connect(self.db_url)
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM release ORDER BY id")
+            release_ids = [r[0] for r in cur.fetchall()]
+        conn.close()
+        assert release_ids == [507]
 
 
 class TestImportArtworkMissing:
