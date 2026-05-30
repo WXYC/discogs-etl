@@ -58,8 +58,12 @@ def _parse_create_table_columns(table_name: str) -> list[str]:
     catches that case as a loud failure instead of a silently-wrong column list.
     """
     sql = SCHEMA_DIR.joinpath("create_database.sql").read_text()
+    # WXYC/discogs-etl#242 flipped these to ``CREATE TABLE IF NOT EXISTS``;
+    # tolerate both forms so the regex doesn't silently miss the body.
     pattern = re.compile(
-        r"CREATE TABLE\s+" + re.escape(table_name) + r"\s*\((.*?)\)\s*;",
+        r"CREATE TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?"
+        + re.escape(table_name)
+        + r"\s*\((.*?)\)\s*;",
         re.DOTALL | re.IGNORECASE,
     )
     match = pattern.search(sql)
