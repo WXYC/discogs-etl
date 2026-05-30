@@ -111,10 +111,10 @@ from lib.observability import init_logger  # noqa: E402
 logger = logging.getLogger(__name__)
 
 
-# Defaults are pulled from the canonical WXYC example data (see org-level
-# CLAUDE.md). They produce non-empty result sets against fixture-loaded
-# tests and are also sane against a real cache (Juana Molina is in the prod
-# WXYC library; "DOGA" lower-cases trivially).
+# Defaults are pulled from the canonical WXYC example data (see
+# docs/test-fixtures.md). They produce non-empty result sets against
+# fixture-loaded tests and are also sane against a real cache (Juana Molina
+# is in the prod WXYC library; "DOGA" lower-cases trivially).
 DEFAULT_ARTIST = "juana molina"
 DEFAULT_TITLE = "doga"
 

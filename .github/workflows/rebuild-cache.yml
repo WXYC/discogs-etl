@@ -281,7 +281,7 @@ jobs:
           RUN_URL: "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
         run: |
           if [ -z "${SLACK_WEBHOOK_URL:-}" ]; then
-            echo "::error::SLACK_MONITORING_WEBHOOK is not set in repo secrets. The workflow failed but no Slack alert was posted. Configure the secret per CLAUDE.md 'Monthly Cache Rebuild' -> 'Required GitHub secrets' so future failures alert. Failing this notifier step so the workflow's overall status remains red and the dispatcher's GitHub notification reflects it."
+            echo "::error::SLACK_MONITORING_WEBHOOK is not set in repo secrets. The workflow failed but no Slack alert was posted. Configure the secret per docs/automation.md 'Monthly Cache Rebuild' -> 'Required GitHub secrets' so future failures alert. Failing this notifier step so the workflow's overall status remains red and the dispatcher's GitHub notification reflects it."
             exit 1
           fi
           curl -s -X POST "$SLACK_WEBHOOK_URL" \

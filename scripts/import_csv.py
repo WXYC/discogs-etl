@@ -663,8 +663,8 @@ def import_artwork(conn, csv_dir: Path) -> int:
 
     Only 'primary' type images are used; the first image is the fallback.
     Stamping artwork_checked_at matches LML's runtime write_release semantics
-    so dump-imported rows are treated as cached. See CLAUDE.md →
-    "artwork_checked_at Column Lifecycle".
+    so dump-imported rows are treated as cached. See
+    docs/architecture.md → "artwork_checked_at Column Lifecycle".
     """
     csv_path = csv_dir / "release_image.csv"
     if not csv_path.exists():
