@@ -259,15 +259,8 @@ TABLES: list[TableConfig] = BASE_TABLES + TRACK_TABLES + VIDEO_TABLES
 # touches track-domain tables, so a tracks-only rerun against an
 # already-populated cache only refreshes the tracks.
 #
-# `release` stays in this list for --truncate-existing's explicit-wipe
-# semantics (operators reach for the flag precisely when they want to
-# wipe and rebuild from scratch). The default incremental path
-# (WXYC/discogs-etl#242) does NOT TRUNCATE release — it goes through
-# import_release_via_upsert, which TRUNCATEs only the child tables of
-# release (release_artist + siblings) and UPSERTs release itself with
-# artwork columns excluded from the SET list, so LML back-patches
-# survive across rebuilds. The two paths are mutually exclusive at the
-# call site (see the `if args.truncate_existing` branch in main()).
+# `release` stays in this list for --truncate-existing only. The default
+# incremental path goes through import_release_via_upsert instead.
 CACHE_TABLES_TO_TRUNCATE_BASE: list[str] = [
     "release",
     "release_artist",
@@ -576,36 +569,24 @@ def create_track_count_table(conn, csv_dir: Path) -> int:
     return len(counts)
 
 
+# Tables wiped by import_release_via_upsert before re-COPY. Derived from
+# the existing config lists so a future child table added to BASE_TABLES /
+# TRACK_TABLES / VIDEO_TABLES is picked up automatically. cache_metadata is
+# the lone non-config entry — it's populated by populate_cache_metadata
+# rather than COPY, but it's still derivative of the current rebuild and
+# stale rows would mismatch release after the upsert's DELETE prunes.
 _RELEASE_CHILD_TABLES: list[str] = [
-    "release_artist",
-    "release_label",
-    "release_genre",
-    "release_style",
-    "release_track",
-    "release_track_artist",
-    "release_video",
-    "cache_metadata",
-]
+    t["table"] for t in BASE_TABLES[1:] + TRACK_TABLES + VIDEO_TABLES
+] + ["cache_metadata"]
 
 
 def import_release_via_upsert(conn, csv_dir: Path) -> int:
     """Reload ``release`` from CSV while preserving artwork columns.
 
-    Today's drop+recreate flow erases any LML-back-patched
-    ``(artwork_url, artwork_checked_at)`` on every rebuild. Option B
-    (WXYC/discogs-etl#242) replaces that with: COPY into a staging table,
-    UPSERT into ``release`` with ``artwork_url`` + ``artwork_checked_at``
-    EXCLUDED from the SET list, then ``DELETE FROM release WHERE id NOT
-    IN staging`` to prune releases that fell out of the new dump (FK
-    ``ON DELETE CASCADE`` handles their child rows).
-
-    Child tables of ``release`` (release_artist, release_label,
-    release_genre, release_style, release_track, release_track_artist,
-    release_video, cache_metadata) are pure derivative data — every row
-    comes from the current dump. They're TRUNCATEd before the upsert so
-    the subsequent COPYs into them don't append duplicates. ``release``
-    itself is NOT in this truncate set; that's what makes preservation
-    work.
+    Staging-table COPY + UPSERT with ``artwork_url`` and
+    ``artwork_checked_at`` excluded from the SET list, plus a DELETE step
+    pruning releases not in the new dump. Child tables of ``release`` are
+    TRUNCATEd first so the subsequent COPYs don't append duplicates.
 
     Returns the staging row count (number of rows COPYed from release.csv).
     """
@@ -618,16 +599,14 @@ def import_release_via_upsert(conn, csv_dir: Path) -> int:
     logger.info("Truncating child tables of release ahead of upsert...")
     with conn.cursor() as cur:
         quoted = ", ".join(f'"{t}"' for t in _RELEASE_CHILD_TABLES)
-        cur.execute(f"TRUNCATE {quoted} RESTART IDENTITY CASCADE")
+        cur.execute(f"TRUNCATE {quoted} CASCADE")
     conn.commit()
 
     logger.info("Creating release_staging temp table...")
     with conn.cursor() as cur:
-        # ON COMMIT PRESERVE ROWS (the default) — `import_csv` below commits
-        # internally, so `ON COMMIT DROP` would wipe the staging table out
-        # from under the subsequent INSERT/DELETE. The temp table is still
-        # session-scoped; it disappears when conn closes (or we DROP it at
-        # the end of this function explicitly).
+        # ON COMMIT PRESERVE ROWS (the default): import_csv() commits
+        # internally, so ON COMMIT DROP would wipe the staging table out
+        # from under the subsequent INSERT/DELETE.
         cur.execute("CREATE TEMP TABLE release_staging (LIKE release INCLUDING DEFAULTS)")
 
     rows = import_csv(
@@ -641,10 +620,24 @@ def import_release_via_upsert(conn, csv_dir: Path) -> int:
         unique_key=release_config.get("unique_key"),
     )
 
+    # Safety floor: refuse to apply an empty rebuild against a populated
+    # cache. A truncated / mid-write release.csv would otherwise DELETE
+    # every release downstream. Operators who *want* an empty cache go
+    # through --fresh-rebuild + DROP CASCADE.
+    if rows == 0:
+        with conn.cursor() as cur:
+            cur.execute("DROP TABLE release_staging")
+        conn.commit()
+        raise RuntimeError(
+            f"release_staging is empty after COPY from {csv_path.name}; "
+            "refusing to DELETE every release. If you intended an empty "
+            "cache, rerun with --fresh-rebuild."
+        )
+
     logger.info(f"Upserting {rows:,} releases (preserving artwork columns)...")
     with conn.cursor() as cur:
         # artwork_url, artwork_checked_at intentionally NOT in the SET
-        # list: preserve prior LML back-patches across rebuilds (#242).
+        # list — the contract of this function.
         cur.execute(
             """
             INSERT INTO release (id, title, country, released, format, master_id)
@@ -666,24 +659,12 @@ def import_release_via_upsert(conn, csv_dir: Path) -> int:
 
 
 def import_artwork(conn, csv_dir: Path) -> int:
-    """Populate release.artwork_url from release_image.csv.
+    """Populate release.artwork_url + stamp release.artwork_checked_at from release_image.csv.
 
-    Reads the release_image CSV and updates the release table with the URI
-    of each release's primary image. Only 'primary' type images are used;
-    if none exists, the first image is used as fallback.
-
-    The UPDATE also stamps ``artwork_checked_at = now()`` on every touched
-    row (WXYC/discogs-etl#242). Populating ``artwork_url`` from the bulk
-    dump is semantically equivalent to LML's runtime "asked Discogs and
-    got an answer" path, so the column must agree across both writers —
-    otherwise LML's predicate (LML#423) would treat dump-imported rows as
-    'never asked' and burn API quota on the first lookup. Rows without an
-    entry in ``release_image.csv`` are not touched by the UPDATE: they
-    retain whatever ``(artwork_url, artwork_checked_at)`` they had going
-    in. For freshly imported releases that's ``(NULL, NULL)`` — the
-    "never asked" state covered by ``release_artwork_null_idx`` for
-    LML#221's drain. For releases preserved across a rebuild (the
-    Option-B UPSERT path), that's the prior LML back-patch.
+    Only 'primary' type images are used; the first image is the fallback.
+    Stamping artwork_checked_at matches LML's runtime write_release semantics
+    so dump-imported rows are treated as cached. See CLAUDE.md →
+    "artwork_checked_at Column Lifecycle".
     """
     csv_path = csv_dir / "release_image.csv"
     if not csv_path.exists():
@@ -1007,19 +988,13 @@ def main():
             release_id_filter=release_ids,
         )
     elif args.base_only:
+        # --truncate-existing wipes release; default path upserts to preserve LML back-patches.
         if args.truncate_existing:
-            # Legacy wipe-and-COPY path: --truncate-existing TRUNCATEd above.
-            # release was wiped, so a plain COPY into the empty table is
-            # the cheapest end state.
             conn.close()
             total = _import_tables_parallel(
                 db_url, csv_dir, parent_tables=BASE_TABLES[:1], child_tables=BASE_TABLES[1:]
             )
         else:
-            # Incremental rebuild (WXYC/discogs-etl#242): upsert release
-            # (preserving artwork_url + artwork_checked_at), then COPY
-            # children. import_release_via_upsert TRUNCATEs the child
-            # tables internally so the subsequent COPY doesn't duplicate.
             conn.close()
             upsert_conn = psycopg.connect(db_url)
             upsert_rows = import_release_via_upsert(upsert_conn, csv_dir)
