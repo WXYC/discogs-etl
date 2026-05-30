@@ -349,6 +349,17 @@ DEDUP_TABLES: list[tuple[str, str, str, str]] = [
 ]
 
 
+# Column DEFAULTs to re-apply on each new_X table *before* swap_tables() makes
+# it live. CTAS strips DEFAULTs along with NOT NULL/CHECK; restoring DEFAULT
+# *before* the swap closes the race window where an LML cache-miss insert
+# (which omits cached_at) could land NULL between the swap and the
+# Level-2 SET DEFAULT, then trip the Level-2 SET NOT NULL. See #254.
+PRE_SWAP_COLUMN_DEFAULTS: dict[str, dict[str, str]] = {
+    "new_cache_metadata": {"cached_at": "now()"},
+    "new_release_artist": {"extra": "0"},
+}
+
+
 def copy_table(conn, old_table: str, new_table: str, columns: str, id_col: str) -> int:
     """Copy rows NOT in dedup_delete_ids to a new table.
 
@@ -366,6 +377,8 @@ def copy_table(conn, old_table: str, new_table: str, columns: str, id_col: str) 
                 SELECT 1 FROM dedup_delete_ids d WHERE d.release_id = t.{id_col}
             )
         """)
+        for column, default_sql in PRE_SWAP_COLUMN_DEFAULTS.get(new_table, {}).items():
+            cur.execute(f"ALTER TABLE {new_table} ALTER COLUMN {column} SET DEFAULT {default_sql}")
         cur.execute(f"SELECT count(*) FROM {new_table}")
         count = int(cur.fetchone()[0])
     conn.commit()
@@ -476,6 +489,20 @@ def add_base_constraints_and_indexes(conn, db_url: str | None = None) -> None:
         "Level 1.5: Clean orphan child rows before FK validation",
     )
 
+    # Level 1.75: Backfill race-window NULLs before SET NOT NULL runs.
+    #
+    # ``PRE_SWAP_COLUMN_DEFAULTS`` is supposed to seal the race by setting
+    # the DEFAULT on ``new_X`` before swap_tables(), so any LML insert that
+    # lands after the swap inherits ``cached_at = now()``. This UPDATE is
+    # the belt-and-suspenders: any row that slipped through (e.g. an LML
+    # transaction that started before the pre-swap ALTER landed and
+    # committed against the renamed table) gets a non-NULL stamp before
+    # Level-2 SET NOT NULL would reject it. See #254.
+    _exec_one(
+        db_url,
+        "UPDATE cache_metadata SET cached_at = now() WHERE cached_at IS NULL",
+    )
+
     # Level 2: FK constraints + PK on cache_metadata + FK indexes + NOT NULL
     # restoration (parallel).
     #
@@ -489,8 +516,12 @@ def add_base_constraints_and_indexes(conn, db_url: str | None = None) -> None:
     # carries column types forward but not NOT NULL / DEFAULT / CHECK. The
     # schema in ``schema/create_database.sql`` declares the data columns
     # below as NOT NULL; without explicit re-application every monthly
-    # rebuild ships a discogs-cache where those constraints are gone. Pinned
-    # by ``tests/integration/test_copy_swap_preserves_not_null.py``.
+    # rebuild ships a discogs-cache where those constraints are gone. The
+    # corresponding DEFAULTs are re-applied earlier — in copy_table() via
+    # ``PRE_SWAP_COLUMN_DEFAULTS``, before swap_tables() makes the new
+    # table live — so LML's cache-miss INSERT (which omits ``cached_at``)
+    # never lands a NULL during the swap window. Pinned by
+    # ``tests/integration/test_copy_swap_preserves_not_null.py``.
     _exec_parallel(
         [
             "ALTER TABLE release_artist ADD CONSTRAINT fk_release_artist_release "
@@ -519,16 +550,8 @@ def add_base_constraints_and_indexes(conn, db_url: str | None = None) -> None:
             "ALTER TABLE release_style ALTER COLUMN style SET NOT NULL",
             "ALTER TABLE cache_metadata ALTER COLUMN cached_at SET NOT NULL",
             "ALTER TABLE cache_metadata ALTER COLUMN source SET NOT NULL",
-            # ``cache_metadata.cached_at`` DEFAULT is load-bearing: LML's
-            # cache-miss INSERT omits the column and relies on the DEFAULT
-            # to avoid the NOT NULL re-applied above. Without restoration,
-            # the next cache miss after a rebuild would fail with a NOT
-            # NULL violation. ``release_artist.extra`` DEFAULT is schema
-            # invariant (nullable column) but restored for consistency.
-            "ALTER TABLE cache_metadata ALTER COLUMN cached_at SET DEFAULT now()",
-            "ALTER TABLE release_artist ALTER COLUMN extra SET DEFAULT 0",
         ],
-        "Level 2: FK constraints + FK indexes + NOT NULL + DEFAULT restoration",
+        "Level 2: FK constraints + FK indexes + NOT NULL",
     )
 
     # Level 3: GIN trigram indexes + cache metadata indexes (parallel)
