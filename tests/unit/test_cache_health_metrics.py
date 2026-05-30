@@ -195,3 +195,23 @@ class TestMain:
             rc = mod.main(["--namespace", "WXYC/DiscogsCache"])
         assert rc == 0
         assert run.call_args.kwargs["database_url"] == "postgresql://from-env"
+
+    def test_dry_run_skips_cloudwatch_client_construction(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``--dry-run`` is documented as "skip the CloudWatch publish".
+
+        It should also skip *building* the CloudWatch client, so a developer
+        without boto3 installed (boto3 is a ``[dev]``-only dep) can still run
+        ``--dry-run`` to validate counts.
+        """
+        monkeypatch.setenv("DATABASE_URL_DISCOGS", "postgresql://from-env")
+        monkeypatch.delenv("DATABASE_URL", raising=False)
+        mod = _load_module()
+        with (
+            patch.object(mod, "run", return_value=0),
+            patch.object(mod, "_build_cloudwatch_client") as build_client,
+        ):
+            rc = mod.main(["--namespace", "WXYC/DiscogsCache", "--dry-run"])
+        assert rc == 0
+        build_client.assert_not_called()
