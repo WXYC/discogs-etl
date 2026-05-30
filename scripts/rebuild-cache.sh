@@ -218,17 +218,18 @@ curl -fL --continue-at - --retry 5 --retry-delay 30 --retry-all-errors \
 echo "    download complete ($(du -h "$WORK_DIR/releases.xml.gz" | cut -f1))"
 
 echo "[$(date -u +%H:%M:%SZ)] start pipeline"
-# --truncate-existing wipes the cache tables before COPY so a rerun after a
-# prior failed rebuild doesn't hit a duplicate-key violation on the first
-# table (the failure mode from WXYC/discogs-etl#188's 2026-05-13 run). The
-# flag is a no-op on a freshly-stamped DB, so it's safe to keep on
-# unconditionally — the only cost is ~1s of TRUNCATE DDL on empty tables.
-# Preserves entity.identity and alembic_version.
+# Default mode (no --truncate-existing): the import path is idempotent via
+# `import_release_via_upsert` (staging-table COPY + UPSERT excluding the
+# artwork columns from the SET list), so a rerun against a populated DB
+# preserves LML's runtime artwork back-patches. Adding --truncate-existing
+# here would force the legacy destructive path and wipe those back-patches —
+# the failure mode WXYC/discogs-etl#252 documents from the 2026-05-30 run.
+# The duplicate-key failure mode from #188 that originally motivated the
+# flag is no longer reachable on the default path (ON CONFLICT skips it).
 python "$REPO_DIR/scripts/run_pipeline.py" \
     --xml "$WORK_DIR/releases.xml.gz" \
     --xml-type releases \
-    --library-db "$WORK_DIR/library.db" \
-    --truncate-existing
+    --library-db "$WORK_DIR/library.db"
 
 # ---------------------------------------------------------------------------
 # 6. Drift watchdog — same library.db the pipeline just filtered against
