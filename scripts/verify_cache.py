@@ -710,6 +710,198 @@ async def prune_releases(conn: asyncpg.Connection, release_ids: set[int]) -> dic
     return {"release": count}
 
 
+# Column DEFAULTs to re-apply on each new_X table *before* the swap makes it
+# live. CTAS strips DEFAULTs along with NOT NULL/CHECK; restoring DEFAULT
+# *before* the swap closes the race window where an LML cache-miss insert
+# (which omits cached_at) could land NULL between the swap and the
+# Level-2 SET DEFAULT, then trip the Level-2 SET NOT NULL. See #256
+# (sibling of #254 fixed in scripts/dedup_releases.py).
+PRUNE_PRE_SWAP_COLUMN_DEFAULTS: dict[str, dict[str, str]] = {
+    "new_cache_metadata": {"cached_at": "now()"},
+    "new_release_artist": {"extra": "0"},
+    "new_release_track_artist": {"extra": "0"},
+}
+
+
+def _prune_copy_swap_tables(
+    db_url: str,
+    keep_ids: set[int],
+    review_ids: set[int],
+) -> None:
+    """CTAS + DEFAULT-restore + RENAME for every table in PRUNE_COPY_TABLES.
+
+    Loads `_keep_ids`, copies keepers into `new_X`, re-applies the column
+    DEFAULTs that CTAS stripped (so the swapped-in table is already DEFAULTed
+    at the moment it goes live), drops the old FK constraints, swaps the
+    tables. Idempotent. See #256.
+    """
+    all_ids = keep_ids | review_ids
+    conn = psycopg.connect(db_url, autocommit=True)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("DROP TABLE IF EXISTS _keep_ids")
+            cur.execute("CREATE UNLOGGED TABLE _keep_ids (release_id integer PRIMARY KEY)")
+            with cur.copy("COPY _keep_ids (release_id) FROM STDIN") as copy:
+                for rid in all_ids:
+                    copy.write_row((rid,))
+
+        for old_table, new_table, columns, id_col in PRUNE_COPY_TABLES:
+            with conn.cursor() as cur:
+                cur.execute(f"DROP TABLE IF EXISTS {new_table}")
+                cur.execute(f"""
+                    CREATE TABLE {new_table} AS
+                    SELECT {columns} FROM {old_table} t
+                    WHERE EXISTS (
+                        SELECT 1 FROM _keep_ids k WHERE k.release_id = t.{id_col}
+                    )
+                """)
+                for column, default_sql in PRUNE_PRE_SWAP_COLUMN_DEFAULTS.get(
+                    new_table, {}
+                ).items():
+                    cur.execute(
+                        f"ALTER TABLE {new_table} ALTER COLUMN {column} SET DEFAULT {default_sql}"
+                    )
+                cur.execute(f"SELECT count(*) FROM {new_table}")
+                count = cur.fetchone()[0]
+            logger.info(f"  Copied {old_table} -> {new_table}: {count:,} rows")
+
+        with conn.cursor() as cur:
+            for stmt in [
+                "ALTER TABLE release_artist DROP CONSTRAINT IF EXISTS fk_release_artist_release",
+                "ALTER TABLE release_label DROP CONSTRAINT IF EXISTS fk_release_label_release",
+                "ALTER TABLE release_genre DROP CONSTRAINT IF EXISTS fk_release_genre_release",
+                "ALTER TABLE release_style DROP CONSTRAINT IF EXISTS fk_release_style_release",
+                "ALTER TABLE release_track DROP CONSTRAINT IF EXISTS fk_release_track_release",
+                "ALTER TABLE release_track_artist DROP CONSTRAINT IF EXISTS fk_release_track_artist_release",
+                "ALTER TABLE cache_metadata DROP CONSTRAINT IF EXISTS fk_cache_metadata_release",
+            ]:
+                cur.execute(stmt)
+
+        for old_table, new_table, _, _ in PRUNE_COPY_TABLES:
+            bak = f"{old_table}_old"
+            with conn.cursor() as cur:
+                cur.execute(f"ALTER TABLE {old_table} RENAME TO {bak}")
+                cur.execute(f"ALTER TABLE {new_table} RENAME TO {old_table}")
+                cur.execute(f"DROP TABLE {bak} CASCADE")
+            logger.info(f"  Swapped {new_table} -> {old_table}")
+    finally:
+        conn.close()
+
+
+def _prune_add_base_constraints_and_indexes(db_url: str) -> None:
+    """Add PK / FK / indexes / NOT NULL on the post-swap tables.
+
+    Runs orphan cleanup, FK + PK creation, FK + trigram + cache metadata
+    indexes, a race-window backfill of any NULL cache_metadata.cached_at
+    that slipped past PRUNE_PRE_SWAP_COLUMN_DEFAULTS, and SET NOT NULL on
+    the schema-required columns. Drops `_keep_ids` at the end.
+
+    DEFAULT restoration happens in ``_prune_copy_swap_tables`` pre-swap
+    (see PRUNE_PRE_SWAP_COLUMN_DEFAULTS); this function only handles
+    constraints/indexes that have to land on the live table.
+    """
+    conn = psycopg.connect(db_url, autocommit=True)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("ALTER TABLE release ADD PRIMARY KEY (id)")
+
+            # Clean orphan child rows before FK validation. The live LML
+            # service writes child rows for releases NOT in the post-prune
+            # subset; deleting them now keeps the ADD CONSTRAINT step below
+            # from failing on validation. NOT VALID on the constraint itself
+            # tolerates new orphans landing between cleanup and ADD. See
+            # #211 + #188 for the parallel fix in dedup_releases.py.
+            for child_table in (
+                "release_artist",
+                "release_label",
+                "release_genre",
+                "release_style",
+                "release_track",
+                "release_track_artist",
+                "cache_metadata",
+            ):
+                cur.execute(
+                    f"DELETE FROM {child_table} WHERE NOT EXISTS "
+                    f"(SELECT 1 FROM release r WHERE r.id = {child_table}.release_id)"
+                )
+
+            for stmt in (
+                "ALTER TABLE release_artist ADD CONSTRAINT fk_release_artist_release "
+                "FOREIGN KEY (release_id) REFERENCES release(id) ON DELETE CASCADE NOT VALID",
+                "ALTER TABLE release_label ADD CONSTRAINT fk_release_label_release "
+                "FOREIGN KEY (release_id) REFERENCES release(id) ON DELETE CASCADE NOT VALID",
+                "ALTER TABLE release_genre ADD CONSTRAINT fk_release_genre_release "
+                "FOREIGN KEY (release_id) REFERENCES release(id) ON DELETE CASCADE NOT VALID",
+                "ALTER TABLE release_style ADD CONSTRAINT fk_release_style_release "
+                "FOREIGN KEY (release_id) REFERENCES release(id) ON DELETE CASCADE NOT VALID",
+                "ALTER TABLE release_track ADD CONSTRAINT fk_release_track_release "
+                "FOREIGN KEY (release_id) REFERENCES release(id) ON DELETE CASCADE NOT VALID",
+                "ALTER TABLE release_track_artist ADD CONSTRAINT fk_release_track_artist_release "
+                "FOREIGN KEY (release_id) REFERENCES release(id) ON DELETE CASCADE NOT VALID",
+                "ALTER TABLE cache_metadata ADD CONSTRAINT fk_cache_metadata_release "
+                "FOREIGN KEY (release_id) REFERENCES release(id) ON DELETE CASCADE NOT VALID",
+                "ALTER TABLE cache_metadata ADD PRIMARY KEY (release_id)",
+                "CREATE INDEX idx_release_artist_release_id ON release_artist(release_id)",
+                "CREATE INDEX idx_release_label_release_id ON release_label(release_id)",
+                "CREATE INDEX idx_release_genre_release_id ON release_genre(release_id)",
+                "CREATE INDEX idx_release_style_release_id ON release_style(release_id)",
+                "CREATE INDEX idx_release_track_release_id ON release_track(release_id)",
+                "CREATE INDEX idx_release_track_artist_release_id ON release_track_artist(release_id)",
+                "CREATE INDEX idx_release_artist_name_trgm ON release_artist "
+                "USING gin (lower(f_unaccent(artist_name)) gin_trgm_ops)",
+                "CREATE INDEX idx_release_title_trgm ON release "
+                "USING gin (lower(f_unaccent(title)) gin_trgm_ops)",
+                "CREATE INDEX idx_release_track_title_trgm ON release_track "
+                "USING gin (lower(f_unaccent(title)) gin_trgm_ops)",
+                "CREATE INDEX idx_release_track_artist_name_trgm ON release_track_artist "
+                "USING gin (lower(f_unaccent(artist_name)) gin_trgm_ops)",
+                "CREATE INDEX idx_cache_metadata_cached_at ON cache_metadata(cached_at)",
+                "CREATE INDEX idx_cache_metadata_source ON cache_metadata(source)",
+            ):
+                cur.execute(stmt)
+
+            # Backfill any race-window NULLs before SET NOT NULL. The
+            # pre-swap DEFAULT restoration in _prune_copy_swap_tables
+            # *should* keep this UPDATE a no-op in steady state; we keep
+            # it as belt-and-suspenders for any LML insert that committed
+            # against the renamed table before the pre-swap ALTER landed.
+            # See #256.
+            cur.execute("UPDATE cache_metadata SET cached_at = now() WHERE cached_at IS NULL")
+
+            # Re-apply NOT NULL constraints stripped by ``CREATE TABLE AS
+            # SELECT`` above. CTAS carries column types forward but not
+            # NOT NULL / DEFAULT / CHECK. The corresponding DEFAULTs are
+            # re-applied earlier — in _prune_copy_swap_tables, before the
+            # RENAME makes the new table live — so LML's cache-miss
+            # INSERT (which omits ``cached_at``) never lands a NULL during
+            # the swap window. Pinned by
+            # ``tests/integration/test_copy_swap_preserves_not_null.py``.
+            for stmt in (
+                "ALTER TABLE release ALTER COLUMN title SET NOT NULL",
+                "ALTER TABLE release_artist ALTER COLUMN release_id SET NOT NULL",
+                "ALTER TABLE release_artist ALTER COLUMN artist_name SET NOT NULL",
+                "ALTER TABLE release_label ALTER COLUMN release_id SET NOT NULL",
+                "ALTER TABLE release_label ALTER COLUMN label_name SET NOT NULL",
+                "ALTER TABLE release_genre ALTER COLUMN release_id SET NOT NULL",
+                "ALTER TABLE release_genre ALTER COLUMN genre SET NOT NULL",
+                "ALTER TABLE release_style ALTER COLUMN release_id SET NOT NULL",
+                "ALTER TABLE release_style ALTER COLUMN style SET NOT NULL",
+                "ALTER TABLE release_track ALTER COLUMN release_id SET NOT NULL",
+                "ALTER TABLE release_track ALTER COLUMN sequence SET NOT NULL",
+                "ALTER TABLE release_track ALTER COLUMN title SET NOT NULL",
+                "ALTER TABLE release_track_artist ALTER COLUMN release_id SET NOT NULL",
+                "ALTER TABLE release_track_artist ALTER COLUMN track_sequence SET NOT NULL",
+                "ALTER TABLE release_track_artist ALTER COLUMN artist_name SET NOT NULL",
+                "ALTER TABLE cache_metadata ALTER COLUMN cached_at SET NOT NULL",
+                "ALTER TABLE cache_metadata ALTER COLUMN source SET NOT NULL",
+            ):
+                cur.execute(stmt)
+
+            cur.execute("DROP TABLE IF EXISTS _keep_ids")
+    finally:
+        conn.close()
+
+
 def prune_releases_copy_swap(
     db_url: str,
     keep_ids: set[int],
@@ -738,194 +930,11 @@ def prune_releases_copy_swap(
         f"{len(all_ids):,}",
     )
 
-    conn = psycopg.connect(db_url, autocommit=True)
     start = time.time()
-
-    try:
-        with conn.cursor() as cur:
-            # Load keep IDs into a temp table for efficient joins
-            cur.execute("DROP TABLE IF EXISTS _keep_ids")
-            cur.execute("CREATE UNLOGGED TABLE _keep_ids (release_id integer PRIMARY KEY)")
-            with cur.copy("COPY _keep_ids (release_id) FROM STDIN") as copy:
-                for rid in all_ids:
-                    copy.write_row((rid,))
-
-        tables = PRUNE_COPY_TABLES
-
-        # Copy keeper rows into new tables
-        for old_table, new_table, columns, id_col in tables:
-            with conn.cursor() as cur:
-                cur.execute(f"DROP TABLE IF EXISTS {new_table}")
-                cur.execute(f"""
-                    CREATE TABLE {new_table} AS
-                    SELECT {columns} FROM {old_table} t
-                    WHERE EXISTS (
-                        SELECT 1 FROM _keep_ids k WHERE k.release_id = t.{id_col}
-                    )
-                """)
-                cur.execute(f"SELECT count(*) FROM {new_table}")
-                count = cur.fetchone()[0]
-            logger.info(f"  Copied {old_table} -> {new_table}: {count:,} rows")
-
-        # Drop FK constraints before swap
-        with conn.cursor() as cur:
-            for stmt in [
-                "ALTER TABLE release_artist DROP CONSTRAINT IF EXISTS fk_release_artist_release",
-                "ALTER TABLE release_label DROP CONSTRAINT IF EXISTS fk_release_label_release",
-                "ALTER TABLE release_genre DROP CONSTRAINT IF EXISTS fk_release_genre_release",
-                "ALTER TABLE release_style DROP CONSTRAINT IF EXISTS fk_release_style_release",
-                "ALTER TABLE release_track DROP CONSTRAINT IF EXISTS fk_release_track_release",
-                "ALTER TABLE release_track_artist DROP CONSTRAINT IF EXISTS fk_release_track_artist_release",
-                "ALTER TABLE cache_metadata DROP CONSTRAINT IF EXISTS fk_cache_metadata_release",
-            ]:
-                cur.execute(stmt)
-
-        # Swap tables
-        for old_table, new_table, _, _ in tables:
-            bak = f"{old_table}_old"
-            with conn.cursor() as cur:
-                cur.execute(f"ALTER TABLE {old_table} RENAME TO {bak}")
-                cur.execute(f"ALTER TABLE {new_table} RENAME TO {old_table}")
-                cur.execute(f"DROP TABLE {bak} CASCADE")
-            logger.info(f"  Swapped {new_table} -> {old_table}")
-
-        # Re-add constraints and indexes
-        with conn.cursor() as cur:
-            # PK on release
-            cur.execute("ALTER TABLE release ADD PRIMARY KEY (id)")
-
-            # Clean orphan child rows before FK validation. The live LML
-            # service writes child rows for releases NOT in the post-prune
-            # subset; deleting them now keeps the ADD CONSTRAINT step below
-            # from failing on validation. NOT VALID on the constraint itself
-            # tolerates new orphans landing between cleanup and ADD. See
-            # #211 + #188 for the parallel fix in dedup_releases.py.
-            for child_table in (
-                "release_artist",
-                "release_label",
-                "release_genre",
-                "release_style",
-                "release_track",
-                "release_track_artist",
-                "cache_metadata",
-            ):
-                cur.execute(
-                    f"DELETE FROM {child_table} WHERE NOT EXISTS "
-                    f"(SELECT 1 FROM release r WHERE r.id = {child_table}.release_id)"
-                )
-
-            # FK constraints (NOT VALID for race tolerance).
-            cur.execute(
-                "ALTER TABLE release_artist ADD CONSTRAINT fk_release_artist_release "
-                "FOREIGN KEY (release_id) REFERENCES release(id) ON DELETE CASCADE NOT VALID"
-            )
-            cur.execute(
-                "ALTER TABLE release_label ADD CONSTRAINT fk_release_label_release "
-                "FOREIGN KEY (release_id) REFERENCES release(id) ON DELETE CASCADE NOT VALID"
-            )
-            cur.execute(
-                "ALTER TABLE release_genre ADD CONSTRAINT fk_release_genre_release "
-                "FOREIGN KEY (release_id) REFERENCES release(id) ON DELETE CASCADE NOT VALID"
-            )
-            cur.execute(
-                "ALTER TABLE release_style ADD CONSTRAINT fk_release_style_release "
-                "FOREIGN KEY (release_id) REFERENCES release(id) ON DELETE CASCADE NOT VALID"
-            )
-            cur.execute(
-                "ALTER TABLE release_track ADD CONSTRAINT fk_release_track_release "
-                "FOREIGN KEY (release_id) REFERENCES release(id) ON DELETE CASCADE NOT VALID"
-            )
-            cur.execute(
-                "ALTER TABLE release_track_artist ADD CONSTRAINT fk_release_track_artist_release "
-                "FOREIGN KEY (release_id) REFERENCES release(id) ON DELETE CASCADE NOT VALID"
-            )
-            cur.execute(
-                "ALTER TABLE cache_metadata ADD CONSTRAINT fk_cache_metadata_release "
-                "FOREIGN KEY (release_id) REFERENCES release(id) ON DELETE CASCADE NOT VALID"
-            )
-            cur.execute("ALTER TABLE cache_metadata ADD PRIMARY KEY (release_id)")
-
-            # FK indexes
-            cur.execute("CREATE INDEX idx_release_artist_release_id ON release_artist(release_id)")
-            cur.execute("CREATE INDEX idx_release_label_release_id ON release_label(release_id)")
-            cur.execute("CREATE INDEX idx_release_genre_release_id ON release_genre(release_id)")
-            cur.execute("CREATE INDEX idx_release_style_release_id ON release_style(release_id)")
-            cur.execute("CREATE INDEX idx_release_track_release_id ON release_track(release_id)")
-            cur.execute(
-                "CREATE INDEX idx_release_track_artist_release_id "
-                "ON release_track_artist(release_id)"
-            )
-
-            # Trigram indexes
-            cur.execute(
-                "CREATE INDEX idx_release_artist_name_trgm ON release_artist "
-                "USING gin (lower(f_unaccent(artist_name)) gin_trgm_ops)"
-            )
-            cur.execute(
-                "CREATE INDEX idx_release_title_trgm ON release "
-                "USING gin (lower(f_unaccent(title)) gin_trgm_ops)"
-            )
-            cur.execute(
-                "CREATE INDEX idx_release_track_title_trgm ON release_track "
-                "USING gin (lower(f_unaccent(title)) gin_trgm_ops)"
-            )
-            cur.execute(
-                "CREATE INDEX idx_release_track_artist_name_trgm ON release_track_artist "
-                "USING gin (lower(f_unaccent(artist_name)) gin_trgm_ops)"
-            )
-
-            # Cache metadata indexes
-            cur.execute("CREATE INDEX idx_cache_metadata_cached_at ON cache_metadata(cached_at)")
-            cur.execute("CREATE INDEX idx_cache_metadata_source ON cache_metadata(source)")
-
-            # Re-apply NOT NULL and DEFAULT constraints stripped by
-            # ``CREATE TABLE AS SELECT`` above. CTAS carries column types
-            # forward but not NOT NULL / DEFAULT / CHECK; the schema in
-            # ``schema/create_database.sql`` declares these columns as
-            # NOT NULL (and a few as DEFAULT now() / DEFAULT 0), and
-            # without explicit re-application every prune run ships a
-            # discogs-cache where those constraints are gone.
-            #
-            # The ``cache_metadata.cached_at`` DEFAULT is load-bearing:
-            # LML's cache-miss INSERT omits the column and relies on the
-            # DEFAULT to avoid the NOT NULL constraint applied here.
-            # Without DEFAULT restoration, the next cache miss after a
-            # rebuild would fail with a NOT NULL violation. The ``extra``
-            # DEFAULTs are schema invariant (nullable columns) but
-            # restored for consistency. Pinned by
-            # ``tests/integration/test_copy_swap_preserves_not_null.py``.
-            for stmt in (
-                "ALTER TABLE release ALTER COLUMN title SET NOT NULL",
-                "ALTER TABLE release_artist ALTER COLUMN release_id SET NOT NULL",
-                "ALTER TABLE release_artist ALTER COLUMN artist_name SET NOT NULL",
-                "ALTER TABLE release_label ALTER COLUMN release_id SET NOT NULL",
-                "ALTER TABLE release_label ALTER COLUMN label_name SET NOT NULL",
-                "ALTER TABLE release_genre ALTER COLUMN release_id SET NOT NULL",
-                "ALTER TABLE release_genre ALTER COLUMN genre SET NOT NULL",
-                "ALTER TABLE release_style ALTER COLUMN release_id SET NOT NULL",
-                "ALTER TABLE release_style ALTER COLUMN style SET NOT NULL",
-                "ALTER TABLE release_track ALTER COLUMN release_id SET NOT NULL",
-                "ALTER TABLE release_track ALTER COLUMN sequence SET NOT NULL",
-                "ALTER TABLE release_track ALTER COLUMN title SET NOT NULL",
-                "ALTER TABLE release_track_artist ALTER COLUMN release_id SET NOT NULL",
-                "ALTER TABLE release_track_artist ALTER COLUMN track_sequence SET NOT NULL",
-                "ALTER TABLE release_track_artist ALTER COLUMN artist_name SET NOT NULL",
-                "ALTER TABLE cache_metadata ALTER COLUMN cached_at SET NOT NULL",
-                "ALTER TABLE cache_metadata ALTER COLUMN source SET NOT NULL",
-                "ALTER TABLE cache_metadata ALTER COLUMN cached_at SET DEFAULT now()",
-                "ALTER TABLE release_artist ALTER COLUMN extra SET DEFAULT 0",
-                "ALTER TABLE release_track_artist ALTER COLUMN extra SET DEFAULT 0",
-            ):
-                cur.execute(stmt)
-
-            # Cleanup
-            cur.execute("DROP TABLE IF EXISTS _keep_ids")
-
-        elapsed = time.time() - start
-        logger.info(f"Copy-and-swap prune completed in {elapsed:.1f}s")
-
-    finally:
-        conn.close()
+    _prune_copy_swap_tables(db_url, keep_ids, review_ids)
+    _prune_add_base_constraints_and_indexes(db_url)
+    elapsed = time.time() - start
+    logger.info(f"Copy-and-swap prune completed in {elapsed:.1f}s")
 
 
 # ---------------------------------------------------------------------------

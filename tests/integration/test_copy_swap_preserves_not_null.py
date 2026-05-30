@@ -485,6 +485,78 @@ class TestPruneCopySwapPreservesNotNull:
         )
 
 
+def _run_prune_swap_with_race_insert(db_url: str) -> None:
+    """Exercise verify_cache's prune copy-swap with an LML-style race INSERT.
+
+    Mirrors `_run_dedup_swap_with_race_insert` against the prune path. Splits
+    the two phases of `prune_releases_copy_swap` so an LML-style INSERT can
+    be injected between them — the exact race window that bit the 2026-05-30
+    rebuild. See #256.
+    """
+    # Keep releases 1, 2 (and the extra race-seed release); prune release 3.
+    keep_ids = {1, 2, _RACE_INSERT_RELEASE_ID}
+    _vc._prune_copy_swap_tables(db_url, keep_ids=keep_ids, review_ids=set())
+
+    # Race insert lands after the swap but before constraint application —
+    # exactly what LML's cache-miss INSERT does in production. Omits
+    # cached_at, relying on the table DEFAULT applied pre-swap.
+    conn = psycopg.connect(db_url, autocommit=True)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO cache_metadata (release_id, source) VALUES (%s, %s)",
+                (_RACE_INSERT_RELEASE_ID, "api_fetch"),
+            )
+    finally:
+        conn.close()
+
+    _vc._prune_add_base_constraints_and_indexes(db_url)
+
+
+class TestPruneCopySwapToleratesRaceWindowInsert:
+    """The race-window LML insert survives prune_releases_copy_swap.
+
+    Pin for [#256](https://github.com/WXYC/discogs-etl/issues/256). The
+    2026-05-30 rebuild failed when an LML cache-miss INSERT landed between
+    verify_cache's swap_tables and the SET NOT NULL on cache_metadata.cached_at.
+    Sibling of `TestDedupCopySwapToleratesRaceWindowInsert` — same fix pattern
+    (pre-swap DEFAULT restoration via PRUNE_PRE_SWAP_COLUMN_DEFAULTS) applied
+    to a different copy-swap site.
+    """
+
+    @pytest.fixture(autouse=True, scope="class")
+    def _set_up_and_prune(self, db_url):
+        self.__class__._db_url = db_url
+        _seed_minimal_fixture(db_url)
+        _seed_extra_release_for_race(db_url)
+        _run_prune_swap_with_race_insert(db_url)
+
+    @pytest.fixture(autouse=True)
+    def _store_url(self):
+        self.db_url = self.__class__._db_url
+
+    def test_race_insert_has_non_null_cached_at(self):
+        """The race-window INSERT gets a non-NULL cached_at via the table DEFAULT."""
+        conn = psycopg.connect(self.db_url, autocommit=True)
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT cached_at FROM cache_metadata WHERE release_id = %s",
+                    (_RACE_INSERT_RELEASE_ID,),
+                )
+                row = cur.fetchone()
+        finally:
+            conn.close()
+
+        assert row is not None, "race-window INSERT row missing from cache_metadata"
+        assert row[0] is not None, (
+            "Race-window INSERT landed with NULL cached_at. CTAS strips the "
+            "DEFAULT on cache_metadata.cached_at; _prune_copy_swap_tables must "
+            "re-apply the DEFAULT on new_cache_metadata before the RENAME so "
+            "the live table has the DEFAULT at the moment of swap."
+        )
+
+
 class TestNotNullPinExpectationsMatchSchema:
     """Catch drift between _EXPECTED_NOT_NULL and schema/create_database.sql.
 
