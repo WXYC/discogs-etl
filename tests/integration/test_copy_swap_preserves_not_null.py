@@ -303,6 +303,129 @@ class TestDedupCopySwapPreservesNotNull:
         )
 
 
+_RACE_INSERT_RELEASE_ID = 4
+
+
+def _seed_extra_release_for_race(db_url: str) -> None:
+    """Add a `release` row with no `cache_metadata` row, ready for the race INSERT.
+
+    Picks an id (`_RACE_INSERT_RELEASE_ID`) outside the seeded set so the post-swap
+    race INSERT into `cache_metadata` (which still has no PK at that point) can't
+    collide with a sibling row, and so the FK validation against `release` passes
+    when Level 2 runs.
+    """
+    conn = psycopg.connect(db_url, autocommit=True)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO release (id, title, master_id, format, country) "
+                "VALUES (%s, %s, %s, %s, %s)",
+                (_RACE_INSERT_RELEASE_ID, "Moon Pix", 300, "LP", "US"),
+            )
+    finally:
+        conn.close()
+
+
+def _run_dedup_swap_with_race_insert(db_url: str) -> None:
+    """Exercise dedup but inject an LML-style INSERT in the race window.
+
+    Mirrors `_run_dedup_swap` but between `swap_tables()` and
+    `add_base_constraints_and_indexes()` issues:
+
+        INSERT INTO cache_metadata (release_id, source) VALUES (...)
+
+    which is what library-metadata-lookup's cache-miss path does in steady
+    state — relying on the table DEFAULT to supply `cached_at = now()`. If
+    CTAS strips the DEFAULT and the dedup path doesn't restore it before the
+    swap, the insert lands with `cached_at = NULL`, and the subsequent
+    `ALTER COLUMN cached_at SET NOT NULL` fails with NotNullViolation —
+    aborting the entire rebuild. See WXYC/discogs-etl#254.
+    """
+    conn = psycopg.connect(db_url, autocommit=True)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("CREATE UNLOGGED TABLE dedup_delete_ids (release_id integer PRIMARY KEY)")
+            cur.execute("INSERT INTO dedup_delete_ids VALUES (3)")
+
+        for old, new, cols, id_col in _dd.DEDUP_TABLES:
+            _dd.copy_table(conn, old, new, cols, id_col)
+
+        with conn.cursor() as cur:
+            for stmt in (
+                "ALTER TABLE release_artist DROP CONSTRAINT IF EXISTS fk_release_artist_release",
+                "ALTER TABLE release_label DROP CONSTRAINT IF EXISTS fk_release_label_release",
+                "ALTER TABLE release_genre DROP CONSTRAINT IF EXISTS fk_release_genre_release",
+                "ALTER TABLE release_style DROP CONSTRAINT IF EXISTS fk_release_style_release",
+                "ALTER TABLE cache_metadata DROP CONSTRAINT IF EXISTS fk_cache_metadata_release",
+            ):
+                cur.execute(stmt)
+
+        for old, new, _, _ in _dd.DEDUP_TABLES:
+            _dd.swap_tables(conn, old, new)
+
+        # Race insert — what LML does in steady state. Omits cached_at,
+        # relying on the table DEFAULT. The release_id is one that's already
+        # in `release` (seeded above) so Level 1.5 orphan cleanup leaves it
+        # alone; and it's not yet in `cache_metadata` so there's no clash
+        # when Level 2 adds the PK on release_id.
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO cache_metadata (release_id, source) VALUES (%s, %s)",
+                (_RACE_INSERT_RELEASE_ID, "api_fetch"),
+            )
+
+        _dd.add_base_constraints_and_indexes(conn, db_url=db_url)
+    finally:
+        conn.close()
+
+
+class TestDedupCopySwapToleratesRaceWindowInsert:
+    """The race-window LML insert survives add_base_constraints_and_indexes.
+
+    Pin for [#254](https://github.com/WXYC/discogs-etl/issues/254). The 2026-05-30
+    rebuild failed when an LML cache-miss INSERT landed between `swap_tables()`
+    and `ALTER COLUMN cached_at SET DEFAULT now()`, writing NULL `cached_at`
+    and tripping the subsequent SET NOT NULL.
+
+    Fix is structural — apply DEFAULTs on the NEW table inside `copy_table()`
+    so the live table already has the DEFAULT at the moment of swap. The
+    sibling pin `TestDedupCopySwapPreservesNotNull` covers end-state; this
+    one covers the race window itself.
+    """
+
+    @pytest.fixture(autouse=True, scope="class")
+    def _set_up_and_dedup(self, db_url):
+        self.__class__._db_url = db_url
+        _seed_minimal_fixture(db_url)
+        _seed_extra_release_for_race(db_url)
+        _run_dedup_swap_with_race_insert(db_url)
+
+    @pytest.fixture(autouse=True)
+    def _store_url(self):
+        self.db_url = self.__class__._db_url
+
+    def test_race_insert_has_non_null_cached_at(self):
+        """The race-window INSERT gets a non-NULL cached_at via the table DEFAULT."""
+        conn = psycopg.connect(self.db_url, autocommit=True)
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT cached_at FROM cache_metadata WHERE release_id = %s",
+                    (_RACE_INSERT_RELEASE_ID,),
+                )
+                row = cur.fetchone()
+        finally:
+            conn.close()
+
+        assert row is not None, "race-window INSERT row missing from cache_metadata"
+        assert row[0] is not None, (
+            "Race-window INSERT landed with NULL cached_at. CTAS strips the "
+            "DEFAULT on cache_metadata.cached_at; copy_table() must re-apply "
+            "the DEFAULT on new_cache_metadata before swap_tables() so the "
+            "live table has the DEFAULT at the moment of swap."
+        )
+
+
 class TestPruneCopySwapPreservesNotNull:
     """verify_cache.prune_releases_copy_swap re-applies NOT NULL on schema-required columns."""
 
