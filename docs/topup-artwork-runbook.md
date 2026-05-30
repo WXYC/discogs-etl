@@ -15,8 +15,17 @@ Environment:
 | Variable | Required | Notes |
 |---|---|---|
 | `DATABASE_URL_DISCOGS` | yes | Cache PG URL. `--database-url` overrides. |
-| `DISCOGS_TOKEN` | yes | Same token LML uses. `DISCOGS_API_TOKEN` also accepted. |
+| Discogs auth (one shape) | yes | See below — either personal token *or* OAuth consumer pair. |
 | `SENTRY_DSN` | optional | Stderr logger works without it. |
+
+Discogs auth accepts either shape (matches LML's `DiscogsService`):
+
+| Variable(s) | Shape | Source |
+|---|---|---|
+| `DISCOGS_TOKEN` (or legacy `DISCOGS_API_TOKEN`) | Personal access token | LML's runtime env on Railway |
+| `DISCOGS_API_KEY` + `DISCOGS_API_SECRET` | OAuth consumer pair | `WXYC/secrets/secrets.txt` (look for the `_V2_5` variant if present) |
+
+If both are exported the token wins. The script fails fast at startup if neither is set.
 
 The script depends only on `psycopg`, stdlib `urllib`, and `lib.observability` — installable from `pip install -e .`.
 
