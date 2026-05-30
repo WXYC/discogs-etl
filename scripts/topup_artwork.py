@@ -13,12 +13,27 @@ a full sequential read. This script walks that tail, asks Discogs
 — stamping ``artwork_checked_at`` even when no image exists collapses the
 "never asked vs asked-but-imageless" ambiguity at the schema level.
 
+Auth
+----
+
+Accepts either Discogs auth shape (matches LML's ``DiscogsService``):
+
+* Personal access token — ``DISCOGS_TOKEN`` (or legacy ``DISCOGS_API_TOKEN``).
+* OAuth consumer pair — ``DISCOGS_API_KEY`` + ``DISCOGS_API_SECRET``.
+
+If both are exported the token wins. The WXYC shared secrets file ships the
+OAuth-pair shape; LML's runtime env on Railway carries the personal token.
+Using a different shape from LML's runtime gives the drain its own Discogs
+identity (and therefore its own rate-limit quota), which is the design point
+behind the conservative default rate below.
+
 Pacing
 ------
 
-LML's runtime caller shares the same Discogs token + ~60/min ceiling. The
-default ``--rate 10`` rate keeps headroom under LML's running 50/min so the
-drain doesn't trip 429s for live traffic. Off-hours operators can raise it.
+LML's runtime caller pulls against Discogs's ~60/min ceiling per token. The
+default ``--rate 10`` rate keeps headroom under LML's running 50/min when
+this drain shares an identity, and is over-conservative when it doesn't.
+Off-hours operators can raise it.
 
 Idempotence
 -----------
@@ -174,28 +189,57 @@ def write_artwork_result(
 # ---------------------------------------------------------------------------
 
 
+def _build_auth_header(
+    token: str | None,
+    api_key: str | None,
+    api_secret: str | None,
+) -> str:
+    """Return the ``Authorization`` value for the Discogs API.
+
+    Mirrors LML's two-mode selector at
+    ``library-metadata-lookup/discogs/service.py:254``. ``token`` takes
+    precedence over the OAuth pair when both are supplied — matches LML
+    and lets an operator who exports both shapes pick the simpler one
+    without surprises.
+    """
+    if token:
+        return f"Discogs token={token}"
+    if api_key and api_secret:
+        return f"Discogs key={api_key}, secret={api_secret}"
+    if api_key or api_secret:
+        raise ValueError("OAuth-pair auth requires both api_key and api_secret; got only one")
+    raise ValueError("Provide either token or api_key + api_secret")
+
+
 def make_discogs_client(
-    token: str,
+    token: str | None = None,
     *,
+    api_key: str | None = None,
+    api_secret: str | None = None,
     user_agent: str = DEFAULT_USER_AGENT,
     timeout_s: float = HTTP_TIMEOUT_S,
 ) -> Callable[[int], dict[str, Any] | None]:
     """Return ``fetch(release_id) -> dict | None``.
 
+    Auth modes (mutually exclusive, ``token`` wins when both supplied):
+        * Personal access token: ``make_discogs_client(token="abc")``
+        * OAuth consumer pair: ``make_discogs_client(api_key="k", api_secret="s")``
+
     Return value contract:
         * ``dict`` — Discogs returned 200 with JSON.
-        * ``None`` with sentinel attribute ``deleted=True`` — Discogs
-          returned 404 (release withdrawn). Caller stamps ``artwork_url=NULL``.
+        * ``None`` — Discogs returned 404 (release withdrawn). Caller
+          stamps ``artwork_url=NULL`` + ``artwork_checked_at=now()``.
         * Raises on transient errors so the orchestrator can record a
           ``failed`` count without writing back.
     """
+    auth_header = _build_auth_header(token, api_key, api_secret)
 
     def fetch(release_id: int) -> dict[str, Any] | None:
         url = f"{DISCOGS_API_BASE}/releases/{release_id}"
         req = urllib.request.Request(
             url,
             headers={
-                "Authorization": f"Discogs token={token}",
+                "Authorization": auth_header,
                 "User-Agent": user_agent,
                 "Accept": "application/json",
             },
@@ -339,6 +383,24 @@ def _build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _credentials_from_env() -> tuple[str | None, str | None, str | None]:
+    """Return ``(token, api_key, api_secret)`` from environment.
+
+    Accepts either auth shape supported by ``make_discogs_client``:
+      * ``DISCOGS_TOKEN`` (or legacy alias ``DISCOGS_API_TOKEN``) — personal token.
+      * ``DISCOGS_API_KEY`` + ``DISCOGS_API_SECRET`` — OAuth consumer pair
+        (matches the WXYC secrets-file shape).
+
+    Precedence is concentrated in ``_build_auth_header`` so this helper
+    stays a thin env reader: it returns whatever is present and lets the
+    factory decide which mode to use.
+    """
+    token = os.environ.get("DISCOGS_TOKEN") or os.environ.get("DISCOGS_API_TOKEN")
+    api_key = os.environ.get("DISCOGS_API_KEY")
+    api_secret = os.environ.get("DISCOGS_API_SECRET")
+    return token, api_key, api_secret
+
+
 def main(argv: list[str] | None = None) -> int:
     init_logger(repo="discogs-etl", tool="discogs-etl topup_artwork")
     args = _build_parser().parse_args(argv)
@@ -347,9 +409,15 @@ def main(argv: list[str] | None = None) -> int:
         logger.error("missing --database-url / $DATABASE_URL_DISCOGS / $DATABASE_URL")
         return 2
 
-    token = os.environ.get("DISCOGS_TOKEN") or os.environ.get("DISCOGS_API_TOKEN")
-    if not token:
-        logger.error("missing $DISCOGS_TOKEN (or $DISCOGS_API_TOKEN)")
+    token, api_key, api_secret = _credentials_from_env()
+    try:
+        client = make_discogs_client(token=token, api_key=api_key, api_secret=api_secret)
+    except ValueError as exc:
+        logger.error(
+            "Discogs credentials missing: %s. "
+            "Export $DISCOGS_TOKEN, or $DISCOGS_API_KEY + $DISCOGS_API_SECRET.",
+            exc,
+        )
         return 2
 
     summary = run_topup(
@@ -358,7 +426,7 @@ def main(argv: list[str] | None = None) -> int:
         rate_per_minute=args.rate,
         batch_size=args.batch_size,
         dry_run=args.dry_run,
-        discogs_client=make_discogs_client(token),
+        discogs_client=client,
     )
     logger.info(
         "drain complete",
