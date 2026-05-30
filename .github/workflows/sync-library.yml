@@ -9,8 +9,10 @@ on:
 # Workflow-level GITHUB_TOKEN scope. No job in this file pushes code,
 # comments on PRs, or creates releases; all writes to external services
 # use their own non-GITHUB_TOKEN secrets. contents:read is the safe floor.
+# id-token:write is required for OIDC against AWS in the cache-health step.
 permissions:
   contents: read
+  id-token: write
 
 jobs:
   sync:
@@ -69,3 +71,23 @@ jobs:
           gh release upload streaming-data-v1 /tmp/library.db --clobber --repo WXYC/library-metadata-lookup
         env:
           GH_TOKEN: ${{ secrets.LML_RELEASE_TOKEN }}
+
+      # Per WXYC/discogs-etl#241: publish artwork-state counts to CloudWatch
+      # so the never-asked share has a time series we can alarm on. Runs
+      # daily alongside the library sync (same cadence the issue recommends).
+      - uses: aws-actions/configure-aws-credentials@v6
+        if: success()
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+
+      - name: Install discogs-etl
+        if: success()
+        run: pip install -e ".[dev]"
+
+      - name: Publish cache-health metrics
+        if: success()
+        run: python scripts/cache_health_metrics.py
+        env:
+          DATABASE_URL_DISCOGS: ${{ secrets.DATABASE_URL_DISCOGS }}
+          SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
