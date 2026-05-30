@@ -81,7 +81,7 @@ _FIXTURE_ROWS = [
 def library_db(tmp_path: Path) -> Path:
     """Build a tiny library.db with WXYC-representative artists.
 
-    Uses the canonical fixture rows from the org-level CLAUDE.md.
+    Uses the canonical fixture rows from docs/test-fixtures.md.
     """
     db_path = tmp_path / "library.db"
     with sqlite3.connect(db_path) as conn:

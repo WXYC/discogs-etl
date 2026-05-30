@@ -16,7 +16,8 @@ if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
 # Resolve the database URL from the environment, matching the cache-builder
-# CLI convention documented in CLAUDE.md:
+# CLI convention documented in docs/architecture.md ("Cache database CLI
+# convention"):
 #   1. DATABASE_URL_DISCOGS  (canonical)
 #   2. DATABASE_URL          (deprecated fallback; emits a warning)
 _db_url = os.environ.get("DATABASE_URL_DISCOGS")

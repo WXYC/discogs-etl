@@ -131,7 +131,7 @@ def _seed_minimal_fixture(db_url: str) -> None:
 
     Three releases (1, 2, 3) with child rows on each table so the copy-swap
     actually touches every table. Compositions chosen from WXYC's canonical
-    example data per the org's CLAUDE.md fixture guidance.
+    example data per docs/test-fixtures.md.
     """
     conn = psycopg.connect(db_url, autocommit=True)
     try:
