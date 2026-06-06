@@ -69,6 +69,14 @@ on_error() {
 }
 trap 'on_error $LINENO' ERR
 
+# fail <message> — same observability as ERR-trapped failures: post to Slack,
+# then exit non-zero. Use this for explicit-failure paths that ERR doesn't
+# catch (`exit N` doesn't fire ERR; neither does the non-zero side of an `if`).
+fail() {
+    notify_slack ":warning:" "$1 Log: ${LOG_FILE}"
+    exit 1
+}
+
 echo "[$(date -u +%H:%M:%SZ)] starting rebuild — log: $LOG_FILE"
 
 # ---------------------------------------------------------------------------
@@ -184,8 +192,7 @@ if ! both_reachable "$url" "$artists_url"; then
     url="$(dump_url "$prev_year" "$prev" releases)"
     artists_url="$(dump_url "$prev_year" "$prev" artists)"
     if ! both_reachable "$url" "$artists_url"; then
-        echo "::error:: neither current nor previous month has both releases.xml.gz and artists.xml.gz reachable" >&2
-        exit 1
+        fail "neither current nor previous month has both releases.xml.gz and artists.xml.gz reachable"
     fi
     echo "    current-month dump not yet fully published; falling back to ${prev}"
 fi
@@ -221,16 +228,14 @@ if [ "${REBUILD_SMOKE:-}" = "1" ]; then
     curl -fL --max-time 30 -r 0-65535 -o "$smoke_file" "$url"
     smoke_bytes=$(wc -c < "$smoke_file" | tr -d ' ')
     if [ "$smoke_bytes" -lt 1024 ]; then
-        echo "::error:: smoke mode read only ${smoke_bytes} bytes from releases URL" >&2
-        exit 1
+        fail "smoke mode read only ${smoke_bytes} bytes from releases URL"
     fi
     echo "    releases smoke OK: read ${smoke_bytes} bytes"
     artists_smoke_file="$WORK_DIR/artists-smoke.xml.gz"
     curl -fL --max-time 30 -r 0-65535 -o "$artists_smoke_file" "$artists_url"
     artists_smoke_bytes=$(wc -c < "$artists_smoke_file" | tr -d ' ')
     if [ "$artists_smoke_bytes" -lt 1024 ]; then
-        echo "::error:: smoke mode read only ${artists_smoke_bytes} bytes from artists URL" >&2
-        exit 1
+        fail "smoke mode read only ${artists_smoke_bytes} bytes from artists URL"
     fi
     echo "    artists smoke OK: read ${artists_smoke_bytes} bytes"
     notify_slack ":mag:" "smoke test passed (no DB write performed)"
@@ -250,13 +255,13 @@ fi
 # below the real dump sizes (~10 GB releases, ~2 GB artists) but high
 # enough that a corrupt/partial download fails loudly here.
 assert_min_size() {
-    # assert_min_size <path> <min_bytes> <label>
+    # assert_min_size <path> <min_bytes> <label>. fail() so the ERR-trap
+    # observability path (Slack notify) still fires for size-floor failures.
     local path="$1" min="$2" label="$3"
     local actual
     actual=$(wc -c < "$path" | tr -d ' ')
     if [ "$actual" -lt "$min" ]; then
-        echo "::error:: $label download too small: ${actual} bytes (expected at least ${min})" >&2
-        exit 1
+        fail "$label download too small: ${actual} bytes (expected at least ${min})"
     fi
 }
 
@@ -294,7 +299,9 @@ echo "[$(date -u +%H:%M:%SZ)] start pipeline"
 # .xml / .xml.gz files and dispatches each by root-element auto-detection
 # (run_directory in main.rs). With both releases.xml.gz and artists.xml.gz
 # present, process_artists runs alongside the release scanner, writing the
-# artist-side CSVs that --artists-only loads after the converter. LML#497.
+# artist-side CSVs (artist.csv, artist_alias.csv, artist_name_variation.csv,
+# artist_member.csv) into the CSV staging dir; import_csv.py --base-only's
+# inline import_artist_details call then loads them. LML#497.
 # --xml-type is intentionally absent — it forces single-file mode and would
 # skip artist processing.
 python "$REPO_DIR/scripts/run_pipeline.py" \
