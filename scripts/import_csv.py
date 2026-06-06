@@ -876,31 +876,54 @@ def import_artist_details(conn, csv_dir: Path) -> int:
 
     total = count
 
+    # The set of stub-artist IDs gates both the profile UPDATE below (so we
+    # don't COPY the entire Discogs artist dump's ~3-4 M rows just to UPDATE
+    # the ~50 K rows that survived release_artist filtering) and the child-
+    # table loads (artist_alias / NV / member) further down.
+    with conn.cursor() as cur:
+        cur.execute("SELECT id FROM artist")
+        artist_ids = {row[0] for row in cur.fetchall()}
+    logger.info(f"  Filtering artist tables to {len(artist_ids):,} known artists")
+
     # Update artist profiles from artist.csv (if present).
     # COPY to a temp staging table + single UPDATE FROM JOIN avoids the
     # millions of libpq round-trips a per-row UPDATE loop would incur once
-    # the rebuild starts producing the full Discogs artist dump (~3-4 M
-    # rows in 2026-03). Same pattern as import_artwork above.
+    # the rebuild starts producing the full Discogs artist dump.
     artist_csv = csv_dir / "artist.csv"
     if artist_csv.exists():
         logger.info("Updating artist profiles from artist.csv...")
         import csv as csv_mod
 
+        # Read + filter + dedup the CSV BEFORE opening the COPY stream so a
+        # file-IO error doesn't abort an in-flight COPY, and so the staging
+        # table never holds rows the JOIN would drop anyway. The dict de-dup
+        # mirrors import_artwork (last-value-wins semantics match the v1
+        # per-row UPDATE behavior — keeps duplicate-artist-id input rows
+        # from aborting the rebuild with a unique-constraint violation).
+        profiles: dict[int, str] = {}
+        with open(artist_csv, newline="", encoding="utf-8") as f:
+            for row in csv_mod.DictReader(f):
+                artist_id_str = row.get("artist_id")
+                profile = row.get("profile", "").strip()
+                if not (artist_id_str and profile):
+                    continue
+                try:
+                    artist_id = int(artist_id_str)
+                except ValueError:
+                    continue
+                if artist_id in artist_ids:
+                    profiles[artist_id] = strip_pg_null_bytes(profile)
+
         with conn.cursor() as cur:
             cur.execute("""
                 CREATE TEMP TABLE _artist_profile (
-                    artist_id integer PRIMARY KEY,
+                    artist_id integer NOT NULL,
                     profile text NOT NULL
                 ) ON COMMIT DROP
             """)
             with cur.copy("COPY _artist_profile (artist_id, profile) FROM STDIN") as copy:
-                with open(artist_csv, newline="", encoding="utf-8") as f:
-                    reader = csv_mod.DictReader(f)
-                    for row in reader:
-                        artist_id = row.get("artist_id")
-                        profile = row.get("profile", "").strip()
-                        if artist_id and profile:
-                            copy.write_row((int(artist_id), strip_pg_null_bytes(profile)))
+                for artist_id, profile in profiles.items():
+                    copy.write_row((artist_id, profile))
             cur.execute("""
                 UPDATE artist a
                 SET profile = p.profile
@@ -913,12 +936,6 @@ def import_artist_details(conn, csv_dir: Path) -> int:
         total += profile_count
     else:
         logger.info("No artist.csv found, skipping profile import")
-
-    # Query known artist IDs for filtering artist_alias and artist_member
-    with conn.cursor() as cur:
-        cur.execute("SELECT id FROM artist")
-        artist_ids = {row[0] for row in cur.fetchall()}
-    logger.info(f"  Filtering artist tables to {len(artist_ids):,} known artists")
 
     total += _import_tables(conn, csv_dir, ARTIST_TABLES, artist_id_filter=artist_ids)
     return total
