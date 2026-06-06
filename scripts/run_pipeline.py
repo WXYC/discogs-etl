@@ -920,18 +920,6 @@ def _run_database_build_post_import(
         description="base trigram indexes",
     )
 
-    # -- import artist details (LML#497)
-    # The converter loaded release tables via COPY but the artist-side CSVs
-    # (artist.csv, artist_alias.csv, artist_name_variation.csv,
-    # artist_member.csv) are still on disk. import_csv.py --artists-only
-    # stubs artist rows from release_artist, UPDATEs profile from artist.csv,
-    # and loads the artist child tables. Runs BEFORE dedup to match the
-    # CSV-mode ordering (--base-only runs import_artist_details before
-    # dedup_releases.py).
-    artists_cmd = [python, str(SCRIPT_DIR / "import_csv.py"), "--artists-only"]
-    artists_cmd.extend([str(csv_dir), db_url])
-    run_step("Import artist details", artists_cmd)
-
     # -- dedup (deduplicate by master_id)
     labels_csv = library_labels
     if labels_csv is None and catalog_source is not None and catalog_db_url is not None:

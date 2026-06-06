@@ -157,21 +157,37 @@ echo "    library.db: $(du -h "$WORK_DIR/library.db" | cut -f1)"
 # 4. Resolve dump URLs — try current month, fall back to previous if 404/403
 # ---------------------------------------------------------------------------
 # Discogs publishes the releases and artists dumps together each month under
-# the same YYYY/discogs_YYYYMM01_*.xml.gz convention. Probe the releases URL
-# (the primary, ~10 GB) — if the current month isn't yet published the
-# artists dump won't be either, so a single probe covers both. LML#497.
+# the same YYYY/discogs_YYYYMM01_*.xml.gz convention, but the two files can
+# land on the CDN minutes-to-hours apart. Probe BOTH URLs and only commit
+# to a month if both are reachable — otherwise we'd pay the ~10 GB releases
+# download then fail at the artists curl, and the ERR/EXIT traps would wipe
+# $WORK_DIR forcing a full re-download next tick. LML#497.
 echo "[$(date -u +%H:%M:%SZ)] resolve Discogs dump URLs"
 year=$(date -u +%Y)
 month=$(date -u +%m)
-url="https://data.discogs.com/?download=data%2F${year}%2Fdiscogs_${year}${month}01_releases.xml.gz"
-artists_url="https://data.discogs.com/?download=data%2F${year}%2Fdiscogs_${year}${month}01_artists.xml.gz"
-if ! curl -sIfL --max-time 15 -o /dev/null "$url"; then
+
+dump_url() {
+    # dump_url <year> <yyyymm> <kind>
+    printf 'https://data.discogs.com/?download=data%%2F%s%%2Fdiscogs_%s01_%s.xml.gz' "$1" "$2" "$3"
+}
+
+both_reachable() {
+    curl -sIfL --max-time 15 -o /dev/null "$1" && curl -sIfL --max-time 15 -o /dev/null "$2"
+}
+
+url="$(dump_url "$year" "${year}${month}" releases)"
+artists_url="$(dump_url "$year" "${year}${month}" artists)"
+if ! both_reachable "$url" "$artists_url"; then
     prev=$(date -u -d "1 month ago" +%Y%m 2>/dev/null \
         || date -u -v-1m +%Y%m)
     prev_year=${prev:0:4}
-    url="https://data.discogs.com/?download=data%2F${prev_year}%2Fdiscogs_${prev}01_releases.xml.gz"
-    artists_url="https://data.discogs.com/?download=data%2F${prev_year}%2Fdiscogs_${prev}01_artists.xml.gz"
-    echo "    current-month dump not yet available; falling back to ${prev}"
+    url="$(dump_url "$prev_year" "$prev" releases)"
+    artists_url="$(dump_url "$prev_year" "$prev" artists)"
+    if ! both_reachable "$url" "$artists_url"; then
+        echo "::error:: neither current nor previous month has both releases.xml.gz and artists.xml.gz reachable" >&2
+        exit 1
+    fi
+    echo "    current-month dump not yet fully published; falling back to ${prev}"
 fi
 echo "    releases URL: $url"
 echo "    artists URL:  $artists_url"
@@ -226,22 +242,42 @@ fi
 # non-zero exit, including the mid-stream HTTP/2 INTERNAL_ERROR (exit 92)
 # that plain --retry refuses to retry. Five attempts at 30s spacing covers
 # a transient CDN incident without unbounded re-cost.
+#
+# After each fetch, assert min on-disk size. curl returning exit 0 isn't
+# enough — a 0-byte or truncated file on disk produces no XML records and
+# the pipeline silently exits 0 with empty artist/release tables, exactly
+# the LML#497 regression this script is meant to detect. Min sizes are well
+# below the real dump sizes (~10 GB releases, ~2 GB artists) but high
+# enough that a corrupt/partial download fails loudly here.
+assert_min_size() {
+    # assert_min_size <path> <min_bytes> <label>
+    local path="$1" min="$2" label="$3"
+    local actual
+    actual=$(wc -c < "$path" | tr -d ' ')
+    if [ "$actual" -lt "$min" ]; then
+        echo "::error:: $label download too small: ${actual} bytes (expected at least ${min})" >&2
+        exit 1
+    fi
+}
+
 echo "[$(date -u +%H:%M:%SZ)] download releases dump → $WORK_DIR/releases.xml.gz"
 curl -fL --continue-at - --retry 5 --retry-delay 30 --retry-all-errors \
     -o "$WORK_DIR/releases.xml.gz" \
     "$url"
+assert_min_size "$WORK_DIR/releases.xml.gz" $((1024 * 1024 * 1024)) "releases.xml.gz"
 echo "    releases download complete ($(du -h "$WORK_DIR/releases.xml.gz" | cut -f1))"
 
 # Artists dump is ~2 GB compressed. Sibling fetch under the same resilience
 # flags. Once both files are in $WORK_DIR, run_pipeline.py is invoked in
 # directory mode (--xml "$WORK_DIR") so the converter's run_directory path
 # triggers process_artists alongside the release scanner. Without this fetch
-# the artist-side CSVs are never written, the post-import --artists-only
-# step finds an empty input, and artist.profile stays 97.9% NULL. LML#497.
+# the artist-side CSVs are never written and artist.profile stays 97.9%
+# NULL. LML#497.
 echo "[$(date -u +%H:%M:%SZ)] download artists dump → $WORK_DIR/artists.xml.gz"
 curl -fL --continue-at - --retry 5 --retry-delay 30 --retry-all-errors \
     -o "$WORK_DIR/artists.xml.gz" \
     "$artists_url"
+assert_min_size "$WORK_DIR/artists.xml.gz" $((100 * 1024 * 1024)) "artists.xml.gz"
 echo "    artists download complete ($(du -h "$WORK_DIR/artists.xml.gz" | cut -f1))"
 
 echo "[$(date -u +%H:%M:%SZ)] start pipeline"
