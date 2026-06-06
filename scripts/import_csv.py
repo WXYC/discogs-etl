@@ -855,10 +855,27 @@ def _import_tables_parallel(
 def import_artist_details(conn, csv_dir: Path) -> int:
     """Import artist detail tables from CSV.
 
-    Creates stub artist rows from release_artist data, then imports
-    artist_alias and artist_member CSVs.
+    Steps, in order:
 
-    Returns total rows imported.
+    1. Stub-INSERT artist (id, name) from release_artist (ON CONFLICT DO
+       NOTHING) so subsequent steps have a stable set of artist IDs.
+    2. Snapshot `SELECT id FROM artist` into `artist_ids`. Used to gate
+       both the profile UPDATE and the child-table loads, so the rebuild
+       doesn't bother staging artists outside the WXYC-filtered set.
+    3. If `artist.csv` is present, UPDATE artist.profile via a temp
+       staging table populated from a Python-deduplicated dict (last-
+       value-wins on duplicate artist_id). Pre-filters CSV rows to those
+       whose artist_id is in `artist_ids`.
+    4. Load `artist_alias`, `artist_name_variation`, and `artist_member`
+       via _import_tables, filtered to `artist_ids`.
+
+    Contract on `_artist_profile`: the staging table has no PRIMARY KEY;
+    uniqueness is guaranteed by the caller-side dict, which is
+    load-bearing — a future refactor that swaps the dict for an iterator
+    must restore the PK or the UPDATE FROM JOIN's choice over duplicates
+    becomes implementation-defined.
+
+    Returns total rows imported (stubs + profile updates + child rows).
     """
     # Create stub artist rows from release_artist (id + name only)
     logger.info("Creating stub artist rows from release_artist...")
@@ -894,13 +911,17 @@ def import_artist_details(conn, csv_dir: Path) -> int:
         logger.info("Updating artist profiles from artist.csv...")
         import csv as csv_mod
 
-        # Read + filter + dedup the CSV BEFORE opening the COPY stream so a
-        # file-IO error doesn't abort an in-flight COPY, and so the staging
-        # table never holds rows the JOIN would drop anyway. The dict de-dup
-        # mirrors import_artwork (last-value-wins semantics match the v1
-        # per-row UPDATE behavior — keeps duplicate-artist-id input rows
-        # from aborting the rebuild with a unique-constraint violation).
+        # Read + filter + dedup the CSV BEFORE opening the COPY stream so
+        # a file-IO error doesn't abort an in-flight COPY, and so the
+        # staging table never holds rows the JOIN would drop anyway. The
+        # dict de-dup is last-value-wins (matches the v1 per-row UPDATE
+        # behavior, which is the opposite of import_artwork's
+        # first-value-wins); since Discogs's dump has unique artist IDs
+        # this only matters if a corrupt dump ever ships dups, in which
+        # case we want to land *something* rather than abort.
         profiles: dict[int, str] = {}
+        skipped_non_int = 0
+        skipped_unknown_artist = 0
         with open(artist_csv, newline="", encoding="utf-8") as f:
             for row in csv_mod.DictReader(f):
                 artist_id_str = row.get("artist_id")
@@ -910,9 +931,20 @@ def import_artist_details(conn, csv_dir: Path) -> int:
                 try:
                     artist_id = int(artist_id_str)
                 except ValueError:
+                    skipped_non_int += 1
                     continue
-                if artist_id in artist_ids:
-                    profiles[artist_id] = strip_pg_null_bytes(profile)
+                if artist_id not in artist_ids:
+                    skipped_unknown_artist += 1
+                    continue
+                profiles[artist_id] = strip_pg_null_bytes(profile)
+        if skipped_non_int:
+            logger.warning(
+                f"  Skipped {skipped_non_int:,} artist.csv rows with non-integer artist_id"
+            )
+        if skipped_unknown_artist:
+            logger.info(
+                f"  Skipped {skipped_unknown_artist:,} artist.csv rows for artists not in release_artist"
+            )
 
         with conn.cursor() as cur:
             cur.execute("""

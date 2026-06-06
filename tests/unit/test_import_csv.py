@@ -1232,3 +1232,165 @@ class TestImportArtistDetailsFiltersById:
         assert "artist_id_filter" in call_kwargs[1] or (
             len(call_kwargs[0]) > 3 and call_kwargs[0][3] is not None
         )
+
+
+class TestImportArtistDetailsProfileCopy:
+    """The profile UPDATE path in import_artist_details (LML#497) reads
+    artist.csv, filters to known artist IDs, dedups via dict (last-value-wins),
+    and stages the rows via COPY-to-temp + UPDATE FROM JOIN.
+
+    These tests mock the connection so the dict-build branch executes
+    end-to-end without needing a live Postgres; we capture the writes to the
+    `copy.write_row` mock and the args to the staging-table SQL to verify
+    behavior. The PG-backed integration test for the actual UPDATE lives in
+    tests/integration/ (pg marker)."""
+
+    def _setup_mock_conn(self, db_artist_ids: list[int]):
+        """Build a MagicMock conn whose cursor's `cur.copy(...)` context yields
+        a mock with a `.write_row` we can inspect, and whose first fetchall
+        on `SELECT id FROM artist` returns `db_artist_ids`."""
+        from unittest.mock import MagicMock
+
+        mock_copy = MagicMock()
+        mock_copy_ctx = MagicMock()
+        mock_copy_ctx.__enter__ = MagicMock(return_value=mock_copy)
+        mock_copy_ctx.__exit__ = MagicMock(return_value=False)
+
+        mock_cursor = MagicMock()
+        mock_cursor.copy.return_value = mock_copy_ctx
+        mock_cursor.rowcount = len(db_artist_ids)
+        mock_cursor.fetchall.return_value = [(aid,) for aid in db_artist_ids]
+
+        mock_conn = MagicMock()
+        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
+        mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+        return mock_conn, mock_copy
+
+    def test_copy_filters_unknown_artist_ids(self, tmp_path) -> None:
+        """artist.csv rows whose artist_id is not in `artist_ids` (the SELECT
+        id FROM artist snapshot) must NOT be staged. Avoids COPYing the full
+        ~3-4M-row Discogs artist dump when only ~50K rows survive
+        release_artist filtering."""
+        from unittest.mock import patch
+
+        (tmp_path / "artist.csv").write_text(
+            "artist_id,artist_name,profile\n"
+            "1,Known Artist,Known artist bio\n"
+            "999,Unknown Artist,Unknown artist bio\n"
+        )
+
+        mock_conn, mock_copy = self._setup_mock_conn(db_artist_ids=[1])
+
+        with patch.object(_ic, "_import_tables", return_value=0):
+            import_artist_details(mock_conn, tmp_path)
+
+        written = [c.args[0] for c in mock_copy.write_row.call_args_list]
+        assert written == [(1, "Known artist bio")], (
+            f"Only artist_id=1 (in DB) should be staged; got {written}"
+        )
+
+    def test_copy_dedups_duplicate_artist_id_last_value_wins(self, tmp_path) -> None:
+        """If artist.csv ever ships duplicate rows for the same artist_id
+        (shouldn't, but defense), the staging table must end up with one row
+        per artist_id and the LATER row wins. Matches v1 per-row UPDATE
+        semantics."""
+        from unittest.mock import patch
+
+        (tmp_path / "artist.csv").write_text(
+            "artist_id,artist_name,profile\n"
+            "1,Artist v1,First write\n"
+            "1,Artist v2,Second write (wins)\n"
+        )
+
+        mock_conn, mock_copy = self._setup_mock_conn(db_artist_ids=[1])
+
+        with patch.object(_ic, "_import_tables", return_value=0):
+            import_artist_details(mock_conn, tmp_path)
+
+        written = [c.args[0] for c in mock_copy.write_row.call_args_list]
+        assert written == [(1, "Second write (wins)")], (
+            f"Last-value-wins dedup should keep the second row; got {written}"
+        )
+
+    def test_copy_skips_non_integer_artist_id(self, tmp_path) -> None:
+        """A malformed CSV row (non-integer artist_id) is skipped without
+        aborting the rebuild. The skip is logged at WARNING so silent data
+        loss is visible."""
+        from unittest.mock import patch
+
+        (tmp_path / "artist.csv").write_text(
+            "artist_id,artist_name,profile\n1,Good Row,Good bio\nabc,Bad Row,Bad bio\n"
+        )
+
+        mock_conn, mock_copy = self._setup_mock_conn(db_artist_ids=[1])
+
+        with patch.object(_ic, "_import_tables", return_value=0):
+            with caplog_at_warning(_ic.logger.name) as caplog:
+                import_artist_details(mock_conn, tmp_path)
+
+        written = [c.args[0] for c in mock_copy.write_row.call_args_list]
+        assert written == [(1, "Good bio")], f"Non-int artist_id must be skipped; got {written}"
+        # The skip must be logged so it's visible to operators
+        assert any("non-integer artist_id" in r.message for r in caplog.records), (
+            f"Skipped non-int row must be logged at WARNING; got {[r.message for r in caplog.records]}"
+        )
+
+    def test_copy_skips_empty_profile_and_unknown(self, tmp_path) -> None:
+        """Rows with empty/whitespace-only profile, or artist_id missing
+        entirely, are skipped silently — these are normal and shouldn't
+        generate noise. Only unknown-artist skips get an INFO log line."""
+        from unittest.mock import patch
+
+        (tmp_path / "artist.csv").write_text(
+            "artist_id,artist_name,profile\n"
+            "1,No Profile,\n"
+            "2,Whitespace Profile,   \n"
+            ",Missing ID,Some bio\n"
+            "3,Known Artist,Real bio\n"
+        )
+
+        mock_conn, mock_copy = self._setup_mock_conn(db_artist_ids=[1, 2, 3])
+
+        with patch.object(_ic, "_import_tables", return_value=0):
+            import_artist_details(mock_conn, tmp_path)
+
+        written = [c.args[0] for c in mock_copy.write_row.call_args_list]
+        assert written == [(3, "Real bio")], (
+            f"Only the row with both artist_id and non-empty profile should "
+            f"land in COPY; got {written}"
+        )
+
+
+import contextlib  # noqa: E402 — module-level imports already at top; this is for test-only helpers
+
+
+@contextlib.contextmanager
+def caplog_at_warning(logger_name: str):
+    """Light shim so the WARNING-skip-count test doesn't depend on the
+    pytest `caplog` fixture being threaded through. Captures records emitted
+    by the named logger at WARNING+ within the `with` block."""
+    import logging
+
+    records: list[logging.LogRecord] = []
+
+    class _Handler(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record)
+
+    handler = _Handler(level=logging.WARNING)
+    logger = logging.getLogger(logger_name)
+    prior_level = logger.level
+    logger.addHandler(handler)
+    if prior_level > logging.WARNING or prior_level == logging.NOTSET:
+        logger.setLevel(logging.WARNING)
+    try:
+
+        class _Captured:
+            @property
+            def records(self_inner):  # noqa: N805 — closure over outer `records`
+                return records
+
+        yield _Captured()
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(prior_level)

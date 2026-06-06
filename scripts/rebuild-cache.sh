@@ -73,7 +73,7 @@ trap 'on_error $LINENO' ERR
 # then exit non-zero. Use this for explicit-failure paths that ERR doesn't
 # catch (`exit N` doesn't fire ERR; neither does the non-zero side of an `if`).
 fail() {
-    notify_slack ":warning:" "$1 Log: ${LOG_FILE}"
+    notify_slack ":warning:" "$1. Log: ${LOG_FILE}"
     exit 1
 }
 
