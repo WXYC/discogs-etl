@@ -1360,6 +1360,40 @@ class TestImportArtistDetailsProfileCopy:
             f"land in COPY; got {written}"
         )
 
+    def test_pins_staging_table_sql_contract(self, tmp_path) -> None:
+        """Pin the SQL shape. The other tests only inspect copy.write_row
+        tuples — they'd pass against a regression that COPYs directly into
+        `artist` and bypasses the staging table entirely, or that queries
+        `release_artist` instead of `artist` for the artist_ids snapshot.
+        This test asserts the production code actually targets the expected
+        relations."""
+        from unittest.mock import patch
+
+        (tmp_path / "artist.csv").write_text("artist_id,artist_name,profile\n1,X,Y\n")
+
+        mock_conn, mock_copy = self._setup_mock_conn(db_artist_ids=[1])
+
+        with patch.object(_ic, "_import_tables", return_value=0):
+            import_artist_details(mock_conn, tmp_path)
+
+        cursor = mock_conn.cursor.return_value.__enter__.return_value
+        executed_sql = " ".join(c.args[0] for c in cursor.execute.call_args_list if c.args)
+        # The artist_ids snapshot must query the `artist` table, NOT release_artist
+        # (a SELECT id FROM release_artist would return raw FK IDs without the
+        # stub-INSERT's DISTINCT filter and without the ON CONFLICT dedup).
+        assert "SELECT id FROM artist" in executed_sql, (
+            f"artist_ids snapshot must query the artist table; SQL was: {executed_sql}"
+        )
+        # The profile UPDATE must go via the temp staging table, not direct.
+        assert "_artist_profile" in executed_sql, (
+            f"Profile UPDATE must use the _artist_profile staging table; SQL was: {executed_sql}"
+        )
+        # COPY must target the staging table, not `artist` directly.
+        copied_sql = " ".join(c.args[0] for c in cursor.copy.call_args_list if c.args)
+        assert "COPY _artist_profile" in copied_sql, (
+            f"COPY must target _artist_profile (staging), not artist directly; got: {copied_sql}"
+        )
+
 
 import contextlib  # noqa: E402 — module-level imports already at top; this is for test-only helpers
 
