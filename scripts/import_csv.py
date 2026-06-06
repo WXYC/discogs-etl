@@ -876,25 +876,38 @@ def import_artist_details(conn, csv_dir: Path) -> int:
 
     total = count
 
-    # Update artist profiles from artist.csv (if present)
+    # Update artist profiles from artist.csv (if present).
+    # COPY to a temp staging table + single UPDATE FROM JOIN avoids the
+    # millions of libpq round-trips a per-row UPDATE loop would incur once
+    # the rebuild starts producing the full Discogs artist dump (~3-4 M
+    # rows in 2026-03). Same pattern as import_artwork above.
     artist_csv = csv_dir / "artist.csv"
     if artist_csv.exists():
         logger.info("Updating artist profiles from artist.csv...")
         import csv as csv_mod
 
-        profile_count = 0
-        with open(artist_csv, newline="", encoding="utf-8") as f:
-            reader = csv_mod.DictReader(f)
-            with conn.cursor() as cur:
-                for row in reader:
-                    artist_id = row.get("artist_id")
-                    profile = row.get("profile", "").strip()
-                    if artist_id and profile:
-                        cur.execute(
-                            "UPDATE artist SET profile = %s WHERE id = %s",
-                            (strip_pg_null_bytes(profile), int(artist_id)),
-                        )
-                        profile_count += cur.rowcount
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TEMP TABLE _artist_profile (
+                    artist_id integer PRIMARY KEY,
+                    profile text NOT NULL
+                ) ON COMMIT DROP
+            """)
+            with cur.copy("COPY _artist_profile (artist_id, profile) FROM STDIN") as copy:
+                with open(artist_csv, newline="", encoding="utf-8") as f:
+                    reader = csv_mod.DictReader(f)
+                    for row in reader:
+                        artist_id = row.get("artist_id")
+                        profile = row.get("profile", "").strip()
+                        if artist_id and profile:
+                            copy.write_row((int(artist_id), strip_pg_null_bytes(profile)))
+            cur.execute("""
+                UPDATE artist a
+                SET profile = p.profile
+                FROM _artist_profile p
+                WHERE a.id = p.artist_id
+            """)
+            profile_count = cur.rowcount
         conn.commit()
         logger.info(f"  Updated {profile_count:,} artist profiles")
         total += profile_count
@@ -946,17 +959,6 @@ def main():
         action="store_true",
         help="Import only track tables, filtered to surviving release IDs",
     )
-    mode.add_argument(
-        "--artists-only",
-        action="store_true",
-        help="Import only the artist-side tables (artist, artist_alias, "
-        "artist_name_variation, artist_member) — the counterpart to the "
-        "artist-details block that --base-only runs inline. Used by the "
-        "direct-pg rebuild path (run_pipeline.py's "
-        "_run_database_build_post_import), where the converter has already "
-        "loaded release tables via COPY and only the artist side is left. "
-        "See LML#497.",
-    )
     parser.add_argument(
         "--truncate-existing",
         action="store_true",
@@ -983,15 +985,7 @@ def main():
         )
         _truncate_tables(conn, truncate_set)
 
-    if args.artists_only:
-        # Direct-pg path (LML#497): converter loaded release tables via COPY;
-        # release_artist is in place, so import_artist_details can stub artist
-        # rows from it and then layer profile + alias/NV/member CSVs on top.
-        logger.info("Importing artist details...")
-        total = import_artist_details(conn, csv_dir)
-        logger.info("Artist details complete")
-        conn.close()
-    elif args.tracks_only:
+    if args.tracks_only:
         # Query surviving release IDs from the database
         with conn.cursor() as cur:
             cur.execute("SELECT id FROM release")

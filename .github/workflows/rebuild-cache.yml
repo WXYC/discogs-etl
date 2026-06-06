@@ -40,6 +40,19 @@ name: Rebuild Discogs Cache
 # fine in ~half an hour on hardware co-located with the destination DB.
 # Tracking the migration to a Railway cron service in WXYC/discogs-etl.
 # `workflow_dispatch` is kept as a manual escape hatch.
+#
+# 2026-06-06: scope limitation — this workflow path is **releases-only**
+# and therefore does NOT populate artist.profile, artist_alias,
+# artist_name_variation, or artist_member (LML#497). The EC2-based
+# `scripts/rebuild-cache.sh` is the canonical path with full artist
+# coverage; it fetches releases.xml.gz + artists.xml.gz and runs the
+# converter in directory mode. Replicating that here requires either
+# (a) two parallel FIFOs with concurrent decompression (the converter's
+# run_directory needs both files visible before scanning starts), or
+# (b) disk-spool — but the ~10 GB releases + ~2 GB artists exceeds the
+# free-runner ~14 GB disk. If you trigger this workflow manually
+# expect 97.9% NULL artist.profile on the resulting cache; re-run on
+# EC2 to recover artist coverage.
 on:
   workflow_dispatch:
     inputs:

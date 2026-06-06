@@ -65,26 +65,28 @@ def test_main_download_artists_uses_continue_at_resume(script_text: str) -> None
     ``--continue-at``. Apply the same resume + retry-all-errors invariants to
     keep both fetches resilient.
     """
+    # Parse the script into individual curl invocations (each starts with a
+    # `curl` token and ends at the next blank line), then locate the one that
+    # writes artists.xml.gz and verify the flags live IN THAT BLOCK. A naive
+    # char-window approach would bleed across the releases-curl block
+    # immediately above (the two blocks are ~290 chars apart in the stripped
+    # script — well inside any reasonable lookback) and pass even if the
+    # artists block lacked the flags.
     code = "\n".join(_non_comment_lines(script_text.splitlines()))
-    # Locate the artists download command — anchored on the unique '-o' target.
-    artists_block_idx = code.find('-o "$WORK_DIR/artists.xml.gz"')
-    assert artists_block_idx >= 0, (
-        "rebuild-cache.sh must include a curl invocation that writes "
-        "'$WORK_DIR/artists.xml.gz' (precondition for this test)."
+    curl_blocks = [b for b in code.split("\n\n") if "curl " in b]
+    artists_blocks = [b for b in curl_blocks if '-o "$WORK_DIR/artists.xml.gz"' in b]
+    assert len(artists_blocks) == 1, (
+        "rebuild-cache.sh must contain exactly one curl block writing "
+        f"'$WORK_DIR/artists.xml.gz' — got {len(artists_blocks)}."
     )
-    # Take a window of 400 chars around the target — large enough to include
-    # the preceding `curl` invocation's flags but tight enough not to bleed
-    # into the releases fetch.
-    start = max(0, artists_block_idx - 400)
-    end = min(len(code), artists_block_idx + 200)
-    window = code[start:end]
-    assert "--continue-at -" in window, (
+    artists_block = artists_blocks[0]
+    assert "--continue-at -" in artists_block, (
         "the curl invocation that writes 'artists.xml.gz' must use "
-        "'--continue-at -' so a mid-stream HTTP/2 reset is resumable. See #181."
+        f"'--continue-at -' so a mid-stream HTTP/2 reset is resumable. See #181. Block:\n{artists_block}"
     )
-    assert "--retry-all-errors" in window, (
+    assert "--retry-all-errors" in artists_block, (
         "the curl invocation that writes 'artists.xml.gz' must use "
-        "'--retry-all-errors' so mid-stream failures trigger a retry. See #181."
+        f"'--retry-all-errors' so mid-stream failures trigger a retry. See #181. Block:\n{artists_block}"
     )
 
 
@@ -133,16 +135,21 @@ def test_pipeline_invocation_drops_xml_type_releases(script_text: str) -> None:
 
 def test_artists_url_uses_same_yyyymmdd_pattern(script_text: str) -> None:
     """The artists dump URL must follow Discogs's
-    ``data/<YYYY>/discogs_<YYYY><MM>01_artists.xml.gz`` convention — the same
-    pattern as releases, only the basename differs.
-
-    Pin the pattern so a stray rename can't silently break the URL
-    derivation. The fallback-to-previous-month logic already handles the
-    case where the current month isn't published yet.
+    ``data/<YYYY>/discogs_<YYYY><MM>01_artists.xml.gz`` convention — the
+    same shape as releases, only the basename differs. Test against the
+    actual URL Bash will build by running the printf template the script
+    uses, since the script now factors the URL into a `dump_url` helper.
     """
     code = "\n".join(_non_comment_lines(script_text.splitlines()))
-    assert "discogs_${year}${month}01_artists.xml.gz" in code, (
-        "rebuild-cache.sh must derive the artists URL via "
-        "'discogs_${year}${month}01_artists.xml.gz' "
-        "(same shape as releases). See LML#497."
+    # The script's dump_url helper must reference 'artists' as a `kind` arg
+    # at least once (for the current-month URL derivation).
+    assert 'dump_url "$year" "${year}${month}" artists' in code, (
+        "rebuild-cache.sh must derive the artists URL by passing 'artists' "
+        "as the kind argument to its dump_url helper. See LML#497."
+    )
+    # The discogs URL convention (`data/YYYY/discogs_YYYYMM01_<kind>.xml.gz`)
+    # is encoded in the printf template inside dump_url. Pin it.
+    assert "discogs_%s01_%s.xml.gz" in code, (
+        "rebuild-cache.sh's dump_url helper must use the Discogs URL "
+        "convention `discogs_<YYYYMM>01_<kind>.xml.gz`. See LML#497."
     )
