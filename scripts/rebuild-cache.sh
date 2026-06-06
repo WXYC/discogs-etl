@@ -154,20 +154,27 @@ gh release download streaming-data-v1 \
 echo "    library.db: $(du -h "$WORK_DIR/library.db" | cut -f1)"
 
 # ---------------------------------------------------------------------------
-# 4. Resolve dump URL — try current month, fall back to previous if 404/403
+# 4. Resolve dump URLs — try current month, fall back to previous if 404/403
 # ---------------------------------------------------------------------------
-echo "[$(date -u +%H:%M:%SZ)] resolve Discogs dump URL"
+# Discogs publishes the releases and artists dumps together each month under
+# the same YYYY/discogs_YYYYMM01_*.xml.gz convention. Probe the releases URL
+# (the primary, ~10 GB) — if the current month isn't yet published the
+# artists dump won't be either, so a single probe covers both. LML#497.
+echo "[$(date -u +%H:%M:%SZ)] resolve Discogs dump URLs"
 year=$(date -u +%Y)
 month=$(date -u +%m)
 url="https://data.discogs.com/?download=data%2F${year}%2Fdiscogs_${year}${month}01_releases.xml.gz"
+artists_url="https://data.discogs.com/?download=data%2F${year}%2Fdiscogs_${year}${month}01_artists.xml.gz"
 if ! curl -sIfL --max-time 15 -o /dev/null "$url"; then
     prev=$(date -u -d "1 month ago" +%Y%m 2>/dev/null \
         || date -u -v-1m +%Y%m)
     prev_year=${prev:0:4}
     url="https://data.discogs.com/?download=data%2F${prev_year}%2Fdiscogs_${prev}01_releases.xml.gz"
+    artists_url="https://data.discogs.com/?download=data%2F${prev_year}%2Fdiscogs_${prev}01_artists.xml.gz"
     echo "    current-month dump not yet available; falling back to ${prev}"
 fi
-echo "    dump URL: $url"
+echo "    releases URL: $url"
+echo "    artists URL:  $artists_url"
 
 # ---------------------------------------------------------------------------
 # 5. Spool dump to disk + run pipeline
@@ -190,18 +197,26 @@ echo "    dump URL: $url"
 # it on this path). See WXYC/discogs-xml-converter#45.
 
 if [ "${REBUILD_SMOKE:-}" = "1" ]; then
-    # Smoke mode validates the URL is reachable. A 64 KiB Range request
+    # Smoke mode validates both URLs are reachable. A 64 KiB Range request
     # confirms DNS, TLS, Cloudflare reachability, and the gzip magic in
-    # the first chunk -- without paying the full 10 GB transfer.
+    # the first chunk -- without paying the full transfer.
     echo "[$(date -u +%H:%M:%SZ)] REBUILD_SMOKE=1 — validating dump URL reachability"
     smoke_file="$WORK_DIR/releases-smoke.xml.gz"
     curl -fL --max-time 30 -r 0-65535 -o "$smoke_file" "$url"
     smoke_bytes=$(wc -c < "$smoke_file" | tr -d ' ')
     if [ "$smoke_bytes" -lt 1024 ]; then
-        echo "::error:: smoke mode read only ${smoke_bytes} bytes" >&2
+        echo "::error:: smoke mode read only ${smoke_bytes} bytes from releases URL" >&2
         exit 1
     fi
-    echo "    smoke OK: read ${smoke_bytes} bytes from the dump URL"
+    echo "    releases smoke OK: read ${smoke_bytes} bytes"
+    artists_smoke_file="$WORK_DIR/artists-smoke.xml.gz"
+    curl -fL --max-time 30 -r 0-65535 -o "$artists_smoke_file" "$artists_url"
+    artists_smoke_bytes=$(wc -c < "$artists_smoke_file" | tr -d ' ')
+    if [ "$artists_smoke_bytes" -lt 1024 ]; then
+        echo "::error:: smoke mode read only ${artists_smoke_bytes} bytes from artists URL" >&2
+        exit 1
+    fi
+    echo "    artists smoke OK: read ${artists_smoke_bytes} bytes"
     notify_slack ":mag:" "smoke test passed (no DB write performed)"
     exit 0
 fi
@@ -211,11 +226,23 @@ fi
 # non-zero exit, including the mid-stream HTTP/2 INTERNAL_ERROR (exit 92)
 # that plain --retry refuses to retry. Five attempts at 30s spacing covers
 # a transient CDN incident without unbounded re-cost.
-echo "[$(date -u +%H:%M:%SZ)] download dump → $WORK_DIR/releases.xml.gz"
+echo "[$(date -u +%H:%M:%SZ)] download releases dump → $WORK_DIR/releases.xml.gz"
 curl -fL --continue-at - --retry 5 --retry-delay 30 --retry-all-errors \
     -o "$WORK_DIR/releases.xml.gz" \
     "$url"
-echo "    download complete ($(du -h "$WORK_DIR/releases.xml.gz" | cut -f1))"
+echo "    releases download complete ($(du -h "$WORK_DIR/releases.xml.gz" | cut -f1))"
+
+# Artists dump is ~2 GB compressed. Sibling fetch under the same resilience
+# flags. Once both files are in $WORK_DIR, run_pipeline.py is invoked in
+# directory mode (--xml "$WORK_DIR") so the converter's run_directory path
+# triggers process_artists alongside the release scanner. Without this fetch
+# the artist-side CSVs are never written, the post-import --artists-only
+# step finds an empty input, and artist.profile stays 97.9% NULL. LML#497.
+echo "[$(date -u +%H:%M:%SZ)] download artists dump → $WORK_DIR/artists.xml.gz"
+curl -fL --continue-at - --retry 5 --retry-delay 30 --retry-all-errors \
+    -o "$WORK_DIR/artists.xml.gz" \
+    "$artists_url"
+echo "    artists download complete ($(du -h "$WORK_DIR/artists.xml.gz" | cut -f1))"
 
 echo "[$(date -u +%H:%M:%SZ)] start pipeline"
 # Default mode (no --truncate-existing): the import path is idempotent via
@@ -226,9 +253,16 @@ echo "[$(date -u +%H:%M:%SZ)] start pipeline"
 # the failure mode WXYC/discogs-etl#252 documents from the 2026-05-30 run.
 # The duplicate-key failure mode from #188 that originally motivated the
 # flag is no longer reachable on the default path (ON CONFLICT skips it).
+#
+# Directory mode (--xml "$WORK_DIR"): the converter scans the directory for
+# .xml / .xml.gz files and dispatches each by root-element auto-detection
+# (run_directory in main.rs). With both releases.xml.gz and artists.xml.gz
+# present, process_artists runs alongside the release scanner, writing the
+# artist-side CSVs that --artists-only loads after the converter. LML#497.
+# --xml-type is intentionally absent — it forces single-file mode and would
+# skip artist processing.
 python "$REPO_DIR/scripts/run_pipeline.py" \
-    --xml "$WORK_DIR/releases.xml.gz" \
-    --xml-type releases \
+    --xml "$WORK_DIR" \
     --library-db "$WORK_DIR/library.db"
 
 # ---------------------------------------------------------------------------

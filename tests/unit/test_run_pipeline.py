@@ -1307,3 +1307,97 @@ class TestParseArgsValidation:
                     "--pair-filter",
                 ]
             )
+
+
+class TestDirectPgImportsArtistTables:
+    """In --direct-pg mode, ``_run_database_build_post_import`` must run an
+    import_csv pass for the artist-side tables (artist, artist_alias,
+    artist_name_variation, artist_member).
+
+    Background — LML#497. The converter writes those CSVs to the data dir in
+    both ``build`` and ``import`` subcommand modes. In CSV mode they get
+    picked up by ``import_csv.py --base-only``'s ``import_artist_details``
+    call. In direct-pg mode, ``_run_database_build_post_import`` previously
+    skipped ``import_csv.py`` entirely (the converter loads release tables
+    via COPY), which silently dropped the artist CSVs. Result: ``artist``
+    only had the stub ``(id, name)`` rows that ``import_artist_details``
+    creates from ``release_artist`` — and that step never ran either. The
+    LML cache ended up 97.9% NULL on ``artist.profile``.
+
+    The fix: invoke ``import_csv.py --artists-only`` (a new mode added in
+    this same change) after the converter, before dedup, so the artist-side
+    CSVs land in PG.
+    """
+
+    def _invoke_post_import_capturing_run_step(self) -> list[list[str]]:
+        captured_cmds: list[list[str]] = []
+
+        def fake_run_step(step_name, cmd, *args, **kwargs):
+            captured_cmds.append(cmd)
+
+        mock_cursor = MagicMock()
+        mock_cursor.fetchone.return_value = [0]
+        mock_cursor.fetchall.return_value = []
+        mock_conn = MagicMock()
+        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
+        mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+
+        with (
+            patch.object(run_pipeline, "run_step", side_effect=fake_run_step),
+            patch.object(run_pipeline, "run_sql_statements_parallel"),
+            patch.object(run_pipeline, "run_vacuum"),
+            patch.object(run_pipeline, "set_tables_logged"),
+            patch.object(run_pipeline, "report_sizes"),
+            patch.object(run_pipeline.psycopg, "connect", return_value=mock_conn),
+        ):
+            run_pipeline._run_database_build_post_import(
+                "postgresql:///test",
+                Path("/tmp/csv"),
+                None,
+                sys.executable,
+            )
+
+        return captured_cmds
+
+    def test_artists_only_import_step_present(self) -> None:
+        """The post-import sequence must include an ``import_csv.py --artists-only``
+        subprocess call. Without it the artist-side CSVs the converter wrote
+        are silently dropped. See LML#497.
+        """
+        cmds = self._invoke_post_import_capturing_run_step()
+        artist_cmds = [c for c in cmds if "--artists-only" in c]
+        assert len(artist_cmds) == 1, (
+            "_run_database_build_post_import must call import_csv.py exactly "
+            "once with --artists-only so the converter-written artist CSVs "
+            f"land in PG. Captured commands: {cmds}. See LML#497."
+        )
+        # The argv should point at import_csv.py and forward csv_dir + db_url.
+        argv = artist_cmds[0]
+        assert any(str(arg).endswith("import_csv.py") for arg in argv), (
+            f"--artists-only invocation must target import_csv.py; got {argv}"
+        )
+        assert "/tmp/csv" in argv, f"--artists-only invocation must forward csv_dir; got {argv}"
+        assert "postgresql:///test" in argv, (
+            f"--artists-only invocation must forward db_url; got {argv}"
+        )
+
+    def test_artists_only_runs_before_dedup(self) -> None:
+        """``import_artist_details`` creates stub artist rows from
+        ``release_artist``. Running it BEFORE dedup matches the CSV-mode
+        ordering (``import_csv.py --base-only`` runs before
+        ``dedup_releases.py``) and ensures the stub rows correspond to the
+        pre-dedup release set. Dedup's CASCADE deletes will not orphan
+        ``artist`` rows because ``artist`` has no FK to ``release``.
+        """
+        cmds = self._invoke_post_import_capturing_run_step()
+        artists_idx = next((i for i, c in enumerate(cmds) if "--artists-only" in c), None)
+        dedup_idx = next(
+            (i for i, c in enumerate(cmds) if any("dedup_releases.py" in str(a) for a in c)),
+            None,
+        )
+        assert artists_idx is not None, "--artists-only step must be present"
+        assert dedup_idx is not None, "dedup step must be present"
+        assert artists_idx < dedup_idx, (
+            f"--artists-only (index {artists_idx}) must come before dedup "
+            f"(index {dedup_idx}) to match the CSV-mode ordering. See LML#497."
+        )

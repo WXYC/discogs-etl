@@ -946,6 +946,17 @@ def main():
         action="store_true",
         help="Import only track tables, filtered to surviving release IDs",
     )
+    mode.add_argument(
+        "--artists-only",
+        action="store_true",
+        help="Import only the artist-side tables (artist, artist_alias, "
+        "artist_name_variation, artist_member) — the counterpart to the "
+        "artist-details block that --base-only runs inline. Used by the "
+        "direct-pg rebuild path (run_pipeline.py's "
+        "_run_database_build_post_import), where the converter has already "
+        "loaded release tables via COPY and only the artist side is left. "
+        "See LML#497.",
+    )
     parser.add_argument(
         "--truncate-existing",
         action="store_true",
@@ -972,7 +983,15 @@ def main():
         )
         _truncate_tables(conn, truncate_set)
 
-    if args.tracks_only:
+    if args.artists_only:
+        # Direct-pg path (LML#497): converter loaded release tables via COPY;
+        # release_artist is in place, so import_artist_details can stub artist
+        # rows from it and then layer profile + alias/NV/member CSVs on top.
+        logger.info("Importing artist details...")
+        total = import_artist_details(conn, csv_dir)
+        logger.info("Artist details complete")
+        conn.close()
+    elif args.tracks_only:
         # Query surviving release IDs from the database
         with conn.cursor() as cur:
             cur.execute("SELECT id FROM release")
