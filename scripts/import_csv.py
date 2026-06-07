@@ -218,6 +218,21 @@ ARTIST_TABLES: list[TableConfig] = [
         "transforms": {},
         "unique_key": ["group_artist_id", "member_artist_id"],
     },
+    {
+        # WXYC/discogs-xml-converter#68 extends the converter to extract
+        # Discogs `<urls>` (Wikipedia, official sites, social) into
+        # artist_url.csv. Without this entry the file would silently drop on
+        # the floor at rebuild time, leaving `artist_url` empty and the LML
+        # `cache_service.get_artist_details` join returning no external URLs.
+        # Step 3 of WXYC/library-metadata-lookup#497.
+        "csv_file": "artist_url.csv",
+        "table": "artist_url",
+        "csv_columns": ["artist_id", "url"],
+        "db_columns": ["artist_id", "url"],
+        "required": ["artist_id", "url"],
+        "transforms": {},
+        "unique_key": ["artist_id", "url"],
+    },
 ]
 
 MASTER_TABLES: list[TableConfig] = [
