@@ -1124,6 +1124,26 @@ class TestArtistTablesConfig:
         assert "name" in config["required"]
         assert config["unique_key"] == ["artist_id", "name"]
 
+    def test_artist_url_entry_exists(self) -> None:
+        """ARTIST_TABLES must include artist_url.
+
+        WXYC/discogs-xml-converter#68 extends the converter to extract Discogs
+        `<urls>` (Wikipedia, official sites, social) into `artist_url.csv`.
+        Without a matching ARTIST_TABLES entry, the file would silently drop
+        on the floor at rebuild time. Step 3 of WXYC/library-metadata-lookup#497.
+        """
+        config = next((t for t in ARTIST_TABLES if t["table"] == "artist_url"), None)
+        assert config is not None, (
+            "ARTIST_TABLES is missing an entry for artist_url — "
+            "see WXYC/library-metadata-lookup#497 + WXYC/discogs-xml-converter#68"
+        )
+        assert config["csv_file"] == "artist_url.csv"
+        assert config["csv_columns"] == ["artist_id", "url"]
+        assert config["db_columns"] == ["artist_id", "url"]
+        assert "artist_id" in config["required"]
+        assert "url" in config["required"]
+        assert config["unique_key"] == ["artist_id", "url"]
+
 
 class TestReleaseTrackUniqueKey:
     """release_track must have unique_key for dedup."""
