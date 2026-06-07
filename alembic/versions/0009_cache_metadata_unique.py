@@ -58,7 +58,7 @@ Companion tickets
 - WXYC/discogs-etl#271 (closed) — TMPDIR redirect that unblocked reaching
   the load phase where this crashed.
 
-Revision ID: 0009_cache_metadata_unique_release_id
+Revision ID: 0009_cache_metadata_unique
 Revises: 0008_release_artwork_checked_at
 Create Date: 2026-06-07
 
@@ -74,7 +74,7 @@ import psycopg
 
 from alembic import context
 
-revision: str = "0009_cache_metadata_unique_release_id"
+revision: str = "0009_cache_metadata_unique"
 down_revision: str | Sequence[str] | None = "0008_release_artwork_checked_at"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
@@ -125,7 +125,7 @@ def _resolve_db_url() -> str:
     if not db_url:
         raise RuntimeError(
             "DATABASE_URL_DISCOGS (or DATABASE_URL) must be set to apply "
-            "0009_cache_metadata_unique_release_id."
+            "0009_cache_metadata_unique."
         )
     return db_url
 
@@ -133,7 +133,7 @@ def _resolve_db_url() -> str:
 def _refuse_offline(direction: str) -> None:
     if context.is_offline_mode():
         raise RuntimeError(
-            f"0009_cache_metadata_unique_release_id does not support --sql / "
+            f"0009_cache_metadata_unique does not support --sql / "
             f"offline mode ({direction}): the migration opens its own "
             "autocommit psycopg connection to apply DDL + DML, mirroring 0008. "
             "Run `alembic upgrade head` (or `downgrade`) against a live DB instead."

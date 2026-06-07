@@ -1,4 +1,4 @@
-"""Verify the 0009_cache_metadata_unique_release_id migration.
+"""Verify the 0009_cache_metadata_unique migration.
 
 ``import_csv.py:524``'s ``populate_cache_metadata`` does
 ``INSERT ... ON CONFLICT (release_id) DO NOTHING`` to tolerate the
@@ -39,7 +39,7 @@ import psycopg
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-MIGRATION_PATH = REPO_ROOT / "alembic" / "versions" / "0009_cache_metadata_unique_release_id.py"
+MIGRATION_PATH = REPO_ROOT / "alembic" / "versions" / "0009_cache_metadata_unique.py"
 SCHEMA_DIR = REPO_ROOT / "schema"
 
 
@@ -87,7 +87,7 @@ def test_migration_adds_unique_constraint() -> None:
 def test_migration_revision_chain() -> None:
     """0009 must revise 0008 so `alembic upgrade head` picks it up."""
     body = MIGRATION_PATH.read_text(encoding="utf-8")
-    assert "0009_cache_metadata_unique_release_id" in body, "revision id missing/wrong"
+    assert "0009_cache_metadata_unique" in body, "revision id missing/wrong"
     assert "0008_release_artwork_checked_at" in body, (
         "down_revision must point at 0008 — without the chain, alembic upgrade head won't run 0009."
     )
