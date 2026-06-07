@@ -61,8 +61,13 @@ notify_slack() {
 }
 
 # Trap surfaces unexpected exits to Slack with the failing line context.
+# exit_code reads $2 first, falling back to $?. Multi-command ERR traps
+# that need to run cleanup before on_error MUST snapshot $? themselves
+# (the cleanup would otherwise clobber it) and pass it as $2. See #269 —
+# the failure mode this guards against is a silent exit-0 report when a
+# preceding successful `rm -rf` (or similar) hides a real failure.
 on_error() {
-    local exit_code=$?
+    local exit_code=${2:-$?}
     local line=$1
     notify_slack ":warning:" "failed at line ${line} (exit ${exit_code}). Log: ${LOG_FILE}"
     exit "$exit_code"
@@ -150,7 +155,10 @@ fi
 # 3. Pull daily-fresh library.db produced by sync-library workflow
 # ---------------------------------------------------------------------------
 WORK_DIR="$(mktemp -d "$REPO_DIR/data-rebuild.XXXXXX")"
-trap 'rm -rf "$WORK_DIR"; on_error $LINENO' ERR
+# Snapshot $? before `rm -rf` clobbers it, then thread the captured code
+# through to on_error as $2. See #269.
+# shellcheck disable=SC2154  # `rc` is assigned in this trap body, not external
+trap 'rc=$?; rm -rf "$WORK_DIR"; on_error $LINENO "$rc"' ERR
 trap 'rm -rf "$WORK_DIR"' EXIT
 
 echo "[$(date -u +%H:%M:%SZ)] download library.db from LML release artifact"
