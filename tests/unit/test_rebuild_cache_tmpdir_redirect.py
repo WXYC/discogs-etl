@@ -101,7 +101,9 @@ def test_tmpdir_points_to_ebs_backed_path(script_lines: list[str]) -> None:
     self-contained and reuses the existing cleanup.
     """
     _, line = _find_tmpdir_assignment(script_lines)
-    assert "$WORK_DIR" in line or "$REPO_DIR" in line or "${WORK_DIR}" in line or "${REPO_DIR}" in line, (
+    assert (
+        "$WORK_DIR" in line or "$REPO_DIR" in line or "${WORK_DIR}" in line or "${REPO_DIR}" in line
+    ), (
         f"TMPDIR assignment must reference $WORK_DIR or $REPO_DIR so the "
         f"converter's temp dir lives on EBS, not tmpfs. Got: {line!r}. "
         f"See #271."
