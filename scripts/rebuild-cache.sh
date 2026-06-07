@@ -161,6 +161,16 @@ WORK_DIR="$(mktemp -d "$REPO_DIR/data-rebuild.XXXXXX")"
 trap 'rc=$?; rm -rf "$WORK_DIR"; on_error $LINENO "$rc"' ERR
 trap 'rm -rf "$WORK_DIR"' EXIT
 
+# Redirect TMPDIR to the EBS-backed WORK_DIR. Without this, run_pipeline.py's
+# `tempfile.TemporaryDirectory(prefix="discogs_pipeline_")` falls back to
+# /tmp, which is tmpfs (~50% of RAM = ~2 GB on c6i.large) on Amazon Linux
+# 2023. The converter's CSV staging exceeds that partway through the
+# release scan and crashes with ENOSPC (run 1 + run 2 of #267). Pinning
+# TMPDIR here keeps the temp dir on the EBS root volume; the existing
+# WORK_DIR cleanup trap reaps the nested temp dir too. See #271 (and #268
+# for the earlier disk-budget hypothesis that didn't address this).
+export TMPDIR="$WORK_DIR"
+
 echo "[$(date -u +%H:%M:%SZ)] download library.db from LML release artifact"
 gh release download streaming-data-v1 \
     --repo WXYC/library-metadata-lookup \
