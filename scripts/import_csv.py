@@ -653,16 +653,22 @@ def import_release_via_upsert(conn, csv_dir: Path) -> int:
     with conn.cursor() as cur:
         # artwork_url, artwork_checked_at intentionally NOT in the SET
         # list — the contract of this function.
+        #
+        # not_found IS in the SET list (LML#510): a fresh dump is
+        # authoritative, so any prior LML 404 tombstone clears here.
+        # Without this, a tombstoned id would survive every rebuild and
+        # stay unreachable until LML's admin recovery endpoint deletes it.
         cur.execute(
             """
-            INSERT INTO release (id, title, country, released, format, master_id)
-            SELECT id, title, country, released, format, master_id FROM release_staging
+            INSERT INTO release (id, title, country, released, format, master_id, not_found)
+            SELECT id, title, country, released, format, master_id, FALSE FROM release_staging
             ON CONFLICT (id) DO UPDATE SET
                 title     = EXCLUDED.title,
                 country   = EXCLUDED.country,
                 released  = EXCLUDED.released,
                 format    = EXCLUDED.format,
-                master_id = EXCLUDED.master_id
+                master_id = EXCLUDED.master_id,
+                not_found = EXCLUDED.not_found
             """
         )
         cur.execute("DELETE FROM release WHERE id NOT IN (SELECT id FROM release_staging)")
@@ -893,18 +899,25 @@ def import_artist_details(conn, csv_dir: Path) -> int:
     Returns total rows imported (stubs + profile updates + child rows).
     """
     # Create stub artist rows from release_artist (id + name only)
+    #
+    # ON CONFLICT clears any prior LML#510 tombstone (`not_found = TRUE`).
+    # `WHERE artist.not_found = TRUE` narrows the rewrite to actual
+    # tombstones so non-tombstone rows aren't disturbed. Without this
+    # branch a tombstoned id would survive every rebuild.
     logger.info("Creating stub artist rows from release_artist...")
     with conn.cursor() as cur:
         cur.execute("""
-            INSERT INTO artist (id, name)
-            SELECT DISTINCT artist_id, artist_name
+            INSERT INTO artist (id, name, not_found)
+            SELECT DISTINCT artist_id, artist_name, FALSE
             FROM release_artist
             WHERE artist_id IS NOT NULL
-            ON CONFLICT (id) DO NOTHING
+            ON CONFLICT (id) DO UPDATE SET
+                not_found = FALSE
+            WHERE artist.not_found = TRUE
         """)
         count = cur.rowcount
     conn.commit()
-    logger.info(f"  Created {count:,} stub artist rows")
+    logger.info(f"  Created or refreshed {count:,} stub artist rows")
 
     total = count
 

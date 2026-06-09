@@ -62,7 +62,7 @@ else:
 # ALTER statements at the same time. The TestNotNullPinExpectationsMatchSchema
 # class below catches drift between the schema and this expectation.
 _EXPECTED_NOT_NULL: dict[str, tuple[str, ...]] = {
-    "release": ("title",),
+    "release": ("title", "not_found"),
     "release_artist": ("release_id", "artist_name"),
     "release_label": ("release_id", "label_name"),
     "release_genre": ("release_id", "genre"),
@@ -82,6 +82,10 @@ _EXPECTED_DEFAULTS: dict[tuple[str, str], str] = {
     ("cache_metadata", "cached_at"): "now()",
     ("release_artist", "extra"): "0",
     ("release_track_artist", "extra"): "0",
+    # LML#510: release.not_found DEFAULT FALSE must survive the swap so the
+    # copy-swap path's restored NOT NULL constraint doesn't reject an LML
+    # cache-miss INSERT (which omits not_found) between the swap and Level-2.
+    ("release", "not_found"): "false",
 }
 
 # Tables that flow through each copy-swap entrypoint.

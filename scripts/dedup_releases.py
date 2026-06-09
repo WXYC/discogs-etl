@@ -313,7 +313,7 @@ DEDUP_TABLES: list[tuple[str, str, str, str]] = [
     (
         "release",
         "new_release",
-        "id, title, release_year, country, artwork_url, released, format, master_id, artwork_checked_at",
+        "id, title, release_year, country, artwork_url, released, format, master_id, artwork_checked_at, not_found",
         "id",
     ),
     (
@@ -357,6 +357,10 @@ DEDUP_TABLES: list[tuple[str, str, str, str]] = [
 PRE_SWAP_COLUMN_DEFAULTS: dict[str, dict[str, str]] = {
     "new_cache_metadata": {"cached_at": "now()"},
     "new_release_artist": {"extra": "0"},
+    # LML#510: tombstone DEFAULT must be re-applied before swap so a
+    # cache-miss INSERT that omits not_found never lands NULL between the
+    # swap and Level-2 SET NOT NULL.
+    "new_release": {"not_found": "false"},
 }
 
 
@@ -540,6 +544,7 @@ def add_base_constraints_and_indexes(conn, db_url: str | None = None) -> None:
             "CREATE INDEX idx_release_genre_release_id ON release_genre(release_id)",
             "CREATE INDEX idx_release_style_release_id ON release_style(release_id)",
             "ALTER TABLE release ALTER COLUMN title SET NOT NULL",
+            "ALTER TABLE release ALTER COLUMN not_found SET NOT NULL",
             "ALTER TABLE release_artist ALTER COLUMN release_id SET NOT NULL",
             "ALTER TABLE release_artist ALTER COLUMN artist_name SET NOT NULL",
             "ALTER TABLE release_label ALTER COLUMN release_id SET NOT NULL",

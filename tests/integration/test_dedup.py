@@ -1105,12 +1105,15 @@ class TestDedupCopySwapAbortCleanup:
         conn = psycopg.connect(self.db_url, autocommit=True)
         ensure_dedup_ids(conn)
 
-        # copy_table drops the stale new_release and creates a fresh one
+        # copy_table drops the stale new_release and creates a fresh one.
+        # Column list must include not_found (LML#510): PRE_SWAP_COLUMN_DEFAULTS
+        # iterates new_release and applies the DEFAULT, so the column must
+        # exist on the CTAS output.
         count = copy_table(
             conn,
             "release",
             "new_release",
-            "id, title, release_year, country, artwork_url, released, format",
+            "id, title, release_year, country, artwork_url, released, format, not_found",
             "id",
         )
 

@@ -720,6 +720,8 @@ PRUNE_PRE_SWAP_COLUMN_DEFAULTS: dict[str, dict[str, str]] = {
     "new_cache_metadata": {"cached_at": "now()"},
     "new_release_artist": {"extra": "0"},
     "new_release_track_artist": {"extra": "0"},
+    # LML#510: see dedup_releases.PRE_SWAP_COLUMN_DEFAULTS for context.
+    "new_release": {"not_found": "false"},
 }
 
 
@@ -878,6 +880,7 @@ def _prune_add_base_constraints_and_indexes(db_url: str) -> None:
             # ``tests/integration/test_copy_swap_preserves_not_null.py``.
             for stmt in (
                 "ALTER TABLE release ALTER COLUMN title SET NOT NULL",
+                "ALTER TABLE release ALTER COLUMN not_found SET NOT NULL",
                 "ALTER TABLE release_artist ALTER COLUMN release_id SET NOT NULL",
                 "ALTER TABLE release_artist ALTER COLUMN artist_name SET NOT NULL",
                 "ALTER TABLE release_label ALTER COLUMN release_id SET NOT NULL",
@@ -965,7 +968,7 @@ PRUNE_COPY_TABLES = [
     (
         "release",
         "new_release",
-        "id, title, release_year, country, artwork_url, released, format, master_id, artwork_checked_at",
+        "id, title, release_year, country, artwork_url, released, format, master_id, artwork_checked_at, not_found",
         "id",
     ),
     (
@@ -1018,6 +1021,7 @@ COPY_TABLE_SPEC = [
             "format",
             "master_id",
             "artwork_checked_at",
+            "not_found",
         ],
     ),
     (
