@@ -26,9 +26,10 @@ except ImportError:
     _HAS_WXYC_ETL = False
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
+from wxyc_etl.pg import to_pg_text_form  # noqa: E402
+
 from lib.format_normalization import normalize_format  # noqa: E402
 from lib.observability import init_logger  # noqa: E402
-from lib.pg_text import strip_pg_null_bytes  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -466,7 +467,7 @@ def import_csv(
 
                         # Strip U+0000 at PG TEXT boundary (WXYC/docs#18 policy).
                         # PostgreSQL TEXT rejects NUL bytes; stripping is idempotent.
-                        val = strip_pg_null_bytes(val)
+                        val = to_pg_text_form(val)
 
                         values.append(val)
 
@@ -731,7 +732,7 @@ def import_artwork(conn, csv_dir: Path) -> int:
 
         with cur.copy("COPY _artwork (release_id, artwork_url) FROM STDIN") as copy:
             for release_id, uri in artwork.items():
-                copy.write_row((release_id, strip_pg_null_bytes(uri)))
+                copy.write_row((release_id, to_pg_text_form(uri)))
 
         cur.execute("""
             UPDATE release r
@@ -951,7 +952,7 @@ def import_artist_details(conn, csv_dir: Path) -> int:
                 if artist_id not in artist_ids:
                     skipped_unknown_artist += 1
                     continue
-                profiles[artist_id] = strip_pg_null_bytes(profile)
+                profiles[artist_id] = to_pg_text_form(profile)
         if skipped_non_int:
             logger.warning(
                 f"  Skipped {skipped_non_int:,} artist.csv rows with non-integer artist_id"

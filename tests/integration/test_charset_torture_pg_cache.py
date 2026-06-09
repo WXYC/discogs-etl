@@ -3,15 +3,15 @@ that would silently corrupt non-ASCII bytes flowing into the discogs-cache.
 
 Per WXYC/docs#18 the write path strips U+0000 at the boundary (idempotent;
 NUL in metadata is always corruption). This test mirrors that boundary by
-applying ``strip_pg_null_bytes`` before INSERT and asserting the round-trip
-matches the stripped form.
+applying ``wxyc_etl.pg.to_pg_text_form`` before INSERT and asserting the
+round-trip matches the stripped form.
 """
 
 from __future__ import annotations
 
 import pytest
+from wxyc_etl.pg import to_pg_text_form
 
-from lib.pg_text import strip_pg_null_bytes
 from tests.charset_torture import CharsetTortureEntry, entry_id, iter_entries
 
 CORPUS_ENTRIES = list(iter_entries())
@@ -22,7 +22,7 @@ CORPUS_ENTRIES = list(iter_entries())
 def test_pg_text_roundtrip(db_conn, entry: CharsetTortureEntry) -> None:
     """INSERT into a TEXT column + SELECT must preserve every corpus entry
     after the boundary strip."""
-    boundary_value = strip_pg_null_bytes(entry["input"])
+    boundary_value = to_pg_text_form(entry["input"])
 
     with db_conn.cursor() as cur:
         # Defensive: TEMP TABLEs survive rollbacks; if a future db_conn fixture

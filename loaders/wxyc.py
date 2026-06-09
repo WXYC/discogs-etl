@@ -44,9 +44,8 @@ from typing import Any
 
 import psycopg
 from psycopg import sql
+from wxyc_etl.pg import to_pg_text_form
 from wxyc_etl.text import to_identity_match_form, to_identity_match_form_title
-
-from lib.pg_text import strip_pg_null_bytes
 
 logger = logging.getLogger(__name__)
 
@@ -227,14 +226,14 @@ def populate_wxyc_library_v2(
         {
             "library_id": r.library_id,
             "artist_id": r.artist_id,
-            "artist_name": strip_pg_null_bytes(r.artist_name),
-            "album_title": strip_pg_null_bytes(r.album_title),
+            "artist_name": to_pg_text_form(r.artist_name),
+            "album_title": to_pg_text_form(r.album_title),
             "label_id": r.label_id,
-            "label_name": strip_pg_null_bytes(r.label_name),
+            "label_name": to_pg_text_form(r.label_name),
             "format_id": r.format_id,
-            "format_name": strip_pg_null_bytes(r.format_name),
-            "wxyc_genre": strip_pg_null_bytes(r.wxyc_genre),
-            "call_letters": strip_pg_null_bytes(r.call_letters),
+            "format_name": to_pg_text_form(r.format_name),
+            "wxyc_genre": to_pg_text_form(r.wxyc_genre),
+            "call_letters": to_pg_text_form(r.call_letters),
             "call_numbers": r.call_numbers,
             "release_year": r.release_year,
             # norm_artist / norm_title are NOT NULL per §3.1; the normalizer
