@@ -629,7 +629,7 @@ class TestDedupTerminatedMidOperation:
                     dedup_conn,
                     "release",
                     "new_release",
-                    "id, title, release_year, country, artwork_url, released, format",
+                    "id, title, release_year, country, artwork_url, released, format, not_found",
                     "id",
                 )
                 dedup_releases.copy_table(
@@ -719,7 +719,7 @@ class TestDedupTerminatedMidOperation:
                     rerun_conn,
                     "release",
                     "new_release",
-                    "id, title, release_year, country, artwork_url, released, format",
+                    "id, title, release_year, country, artwork_url, released, format, not_found",
                     "id",
                 )
                 with rerun_conn.cursor() as cur:

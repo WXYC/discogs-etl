@@ -22,6 +22,7 @@ _spec.loader.exec_module(_ic)
 import_csv_func = _ic.import_csv
 import_artwork = _ic.import_artwork
 import_release_via_upsert = _ic.import_release_via_upsert
+import_artist_details = _ic.import_artist_details
 create_track_count_table = _ic.create_track_count_table
 populate_cache_metadata = _ic.populate_cache_metadata
 populate_release_year = _ic.populate_release_year
@@ -1259,3 +1260,101 @@ class TestFilteredVideoImport:
         conn.close()
         # 1001: 2, 3001: 1 = 3
         assert count == 3
+
+
+class TestImportClearsTombstones:
+    """Rebuild paths clear ``not_found`` tombstones from prior LML 404 writes.
+
+    LML#510's tombstone column marks rows where Discogs returned 404 at lookup
+    time. The rebuild pipeline is authoritative — when a fresh dump includes
+    an id that was previously tombstoned, the tombstone must clear so the
+    rebuilt row is reachable again. Without this, a tombstoned id would
+    survive every refresh until LML's admin recovery endpoint deletes it.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _fresh_schema(self, fresh_db_url):
+        self.db_url = fresh_db_url
+        conn = psycopg.connect(fresh_db_url, autocommit=True)
+        with conn.cursor() as cur:
+            cur.execute(SCHEMA_DIR.joinpath("create_database.sql").read_text())
+        conn.close()
+
+    def _write_release_csv(self, tmp_path: Path, rows: list[tuple]) -> None:
+        lines = ["id,title,country,released,format,master_id"]
+        for row in rows:
+            lines.append(",".join("" if v is None else str(v) for v in row))
+        (tmp_path / "release.csv").write_text("\n".join(lines) + "\n")
+
+    def test_rebuild_clears_release_tombstone(self, tmp_path) -> None:
+        """A tombstoned release in PG gets ``not_found`` reset when the
+        fresh dump includes its id. Without this, the rebuild would leave
+        the tombstone in place and the id would stay unreachable."""
+        conn = psycopg.connect(self.db_url)
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO release (id, title, not_found, artwork_checked_at) "
+                "VALUES (601, '', TRUE, now())"
+            )
+        conn.commit()
+        conn.close()
+
+        self._write_release_csv(tmp_path, [(601, "Aluminum Tunes", "US", "1998", "LP", None)])
+        # Minimal release_image.csv so import_artwork (called by rebuild flow
+        # callers) doesn't fail — but we only call import_release_via_upsert
+        # here, so it's not strictly required.
+        (tmp_path / "release_image.csv").write_text("release_id,type,width,height,uri\n")
+
+        conn = psycopg.connect(self.db_url)
+        import_release_via_upsert(conn, tmp_path)
+        conn.close()
+
+        conn = psycopg.connect(self.db_url)
+        with conn.cursor() as cur:
+            cur.execute("SELECT title, not_found FROM release WHERE id = 601")
+            row = cur.fetchone()
+        conn.close()
+        assert row == ("Aluminum Tunes", False), (
+            f"Rebuild must clear the tombstone (not_found=FALSE) and write "
+            f"the fresh title; got {row!r}. The INSERT/UPSERT in "
+            f"import_release_via_upsert must include not_found in both the "
+            f"column list and the ON CONFLICT DO UPDATE SET clause."
+        )
+
+    def test_rebuild_clears_artist_tombstone(self, tmp_path) -> None:
+        """A tombstoned artist in PG gets ``not_found`` reset when the
+        fresh dump's release_artist re-stubs its id."""
+        conn = psycopg.connect(self.db_url)
+        with conn.cursor() as cur:
+            # Set up a release + release_artist row referencing artist 701 so
+            # the stub-INSERT pass touches artist 701.
+            cur.execute("INSERT INTO release (id, title) VALUES (700, 'Aluminum Tunes')")
+            cur.execute(
+                "INSERT INTO release_artist (release_id, artist_id, artist_name) "
+                "VALUES (700, 701, 'Stereolab')"
+            )
+            # Pre-existing tombstoned artist.
+            cur.execute("INSERT INTO artist (id, name, not_found) VALUES (701, '', TRUE)")
+        conn.commit()
+        conn.close()
+
+        # No artist.csv → only the stub-INSERT path runs. The stub path is
+        # what the issue specifies must clear tombstones.
+        conn = psycopg.connect(self.db_url)
+        # import_artist_details requires the csv_dir to exist but only reads
+        # artist.csv (optional) for the profile pass — we want only the stub.
+        import_artist_details(conn, tmp_path)
+        conn.close()
+
+        conn = psycopg.connect(self.db_url)
+        with conn.cursor() as cur:
+            cur.execute("SELECT name, not_found FROM artist WHERE id = 701")
+            row = cur.fetchone()
+        conn.close()
+        assert row is not None
+        name, not_found = row
+        assert not_found is False, (
+            f"Rebuild must clear the artist tombstone (not_found=FALSE); "
+            f"got not_found={not_found!r}. The stub-INSERT in "
+            f"import_artist_details must update not_found = FALSE on conflict."
+        )

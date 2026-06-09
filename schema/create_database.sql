@@ -62,7 +62,8 @@ CREATE TABLE IF NOT EXISTS release (
     released            text,              -- full date string, e.g. "2024-03-15"
     format              text,              -- normalized format category: 'Vinyl', 'CD', etc.
     master_id           integer,           -- Discogs master ID; used by dedup partitioning, persists post-swap (see DEDUP_TABLES in scripts/dedup_releases.py)
-    artwork_checked_at  timestamptz        -- WXYC/discogs-etl#239. NULL = never asked, set = LML asked Discogs at lookup time. LML's predicate honors this so genuinely-imageless releases aren't refetched. Index below covers LML#221's never-asked drain.
+    artwork_checked_at  timestamptz,       -- WXYC/discogs-etl#239. NULL = never asked, set = LML asked Discogs at lookup time. LML's predicate honors this so genuinely-imageless releases aren't refetched. Index below covers LML#221's never-asked drain.
+    not_found           boolean NOT NULL DEFAULT FALSE   -- WXYC/library-metadata-lookup#510. Tombstone marker for Discogs 404s on get_release. LML's read short-circuits on TRUE; rebuild/UPSERT paths clear to FALSE on fresh data. Mirrored in alembic/versions/0010_release_not_found.py.
 );
 
 -- Partial index for LML#221's never-asked top-up drain (WXYC/discogs-etl#239).
@@ -152,7 +153,8 @@ CREATE TABLE IF NOT EXISTS artist (
     name            text NOT NULL,
     profile         text,
     image_url       text,
-    fetched_at      timestamptz NOT NULL DEFAULT now()
+    fetched_at      timestamptz NOT NULL DEFAULT now(),
+    not_found       boolean NOT NULL DEFAULT FALSE   -- WXYC/library-metadata-lookup#510. Tombstone marker for Discogs 404s on get_artist_details. Mirrored in alembic/versions/0011_artist_not_found.py.
 );
 
 CREATE TABLE IF NOT EXISTS artist_alias (
