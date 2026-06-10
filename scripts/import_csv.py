@@ -306,6 +306,21 @@ CACHE_TABLES_TO_TRUNCATE_TRACKS: list[str] = [
 ]
 
 
+# Runtime guard for the "preserves the entire entity schema" promise carried
+# by the comment above and by --truncate-existing's help text. The exclusion
+# is enforced by absence (entity.* tables simply aren't listed), so any
+# accidental addition of a schema-qualified name — or any bare 'entity' alias
+# — would silently break the contract. Tripped at import time, before any
+# pipeline run can do damage.
+for _t in (*CACHE_TABLES_TO_TRUNCATE_BASE, *CACHE_TABLES_TO_TRUNCATE_TRACKS):
+    if "." in _t or _t.startswith("entity"):
+        raise RuntimeError(
+            f"--truncate-existing list must not include entity-schema tables; "
+            f"found {_t!r}. Entity-schema state is LML-owned and survives "
+            f"every cache rebuild — see comment above CACHE_TABLES_TO_TRUNCATE_BASE."
+        )
+
+
 def _truncate_tables(conn, table_names: list[str]) -> None:
     """Wipe the named tables with a single TRUNCATE ... CASCADE.
 
