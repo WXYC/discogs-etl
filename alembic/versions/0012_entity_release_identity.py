@@ -30,10 +30,12 @@ it. The column exists for forward compatibility with LML#207's
 cross-source joiner and the upcoming reconciliation_status writer; no
 trigger needed in v1.
 
-The downgrade drops in FK order — index, then log, then identity — and
-intentionally leaves the ``entity`` schema in place: the artist-side
-tables (``entity.identity`` / ``entity.reconciliation_log``) still live
-there. Adopting those into the alembic chain is tracked at
+The downgrade drops in FK order — child table (release_reconciliation_log)
+first, then parent (release_identity). The DROP TABLE on the child also
+drops its FK index, so no explicit DROP INDEX is needed. The ``entity``
+schema is intentionally left in place: the artist-side tables
+(``entity.identity`` / ``entity.reconciliation_log``) still live there.
+Adopting those into the alembic chain is tracked at
 WXYC/discogs-etl#279.
 
 Defensive pattern: same ``is_offline_mode()`` refuse + autocommit

@@ -55,6 +55,11 @@ def _read_revision_metadata() -> tuple[str, str]:
     Regex over the file rather than importlib because the migration's
     imports (``from lib.alembic_helpers import ...``) require alembic-aware
     sys.path setup that pytest collection does not guarantee.
+
+    Called lazily from ``_stamp_and_upgrade`` rather than at module load so
+    a missing or malformed migration file shows up as the dedicated
+    ``test_migration_file_exists`` failure instead of an opaque collection
+    error that swallows every other test in the file.
     """
     body = MIGRATION_PATH.read_text(encoding="utf-8")
     rev = re.search(r'^revision:\s*str\s*=\s*"([^"]+)"', body, re.MULTILINE)
@@ -62,9 +67,6 @@ def _read_revision_metadata() -> tuple[str, str]:
     assert rev is not None, f"Could not find revision assignment in {MIGRATION_PATH}"
     assert down is not None, f"Could not find down_revision assignment in {MIGRATION_PATH}"
     return rev.group(1), down.group(1)
-
-
-REVISION, PRIOR_REVISION = _read_revision_metadata()
 
 
 # Per-source UNIQUE columns load-bearing for LML's mint protocol.
@@ -138,11 +140,12 @@ def _stamp_and_upgrade(run_alembic, db_url: str) -> None:
     cares about 0012's surface. The migration is self-contained: it does
     not depend on any column added by earlier revisions.
     """
-    stamp = run_alembic(["stamp", PRIOR_REVISION], db_url)
+    revision, prior_revision = _read_revision_metadata()
+    stamp = run_alembic(["stamp", prior_revision], db_url)
     assert stamp.returncode == 0, (
         f"alembic stamp failed:\nstdout: {stamp.stdout}\nstderr: {stamp.stderr}"
     )
-    result = run_alembic(["upgrade", REVISION], db_url)
+    result = run_alembic(["upgrade", revision], db_url)
     assert result.returncode == 0, (
         f"alembic upgrade failed:\nstdout: {result.stdout}\nstderr: {result.stderr}"
     )
@@ -474,9 +477,10 @@ def test_reapply_is_noop(run_alembic, fresh_db_url: str) -> None:
 
     # Rewind alembic state (stamp, not downgrade — tables stay) and re-upgrade
     # so the IF NOT EXISTS branches fire against existing tables.
-    rewind = run_alembic(["stamp", PRIOR_REVISION], fresh_db_url)
+    revision, prior_revision = _read_revision_metadata()
+    rewind = run_alembic(["stamp", prior_revision], fresh_db_url)
     assert rewind.returncode == 0
-    reupgrade = run_alembic(["upgrade", REVISION], fresh_db_url)
+    reupgrade = run_alembic(["upgrade", revision], fresh_db_url)
     assert reupgrade.returncode == 0, (
         f"Re-application failed:\nstdout: {reupgrade.stdout}\nstderr: {reupgrade.stderr}"
     )
@@ -508,7 +512,8 @@ def test_downgrade_drops_release_side_tables(run_alembic, fresh_db_url: str) -> 
     """
     _stamp_and_upgrade(run_alembic, fresh_db_url)
 
-    downgrade = run_alembic(["downgrade", PRIOR_REVISION], fresh_db_url)
+    _, prior_revision = _read_revision_metadata()
+    downgrade = run_alembic(["downgrade", prior_revision], fresh_db_url)
     assert downgrade.returncode == 0, (
         f"alembic downgrade failed:\nstdout: {downgrade.stdout}\nstderr: {downgrade.stderr}"
     )
@@ -541,3 +546,61 @@ def test_downgrade_drops_release_side_tables(run_alembic, fresh_db_url: str) -> 
             "tables (entity.identity / entity.reconciliation_log) still live "
             "there. See migration docstring."
         )
+
+
+# ---------------------------------------------------------------------------
+# Dual-write drift detection (schema/create_database.sql direction)
+# ---------------------------------------------------------------------------
+
+
+CREATE_DATABASE_SQL_PATH = REPO_ROOT / "schema" / "create_database.sql"
+
+
+def _shape_from_db(conn, table_name: str) -> dict[str, tuple[str, str]]:
+    """Return ``{column_name: (data_type, is_nullable)}`` for ``entity.<table>``."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT column_name, data_type, is_nullable
+            FROM information_schema.columns
+            WHERE table_schema = 'entity' AND table_name = %s
+            ORDER BY ordinal_position
+            """,
+            (table_name,),
+        )
+        return {name: (data_type, is_nullable) for name, data_type, is_nullable in cur.fetchall()}
+
+
+@pytest.mark.pg
+def test_create_database_sql_matches_migration_shape(fresh_db_url: str) -> None:
+    """Apply schema/create_database.sql against a fresh DB and assert the
+    same entity-table shape the migration produces.
+
+    Catches the OTHER direction of dual-write drift: the migration tests
+    already pin the alembic path; this test pins the create_database.sql
+    path. If a future PR edits one but not the other, this test fails
+    instead of letting the divergence ship to dev DBs built by
+    ``--fresh-rebuild``.
+    """
+    sql_body = CREATE_DATABASE_SQL_PATH.read_text(encoding="utf-8")
+    with psycopg.connect(fresh_db_url, autocommit=True) as conn, conn.cursor() as cur:
+        cur.execute(sql_body)
+
+    with psycopg.connect(fresh_db_url) as conn:
+        identity_shape = _shape_from_db(conn, "release_identity")
+        log_shape = _shape_from_db(conn, "release_reconciliation_log")
+
+    assert identity_shape == RELEASE_IDENTITY_COLUMN_SHAPE, (
+        "schema/create_database.sql's entity.release_identity diverged from "
+        "the migration's shape. Dual-write convention requires both produce "
+        "the same end state.\n"
+        f"Got: {identity_shape}\n"
+        f"Expected: {RELEASE_IDENTITY_COLUMN_SHAPE}"
+    )
+    assert log_shape == RECONCILIATION_LOG_COLUMN_SHAPE, (
+        "schema/create_database.sql's entity.release_reconciliation_log "
+        "diverged from the migration's shape. Dual-write convention requires "
+        "both produce the same end state.\n"
+        f"Got: {log_shape}\n"
+        f"Expected: {RECONCILIATION_LOG_COLUMN_SHAPE}"
+    )
