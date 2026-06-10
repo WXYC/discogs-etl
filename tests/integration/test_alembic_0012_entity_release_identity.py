@@ -22,7 +22,7 @@ The migration must be re-application-safe (existing prod already has the
 schema, plus a fresh dev DB after a prior partial run). All DDL uses
 ``IF NOT EXISTS``.
 
-The downgrade drops in FK order — index, then log, then identity — and
+The downgrade drops in FK order — child table, then parent — and
 intentionally leaves the ``entity`` schema in place because the artist-side
 tables (``entity.identity`` / ``entity.reconciliation_log``) still live
 there. Adopting those into the alembic chain is tracked at
@@ -33,9 +33,6 @@ Tracked at WXYC/discogs-etl#278.
 
 from __future__ import annotations
 
-import os
-import subprocess
-import sys
 from pathlib import Path
 
 import psycopg
@@ -57,12 +54,46 @@ PER_SOURCE_UNIQUE_COLUMNS: tuple[str, ...] = (
 )
 
 
+# Expected column shape on entity.release_identity:
+# (data_type, is_nullable). Keys are column names.
+# Pins types so a future widening (id INTEGER → BIGINT, discogs_*_id INTEGER →
+# BIGINT) trips this test before reaching LML's mint protocol.
+RELEASE_IDENTITY_COLUMN_SHAPE: dict[str, tuple[str, str]] = {
+    "id": ("integer", "NO"),
+    "discogs_release_id": ("integer", "YES"),
+    "discogs_master_id": ("integer", "YES"),
+    "musicbrainz_release_id": ("text", "YES"),
+    "spotify_album_id": ("text", "YES"),
+    "apple_music_album_id": ("text", "YES"),
+    "bandcamp_album_url": ("text", "YES"),
+    "reconciliation_status": ("text", "NO"),
+    "created_at": ("timestamp with time zone", "NO"),
+    "updated_at": ("timestamp with time zone", "NO"),
+}
+
+
+# Expected column shape on entity.release_reconciliation_log.
+# LML's audit-log INSERT binds the (source, external_id, confidence, method)
+# tuple positionally; drift in nullability or types corrupts the audit trail.
+RECONCILIATION_LOG_COLUMN_SHAPE: dict[str, tuple[str, str]] = {
+    "id": ("integer", "NO"),
+    "identity_id": ("integer", "NO"),
+    "source": ("text", "NO"),
+    "external_id": ("text", "NO"),
+    "confidence": ("real", "YES"),
+    "method": ("text", "NO"),
+    "created_at": ("timestamp with time zone", "NO"),
+}
+
+
 # ---------------------------------------------------------------------------
 # Static (no DB) checks
 # ---------------------------------------------------------------------------
 
 
 def test_migration_file_exists() -> None:
+    """Fast static gate so a missing-file regression doesn't masquerade as a
+    pg-skip when the Docker DB isn't available."""
     assert MIGRATION_PATH.exists(), (
         f"0012 migration missing at {MIGRATION_PATH}. The LML release-identity "
         "surface returns 503 in prod until both entity tables exist on the "
@@ -70,68 +101,57 @@ def test_migration_file_exists() -> None:
     )
 
 
-def test_migration_creates_schema_before_tables() -> None:
-    """The LML canonical DDL omits the schema-create; this migration adds it.
-
-    Fresh dev DBs would fail otherwise.
-    """
-    body = MIGRATION_PATH.read_text(encoding="utf-8")
-    assert "CREATE SCHEMA IF NOT EXISTS entity" in body, (
-        "0012 must bootstrap the entity schema. The canonical "
-        "entity/release_identity.sql in LML#530 assumes the schema is "
-        "already present; against a fresh dev DB without prior out-of-band "
-        "bootstrap, the canonical DDL would fail."
-    )
-
-
-def test_migration_declares_all_per_source_uniques() -> None:
-    body = MIGRATION_PATH.read_text(encoding="utf-8")
-    for col in PER_SOURCE_UNIQUE_COLUMNS:
-        assert col in body, (
-            f"0012 must declare {col} on entity.release_identity. LML's mint "
-            f"protocol uses INSERT ... ON CONFLICT ({col}) DO NOTHING RETURNING "
-            f"id; dropping the column breaks the write surface with a loud "
-            f"500, not a silent duplicate-mint."
-        )
-
-
 # ---------------------------------------------------------------------------
 # Live-PG assertions
 # ---------------------------------------------------------------------------
 
 
-def _run_alembic(args: list[str], db_url: str) -> subprocess.CompletedProcess[str]:
-    env = {**os.environ, "DATABASE_URL_DISCOGS": db_url}
-    env.pop("DATABASE_URL", None)
-    return subprocess.run(
-        [sys.executable, "-m", "alembic", *args],
-        cwd=REPO_ROOT,
-        env=env,
-        capture_output=True,
-        text=True,
-    )
-
-
-def _stamp_and_upgrade(db_url: str) -> None:
+def _stamp_and_upgrade(run_alembic, db_url: str) -> None:
     """Stamp at 0011 (skipping the prior chain) then upgrade to 0012.
 
     Stamping avoids dragging the whole 0001→0011 chain into a test that only
     cares about 0012's surface. The migration is self-contained: it does
     not depend on any column added by earlier revisions.
     """
-    stamp = _run_alembic(["stamp", "0011_artist_not_found"], db_url)
+    stamp = run_alembic(["stamp", "0011_artist_not_found"], db_url)
     assert stamp.returncode == 0, (
         f"alembic stamp failed:\nstdout: {stamp.stdout}\nstderr: {stamp.stderr}"
     )
-    result = _run_alembic(["upgrade", "0012_entity_release_identity"], db_url)
+    result = run_alembic(["upgrade", "0012_entity_release_identity"], db_url)
     assert result.returncode == 0, (
         f"alembic upgrade failed:\nstdout: {result.stdout}\nstderr: {result.stderr}"
     )
 
 
+def _seed_bootstrap_state(db_url: str) -> None:
+    """Pre-create the entity schema + a mock artist-side ``entity.identity``
+    table so we exercise the documented prod scenario: existing prod has the
+    schema and artist-side tables from out-of-band bootstrap before 0012
+    runs. The migration must no-op cleanly against that state.
+
+    The mock ``entity.identity`` table is shaped after LML's canonical
+    artist-side SQL — just enough to verify the migration leaves
+    pre-existing entity tables alone.
+    """
+    with psycopg.connect(db_url, autocommit=True) as conn, conn.cursor() as cur:
+        cur.execute("CREATE SCHEMA entity")
+        cur.execute(
+            """
+            CREATE TABLE entity.identity (
+                id SERIAL PRIMARY KEY,
+                discogs_artist_id INTEGER UNIQUE,
+                musicbrainz_artist_id TEXT UNIQUE,
+                reconciliation_status TEXT NOT NULL DEFAULT 'unreconciled',
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )
+            """
+        )
+        cur.execute("INSERT INTO entity.identity (discogs_artist_id) VALUES (777) RETURNING id")
+
+
 @pytest.mark.pg
-def test_entity_schema_exists(fresh_db_url: str) -> None:
-    _stamp_and_upgrade(fresh_db_url)
+def test_entity_schema_exists(run_alembic, fresh_db_url: str) -> None:
+    _stamp_and_upgrade(run_alembic, fresh_db_url)
     with psycopg.connect(fresh_db_url) as conn, conn.cursor() as cur:
         cur.execute(
             "SELECT schema_name FROM information_schema.schemata WHERE schema_name = %s",
@@ -144,48 +164,96 @@ def test_entity_schema_exists(fresh_db_url: str) -> None:
 
 
 @pytest.mark.pg
-def test_release_identity_columns(fresh_db_url: str) -> None:
-    _stamp_and_upgrade(fresh_db_url)
+def test_release_identity_columns(run_alembic, fresh_db_url: str) -> None:
+    """Pin every column's type, nullability, and (where load-bearing) default.
+
+    Strict equality on the column set: a stray added column trips this test
+    instead of slipping through as a silent schema drift.
+    """
+    _stamp_and_upgrade(run_alembic, fresh_db_url)
     with psycopg.connect(fresh_db_url) as conn, conn.cursor() as cur:
         cur.execute(
             """
-            SELECT column_name, data_type, is_nullable
+            SELECT column_name, data_type, is_nullable, column_default
             FROM information_schema.columns
             WHERE table_schema = 'entity' AND table_name = 'release_identity'
             ORDER BY ordinal_position
             """
         )
-        rows = {name: (data_type, is_nullable) for name, data_type, is_nullable in cur.fetchall()}
+        rows = {
+            name: (data_type, is_nullable, column_default)
+            for name, data_type, is_nullable, column_default in cur.fetchall()
+        }
 
-    expected_columns = {
-        "id",
-        "discogs_release_id",
-        "discogs_master_id",
-        "musicbrainz_release_id",
-        "spotify_album_id",
-        "apple_music_album_id",
-        "bandcamp_album_url",
-        "reconciliation_status",
-        "created_at",
-        "updated_at",
-    }
-    assert expected_columns.issubset(rows.keys()), (
-        f"entity.release_identity missing columns: {expected_columns - rows.keys()}"
+    assert rows.keys() == RELEASE_IDENTITY_COLUMN_SHAPE.keys(), (
+        f"entity.release_identity column-set drift. "
+        f"Missing: {RELEASE_IDENTITY_COLUMN_SHAPE.keys() - rows.keys()}; "
+        f"Unexpected: {rows.keys() - RELEASE_IDENTITY_COLUMN_SHAPE.keys()}."
     )
-    assert rows["reconciliation_status"] == ("text", "NO")
-    assert rows["created_at"][0] == "timestamp with time zone"
-    assert rows["updated_at"][0] == "timestamp with time zone"
+    for col, (expected_type, expected_nullable) in RELEASE_IDENTITY_COLUMN_SHAPE.items():
+        actual_type, actual_nullable, _ = rows[col]
+        assert (actual_type, actual_nullable) == (expected_type, expected_nullable), (
+            f"entity.release_identity.{col} drifted: "
+            f"got ({actual_type!r}, {actual_nullable!r}), "
+            f"expected ({expected_type!r}, {expected_nullable!r}). "
+            f"A SERIAL→BIGSERIAL widening or INTEGER↔TEXT swap on any per-source "
+            f"identifier breaks LML's mint protocol or the FK alignment with "
+            f"entity.release_reconciliation_log.identity_id INTEGER."
+        )
+
+    # reconciliation_status DEFAULT 'unreconciled' is load-bearing for LML's
+    # state machine — newly-minted rows must carry the canonical sentinel so
+    # the reconciler routes them to the right branch.
+    status_default = rows["reconciliation_status"][2] or ""
+    assert "'unreconciled'" in status_default, (
+        f"entity.release_identity.reconciliation_status DEFAULT drifted. "
+        f"Got column_default={status_default!r}; expected the literal "
+        f"'unreconciled'. LML's mint INSERT omits this column, so the "
+        f"DEFAULT is the only place the seed sentinel is written."
+    )
 
 
 @pytest.mark.pg
-def test_six_per_source_unique_constraints(fresh_db_url: str) -> None:
+def test_release_reconciliation_log_columns(run_alembic, fresh_db_url: str) -> None:
+    """Pin entity.release_reconciliation_log column shape end-to-end.
+
+    LML's audit-log writer binds (identity_id, source, external_id, confidence,
+    method) positionally; any drift in column existence, type, or nullability
+    corrupts the audit trail.
+    """
+    _stamp_and_upgrade(run_alembic, fresh_db_url)
+    with psycopg.connect(fresh_db_url) as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT column_name, data_type, is_nullable
+            FROM information_schema.columns
+            WHERE table_schema = 'entity' AND table_name = 'release_reconciliation_log'
+            ORDER BY ordinal_position
+            """
+        )
+        rows = {name: (data_type, is_nullable) for name, data_type, is_nullable in cur.fetchall()}
+
+    assert rows.keys() == RECONCILIATION_LOG_COLUMN_SHAPE.keys(), (
+        f"entity.release_reconciliation_log column-set drift. "
+        f"Missing: {RECONCILIATION_LOG_COLUMN_SHAPE.keys() - rows.keys()}; "
+        f"Unexpected: {rows.keys() - RECONCILIATION_LOG_COLUMN_SHAPE.keys()}."
+    )
+    for col, expected in RECONCILIATION_LOG_COLUMN_SHAPE.items():
+        assert rows[col] == expected, (
+            f"entity.release_reconciliation_log.{col} drifted: got {rows[col]!r}, "
+            f"expected {expected!r}."
+        )
+
+
+@pytest.mark.pg
+def test_six_per_source_unique_constraints(run_alembic, fresh_db_url: str) -> None:
     """All six per-source UNIQUEs are load-bearing for LML's mint protocol.
 
     Dropping any one breaks the ON CONFLICT clause in
     ``entity/store.py::mint_or_get_release_identity`` and raises a loud
     500 on the LML write surface.
     """
-    _stamp_and_upgrade(fresh_db_url)
+    _stamp_and_upgrade(run_alembic, fresh_db_url)
     with psycopg.connect(fresh_db_url) as conn, conn.cursor() as cur:
         # Per the wxyc-shared convention, walk pg_constraint rather than
         # information_schema.table_constraints — the latter loses the
@@ -216,13 +284,16 @@ def test_six_per_source_unique_constraints(fresh_db_url: str) -> None:
 
 
 @pytest.mark.pg
-def test_reconciliation_log_fk_no_action(fresh_db_url: str) -> None:
-    """FK has no ON DELETE CASCADE — matches the artist-side convention."""
-    _stamp_and_upgrade(fresh_db_url)
+def test_reconciliation_log_fk_rules(run_alembic, fresh_db_url: str) -> None:
+    """FK has neither ON DELETE CASCADE nor ON UPDATE CASCADE — matches the
+    artist-side convention. CASCADE would silently delete the audit log or
+    propagate id renumbering through it; consumers expect explicit cleanup.
+    """
+    _stamp_and_upgrade(run_alembic, fresh_db_url)
     with psycopg.connect(fresh_db_url) as conn, conn.cursor() as cur:
         cur.execute(
             """
-            SELECT rc.delete_rule
+            SELECT rc.delete_rule, rc.update_rule
             FROM information_schema.referential_constraints rc
             JOIN information_schema.table_constraints tc
               ON tc.constraint_name = rc.constraint_name
@@ -236,16 +307,21 @@ def test_reconciliation_log_fk_no_action(fresh_db_url: str) -> None:
     assert len(rows) == 1, (
         f"Expected exactly one FK on entity.release_reconciliation_log, got {len(rows)}."
     )
-    assert rows[0][0] == "NO ACTION", (
-        f"FK delete_rule must be NO ACTION, got {rows[0][0]!r}. CASCADE would "
+    delete_rule, update_rule = rows[0]
+    assert delete_rule == "NO ACTION", (
+        f"FK delete_rule must be NO ACTION, got {delete_rule!r}. CASCADE would "
         "silently delete the audit log; consumers expect explicit cleanup."
+    )
+    assert update_rule == "NO ACTION", (
+        f"FK update_rule must be NO ACTION, got {update_rule!r}. CASCADE would "
+        "silently propagate id renumbering through the audit log."
     )
 
 
 @pytest.mark.pg
-def test_fk_index_present(fresh_db_url: str) -> None:
+def test_fk_index_present(run_alembic, fresh_db_url: str) -> None:
     """idx_release_reconciliation_log_identity_id covers WHERE identity_id = $1."""
-    _stamp_and_upgrade(fresh_db_url)
+    _stamp_and_upgrade(run_alembic, fresh_db_url)
     with psycopg.connect(fresh_db_url) as conn, conn.cursor() as cur:
         cur.execute(
             """
@@ -262,7 +338,7 @@ def test_fk_index_present(fresh_db_url: str) -> None:
 
 
 @pytest.mark.pg
-def test_mint_then_remint_smoke(fresh_db_url: str) -> None:
+def test_mint_then_remint_smoke(run_alembic, fresh_db_url: str) -> None:
     """End-to-end mint protocol shape: first INSERT mints, second is a no-op.
 
     Mirrors ``entity/store.py::mint_or_get_release_identity`` in LML#530:
@@ -270,7 +346,7 @@ def test_mint_then_remint_smoke(fresh_db_url: str) -> None:
     The second call must return zero rows so the LML caller falls through
     to the SELECT-for-conflict-loser branch.
     """
-    _stamp_and_upgrade(fresh_db_url)
+    _stamp_and_upgrade(run_alembic, fresh_db_url)
     with psycopg.connect(fresh_db_url, autocommit=True) as conn, conn.cursor() as cur:
         cur.execute(
             """
@@ -307,14 +383,51 @@ def test_mint_then_remint_smoke(fresh_db_url: str) -> None:
 
 
 @pytest.mark.pg
-def test_reapply_is_noop(fresh_db_url: str) -> None:
+def test_upgrade_against_prod_bootstrap_state(run_alembic, fresh_db_url: str) -> None:
+    """Simulate the documented prod scenario before upgrade.
+
+    Per 0012's docstring, prod already has the entity schema + artist-side
+    ``entity.identity`` / ``entity.reconciliation_log`` tables from
+    out-of-band bootstrap. The upgrade must:
+
+    * succeed without error,
+    * create entity.release_identity / entity.release_reconciliation_log,
+    * leave the pre-existing entity.identity rows untouched.
+    """
+    _seed_bootstrap_state(fresh_db_url)
+    _stamp_and_upgrade(run_alembic, fresh_db_url)
+
+    with psycopg.connect(fresh_db_url) as conn, conn.cursor() as cur:
+        # Release-side tables landed.
+        cur.execute(
+            "SELECT to_regclass('entity.release_identity'), "
+            "to_regclass('entity.release_reconciliation_log')"
+        )
+        release_identity, log = cur.fetchone()
+        assert release_identity is not None, (
+            "0012 upgrade failed to create entity.release_identity against a "
+            "prod-bootstrap-shaped DB. The IF NOT EXISTS path should still "
+            "create the new release-side tables alongside artist-side ones."
+        )
+        assert log is not None, "0012 upgrade failed to create entity.release_reconciliation_log."
+
+        # Pre-existing artist-side data survived.
+        cur.execute("SELECT discogs_artist_id FROM entity.identity")
+        assert cur.fetchall() == [(777,)], (
+            "Pre-existing entity.identity data was perturbed by 0012 upgrade. "
+            "The artist-side tables (out-of-band bootstrap) must survive."
+        )
+
+
+@pytest.mark.pg
+def test_reapply_is_noop(run_alembic, fresh_db_url: str) -> None:
     """Re-running the migration against an already-upgraded DB must not fail.
 
-    Production prereq: discogs-cache PG already has the entity schema +
-    artist-side tables from the out-of-band bootstrap. The migration must
-    no-op against that state rather than perturbing it.
+    Stamps the alembic_version row back to 0011 (no DDL — the actual tables
+    are not dropped) and re-runs the upgrade so the IF NOT EXISTS branches
+    fire against existing tables. Existing rows must survive.
     """
-    _stamp_and_upgrade(fresh_db_url)
+    _stamp_and_upgrade(run_alembic, fresh_db_url)
 
     # Seed a sentinel row so we can prove re-application doesn't perturb data.
     with psycopg.connect(fresh_db_url, autocommit=True) as conn, conn.cursor() as cur:
@@ -323,10 +436,11 @@ def test_reapply_is_noop(fresh_db_url: str) -> None:
         )
         sentinel_id = cur.fetchone()[0]
 
-    # Downgrade alembic state and re-upgrade so the IF NOT EXISTS branches fire.
-    downgrade = _run_alembic(["stamp", "0011_artist_not_found"], fresh_db_url)
-    assert downgrade.returncode == 0
-    reupgrade = _run_alembic(["upgrade", "0012_entity_release_identity"], fresh_db_url)
+    # Rewind alembic state (stamp, not downgrade — tables stay) and re-upgrade
+    # so the IF NOT EXISTS branches fire against existing tables.
+    rewind = run_alembic(["stamp", "0011_artist_not_found"], fresh_db_url)
+    assert rewind.returncode == 0
+    reupgrade = run_alembic(["upgrade", "0012_entity_release_identity"], fresh_db_url)
     assert reupgrade.returncode == 0, (
         f"Re-application failed:\nstdout: {reupgrade.stdout}\nstderr: {reupgrade.stderr}"
     )
@@ -339,4 +453,55 @@ def test_reapply_is_noop(fresh_db_url: str) -> None:
         assert cur.fetchone() == (99999,), (
             "Sentinel row lost across re-application. The migration must use "
             "CREATE TABLE IF NOT EXISTS so existing rows survive."
+        )
+
+
+@pytest.mark.pg
+def test_downgrade_drops_release_side_tables(run_alembic, fresh_db_url: str) -> None:
+    """Exercise _DOWNGRADE_SQL end-to-end.
+
+    After upgrade → downgrade:
+
+    * ``entity.release_identity`` and ``entity.release_reconciliation_log``
+      are dropped (the FK index goes with the child table).
+    * The ``entity`` schema is preserved (artist-side tables outlive this
+      migration; their adoption is tracked at WXYC/discogs-etl#279).
+
+    This is the only test that runs the actual ``alembic downgrade`` —
+    without it, a typo in _DOWNGRADE_SQL would ship green.
+    """
+    _stamp_and_upgrade(run_alembic, fresh_db_url)
+
+    downgrade = run_alembic(["downgrade", "0011_artist_not_found"], fresh_db_url)
+    assert downgrade.returncode == 0, (
+        f"alembic downgrade failed:\nstdout: {downgrade.stdout}\nstderr: {downgrade.stderr}"
+    )
+
+    with psycopg.connect(fresh_db_url) as conn, conn.cursor() as cur:
+        # Release-side tables and FK index gone.
+        cur.execute(
+            "SELECT to_regclass('entity.release_identity'), "
+            "to_regclass('entity.release_reconciliation_log')"
+        )
+        release_identity, log = cur.fetchone()
+        assert release_identity is None, "entity.release_identity should be dropped"
+        assert log is None, "entity.release_reconciliation_log should be dropped"
+
+        cur.execute(
+            """
+            SELECT 1 FROM pg_indexes
+            WHERE schemaname = 'entity'
+              AND indexname = 'idx_release_reconciliation_log_identity_id'
+            """
+        )
+        assert cur.fetchone() is None, "FK index should be gone with its table"
+
+        # Schema preserved.
+        cur.execute(
+            "SELECT schema_name FROM information_schema.schemata WHERE schema_name = 'entity'"
+        )
+        assert cur.fetchone() is not None, (
+            "entity schema should outlive the downgrade — the artist-side "
+            "tables (entity.identity / entity.reconciliation_log) still live "
+            "there. See migration docstring."
         )

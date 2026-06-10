@@ -287,3 +287,48 @@ CREATE INDEX IF NOT EXISTS idx_cache_metadata_source ON cache_metadata(source);
 
 -- Negative-cache TTL-sweep index (mirrors 0006_lookup_negative.py)
 CREATE INDEX IF NOT EXISTS idx_lookup_negative_attempted_at ON lookup_negative(attempted_at);
+
+-- ============================================
+-- LML-owned identity layer (entity schema)
+-- ============================================
+-- Mirrors alembic/versions/0012_entity_release_identity.py per the dual-write
+-- convention so a fresh rebuild (`run_pipeline.py --fresh-rebuild`) produces
+-- the same end state as the alembic upgrade chain. Without the mirror, a dev
+-- DB built only through create_database.sql leaves LML's
+-- POST /api/v1/identity/resolve probe returning 503.
+--
+-- Lifecycle note: entity.* tables hold LML-owned mint state and survive the
+-- monthly cache rebuild. drop_core_tables.sql intentionally does NOT drop
+-- them; --truncate-existing intentionally does NOT include them in the
+-- TRUNCATE list (see CACHE_TABLES_TO_TRUNCATE_BASE in scripts/import_csv.py).
+--
+-- Artist-side counterparts (entity.identity / entity.reconciliation_log) still
+-- live in prod via out-of-band bootstrap and are not yet adopted into the
+-- alembic chain or this file — tracked at WXYC/discogs-etl#279.
+CREATE SCHEMA IF NOT EXISTS entity;
+
+CREATE TABLE IF NOT EXISTS entity.release_identity (
+    id                       SERIAL PRIMARY KEY,
+    discogs_release_id       INTEGER UNIQUE,
+    discogs_master_id        INTEGER UNIQUE,
+    musicbrainz_release_id   TEXT UNIQUE,
+    spotify_album_id         TEXT UNIQUE,
+    apple_music_album_id     TEXT UNIQUE,
+    bandcamp_album_url       TEXT UNIQUE,
+    reconciliation_status    TEXT NOT NULL DEFAULT 'unreconciled',
+    created_at               TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at               TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS entity.release_reconciliation_log (
+    id           SERIAL PRIMARY KEY,
+    identity_id  INTEGER NOT NULL REFERENCES entity.release_identity(id),
+    source       TEXT NOT NULL,
+    external_id  TEXT NOT NULL,
+    confidence   REAL,
+    method       TEXT NOT NULL,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_release_reconciliation_log_identity_id
+    ON entity.release_reconciliation_log(identity_id);

@@ -38,12 +38,11 @@ Create Date: 2026-06-08
 from __future__ import annotations
 
 import logging
-import os
 from collections.abc import Sequence
 
 import psycopg
 
-from alembic import context
+from lib.alembic_helpers import refuse_offline, resolve_db_url
 
 revision: str = "0011_artist_not_found"
 down_revision: str | Sequence[str] | None = "0010_release_not_found"
@@ -64,25 +63,6 @@ ALTER TABLE artist DROP COLUMN IF EXISTS not_found;
 _PROBE_ID = -2147483648
 
 
-def _resolve_db_url() -> str:
-    db_url = os.environ.get("DATABASE_URL_DISCOGS") or os.environ.get("DATABASE_URL")
-    if not db_url:
-        raise RuntimeError(
-            "DATABASE_URL_DISCOGS (or DATABASE_URL) must be set to apply 0011_artist_not_found."
-        )
-    return db_url
-
-
-def _refuse_offline(direction: str) -> None:
-    if context.is_offline_mode():
-        raise RuntimeError(
-            f"0011_artist_not_found does not support --sql / offline mode "
-            f"({direction}): the migration opens its own psycopg connection "
-            "to apply DDL and run a precondition probe. Run `alembic "
-            "upgrade head` (or `downgrade`) against a live DB instead."
-        )
-
-
 def _probe_empty_name_write() -> None:
     """Verify ``artist.name = ''`` can be written.
 
@@ -90,7 +70,7 @@ def _probe_empty_name_write() -> None:
     Probing surfaces a future-added CHECK at migration time rather than
     on the first prod 404.
     """
-    with psycopg.connect(_resolve_db_url(), autocommit=True) as conn, conn.cursor() as cur:
+    with psycopg.connect(resolve_db_url(revision), autocommit=True) as conn, conn.cursor() as cur:
         cur.execute("BEGIN")
         try:
             cur.execute(
@@ -111,18 +91,18 @@ def _probe_empty_name_write() -> None:
 
 
 def upgrade() -> None:
-    _refuse_offline("upgrade")
+    refuse_offline(revision, "upgrade")
 
     log = logging.getLogger("alembic.runtime.migration")
     _probe_empty_name_write()
 
-    with psycopg.connect(_resolve_db_url(), autocommit=True) as conn, conn.cursor() as cur:
+    with psycopg.connect(resolve_db_url(revision), autocommit=True) as conn, conn.cursor() as cur:
         log.info("0011: ALTER artist ADD COLUMN not_found")
         cur.execute(_UPGRADE_SQL)
 
 
 def downgrade() -> None:
-    _refuse_offline("downgrade")
+    refuse_offline(revision, "downgrade")
 
-    with psycopg.connect(_resolve_db_url(), autocommit=True) as conn, conn.cursor() as cur:
+    with psycopg.connect(resolve_db_url(revision), autocommit=True) as conn, conn.cursor() as cur:
         cur.execute(_DOWNGRADE_SQL)

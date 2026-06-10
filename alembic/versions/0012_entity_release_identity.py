@@ -50,12 +50,11 @@ Create Date: 2026-06-10
 from __future__ import annotations
 
 import logging
-import os
 from collections.abc import Sequence
 
 import psycopg
 
-from alembic import context
+from lib.alembic_helpers import refuse_offline, resolve_db_url
 
 revision: str = "0012_entity_release_identity"
 down_revision: str | Sequence[str] | None = "0011_artist_not_found"
@@ -93,47 +92,29 @@ CREATE INDEX IF NOT EXISTS idx_release_reconciliation_log_identity_id
     ON entity.release_reconciliation_log(identity_id);
 """
 
-# FK order: index, then FK-child table, then FK-parent table. Schema is left
-# in place because the artist-side entity.identity / entity.reconciliation_log
+# FK order: child table first, then parent. The DROP TABLE on the child also
+# drops its FK index, so no explicit DROP INDEX is needed. Schema is left in
+# place because the artist-side entity.identity / entity.reconciliation_log
 # tables still live there (out-of-band bootstrap; see #279 for adoption).
 _DOWNGRADE_SQL = """
-DROP INDEX IF EXISTS entity.idx_release_reconciliation_log_identity_id;
 DROP TABLE IF EXISTS entity.release_reconciliation_log;
 DROP TABLE IF EXISTS entity.release_identity;
 """
 
 
-def _resolve_db_url() -> str:
-    db_url = os.environ.get("DATABASE_URL_DISCOGS") or os.environ.get("DATABASE_URL")
-    if not db_url:
-        raise RuntimeError(
-            "DATABASE_URL_DISCOGS (or DATABASE_URL) must be set to apply "
-            "0012_entity_release_identity."
-        )
-    return db_url
-
-
-def _refuse_offline(direction: str) -> None:
-    if context.is_offline_mode():
-        raise RuntimeError(
-            f"0012_entity_release_identity does not support --sql / offline mode "
-            f"({direction}): the migration opens its own psycopg connection to "
-            "apply DDL. Run `alembic upgrade head` (or `downgrade`) against a "
-            "live DB instead."
-        )
-
-
 def upgrade() -> None:
-    _refuse_offline("upgrade")
+    refuse_offline(revision, "upgrade")
 
     log = logging.getLogger("alembic.runtime.migration")
-    with psycopg.connect(_resolve_db_url(), autocommit=True) as conn, conn.cursor() as cur:
+    with psycopg.connect(resolve_db_url(revision), autocommit=True) as conn, conn.cursor() as cur:
         log.info("0012: CREATE SCHEMA + entity.release_identity + reconciliation_log + FK index")
         cur.execute(_UPGRADE_SQL)
 
 
 def downgrade() -> None:
-    _refuse_offline("downgrade")
+    refuse_offline(revision, "downgrade")
 
-    with psycopg.connect(_resolve_db_url(), autocommit=True) as conn, conn.cursor() as cur:
+    log = logging.getLogger("alembic.runtime.migration")
+    with psycopg.connect(resolve_db_url(revision), autocommit=True) as conn, conn.cursor() as cur:
+        log.info("0012: DROP entity.release_reconciliation_log + entity.release_identity")
         cur.execute(_DOWNGRADE_SQL)
