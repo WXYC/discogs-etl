@@ -144,6 +144,108 @@ This is what wiped the WXYC prod discogs-cache on 2026-04-28 (~14,667 release ro
 
 If a future migration needs autocommit DDL (e.g., `CREATE INDEX CONCURRENTLY`, extension creation), keep the guards: either follow the same `is_offline_mode()` check, or write the migration with `op.execute(..., execution_options={"isolation_level": "AUTOCOMMIT"})` so alembic's offline mode can intercept it.
 
+## Applying a single migration out-of-band (between rebuilds)
+
+The monthly EC2 rebuild (`scripts/rebuild-cache.sh`) runs `alembic upgrade head` against the prod cache at step 2b before any dump work. That's the canonical deploy path, and most migrations should ride it: schema and data changes coalesce, and the rebuild's `Verify alembic baseline is stamped` guard catches connectivity / credential drift cheaply.
+
+Sometimes you want to apply a migration *now* — a consumer-side deploy is gated on the new schema being live (e.g. LML#530's `POST /api/v1/identity/resolve` returning 200 instead of 503 once `entity.release_identity` exists) and you don't want to schedule a multi-hour rebuild to ship pure DDL. This section is for that case.
+
+### When to use this path
+
+Use the direct invocation when **all four** are true:
+
+1. The migration is **pure DDL** (no data backfill, no row mutation, no application-level coordination beyond the schema change itself). Skim the migration body — if it's `op.execute(...)` on `CREATE TABLE` / `CREATE INDEX` / `ALTER TABLE ADD COLUMN` and nothing else, you're in scope. If it backfills, do it via the rebuild so the data step rides the same operator window.
+2. The migration is **idempotent** under re-application (DDL uses `IF NOT EXISTS` / `IF EXISTS`). Every revision since 0001 follows this convention; the integration tests in `tests/integration/test_alembic_*.py` pin it.
+3. The migration is **reversible** in case you want to roll back without restoring from snapshot. The downgrade should be DDL-only too.
+4. A **consumer is blocked** on the schema being live. If nothing's waiting, just let the next rebuild apply it on the natural cadence — fewer moving parts.
+
+If any of those is false, trigger the EC2 rebuild instead. The direct path is surgical, not a substitute for the rebuild.
+
+### Preconditions
+
+- The PR that introduces the migration is **merged to `main`**. The deploy applies whatever's at the `main` checkout's `alembic upgrade head`; running this against an unmerged branch is how you ship something that didn't pass review.
+- A recent backup snapshot. Cheap insurance — the migration is DDL only, but a typo on `DATABASE_URL_DISCOGS` can land you in the wrong DB.
+- `discogs-cache` is already alembic-stamped (see the "Procedure" block above). `alembic upgrade head` against an unstamped + populated DB is covered by the `0001_initial` populated-schema short-circuit, but that's the workflow's territory — the direct path assumes a normal stamped state.
+- You know the migration's current head and target head. Read `alembic current` before, expect a specific revision id after.
+
+### Procedure
+
+```bash
+# 1. Take a backup snapshot. RDS console → Take snapshot, or `pg_dump`. Same
+#    discipline as the first-deploy stamp — pure DDL is reversible, but the
+#    snapshot covers "I pointed at the wrong DB".
+
+# 2. Pull the merged migration into a clean checkout. Don't run from a stale
+#    branch — the deploy applies whatever `alembic upgrade head` finds in
+#    your local `alembic/versions/`.
+cd /path/to/discogs-etl
+git fetch origin && git checkout main && git pull --ff-only origin main
+
+# 3. Activate the venv and point at the prod DB. Use ".venv/bin/alembic"
+#    explicitly if you're not sure activation is sticky.
+source .venv/bin/activate
+export DATABASE_URL_DISCOGS="<prod url>"
+
+# 4. Confirm the pre-state. The current revision should match what you
+#    expect to upgrade *from* (i.e. the previous head, not your new one).
+alembic current
+# → e.g. 0011_artist_not_found (head)
+# If this prints your NEW revision, the migration already applied and you
+# can skip step 6.
+# If this prints an unexpected revision, STOP and figure out why before
+# applying anything.
+
+# 5. List what `upgrade head` will apply. Read-only; safe.
+alembic history --indicate-current | head -20
+# → confirm the only pending revision is the one you intend to apply.
+# If there are multiple pending revisions and you only want one, name the
+# target explicitly in step 6 instead of `head`.
+
+# 6. Apply the migration.
+alembic upgrade head
+# → or: alembic upgrade <revision_id>   (single-step the chain)
+
+# 7. Verify alembic agrees on the new head.
+alembic current
+# → e.g. 0012_entity_release_identity (head)
+```
+
+### Why `--sql` is still off-limits
+
+Every migration since 0001 opens its own `psycopg.connect(..., autocommit=True)` for DDL — see the helpers in `lib/alembic_helpers.py` (`refuse_offline`, `resolve_db_url`) that 0010 / 0011 / 0012 share. `alembic upgrade head --sql` cannot intercept that side-channel, so the apparent "dry run" output is misleading: the DDL runs for real and the SQL emission shows only the `alembic_version` UPDATE. Every shared helper calls `refuse_offline` first and raises loudly if `context.is_offline_mode()` is true, so the command fails fast — but the lesson from the 2026-04-28 wipe (logged above under "Why `alembic upgrade head --sql` is unsafe with this baseline") is "don't try to dry-run alembic against this schema." If you want to preview the SQL, read the migration source.
+
+### Post-deploy smoke
+
+The migration owner is responsible for naming a smoke that proves the new surface is live. Examples:
+
+- **0010 / 0011** (release / artist `not_found`): `\d release` / `\d artist` shows the column with `NOT NULL DEFAULT false`.
+- **0012** (entity.release_identity): `POST /api/v1/identity/resolve` against the LML deploy that consumes the table returns 200 with `{"identity_id": N, "minted": true}` on a fresh `(discogs_release, 12345)` and `{"minted": false}` on the repeat. The pg-marked test `tests/integration/test_alembic_0012_entity_release_identity.py::test_mint_then_remint_smoke` is the in-CI mirror.
+
+If the migration is purely structural and no consumer is using it yet, the smoke is `alembic current` reporting the new head — that's the bar.
+
+### Recovery
+
+DDL migrations have working `downgrade()` paths. If you applied the wrong revision or the post-deploy smoke fails:
+
+```bash
+# Step back one revision.
+alembic downgrade -1
+alembic current
+# → confirm you're back at the previous head.
+```
+
+The integration tests pin downgrade-idempotence (re-application is a no-op), so a downgrade + re-upgrade cycle is safe.
+
+If the downgrade itself errors (rare, but possible if a consumer raced you and wrote rows that block the DROP), STOP. The wrong move is to force the drop via `psql -c "DROP TABLE ... CASCADE"` — that breaks the alembic state. The right move is to read the error, decide whether to roll forward (apply a follow-up migration) or restore from snapshot.
+
+### What NOT to do
+
+- **Don't run from a feature branch.** `alembic upgrade head` applies what's on the local checkout. Always `git checkout main && git pull` first.
+- **Don't run `alembic upgrade head --sql`.** See above. Read the migration source if you want to preview.
+- **Don't apply multiple unrelated migrations in one direct invocation** unless they're a tightly-coupled chain. Each migration deserves its own consumer smoke; chaining them muddles attribution if the smoke fails.
+- **Don't substitute the direct path for a rebuild that includes data backfill.** If the migration body has anything past pure DDL (UPDATE, COPY, function bodies that rewrite rows), the rebuild is the right path so the data and schema operations share an operator window.
+- **Don't skip the snapshot** even though the operation is reversible. The snapshot's job is to catch the "wrong DB" error class, not the "bad migration" one.
+
 ## One-time recovery: dev/EC2 systems on the dict-based 0004 (post-#223)
 
 `alembic/versions/0004_wxyc_identity_match_fns.py` was rewritten in [#223](https://github.com/WXYC/discogs-etl/issues/223) to deploy `wxyc_unaccent` via a pure-SQL `wxyc_unaccent_text(text)` function instead of a `$SHAREDIR/tsearch_data/`-backed text-search dictionary. Railway-managed Postgres can't host the rules file (the path is root-owned and unwritable even with `pg_write_server_files`), and that's where the rebuild target lives going forward.
