@@ -274,8 +274,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Pass --truncate-existing to scripts/import_csv.py so the cache "
         "tables are wiped before COPY. Use when re-running a rebuild against "
-        "a DB with stale rows from a prior failed attempt. Preserves "
-        "entity.identity and alembic_version.",
+        "a DB with stale rows from a prior failed attempt. Preserves the "
+        "entity schema and alembic_version.",
     )
     parser.add_argument(
         "--fresh-rebuild",
@@ -1066,7 +1066,9 @@ def _run_database_build(
             # is a no-op against a populated DB (every CREATE is IF NOT
             # EXISTS), which is the incremental default that preserves
             # LML-back-patched artwork. drop_core_tables.sql does NOT drop
-            # alembic_version, entity.identity, etc.
+            # alembic_version or the entity schema (which holds LML-owned
+            # identity / reconciliation state on both the artist and release
+            # sides — entity.release_identity ships in alembic 0012).
             logger.warning("--fresh-rebuild: dropping core-table subgraph")
             run_sql_file(db_url, SCHEMA_DIR / "drop_core_tables.sql")
         run_sql_file(db_url, SCHEMA_DIR / "create_functions.sql")
