@@ -264,8 +264,11 @@ TABLES: list[TableConfig] = BASE_TABLES + TRACK_TABLES + VIDEO_TABLES
 # set wipes the full cache; the tracks set wipes only the tables that
 # --tracks-only writes to. Two exclusions in either set:
 #
-#   - entity.identity / entity.reconciliation_log — WXYC-side identity
-#     records the rebuild must NOT touch.
+#   - the entire entity schema (entity.identity / entity.reconciliation_log
+#     are WXYC-side artist identity; entity.release_identity /
+#     entity.release_reconciliation_log are the release-side counterpart
+#     added by alembic 0012 for LML#526). The rebuild must NOT touch any
+#     of these — they hold mint state owned by LML.
 #   - alembic_version — migration history must persist across rebuilds.
 #
 # Mode-awareness matters: in a full run_pipeline.py invocation the base
@@ -1042,7 +1045,7 @@ def main():
         action="store_true",
         help="TRUNCATE the cache tables before COPY. Use when re-running a "
         "rebuild against a DB with stale rows from a prior failed attempt. "
-        "Preserves entity.identity and alembic_version. Without this flag, "
+        "Preserves the entity schema and alembic_version. Without this flag, "
         "a duplicate-key violation on the first table aborts the pipeline.",
     )
 
