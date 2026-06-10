@@ -306,23 +306,31 @@ CACHE_TABLES_TO_TRUNCATE_TRACKS: list[str] = [
 ]
 
 
-# Runtime guard for the "preserves the entire entity schema" promise carried
-# by the comment above and by --truncate-existing's help text. The exclusion
-# works because both lists hold bare public-schema table names — any
-# schema-qualified name (the only way to reach entity.* via TRUNCATE) trips
-# this guard at import time, before any pipeline run can do damage. A loose
-# bare-prefix check would overshoot onto legitimate public tables that
-# happen to start with "entity" (e.g. a future `entity_log` analytics
-# table), so the contract is narrowed to schema qualifiers only.
-for _truncate_table in (*CACHE_TABLES_TO_TRUNCATE_BASE, *CACHE_TABLES_TO_TRUNCATE_TRACKS):
-    if "." in _truncate_table:
-        raise RuntimeError(
-            f"--truncate-existing list must not include schema-qualified names; "
-            f"found {_truncate_table!r}. Cross-schema TRUNCATE is the only path "
-            f"that could reach LML-owned entity.* state — see comment above "
-            f"CACHE_TABLES_TO_TRUNCATE_BASE."
-        )
-del _truncate_table
+def _validate_truncate_lists() -> None:
+    """Enforce the 'preserves the entire entity schema' promise at import time.
+
+    The exclusion works because both truncate lists hold bare public-schema
+    table names — any schema-qualified entry (the only way to reach entity.*
+    via TRUNCATE) trips this guard before any pipeline run can do damage.
+    A loose bare-prefix check would overshoot onto legitimate public tables
+    that happen to start with "entity" (e.g. a future ``entity_log``
+    analytics table), so the contract is narrowed to schema qualifiers only.
+
+    Wrapped in a function so the loop variable doesn't leak into the module
+    namespace and so an empty truncate list (e.g. during a future refactor)
+    doesn't raise ``NameError`` from a stray ``del``.
+    """
+    for table in (*CACHE_TABLES_TO_TRUNCATE_BASE, *CACHE_TABLES_TO_TRUNCATE_TRACKS):
+        if "." in table:
+            raise RuntimeError(
+                f"--truncate-existing list must not include schema-qualified "
+                f"names; found {table!r}. Cross-schema TRUNCATE is the only "
+                f"path that could reach LML-owned entity.* state — see "
+                f"comment above CACHE_TABLES_TO_TRUNCATE_BASE."
+            )
+
+
+_validate_truncate_lists()
 
 
 def _truncate_tables(conn, table_names: list[str]) -> None:
