@@ -154,8 +154,8 @@ Sometimes you want to apply a migration *now* — a consumer-side deploy is gate
 
 Use the direct invocation when **all four** are true:
 
-1. The migration is **pure DDL** (no data backfill, no row mutation, no application-level coordination beyond the schema change itself). Skim the migration body — if it's `op.execute(...)` on `CREATE TABLE` / `CREATE INDEX` / `ALTER TABLE ADD COLUMN` and nothing else, you're in scope. If it backfills, do it via the rebuild so the data step rides the same operator window.
-2. The migration is **idempotent** under re-application (DDL uses `IF NOT EXISTS` / `IF EXISTS`). Every revision since 0001 follows this convention; the integration tests in `tests/integration/test_alembic_*.py` pin it.
+1. The migration is **pure DDL** (no data backfill, no row mutation of persisted rows, no application-level coordination beyond the schema change itself). Skim the migration body — `op.execute(...)` or side-channel `cur.execute(...)` against `CREATE TABLE` / `CREATE INDEX` / `ALTER TABLE ADD COLUMN` is in scope. Precondition probes that BEGIN → INSERT → ROLLBACK to verify a schema contract (the pattern 0010 / 0011 use to confirm an empty-string tombstone is writable) are also in scope — they touch no persisted state. If the body backfills, do it via the rebuild so the data step rides the same operator window.
+2. The migration is **idempotent** under re-application (DDL uses `IF NOT EXISTS` / `IF EXISTS`). All revisions in this chain follow that convention in their SQL; per-revision integration tests exist for the baseline (0001), 0002, and 0006–0012, with the bigger revisions (0007 / 0008 / 0009 / 0012) pinning the dual-write contract explicitly. 0003 / 0004 / 0005 rely on the SQL guards alone — re-running them is safe but isn't gated by a dedicated regression test.
 3. The migration is **reversible** in case you want to roll back without restoring from snapshot. The downgrade should be DDL-only too.
 4. A **consumer is blocked** on the schema being live. If nothing's waiting, just let the next rebuild apply it on the natural cadence — fewer moving parts.
 
