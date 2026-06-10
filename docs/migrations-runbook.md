@@ -146,7 +146,7 @@ If a future migration needs autocommit DDL (e.g., `CREATE INDEX CONCURRENTLY`, e
 
 ## Applying a single migration out-of-band (between rebuilds)
 
-The monthly EC2 rebuild (`scripts/rebuild-cache.sh`) runs `alembic upgrade head` against the prod cache at step 2b before any dump work. That's the canonical deploy path, and most migrations should ride it: schema and data changes coalesce, and the rebuild's `Verify alembic baseline is stamped` guard catches connectivity / credential drift cheaply.
+The monthly EC2 rebuild (`scripts/rebuild-cache.sh`) runs `alembic upgrade head` against the prod cache at step 2b before any dump work. That's the canonical deploy path, and most migrations should ride it: schema and data changes coalesce inside one operator window. (The sibling `workflow_dispatch`-only path at `.github/workflows/rebuild-cache.yml` adds a `Verify alembic baseline is stamped` pre-guard before its own `alembic upgrade head`; the EC2 script does not, and assumes the stamp procedure earlier in this runbook has already run.)
 
 Sometimes you want to apply a migration *now* — a consumer-side deploy is gated on the new schema being live (e.g. LML#530's `POST /api/v1/identity/resolve` returning 200 instead of 503 once `entity.release_identity` exists) and you don't want to schedule a multi-hour rebuild to ship pure DDL. This section is for that case.
 
@@ -195,8 +195,10 @@ alembic current
 # If this prints an unexpected revision, STOP and figure out why before
 # applying anything.
 
-# 5. List what `upgrade head` will apply. Read-only; safe.
-alembic history --indicate-current | head -20
+# 5. List what `upgrade head` will apply. Read-only; safe. No truncation —
+#    if the chain grows past one terminal page, scroll. Hiding the tail is
+#    how you ship a revision you didn't intend.
+alembic history --indicate-current
 # → confirm the only pending revision is the one you intend to apply.
 # If there are multiple pending revisions and you only want one, name the
 # target explicitly in step 6 instead of `head`.
@@ -212,14 +214,14 @@ alembic current
 
 ### Why `--sql` is still off-limits
 
-Every migration since 0001 opens its own `psycopg.connect(..., autocommit=True)` for DDL — see the helpers in `lib/alembic_helpers.py` (`refuse_offline`, `resolve_db_url`) that 0010 / 0011 / 0012 share. `alembic upgrade head --sql` cannot intercept that side-channel, so the apparent "dry run" output is misleading: the DDL runs for real and the SQL emission shows only the `alembic_version` UPDATE. Every shared helper calls `refuse_offline` first and raises loudly if `context.is_offline_mode()` is true, so the command fails fast — but the lesson from the 2026-04-28 wipe (logged above under "Why `alembic upgrade head --sql` is unsafe with this baseline") is "don't try to dry-run alembic against this schema." If you want to preview the SQL, read the migration source.
+Most migrations in this chain open their own `psycopg.connect(..., autocommit=True)` for DDL rather than going through alembic's wrapped connection — 0001 through 0005 and 0007 through 0012 follow that pattern. 0010 / 0011 / 0012 share the helpers in `lib/alembic_helpers.py` (`refuse_offline`, `resolve_db_url`); 0002–0005 and 0007–0009 carry inline copies of the same two functions; 0006 is the lone exception, using `op.execute` because it's idempotent CREATE-TABLE-IF-NOT-EXISTS DDL that alembic's wrapper handles fine. `alembic upgrade head --sql` cannot intercept the side-channel, so for any migration that opens its own connection the apparent "dry run" output is misleading: the DDL runs for real and the SQL emission shows only the `alembic_version` UPDATE. Every side-channel migration calls `refuse_offline` (or its inline equivalent) first and raises loudly if `context.is_offline_mode()` is true, so the command fails fast — but the lesson from the 2026-04-28 wipe (logged above under "Why `alembic upgrade head --sql` is unsafe with this baseline") is "don't try to dry-run alembic against this schema." If you want to preview the SQL, read the migration source.
 
 ### Post-deploy smoke
 
 The migration owner is responsible for naming a smoke that proves the new surface is live. Examples:
 
 - **0010 / 0011** (release / artist `not_found`): `\d release` / `\d artist` shows the column with `NOT NULL DEFAULT false`.
-- **0012** (entity.release_identity): `POST /api/v1/identity/resolve` against the LML deploy that consumes the table returns 200 with `{"identity_id": N, "minted": true}` on a fresh `(discogs_release, 12345)` and `{"minted": false}` on the repeat. The pg-marked test `tests/integration/test_alembic_0012_entity_release_identity.py::test_mint_then_remint_smoke` is the in-CI mirror.
+- **0012** (entity.release_identity): `POST /api/v1/identity/resolve` against the LML deploy that consumes the table returns 200 with the mint-then-remint shape locked in [WXYC/wxyc-shared#175](https://github.com/WXYC/wxyc-shared/pull/175) (1.13.0) — first call mints (`minted: true`), second call returns the same identity (`minted: false`). The pg-marked test `tests/integration/test_alembic_0012_entity_release_identity.py::test_mint_then_remint_smoke` exercises the underlying DB shape; the HTTP shape lives in the wxyc-shared spec and the LML#530 implementation.
 
 If the migration is purely structural and no consumer is using it yet, the smoke is `alembic current` reporting the new head — that's the bar.
 
