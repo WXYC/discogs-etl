@@ -189,9 +189,12 @@ export DATABASE_URL_DISCOGS="<prod url>"
 # 4. Confirm the pre-state. The current revision should match what you
 #    expect to upgrade *from* (i.e. the previous head, not your new one).
 alembic current
-# → e.g. 0011_artist_not_found (head)
-# If this prints your NEW revision, the migration already applied and you
-# can skip step 6.
+# → e.g. 0011_artist_not_found
+# No "(head)" suffix here because step 2's `git pull` brought your new
+# revision into alembic/versions/, so the previous head is no longer the
+# tip of the known chain.
+# If this prints your NEW revision, the migration already applied — jump
+# to step 7.
 # If this prints an unexpected revision, STOP and figure out why before
 # applying anything.
 
