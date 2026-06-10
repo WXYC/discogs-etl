@@ -33,6 +33,7 @@ Tracked at WXYC/discogs-etl#278.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import psycopg
@@ -40,6 +41,30 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 MIGRATION_PATH = REPO_ROOT / "alembic" / "versions" / "0012_entity_release_identity.py"
+
+
+def _read_revision_metadata() -> tuple[str, str]:
+    """Return (revision, down_revision) parsed from 0012's source file.
+
+    Source-of-truth lookup keeps the test from hardcoding revision strings
+    that might be shortened later (e.g., 0009's revision id was trimmed to
+    fit alembic_version varchar(32) in commit c228b47). If the chain is
+    renamed, this test tracks automatically instead of failing eight cases
+    in lockstep on a stale stamp target.
+
+    Regex over the file rather than importlib because the migration's
+    imports (``from lib.alembic_helpers import ...``) require alembic-aware
+    sys.path setup that pytest collection does not guarantee.
+    """
+    body = MIGRATION_PATH.read_text(encoding="utf-8")
+    rev = re.search(r'^revision:\s*str\s*=\s*"([^"]+)"', body, re.MULTILINE)
+    down = re.search(r'^down_revision:\s*str\s*\|[^=]+=\s*"([^"]+)"', body, re.MULTILINE)
+    assert rev is not None, f"Could not find revision assignment in {MIGRATION_PATH}"
+    assert down is not None, f"Could not find down_revision assignment in {MIGRATION_PATH}"
+    return rev.group(1), down.group(1)
+
+
+REVISION, PRIOR_REVISION = _read_revision_metadata()
 
 
 # Per-source UNIQUE columns load-bearing for LML's mint protocol.
@@ -113,11 +138,11 @@ def _stamp_and_upgrade(run_alembic, db_url: str) -> None:
     cares about 0012's surface. The migration is self-contained: it does
     not depend on any column added by earlier revisions.
     """
-    stamp = run_alembic(["stamp", "0011_artist_not_found"], db_url)
+    stamp = run_alembic(["stamp", PRIOR_REVISION], db_url)
     assert stamp.returncode == 0, (
         f"alembic stamp failed:\nstdout: {stamp.stdout}\nstderr: {stamp.stderr}"
     )
-    result = run_alembic(["upgrade", "0012_entity_release_identity"], db_url)
+    result = run_alembic(["upgrade", REVISION], db_url)
     assert result.returncode == 0, (
         f"alembic upgrade failed:\nstdout: {result.stdout}\nstderr: {result.stderr}"
     )
@@ -203,13 +228,24 @@ def test_release_identity_columns(run_alembic, fresh_db_url: str) -> None:
 
     # reconciliation_status DEFAULT 'unreconciled' is load-bearing for LML's
     # state machine — newly-minted rows must carry the canonical sentinel so
-    # the reconciler routes them to the right branch.
+    # the reconciler routes them to the right branch. Extract the literal
+    # portion of the column_default expression and assert exact equality so
+    # a drift to 'unreconciled_v2' or similar (which would still pass a
+    # substring check that didn't anchor the closing quote in PG syntax)
+    # cannot slip through.
     status_default = rows["reconciliation_status"][2] or ""
-    assert "'unreconciled'" in status_default, (
-        f"entity.release_identity.reconciliation_status DEFAULT drifted. "
-        f"Got column_default={status_default!r}; expected the literal "
-        f"'unreconciled'. LML's mint INSERT omits this column, so the "
-        f"DEFAULT is the only place the seed sentinel is written."
+    literal_match = re.fullmatch(r"'([^']*)'::text", status_default)
+    assert literal_match is not None, (
+        f"entity.release_identity.reconciliation_status DEFAULT expression "
+        f"is not a bare text literal. Got column_default={status_default!r}; "
+        f"expected 'unreconciled'::text. LML's mint INSERT omits this column, "
+        f"so the DEFAULT is the only place the seed sentinel is written."
+    )
+    assert literal_match.group(1) == "unreconciled", (
+        f"entity.release_identity.reconciliation_status DEFAULT literal "
+        f"drifted: got {literal_match.group(1)!r}, expected 'unreconciled'. "
+        f"LML's reconciler routes on the canonical sentinel; any rename "
+        f"strands newly-minted rows in the wrong state-machine branch."
     )
 
 
@@ -438,9 +474,9 @@ def test_reapply_is_noop(run_alembic, fresh_db_url: str) -> None:
 
     # Rewind alembic state (stamp, not downgrade — tables stay) and re-upgrade
     # so the IF NOT EXISTS branches fire against existing tables.
-    rewind = run_alembic(["stamp", "0011_artist_not_found"], fresh_db_url)
+    rewind = run_alembic(["stamp", PRIOR_REVISION], fresh_db_url)
     assert rewind.returncode == 0
-    reupgrade = run_alembic(["upgrade", "0012_entity_release_identity"], fresh_db_url)
+    reupgrade = run_alembic(["upgrade", REVISION], fresh_db_url)
     assert reupgrade.returncode == 0, (
         f"Re-application failed:\nstdout: {reupgrade.stdout}\nstderr: {reupgrade.stderr}"
     )
@@ -472,7 +508,7 @@ def test_downgrade_drops_release_side_tables(run_alembic, fresh_db_url: str) -> 
     """
     _stamp_and_upgrade(run_alembic, fresh_db_url)
 
-    downgrade = run_alembic(["downgrade", "0011_artist_not_found"], fresh_db_url)
+    downgrade = run_alembic(["downgrade", PRIOR_REVISION], fresh_db_url)
     assert downgrade.returncode == 0, (
         f"alembic downgrade failed:\nstdout: {downgrade.stdout}\nstderr: {downgrade.stderr}"
     )

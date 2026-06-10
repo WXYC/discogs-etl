@@ -20,14 +20,15 @@ from __future__ import annotations
 
 import os
 
-from alembic import context
-
 
 def resolve_db_url(revision_label: str) -> str:
     """Return the discogs-cache DB URL or raise with an actionable message.
 
     ``revision_label`` is the migration's revision id, used in the error
     message so operators see which migration is missing the env var.
+
+    Does NOT import alembic — callable from any context (unit tests, CLI
+    scripts, etc.) without a live MigrationContext.
     """
     db_url = os.environ.get("DATABASE_URL_DISCOGS") or os.environ.get("DATABASE_URL")
     if not db_url:
@@ -45,7 +46,12 @@ def refuse_offline(revision_label: str, direction: str) -> None:
     actually opening a connection, so the side-channel ``psycopg.connect``
     would never run — the operator would see a successful ``alembic
     upgrade --sql`` while the DDL never landed on the target DB.
+
+    ``alembic.context`` is imported lazily so callers that only need
+    ``resolve_db_url`` do not take a hard dependency on alembic.
     """
+    from alembic import context
+
     if context.is_offline_mode():
         raise RuntimeError(
             f"{revision_label} does not support --sql / offline mode "
