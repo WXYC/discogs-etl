@@ -308,6 +308,7 @@ CREATE INDEX IF NOT EXISTS idx_lookup_negative_attempted_at ON lookup_negative(a
 -- Artist-side DDL (entity.identity / entity.reconciliation_log + indexes) is
 -- copied from wxyc-etl/src/schema/entity.rs — the canonical mirror of the
 -- prod shape — and embedded by copy (not import), matching 0013's policy.
+-- Artist-side adoption tracked at WXYC/discogs-etl#279.
 CREATE SCHEMA IF NOT EXISTS entity;
 
 CREATE TABLE IF NOT EXISTS entity.release_identity (

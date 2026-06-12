@@ -1068,7 +1068,9 @@ def _run_database_build(
             # LML-back-patched artwork. drop_core_tables.sql does NOT drop
             # alembic_version or the entity schema (which holds LML-owned
             # identity / reconciliation state on both the artist and release
-            # sides — entity.release_identity ships in alembic 0012).
+            # sides — entity.release_identity ships in alembic 0012, the
+            # artist-side entity.identity / entity.reconciliation_log are
+            # adopted into the chain by alembic 0013).
             logger.warning("--fresh-rebuild: dropping core-table subgraph")
             run_sql_file(db_url, SCHEMA_DIR / "drop_core_tables.sql")
         run_sql_file(db_url, SCHEMA_DIR / "create_functions.sql")
