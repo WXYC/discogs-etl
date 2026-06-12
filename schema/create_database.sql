@@ -291,20 +291,23 @@ CREATE INDEX IF NOT EXISTS idx_lookup_negative_attempted_at ON lookup_negative(a
 -- ============================================
 -- LML-owned identity layer (entity schema)
 -- ============================================
--- Mirrors alembic/versions/0012_entity_release_identity.py per the dual-write
--- convention so a fresh rebuild (`run_pipeline.py --fresh-rebuild`) produces
--- the same end state as the alembic upgrade chain. Without the mirror, a dev
--- DB built only through create_database.sql leaves LML's
--- POST /api/v1/identity/resolve probe returning 503.
+-- Mirrors alembic/versions/0012_entity_release_identity.py (release-side) and
+-- 0013_adopt_entity_identity.py (artist-side) per the dual-write convention so
+-- a fresh rebuild (`run_pipeline.py --fresh-rebuild`) produces the same end
+-- state as the alembic upgrade chain. Without the mirror, a dev DB built only
+-- through create_database.sql leaves LML's POST /api/v1/identity/resolve probe
+-- returning 503 and the artist-side `SELECT 1 FROM entity.identity LIMIT 0`
+-- probe also failing.
 --
--- Lifecycle note: entity.* tables hold LML-owned mint state and survive the
--- monthly cache rebuild. drop_core_tables.sql intentionally does NOT drop
--- them; --truncate-existing intentionally does NOT include them in the
--- TRUNCATE list (see CACHE_TABLES_TO_TRUNCATE_BASE in scripts/import_csv.py).
+-- Lifecycle note: entity.* tables hold LML-owned mint and reconciliation state
+-- and survive the monthly cache rebuild. drop_core_tables.sql intentionally
+-- does NOT drop them; --truncate-existing intentionally does NOT include them
+-- in the TRUNCATE list (see CACHE_TABLES_TO_TRUNCATE_BASE in
+-- scripts/import_csv.py).
 --
--- Artist-side counterparts (entity.identity / entity.reconciliation_log) still
--- live in prod via out-of-band bootstrap and are not yet adopted into the
--- alembic chain or this file — tracked at WXYC/discogs-etl#279.
+-- Artist-side DDL (entity.identity / entity.reconciliation_log + indexes) is
+-- copied from wxyc-etl/src/schema/entity.rs — the canonical mirror of the
+-- prod shape — and embedded by copy (not import), matching 0013's policy.
 CREATE SCHEMA IF NOT EXISTS entity;
 
 CREATE TABLE IF NOT EXISTS entity.release_identity (
@@ -332,3 +335,35 @@ CREATE TABLE IF NOT EXISTS entity.release_reconciliation_log (
 
 CREATE INDEX IF NOT EXISTS idx_release_reconciliation_log_identity_id
     ON entity.release_reconciliation_log(identity_id);
+
+-- Artist-side: mirrors alembic/versions/0013_adopt_entity_identity.py.
+-- library_name UNIQUE is load-bearing for LML's artist-side resolve path.
+CREATE TABLE IF NOT EXISTS entity.identity (
+    id                       SERIAL PRIMARY KEY,
+    library_name             TEXT NOT NULL UNIQUE,
+    discogs_artist_id        INTEGER,
+    wikidata_qid             TEXT,
+    musicbrainz_artist_id    TEXT,
+    spotify_artist_id        TEXT,
+    apple_music_artist_id    TEXT,
+    bandcamp_id              TEXT,
+    reconciliation_status    TEXT NOT NULL DEFAULT 'unreconciled',
+    created_at               TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at               TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_entity_identity_status
+    ON entity.identity(reconciliation_status);
+
+CREATE TABLE IF NOT EXISTS entity.reconciliation_log (
+    id           SERIAL PRIMARY KEY,
+    identity_id  INTEGER NOT NULL REFERENCES entity.identity(id),
+    source       TEXT NOT NULL,
+    external_id  TEXT NOT NULL,
+    confidence   REAL,
+    method       TEXT NOT NULL,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_entity_reconciliation_log_identity_id
+    ON entity.reconciliation_log(identity_id);
