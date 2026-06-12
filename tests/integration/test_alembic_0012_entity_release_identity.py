@@ -436,7 +436,21 @@ def test_upgrade_against_prod_bootstrap_state(run_alembic, fresh_db_url: str) ->
     _seed_bootstrap_state(fresh_db_url)
     _stamp_and_upgrade(run_alembic, fresh_db_url)
 
+    revision, _ = _read_revision_metadata()
     with psycopg.connect(fresh_db_url) as conn, conn.cursor() as cur:
+        # Pin that the upgrade actually executed by reading the version row.
+        # Without this anchor, a future env.py refactor that auto-stamps at
+        # head (or an accidental post-upgrade stamp) would let every
+        # post-condition pass trivially via the seed alone. Mirrors the
+        # analogous assertion in 0013's prod-bootstrap test.
+        cur.execute("SELECT version_num FROM alembic_version")
+        version_rows = cur.fetchall()
+        assert version_rows == [(revision,)], (
+            f"alembic_version not advanced to {revision} after upgrade — "
+            f"got {version_rows!r}. Without this check, a no-op upgrade "
+            f"would let every post-condition pass trivially via the seed."
+        )
+
         # Release-side tables landed.
         cur.execute(
             "SELECT to_regclass('entity.release_identity'), "
@@ -623,6 +637,24 @@ def test_create_database_sql_matches_migration_shape(fresh_db_url: str) -> None:
     # All six per-source UNIQUE constraints — load-bearing for LML's mint
     # protocol. Same pg_constraint pattern as the alembic-side test.
     with psycopg.connect(fresh_db_url) as conn, conn.cursor() as cur:
+        # Default literal — the alembic-side test asserts this; the SQL-side
+        # was silent before being lifted to parity with 0013's analog.
+        cur.execute(
+            """
+            SELECT column_default
+            FROM information_schema.columns
+            WHERE table_schema = 'entity' AND table_name = 'release_identity'
+              AND column_name = 'reconciliation_status'
+            """
+        )
+        status_default = (cur.fetchone() or (None,))[0] or ""
+        assert re.fullmatch(r"'unreconciled'::text", status_default), (
+            f"create_database.sql's entity.release_identity.reconciliation_status DEFAULT "
+            f"drifted: got {status_default!r}, expected 'unreconciled'::text. LML's "
+            f"mint INSERT omits this column, so DEFAULT is the only place the seed "
+            f"sentinel is written."
+        )
+
         cur.execute(
             """
             SELECT a.attname
