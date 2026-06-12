@@ -461,12 +461,31 @@ def test_upgrade_against_prod_bootstrap_state(run_alembic, fresh_db_url: str) ->
     indexes' covered columns. ``CREATE TABLE IF NOT EXISTS`` no-ops over
     the pre-seeded shape, so any drift in the migration's table DDL would
     otherwise be silently masked on the adoption path (only the fresh-dev
-    tests would catch it). The bootstrap fixture matches the canonical
-    shape, so a passing adoption test plus a passing fresh-dev test
-    together prove the migration agrees with prod's documented shape.
+    tests would catch it).
+
+    Caveat: the bootstrap fixture and the migration's ``_UPGRADE_SQL`` were
+    transcribed from the same ``wxyc-etl/src/schema/entity.rs`` source by
+    the same hand at the same time — neither independently confirms the
+    other. This test catches *future* drift between the two; the *initial*
+    transcription correctness vs. prod is enforced by the operator-side
+    ``information_schema`` probe in the PR body.
     """
     sentinel_id = _seed_prod_bootstrap_state(fresh_db_url)
     _stamp_and_upgrade(run_alembic, fresh_db_url)
+
+    revision, _ = _read_revision_metadata()
+    with psycopg.connect(fresh_db_url) as conn, conn.cursor() as cur:
+        # Pin that the upgrade actually executed by reading the version row.
+        # Otherwise a future env.py refactor that auto-stamps at head would
+        # let every post-condition pass trivially via the seed alone.
+        cur.execute("SELECT version_num FROM alembic_version")
+        version_rows = cur.fetchall()
+        assert version_rows == [(revision,)], (
+            f"alembic_version not advanced to {revision} after upgrade — "
+            f"got {version_rows!r}. Without this check, a no-op upgrade "
+            f"(e.g., stamp put us past head) would let every post-condition "
+            f"pass trivially via the seed alone."
+        )
 
     with psycopg.connect(fresh_db_url) as conn, conn.cursor() as cur:
         # Pre-existing artist-side row survived.

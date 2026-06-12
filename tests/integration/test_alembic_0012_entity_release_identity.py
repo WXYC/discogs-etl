@@ -574,13 +574,20 @@ def _shape_from_db(conn, table_name: str) -> dict[str, tuple[str, str]]:
 @pytest.mark.pg
 def test_create_database_sql_matches_migration_shape(fresh_db_url: str) -> None:
     """Apply schema/create_database.sql against a fresh DB and assert the
-    same entity-table shape the migration produces.
+    same entity-table shape the migration produces — column shape AND
+    all six per-source UNIQUE constraints, the FK NO ACTION rules + target
+    column, and ``idx_release_reconciliation_log_identity_id``.
 
     Catches the OTHER direction of dual-write drift: the migration tests
     already pin the alembic path; this test pins the create_database.sql
     path. If a future PR edits one but not the other, this test fails
     instead of letting the divergence ship to dev DBs built by
     ``--fresh-rebuild``.
+
+    Asserts at the same depth as the alembic-side tests (UNIQUE, FK,
+    indexes) — a narrower comparison would let SQL-side drift ship in any
+    of those dimensions while the test still passed. Matches the depth of
+    0013's analogous test for the artist-side block.
     """
     sql_body = CREATE_DATABASE_SQL_PATH.read_text(encoding="utf-8")
     with psycopg.connect(fresh_db_url, autocommit=True) as conn, conn.cursor() as cur:
@@ -589,6 +596,14 @@ def test_create_database_sql_matches_migration_shape(fresh_db_url: str) -> None:
     with psycopg.connect(fresh_db_url) as conn:
         identity_shape = _shape_from_db(conn, "release_identity")
         log_shape = _shape_from_db(conn, "release_reconciliation_log")
+
+    # Up-front existence check so a missing block surfaces as a clear
+    # 'block not created' rather than 'column-set drift {} != {...}'.
+    assert identity_shape, (
+        "schema/create_database.sql did not create entity.release_identity. "
+        "The release-side dual-write block is missing entirely."
+    )
+    assert log_shape, "schema/create_database.sql did not create entity.release_reconciliation_log."
 
     assert identity_shape == RELEASE_IDENTITY_COLUMN_SHAPE, (
         "schema/create_database.sql's entity.release_identity diverged from "
@@ -604,3 +619,83 @@ def test_create_database_sql_matches_migration_shape(fresh_db_url: str) -> None:
         f"Got: {log_shape}\n"
         f"Expected: {RECONCILIATION_LOG_COLUMN_SHAPE}"
     )
+
+    # All six per-source UNIQUE constraints — load-bearing for LML's mint
+    # protocol. Same pg_constraint pattern as the alembic-side test.
+    with psycopg.connect(fresh_db_url) as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT a.attname
+            FROM pg_constraint c
+            JOIN pg_class t ON t.oid = c.conrelid
+            JOIN pg_namespace n ON n.oid = t.relnamespace
+            JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = ANY(c.conkey)
+            WHERE n.nspname = 'entity'
+              AND t.relname = 'release_identity'
+              AND c.contype = 'u'
+              AND cardinality(c.conkey) = 1
+            ORDER BY a.attname
+            """
+        )
+        unique_columns = {row[0] for row in cur.fetchall()}
+        assert unique_columns == set(PER_SOURCE_UNIQUE_COLUMNS), (
+            f"create_database.sql per-source UNIQUE drift on "
+            f"entity.release_identity. Got {unique_columns}, expected "
+            f"{set(PER_SOURCE_UNIQUE_COLUMNS)}."
+        )
+
+        # FK target column + rules.
+        cur.execute(
+            """
+            SELECT rc.delete_rule,
+                   rc.update_rule,
+                   kcu_ref.table_schema,
+                   kcu_ref.table_name,
+                   kcu_ref.column_name
+            FROM information_schema.referential_constraints rc
+            JOIN information_schema.table_constraints tc
+              ON tc.constraint_name = rc.constraint_name
+             AND tc.constraint_schema = rc.constraint_schema
+            JOIN information_schema.key_column_usage kcu_ref
+              ON kcu_ref.constraint_name = rc.unique_constraint_name
+             AND kcu_ref.constraint_schema = rc.unique_constraint_schema
+            WHERE tc.table_schema = 'entity'
+              AND tc.table_name = 'release_reconciliation_log'
+              AND tc.constraint_type = 'FOREIGN KEY'
+            """
+        )
+        fk_rows = cur.fetchall()
+        assert len(fk_rows) == 1, (
+            f"create_database.sql's entity.release_reconciliation_log "
+            f"has {len(fk_rows)} FKs; expected 1."
+        )
+        delete_rule, update_rule, ref_schema, ref_table, ref_column = fk_rows[0]
+        assert (delete_rule, update_rule) == ("NO ACTION", "NO ACTION"), (
+            f"create_database.sql FK rules drifted: delete={delete_rule!r}, update={update_rule!r}."
+        )
+        assert (ref_schema, ref_table, ref_column) == (
+            "entity",
+            "release_identity",
+            "id",
+        ), f"create_database.sql FK target drifted: {ref_schema}.{ref_table}.{ref_column}."
+
+        # FK index present + on the expected column.
+        cur.execute(
+            """
+            SELECT ARRAY(
+                SELECT pg_get_indexdef(i.indexrelid, k + 1, true)
+                FROM generate_subscripts(i.indkey, 1) AS k
+                ORDER BY k
+            )
+            FROM pg_index i
+            JOIN pg_class c ON c.oid = i.indexrelid
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE n.nspname = 'entity'
+              AND c.relname = 'idx_release_reconciliation_log_identity_id'
+            """
+        )
+        index_rows = cur.fetchall()
+        assert index_rows == [(["identity_id"],)], (
+            f"create_database.sql FK index drift (name or covered column): "
+            f"got {index_rows!r}, expected one row with [identity_id]."
+        )
