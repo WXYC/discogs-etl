@@ -30,25 +30,18 @@ def _run_alembic(args: list[str], db_url: str) -> subprocess.CompletedProcess[st
 
     Pops ``DATABASE_URL`` so the deprecated fallback in ``alembic/env.py``
     can't accidentally point the subprocess at a different DB if it's
-    inherited from the caller's shell. Also pops the libpq ``PG*`` env
-    vars (``PGUSER`` / ``PGPASSWORD`` / ``PGHOST`` / ``PGPORT`` /
-    ``PGDATABASE`` / ``PGSERVICE``) — the test ``db_url`` carries no
-    user/password, so libpq would otherwise backfill from the inherited
-    shell env, giving non-reproducible auth context between a clean shell
-    and a developer's local rc. Raises ``subprocess.TimeoutExpired``
+    inherited from the caller's shell. Leaves libpq ``PG*`` vars alone
+    on purpose: docker-compose's postgres image expects user ``discogs``,
+    and the documented dev pattern (``DATABASE_URL_TEST=postgresql://
+    localhost:5433/postgres``) leaves credentials to PGUSER / PGPASSWORD
+    in the shell — popping them would force a fallback to the OS user
+    and break the local pg suite for that workflow. URL-side params
+    already win over env defaults when present, so PG* backfill only
+    fills in what the URL omits. Raises ``subprocess.TimeoutExpired``
     rather than hanging if the subprocess deadlocks.
     """
     env = {**os.environ, "DATABASE_URL_DISCOGS": db_url}
-    for key in (
-        "DATABASE_URL",
-        "PGUSER",
-        "PGPASSWORD",
-        "PGHOST",
-        "PGPORT",
-        "PGDATABASE",
-        "PGSERVICE",
-    ):
-        env.pop(key, None)
+    env.pop("DATABASE_URL", None)
     return subprocess.run(
         [sys.executable, "-m", "alembic", *args],
         cwd=REPO_ROOT,
