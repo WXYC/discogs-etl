@@ -62,8 +62,13 @@ def _read_revision_metadata() -> tuple[str, str]:
     error that swallows every other test in the file.
     """
     body = MIGRATION_PATH.read_text(encoding="utf-8")
-    rev = re.search(r'^revision:\s*str\s*=\s*"([^"]+)"', body, re.MULTILINE)
-    down = re.search(r'^down_revision:\s*str\s*\|[^=]+=\s*"([^"]+)"', body, re.MULTILINE)
+    # Both regexes accept the full union annotation (``str | Sequence[str] | None``)
+    # OR a future-simplified bare ``str`` form — keeping the test resilient to
+    # a routine annotation cleanup on the next revision template. Mirrors
+    # 0013's relaxation; round-3 grew this helper's call sites without
+    # re-running the regex hardening.
+    rev = re.search(r'^revision:\s*str(?:\s*\|[^=]+)?\s*=\s*"([^"]+)"', body, re.MULTILINE)
+    down = re.search(r'^down_revision:\s*str(?:\s*\|[^=]+)?\s*=\s*"([^"]+)"', body, re.MULTILINE)
     assert rev is not None, f"Could not find revision assignment in {MIGRATION_PATH}"
     assert down is not None, f"Could not find down_revision assignment in {MIGRATION_PATH}"
     return rev.group(1), down.group(1)
@@ -359,20 +364,35 @@ def test_reconciliation_log_fk_rules(run_alembic, fresh_db_url: str) -> None:
 
 @pytest.mark.pg
 def test_fk_index_present(run_alembic, fresh_db_url: str) -> None:
-    """idx_release_reconciliation_log_identity_id covers WHERE identity_id = $1."""
+    """idx_release_reconciliation_log_identity_id covers WHERE identity_id = $1.
+
+    Asserts the index NAME and its COVERED COLUMN via ``pg_index.indkey`` —
+    a name-only check would silently accept a mis-targeted index (e.g.,
+    same name on column ``id``), and every FK lookup would seq-scan.
+    Mirrors 0013's pattern.
+    """
     _stamp_and_upgrade(run_alembic, fresh_db_url)
     with psycopg.connect(fresh_db_url) as conn, conn.cursor() as cur:
         cur.execute(
             """
-            SELECT indexname FROM pg_indexes
-            WHERE schemaname = 'entity'
-              AND tablename = 'release_reconciliation_log'
-              AND indexname = 'idx_release_reconciliation_log_identity_id'
+            SELECT ARRAY(
+                SELECT pg_get_indexdef(i.indexrelid, k + 1, true)
+                FROM generate_subscripts(i.indkey, 1) AS k
+                ORDER BY k
+            )
+            FROM pg_index i
+            JOIN pg_class c ON c.oid = i.indexrelid
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE n.nspname = 'entity'
+              AND c.relname = 'idx_release_reconciliation_log_identity_id'
             """
         )
-        assert cur.fetchone() is not None, (
-            "FK index missing. Postgres does not auto-index FK referencing "
-            "columns, so every WHERE identity_id = $1 lookup would seq-scan."
+        index_rows = cur.fetchall()
+        assert index_rows == [(["identity_id"],)], (
+            f"FK index drift (name or covered column): got {index_rows!r}, "
+            "expected one row with [identity_id]. Postgres does not auto-index "
+            "FK referencing columns, so every WHERE identity_id = $1 lookup "
+            "would seq-scan if the index covers the wrong column."
         )
 
 
