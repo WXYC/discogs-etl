@@ -30,11 +30,25 @@ def _run_alembic(args: list[str], db_url: str) -> subprocess.CompletedProcess[st
 
     Pops ``DATABASE_URL`` so the deprecated fallback in ``alembic/env.py``
     can't accidentally point the subprocess at a different DB if it's
-    inherited from the caller's shell. Raises ``subprocess.TimeoutExpired``
+    inherited from the caller's shell. Also pops the libpq ``PG*`` env
+    vars (``PGUSER`` / ``PGPASSWORD`` / ``PGHOST`` / ``PGPORT`` /
+    ``PGDATABASE`` / ``PGSERVICE``) — the test ``db_url`` carries no
+    user/password, so libpq would otherwise backfill from the inherited
+    shell env, giving non-reproducible auth context between a clean shell
+    and a developer's local rc. Raises ``subprocess.TimeoutExpired``
     rather than hanging if the subprocess deadlocks.
     """
     env = {**os.environ, "DATABASE_URL_DISCOGS": db_url}
-    env.pop("DATABASE_URL", None)
+    for key in (
+        "DATABASE_URL",
+        "PGUSER",
+        "PGPASSWORD",
+        "PGHOST",
+        "PGPORT",
+        "PGDATABASE",
+        "PGSERVICE",
+    ):
+        env.pop(key, None)
     return subprocess.run(
         [sys.executable, "-m", "alembic", *args],
         cwd=REPO_ROOT,

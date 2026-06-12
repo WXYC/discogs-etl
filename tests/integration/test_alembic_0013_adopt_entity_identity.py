@@ -67,8 +67,13 @@ def _read_revision_metadata() -> tuple[str, str]:
     sys.path setup that pytest collection does not guarantee.
     """
     body = MIGRATION_PATH.read_text(encoding="utf-8")
-    rev = re.search(r'^revision:\s*str\s*=\s*"([^"]+)"', body, re.MULTILINE)
-    down = re.search(r'^down_revision:\s*str\s*\|[^=]+=\s*"([^"]+)"', body, re.MULTILINE)
+    # Both regexes accept the full union annotation (``str | Sequence[str] | None``)
+    # OR a future-simplified bare ``str`` form. The previous regex required
+    # the literal ``|`` and would silently abort all pg tests with a
+    # 'Could not find' AssertionError if anyone dropped the union in a
+    # future revision template.
+    rev = re.search(r'^revision:\s*str(?:\s*\|[^=]+)?\s*=\s*"([^"]+)"', body, re.MULTILINE)
+    down = re.search(r'^down_revision:\s*str(?:\s*\|[^=]+)?\s*=\s*"([^"]+)"', body, re.MULTILINE)
     assert rev is not None, f"Could not find revision assignment in {MIGRATION_PATH}"
     assert down is not None, f"Could not find down_revision assignment in {MIGRATION_PATH}"
     return rev.group(1), down.group(1)
@@ -331,19 +336,36 @@ def test_library_name_unique(run_alembic, fresh_db_url: str) -> None:
 
 @pytest.mark.pg
 def test_reconciliation_log_fk_rules(run_alembic, fresh_db_url: str) -> None:
-    """FK has neither ON DELETE CASCADE nor ON UPDATE CASCADE — matches the
-    release-side convention (0012). CASCADE would silently delete the
-    audit log or propagate id renumbering through it.
+    """FK has neither ON DELETE CASCADE nor ON UPDATE CASCADE AND references
+    ``entity.identity(id)`` — matches the release-side convention (0012).
+
+    The referenced column check catches typos like
+    ``REFERENCES entity.identity(library_name)``: action-rule checks alone
+    would pass, but LML's audit-log writer binds ``identity_id INTEGER``
+    against a text-keyed parent and 500s at the first reconciliation
+    write. CASCADE would silently delete the audit log or propagate id
+    renumbering through it.
     """
     _stamp_and_upgrade(run_alembic, fresh_db_url)
     with psycopg.connect(fresh_db_url) as conn, conn.cursor() as cur:
         cur.execute(
             """
-            SELECT rc.delete_rule, rc.update_rule
+            SELECT rc.delete_rule,
+                   rc.update_rule,
+                   kcu_ref.table_schema,
+                   kcu_ref.table_name,
+                   kcu_ref.column_name,
+                   kcu_src.column_name AS source_column
             FROM information_schema.referential_constraints rc
             JOIN information_schema.table_constraints tc
               ON tc.constraint_name = rc.constraint_name
              AND tc.constraint_schema = rc.constraint_schema
+            JOIN information_schema.key_column_usage kcu_src
+              ON kcu_src.constraint_name = tc.constraint_name
+             AND kcu_src.constraint_schema = tc.constraint_schema
+            JOIN information_schema.key_column_usage kcu_ref
+              ON kcu_ref.constraint_name = rc.unique_constraint_name
+             AND kcu_ref.constraint_schema = rc.unique_constraint_schema
             WHERE tc.table_schema = 'entity'
               AND tc.table_name = 'reconciliation_log'
               AND tc.constraint_type = 'FOREIGN KEY'
@@ -351,7 +373,7 @@ def test_reconciliation_log_fk_rules(run_alembic, fresh_db_url: str) -> None:
         )
         rows = cur.fetchall()
     assert len(rows) == 1, f"Expected exactly one FK on entity.reconciliation_log, got {len(rows)}."
-    delete_rule, update_rule = rows[0]
+    delete_rule, update_rule, ref_schema, ref_table, ref_column, source_column = rows[0]
     assert delete_rule == "NO ACTION", (
         f"FK delete_rule must be NO ACTION, got {delete_rule!r}. CASCADE would "
         "silently delete the audit log; consumers expect explicit cleanup."
@@ -360,11 +382,57 @@ def test_reconciliation_log_fk_rules(run_alembic, fresh_db_url: str) -> None:
         f"FK update_rule must be NO ACTION, got {update_rule!r}. CASCADE would "
         "silently propagate id renumbering through the audit log."
     )
+    assert (ref_schema, ref_table, ref_column) == ("entity", "identity", "id"), (
+        f"FK target drifted: {ref_schema}.{ref_table}.{ref_column}. LML's "
+        f"audit-log writer binds identity_id INTEGER and only the entity.identity.id "
+        f"PK is type-compatible."
+    )
+    assert source_column == "identity_id", (
+        f"FK source column drifted: got {source_column!r}, expected 'identity_id'."
+    )
+
+
+def _entity_index_columns(conn) -> dict[str, tuple[str, ...]]:
+    """Return ``{indexname: (col1, col2, ...)}`` for indexes in the entity
+    schema, decoding the column list from ``pg_index.indkey``.
+
+    Asserts the indexed column, not just the index name. ``CREATE INDEX IF
+    NOT EXISTS`` is name-only — an out-of-band-bootstrapped or refactored
+    index of the same name on a different column slips through any name-
+    only assertion. The reconciler dashboard scan and the FK lookup both
+    depend on the *column* being indexed, not the name.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT c.relname, ARRAY(
+                SELECT pg_get_indexdef(i.indexrelid, k + 1, true)
+                FROM generate_subscripts(i.indkey, 1) AS k
+                ORDER BY k
+            )
+            FROM pg_index i
+            JOIN pg_class c ON c.oid = i.indexrelid
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE n.nspname = 'entity'
+              AND c.relname IN (
+                'idx_entity_identity_status',
+                'idx_entity_reconciliation_log_identity_id'
+              )
+            """
+        )
+        return {name: tuple(cols) for name, cols in cur.fetchall()}
+
+
+_EXPECTED_INDEX_COLUMNS: dict[str, tuple[str, ...]] = {
+    "idx_entity_identity_status": ("reconciliation_status",),
+    "idx_entity_reconciliation_log_identity_id": ("identity_id",),
+}
 
 
 @pytest.mark.pg
 def test_indexes_present(run_alembic, fresh_db_url: str) -> None:
-    """Both 0013-managed indexes land on a fresh dev DB.
+    """Both 0013-managed indexes land on a fresh dev DB AND cover the
+    expected columns (not just the expected names).
 
     * ``idx_entity_identity_status`` powers LML's reconciler dashboard
       scans (``WHERE reconciliation_status = ?``).
@@ -373,22 +441,11 @@ def test_indexes_present(run_alembic, fresh_db_url: str) -> None:
       referencing columns.
     """
     _stamp_and_upgrade(run_alembic, fresh_db_url)
-    with psycopg.connect(fresh_db_url) as conn, conn.cursor() as cur:
-        cur.execute(
-            """
-            SELECT indexname FROM pg_indexes
-            WHERE schemaname = 'entity'
-              AND indexname IN (
-                'idx_entity_identity_status',
-                'idx_entity_reconciliation_log_identity_id'
-              )
-            """
-        )
-        found = {row[0] for row in cur.fetchall()}
-    assert found == {
-        "idx_entity_identity_status",
-        "idx_entity_reconciliation_log_identity_id",
-    }, f"Index drift: got {found}."
+    with psycopg.connect(fresh_db_url) as conn:
+        found = _entity_index_columns(conn)
+    assert found == _EXPECTED_INDEX_COLUMNS, (
+        f"Index drift (name or covered column): got {found}, expected {_EXPECTED_INDEX_COLUMNS}."
+    )
 
 
 @pytest.mark.pg
@@ -398,6 +455,15 @@ def test_upgrade_against_prod_bootstrap_state(run_alembic, fresh_db_url: str) ->
     Pre-existing rows must survive — the prod tables hold LML's
     source-of-truth reconciliation records and an INSERT/DDL that
     perturbed them would destroy real reconciliation state.
+
+    The adoption path is also re-verified for column shape, library_name
+    UNIQUE, FK rules + referenced column, default literals, and the two
+    indexes' covered columns. ``CREATE TABLE IF NOT EXISTS`` no-ops over
+    the pre-seeded shape, so any drift in the migration's table DDL would
+    otherwise be silently masked on the adoption path (only the fresh-dev
+    tests would catch it). The bootstrap fixture matches the canonical
+    shape, so a passing adoption test plus a passing fresh-dev test
+    together prove the migration agrees with prod's documented shape.
     """
     sentinel_id = _seed_prod_bootstrap_state(fresh_db_url)
     _stamp_and_upgrade(run_alembic, fresh_db_url)
@@ -409,34 +475,111 @@ def test_upgrade_against_prod_bootstrap_state(run_alembic, fresh_db_url: str) ->
             "FROM entity.identity WHERE id = %s",
             (sentinel_id,),
         )
-        row = cur.fetchone()
-        assert row == ("Stereolab", 5432, "reconciled"), (
+        sentinel_row = cur.fetchone()
+        assert sentinel_row == ("Stereolab", 5432, "reconciled"), (
             f"Pre-existing entity.identity row was perturbed by 0013 upgrade. "
-            f"Got {row!r}. The prod tables hold LML's source-of-truth "
+            f"Got {sentinel_row!r}. The prod tables hold LML's source-of-truth "
             f"reconciliation records — the upgrade must be a strict no-op "
             f"against the documented prod shape."
         )
 
-        # Both indexes landed (the bootstrap omits them — see docstring).
+        # Column shape + default survived (would catch a hypothetical edit
+        # that changed the migration's _UPGRADE_SQL away from the prod-shape
+        # canonical).
         cur.execute(
             """
-            SELECT indexname FROM pg_indexes
-            WHERE schemaname = 'entity'
-              AND indexname IN (
-                'idx_entity_identity_status',
-                'idx_entity_reconciliation_log_identity_id'
-              )
+            SELECT column_name, data_type, is_nullable, column_default
+            FROM information_schema.columns
+            WHERE table_schema = 'entity' AND table_name = 'identity'
+            ORDER BY ordinal_position
             """
         )
-        found = {row[0] for row in cur.fetchall()}
-        assert found == {
-            "idx_entity_identity_status",
-            "idx_entity_reconciliation_log_identity_id",
-        }, (
-            f"Index drift after prod-bootstrap adoption: got {found}. The "
-            f"migration must idempotently land both indexes regardless of "
-            f"whether the prod DB already had them."
+        column_rows = {
+            name: (data_type, is_nullable, column_default)
+            for name, data_type, is_nullable, column_default in cur.fetchall()
+        }
+        shape_only = {col: (dt, nn) for col, (dt, nn, _) in column_rows.items()}
+        assert shape_only == IDENTITY_COLUMN_SHAPE, (
+            f"entity.identity shape diverged from canonical after adoption. "
+            f"Got: {shape_only}. The bootstrap fixture is the canonical "
+            f"shape; this assertion catches migration-side drift on the "
+            f"adoption path that CREATE TABLE IF NOT EXISTS would otherwise "
+            f"silently mask."
         )
+        status_default = column_rows["reconciliation_status"][2] or ""
+        assert re.fullmatch(r"'unreconciled'::text", status_default), (
+            f"reconciliation_status DEFAULT drifted on prod-bootstrap adoption: "
+            f"got {status_default!r}. CREATE TABLE IF NOT EXISTS cannot rewrite "
+            f"DEFAULTs on existing tables — the bootstrap fixture must match "
+            f"the canonical default exactly for adoption + fresh-dev parity."
+        )
+
+        # library_name UNIQUE survived.
+        cur.execute(
+            """
+            SELECT a.attname
+            FROM pg_constraint c
+            JOIN pg_class t ON t.oid = c.conrelid
+            JOIN pg_namespace n ON n.oid = t.relnamespace
+            JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = ANY(c.conkey)
+            WHERE n.nspname = 'entity'
+              AND t.relname = 'identity'
+              AND c.contype = 'u'
+              AND cardinality(c.conkey) = 1
+            """
+        )
+        unique_columns = {row[0] for row in cur.fetchall()}
+        assert "library_name" in unique_columns, (
+            f"library_name UNIQUE missing on entity.identity post-adoption. Got {unique_columns}."
+        )
+
+        # FK target + rules survived.
+        cur.execute(
+            """
+            SELECT rc.delete_rule,
+                   rc.update_rule,
+                   kcu_ref.table_schema,
+                   kcu_ref.table_name,
+                   kcu_ref.column_name
+            FROM information_schema.referential_constraints rc
+            JOIN information_schema.table_constraints tc
+              ON tc.constraint_name = rc.constraint_name
+             AND tc.constraint_schema = rc.constraint_schema
+            JOIN information_schema.key_column_usage kcu_ref
+              ON kcu_ref.constraint_name = rc.unique_constraint_name
+             AND kcu_ref.constraint_schema = rc.unique_constraint_schema
+            WHERE tc.table_schema = 'entity'
+              AND tc.table_name = 'reconciliation_log'
+              AND tc.constraint_type = 'FOREIGN KEY'
+            """
+        )
+        fk_rows = cur.fetchall()
+        assert len(fk_rows) == 1, (
+            f"Expected exactly one FK on entity.reconciliation_log post-adoption, "
+            f"got {len(fk_rows)}."
+        )
+        delete_rule, update_rule, ref_schema, ref_table, ref_column = fk_rows[0]
+        assert (delete_rule, update_rule) == ("NO ACTION", "NO ACTION"), (
+            f"FK rules drifted on prod-bootstrap adoption: "
+            f"delete={delete_rule!r}, update={update_rule!r}."
+        )
+        assert (ref_schema, ref_table, ref_column) == ("entity", "identity", "id"), (
+            f"FK target drifted on prod-bootstrap adoption: {ref_schema}.{ref_table}.{ref_column}."
+        )
+
+    # Both indexes landed (the bootstrap omits them — see docstring) on the
+    # expected columns. Per the index-name-vs-column risk: if the prod DB
+    # had an unrelated `idx_entity_identity_status` on a different column,
+    # CREATE INDEX IF NOT EXISTS would no-op — that's a separate scenario
+    # the bootstrap intentionally doesn't simulate (it omits indexes
+    # entirely). What this assertion catches: 0013 landing both indexes
+    # against an indexless pre-existing table, on the right columns.
+    with psycopg.connect(fresh_db_url) as conn:
+        index_cols = _entity_index_columns(conn)
+    assert index_cols == _EXPECTED_INDEX_COLUMNS, (
+        f"Index drift (name or covered column) after prod-bootstrap adoption: "
+        f"got {index_cols}, expected {_EXPECTED_INDEX_COLUMNS}."
+    )
 
 
 @pytest.mark.pg
@@ -580,13 +723,19 @@ def _shape_from_db(conn, table_name: str) -> dict[str, tuple[str, str]]:
 @pytest.mark.pg
 def test_create_database_sql_matches_migration_shape(fresh_db_url: str) -> None:
     """Apply schema/create_database.sql against a fresh DB and assert the
-    same artist-side entity-table shape the migration produces.
+    same artist-side entity-table shape the migration produces — column
+    shape, library_name UNIQUE, FK rules + target column, default literal,
+    and both indexes (name + covered column).
 
     Catches the OTHER direction of dual-write drift: the migration tests
     above pin the alembic path; this test pins the create_database.sql
     path. Without this guard, a future PR that edited the migration but
     not the SQL (or vice versa) would silently let ``--fresh-rebuild`` dev
     DBs and alembic-upgrade dev DBs diverge on the artist-side schema.
+
+    Asserts at the same depth as the alembic-side tests (UNIQUE, FK,
+    indexes, defaults) — a narrower comparison would let SQL-side drift
+    ship in any of those dimensions while the test still passed.
     """
     sql_body = CREATE_DATABASE_SQL_PATH.read_text(encoding="utf-8")
     with psycopg.connect(fresh_db_url, autocommit=True) as conn, conn.cursor() as cur:
@@ -595,6 +744,15 @@ def test_create_database_sql_matches_migration_shape(fresh_db_url: str) -> None:
     with psycopg.connect(fresh_db_url) as conn:
         identity_shape = _shape_from_db(conn, "identity")
         log_shape = _shape_from_db(conn, "reconciliation_log")
+
+    # Up-front existence check so a missing block surfaces as a clear
+    # 'block not created' rather than 'column-set drift {} != {...}'.
+    assert identity_shape, (
+        "schema/create_database.sql did not create entity.identity. The "
+        "artist-side dual-write block is missing entirely (or guarded "
+        "behind a condition that didn't fire)."
+    )
+    assert log_shape, "schema/create_database.sql did not create entity.reconciliation_log."
 
     assert identity_shape == IDENTITY_COLUMN_SHAPE, (
         "schema/create_database.sql's entity.identity diverged from the "
@@ -609,4 +767,81 @@ def test_create_database_sql_matches_migration_shape(fresh_db_url: str) -> None:
         "produce the same end state.\n"
         f"Got: {log_shape}\n"
         f"Expected: {RECONCILIATION_LOG_COLUMN_SHAPE}"
+    )
+
+    with psycopg.connect(fresh_db_url) as conn, conn.cursor() as cur:
+        # Default literal — the alembic-side test asserts this; the SQL-side
+        # was silent before the round-1 hardening pass.
+        cur.execute(
+            """
+            SELECT column_default
+            FROM information_schema.columns
+            WHERE table_schema = 'entity' AND table_name = 'identity'
+              AND column_name = 'reconciliation_status'
+            """
+        )
+        status_default = (cur.fetchone() or (None,))[0] or ""
+        assert re.fullmatch(r"'unreconciled'::text", status_default), (
+            f"create_database.sql's entity.identity.reconciliation_status DEFAULT "
+            f"drifted: got {status_default!r}, expected 'unreconciled'::text."
+        )
+
+        # library_name UNIQUE — load-bearing for LML's artist-side resolve.
+        cur.execute(
+            """
+            SELECT a.attname
+            FROM pg_constraint c
+            JOIN pg_class t ON t.oid = c.conrelid
+            JOIN pg_namespace n ON n.oid = t.relnamespace
+            JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = ANY(c.conkey)
+            WHERE n.nspname = 'entity'
+              AND t.relname = 'identity'
+              AND c.contype = 'u'
+              AND cardinality(c.conkey) = 1
+            """
+        )
+        unique_columns = {row[0] for row in cur.fetchall()}
+        assert "library_name" in unique_columns, (
+            f"create_database.sql's entity.identity is missing library_name UNIQUE. "
+            f"Got {unique_columns}."
+        )
+
+        # FK target + rules.
+        cur.execute(
+            """
+            SELECT rc.delete_rule,
+                   rc.update_rule,
+                   kcu_ref.table_schema,
+                   kcu_ref.table_name,
+                   kcu_ref.column_name
+            FROM information_schema.referential_constraints rc
+            JOIN information_schema.table_constraints tc
+              ON tc.constraint_name = rc.constraint_name
+             AND tc.constraint_schema = rc.constraint_schema
+            JOIN information_schema.key_column_usage kcu_ref
+              ON kcu_ref.constraint_name = rc.unique_constraint_name
+             AND kcu_ref.constraint_schema = rc.unique_constraint_schema
+            WHERE tc.table_schema = 'entity'
+              AND tc.table_name = 'reconciliation_log'
+              AND tc.constraint_type = 'FOREIGN KEY'
+            """
+        )
+        fk_rows = cur.fetchall()
+        assert len(fk_rows) == 1, (
+            f"create_database.sql's entity.reconciliation_log has {len(fk_rows)} FKs; expected 1."
+        )
+        delete_rule, update_rule, ref_schema, ref_table, ref_column = fk_rows[0]
+        assert (delete_rule, update_rule) == ("NO ACTION", "NO ACTION"), (
+            f"create_database.sql FK rules drifted: delete={delete_rule!r}, update={update_rule!r}."
+        )
+        assert (ref_schema, ref_table, ref_column) == ("entity", "identity", "id"), (
+            f"create_database.sql FK target drifted: {ref_schema}.{ref_table}.{ref_column}."
+        )
+
+    # Both indexes present + on the expected columns.
+    with psycopg.connect(fresh_db_url) as conn:
+        index_cols = _entity_index_columns(conn)
+    assert index_cols == _EXPECTED_INDEX_COLUMNS, (
+        f"create_database.sql index drift (name or covered column): "
+        f"got {index_cols}, expected {_EXPECTED_INDEX_COLUMNS}."
     )
