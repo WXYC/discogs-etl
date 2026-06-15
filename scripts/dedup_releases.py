@@ -32,7 +32,7 @@ from lib.observability import init_logger  # noqa: E402
 from lib.pg_concurrent_ddl import (  # noqa: E402
     add_constraint_safely,
     add_index_concurrently_safely,
-    extract_index_target_table,
+    group_concurrent_index_ddls_by_table,
 )
 
 logger = logging.getLogger(__name__)
@@ -556,10 +556,7 @@ def add_base_constraints_and_indexes(conn, db_url: str | None = None) -> None:
         logger.info(f"  {label} ({len(ddls)} indexes)...")
         level_start = time.time()
 
-        groups: dict[str, list[str]] = {}
-        for ddl in ddls:
-            table = extract_index_target_table(ddl)
-            groups.setdefault(table or ddl, []).append(ddl)
+        groups = group_concurrent_index_ddls_by_table(ddls)
 
         def _run_serial_per_table(ddl_list: list[str]) -> None:
             for ddl in ddl_list:
@@ -853,10 +850,7 @@ def add_track_constraints_and_indexes(conn, db_url: str | None = None) -> None:
         logger.info(f"  {label} ({len(ddls)} indexes)...")
         level_start = time.time()
 
-        groups: dict[str, list[str]] = {}
-        for ddl in ddls:
-            table = extract_index_target_table(ddl)
-            groups.setdefault(table or ddl, []).append(ddl)
+        groups = group_concurrent_index_ddls_by_table(ddls)
 
         def _run_serial_per_table(ddl_list: list[str]) -> None:
             for ddl in ddl_list:

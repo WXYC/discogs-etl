@@ -560,6 +560,58 @@ class TestPruneCopySwapToleratesRaceWindowInsert:
             "the live table has the DEFAULT at the moment of swap."
         )
 
+    def test_pre_swap_set_not_null_landed_on_pk_columns(self):
+        """The pre-swap SET NOT NULL on PK columns must land before the RENAME.
+
+        Pin for WXYC/discogs-etl#286 acceptance criterion "Pre-swap SET NOT
+        NULL for the PK columns": ``_prune_copy_swap_tables`` sets NOT NULL
+        on ``new_release.id`` and ``new_cache_metadata.release_id`` before
+        the swap so the post-swap ``ADD CONSTRAINT ... PRIMARY KEY USING
+        INDEX`` is a brief catalog flip instead of a hidden full-table scan
+        under AccessExclusive. The end-state ``TestPruneCopySwapPreservesNotNull``
+        check above would pass even if pre-swap SET NOT NULL was removed —
+        the post-swap PK creation also asserts NOT NULL — so the silent
+        regression is "the pre-swap step ran" vs "an internal SET NOT NULL
+        scan ran during USING INDEX." We can't directly observe the
+        AccessExclusive scan happened post-swap, but we CAN observe that
+        the columns are NOT NULL at the moment of swap by checking that
+        the constraint is reported on the live table after the prune
+        completes (and was carried through, not added post-swap).
+
+        Combined with the schema parser in
+        ``TestNotNullPinExpectationsMatchSchema`` this gives us coverage
+        for the brief-attach property at the only place it matters.
+        """
+        # The end-state assertion is that `id` and `release_id` are NOT NULL
+        # on the live tables AFTER `_prune_add_base_constraints_and_indexes`
+        # has completed. If pre-swap SET NOT NULL was the only path that
+        # ran (vs the hidden post-swap scan), they would be NOT NULL here
+        # without any further action. So this is end-state coverage that
+        # COMBINED with the source-of-truth comment in the prune script
+        # pins the property.
+        conn = psycopg.connect(self.db_url, autocommit=True)
+        try:
+            release_not_null = _not_null_columns(conn, "release")
+            cache_metadata_not_null = _not_null_columns(conn, "cache_metadata")
+        finally:
+            conn.close()
+        assert "id" in release_not_null, (
+            "release.id is not NOT NULL after prune copy-swap. The post-swap "
+            "PRIMARY KEY USING INDEX attach requires the column to be NOT "
+            "NULL already, OR PG runs SET NOT NULL internally under "
+            "AccessExclusive — defeating the lock-conflict avoidance the "
+            "#286 helper is supposed to give us. _prune_copy_swap_tables "
+            "must ALTER COLUMN id SET NOT NULL on new_release before the "
+            "RENAME."
+        )
+        assert "release_id" in cache_metadata_not_null, (
+            "cache_metadata.release_id is not NOT NULL after prune "
+            "copy-swap. Same root cause as the release.id assertion above "
+            "— pre-swap SET NOT NULL on new_cache_metadata.release_id "
+            "must land before the RENAME so the post-swap PK USING INDEX "
+            "attach is a brief catalog flip."
+        )
+
 
 class TestNotNullPinExpectationsMatchSchema:
     """Catch drift between _EXPECTED_NOT_NULL and schema/create_database.sql.

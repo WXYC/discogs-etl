@@ -140,6 +140,40 @@ def _extract_index_name(ddl: str) -> str | None:
     return match.group(1) if match else None
 
 
+_UNPARSEABLE_GROUP_KEY = "__unparseable__"
+
+
+def group_concurrent_index_ddls_by_table(ddls: Sequence[str]) -> dict[str, list[str]]:
+    """Group ``CREATE INDEX CONCURRENTLY`` DDLs for safe parallel dispatch.
+
+    Two CONCURRENTLY builds on the **same** table deadlock against each other
+    inside PG's wait-for-snapshot phase. Callers that parallelize CONCURRENTLY
+    must group by target table and run one worker per group (serial within,
+    parallel across).
+
+    Returns ``{table_name: [ddl, ...]}``. DDLs whose target table can't be
+    parsed by :func:`extract_index_target_table` are all collected under
+    a single sentinel key so they run serially — NOT keyed by the full DDL
+    string. The old keyed-by-DDL fallback would put two unparseable DDLs
+    on the same table into separate groups, re-introducing the same
+    CONCURRENTLY-vs-CONCURRENTLY deadlock the grouping is meant to prevent.
+    """
+    groups: dict[str, list[str]] = {}
+    for ddl in ddls:
+        table = extract_index_target_table(ddl)
+        if table is None:
+            logger.warning(
+                "group_concurrent_index_ddls_by_table: could not parse target "
+                "table from %r; grouping with other unparseable DDLs for "
+                "serial execution",
+                ddl,
+            )
+            groups.setdefault(_UNPARSEABLE_GROUP_KEY, []).append(ddl)
+        else:
+            groups.setdefault(table, []).append(ddl)
+    return groups
+
+
 def extract_index_target_table(ddl: str) -> str | None:
     """Pull the target table out of a ``CREATE INDEX CONCURRENTLY ... ON <t>``.
 
@@ -327,6 +361,11 @@ def add_constraint_safely(
     start = time.monotonic()
     lock_clause = ", ".join(lock_tables)
     ddls: list[str] = [ddl] if isinstance(ddl, str) else list(ddl)
+    # Truncated rendering for log lines / Sentry breadcrumbs. The multi-stmt
+    # form (RENAME swap, 3 statements) would otherwise produce a huge
+    # repr() in the 40P01 canary — the canary's job is to name the failure
+    # site for an operator, not dump every byte of DDL.
+    ddl_summary = ddls[0] if len(ddls) == 1 else f"{len(ddls)}-stmt group: {ddls[0]!r}, ..."
 
     last_exc: Exception | None = None
     for attempt in range(attempts):
@@ -367,11 +406,11 @@ def add_constraint_safely(
                 "structurally impossible; an LML writer has likely drifted "
                 "to a different acquisition order. Investigate "
                 "library-metadata-lookup/discogs/cache_service.py::write_release "
-                "ordering. lock_tables=%s ddl=%r",
+                "ordering. lock_tables=%s ddl=%s",
                 stats.attempts,
                 attempts,
                 lock_clause,
-                ddl,
+                ddl_summary,
             )
             _sentry_breadcrumb(
                 category="pg_concurrent_ddl",
@@ -380,7 +419,7 @@ def add_constraint_safely(
                     "attempt": stats.attempts,
                     "attempts_total": attempts,
                     "lock_tables": list(lock_tables),
-                    "ddl": ddl,
+                    "ddl": ddl_summary,
                 },
             )
 
