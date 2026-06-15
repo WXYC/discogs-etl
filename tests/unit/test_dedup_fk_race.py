@@ -218,8 +218,16 @@ class TestFkConstraintLockOrderingIsParentFirst:
     invariant is testable.
     """
 
-    def _captured_ops(self) -> list[tuple[str, tuple[str, ...]]]:
-        """Return ``[(ddl, lock_tables), ...]`` for every constraint-add call."""
+    def _captured_ops(self, entrypoint_name: str) -> list[tuple[str, tuple[str, ...]]]:
+        """Return ``[(ddl, lock_tables), ...]`` for every constraint-add call.
+
+        ``entrypoint_name`` selects which top-level function to exercise:
+        ``"add_base_constraints_and_indexes"`` (FK adds on the base tables) or
+        ``"add_track_constraints_and_indexes"`` (FK adds on the track tables).
+        Both paths must satisfy the parent-first invariant; both need
+        independent coverage because a refactor could touch one without the
+        other.
+        """
         from unittest.mock import MagicMock, patch
 
         captured: list[tuple[str, tuple[str, ...]]] = []
@@ -233,21 +241,29 @@ class TestFkConstraintLockOrderingIsParentFirst:
         mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
         mock_conn.info.dsn = "postgresql:///test"
 
+        entrypoint = getattr(_dr, entrypoint_name)
         with (
             patch.object(_dr, "_exec_one"),
             patch.object(_dr, "_add_constraint_one", side_effect=fake_add_constraint_one),
             patch.object(_dr, "_add_index_concurrently_one"),
         ):
-            _dr.add_base_constraints_and_indexes(mock_conn, db_url="postgresql:///test")
+            entrypoint(mock_conn, db_url="postgresql:///test")
         return captured
 
-    def test_every_fk_add_locks_release_before_child(self) -> None:
+    @pytest.mark.parametrize(
+        "entrypoint_name",
+        [
+            "add_base_constraints_and_indexes",
+            "add_track_constraints_and_indexes",
+        ],
+    )
+    def test_every_fk_add_locks_release_before_child(self, entrypoint_name) -> None:
         fk_ops = [
             (ddl, lock_tables)
-            for ddl, lock_tables in self._captured_ops()
+            for ddl, lock_tables in self._captured_ops(entrypoint_name)
             if "ADD CONSTRAINT fk_" in ddl and "FOREIGN KEY" in ddl
         ]
-        assert fk_ops, "no FK adds captured — patch targets may have drifted"
+        assert fk_ops, f"no FK adds captured from {entrypoint_name}; patch targets may have drifted"
         for ddl, lock_tables in fk_ops:
             assert len(lock_tables) == 2, (
                 f"FK add must lock exactly (parent, child); got {lock_tables} for {ddl!r}"
