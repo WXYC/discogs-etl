@@ -46,7 +46,14 @@ class TestLevel15OrphanCleanup:
 
     def _captured_statements(self) -> list[str]:
         """Run ``add_base_constraints_and_indexes`` with all parallel
-        execution stubbed out, capturing the SQL it would have run."""
+        execution stubbed out, capturing the SQL it would have run.
+
+        Patches all three executor entry points (``_exec_one``,
+        ``_add_constraint_one``, ``_add_index_concurrently_one``) since the
+        #286 helper migration spread the DDL across the constraint helper
+        + the CONCURRENTLY index helper alongside the unchanged orphan
+        cleanup ``_exec_one`` path.
+        """
         from unittest.mock import MagicMock, patch
 
         captured: list[str] = []
@@ -54,13 +61,27 @@ class TestLevel15OrphanCleanup:
         def fake_exec_one(db_url, stmt):
             captured.append(stmt)
 
+        def fake_add_constraint_one(db_url, ddl, lock_tables):
+            captured.append(ddl)
+
+        def fake_add_index_concurrently_one(db_url, ddl):
+            captured.append(ddl)
+
         mock_cursor = MagicMock()
         mock_conn = MagicMock()
         mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
         mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
         mock_conn.info.dsn = "postgresql:///test"
 
-        with patch.object(_dr, "_exec_one", side_effect=fake_exec_one):
+        with (
+            patch.object(_dr, "_exec_one", side_effect=fake_exec_one),
+            patch.object(_dr, "_add_constraint_one", side_effect=fake_add_constraint_one),
+            patch.object(
+                _dr,
+                "_add_index_concurrently_one",
+                side_effect=fake_add_index_concurrently_one,
+            ),
+        ):
             _dr.add_base_constraints_and_indexes(mock_conn, db_url="postgresql:///test")
 
         # The serial cur.execute calls also produce SQL — capture those too.
@@ -133,13 +154,27 @@ class TestFkConstraintsUseNotValid:
         def fake_exec_one(db_url, stmt):
             captured.append(stmt)
 
+        def fake_add_constraint_one(db_url, ddl, lock_tables):
+            captured.append(ddl)
+
+        def fake_add_index_concurrently_one(db_url, ddl):
+            captured.append(ddl)
+
         mock_cursor = MagicMock()
         mock_conn = MagicMock()
         mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
         mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
         mock_conn.info.dsn = "postgresql:///test"
 
-        with patch.object(_dr, "_exec_one", side_effect=fake_exec_one):
+        with (
+            patch.object(_dr, "_exec_one", side_effect=fake_exec_one),
+            patch.object(_dr, "_add_constraint_one", side_effect=fake_add_constraint_one),
+            patch.object(
+                _dr,
+                "_add_index_concurrently_one",
+                side_effect=fake_add_index_concurrently_one,
+            ),
+        ):
             _dr.add_base_constraints_and_indexes(mock_conn, db_url="postgresql:///test")
         return captured
 

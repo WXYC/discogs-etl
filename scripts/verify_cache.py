@@ -63,6 +63,12 @@ from wxyc_etl.text import is_compilation_artist, split_artist_name_contextual
 
 from lib.format_normalization import format_matches, normalize_library_format
 from lib.observability import init_logger
+from lib.pg_concurrent_ddl import (
+    SWAP_PATH_ATTEMPTS,
+    SWAP_PATH_BACKOFF_SECONDS,
+    add_constraint_safely,
+    add_index_concurrently_safely,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -767,24 +773,91 @@ def _prune_copy_swap_tables(
                 count = cur.fetchone()[0]
             logger.info(f"  Copied {old_table} -> {new_table}: {count:,} rows")
 
+        # Pre-swap NOT NULL on PK columns. The new_X tables aren't live yet, so
+        # the implicit full-table scan that ``ALTER COLUMN ... SET NOT NULL``
+        # performs can't conflict with LML's writes — and doing it now is the
+        # prerequisite for the post-swap ``ADD CONSTRAINT ... PRIMARY KEY USING
+        # INDEX`` step in ``_prune_add_base_constraints_and_indexes`` to be the
+        # brief catalog flip CONCURRENTLY promises rather than a hidden
+        # AccessExclusive scan. Without this, CTAS-stripped NULLability would
+        # force PG to run SET NOT NULL internally under AccessExclusive,
+        # defeating the lock-conflict avoidance the helper is supposed to give
+        # us. See #286 "Prereq for the 'brief AccessExclusive' claim".
         with conn.cursor() as cur:
-            for stmt in [
+            cur.execute("ALTER TABLE new_release ALTER COLUMN id SET NOT NULL")
+            cur.execute("ALTER TABLE new_cache_metadata ALTER COLUMN release_id SET NOT NULL")
+
+        # DROP CONSTRAINT + RENAME deadlock surface — same lock-acquisition
+        # mismatch as the FK-add path below, with the *broader* surface
+        # (AccessExclusive instead of ShareRowExclusive). Conflicts with every
+        # live LML lock mode on the involved tables, not just the
+        # ShareRowExclusive ↔ RowExclusive pairing from the FK-add path.
+        # Wrap each statement in :func:`add_constraint_safely` with the wider
+        # SWAP_PATH_ATTEMPTS budget so a transient LML transaction doesn't
+        # abort the whole prune. See #286 "Second deadlock surface in the
+        # same script."
+        for stmt, table in (
+            (
                 "ALTER TABLE release_artist DROP CONSTRAINT IF EXISTS fk_release_artist_release",
+                "release_artist",
+            ),
+            (
                 "ALTER TABLE release_label DROP CONSTRAINT IF EXISTS fk_release_label_release",
+                "release_label",
+            ),
+            (
                 "ALTER TABLE release_genre DROP CONSTRAINT IF EXISTS fk_release_genre_release",
+                "release_genre",
+            ),
+            (
                 "ALTER TABLE release_style DROP CONSTRAINT IF EXISTS fk_release_style_release",
+                "release_style",
+            ),
+            (
                 "ALTER TABLE release_track DROP CONSTRAINT IF EXISTS fk_release_track_release",
-                "ALTER TABLE release_track_artist DROP CONSTRAINT IF EXISTS fk_release_track_artist_release",
+                "release_track",
+            ),
+            (
+                "ALTER TABLE release_track_artist DROP CONSTRAINT "
+                "IF EXISTS fk_release_track_artist_release",
+                "release_track_artist",
+            ),
+            (
                 "ALTER TABLE cache_metadata DROP CONSTRAINT IF EXISTS fk_cache_metadata_release",
-            ]:
-                cur.execute(stmt)
+                "cache_metadata",
+            ),
+        ):
+            add_constraint_safely(
+                conn,
+                stmt,
+                lock_tables=[table],
+                attempts=SWAP_PATH_ATTEMPTS,
+                backoff_seconds=SWAP_PATH_BACKOFF_SECONDS,
+            )
 
         for old_table, new_table, _, _ in PRUNE_COPY_TABLES:
             bak = f"{old_table}_old"
-            with conn.cursor() as cur:
-                cur.execute(f"ALTER TABLE {old_table} RENAME TO {bak}")
-                cur.execute(f"ALTER TABLE {new_table} RENAME TO {old_table}")
-                cur.execute(f"DROP TABLE {bak} CASCADE")
+            # Atomic swap: the three statements (RENAME old → bak, RENAME
+            # new → old, DROP bak CASCADE) run in one transaction so the
+            # table name ``old_table`` is never momentarily unbound (which
+            # would race-fail LML's writes with ``relation does not exist``)
+            # AND so AccessExclusive on ``old_table`` is held coherently
+            # for the full swap window — LML's writes queue on the lock
+            # and land in the swapped-in table once we commit. See #286
+            # "Swap path lock-contention coverage." Both names are listed
+            # in the LOCK TABLE for completeness even though the surviving
+            # post-swap relation reuses the ``old_table`` name.
+            add_constraint_safely(
+                conn,
+                [
+                    f"ALTER TABLE {old_table} RENAME TO {bak}",
+                    f"ALTER TABLE {new_table} RENAME TO {old_table}",
+                    f"DROP TABLE {bak} CASCADE",
+                ],
+                lock_tables=[old_table, new_table],
+                attempts=SWAP_PATH_ATTEMPTS,
+                backoff_seconds=SWAP_PATH_BACKOFF_SECONDS,
+            )
             logger.info(f"  Swapped {new_table} -> {old_table}")
     finally:
         conn.close()
@@ -804,15 +877,31 @@ def _prune_add_base_constraints_and_indexes(db_url: str) -> None:
     """
     conn = psycopg.connect(db_url, autocommit=True)
     try:
-        with conn.cursor() as cur:
-            cur.execute("ALTER TABLE release ADD PRIMARY KEY (id)")
+        # PK on release: build CONCURRENTLY so the index scan doesn't take
+        # Share on ``release`` (which conflicts with LML's RowExclusive for
+        # the full minutes-long build). The post-swap ``new_release.id``
+        # column was set NOT NULL pre-swap in _prune_copy_swap_tables so
+        # ``ADD CONSTRAINT ... USING INDEX`` is the brief catalog flip
+        # CONCURRENTLY promises — without that prereq it would silently
+        # run a full-table NOT NULL scan under AccessExclusive. See #286
+        # "Prereq for the brief AccessExclusive claim".
+        add_index_concurrently_safely(
+            conn,
+            "CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS release_pkey ON release(id)",
+        )
+        add_constraint_safely(
+            conn,
+            "ALTER TABLE release ADD CONSTRAINT release_pkey PRIMARY KEY USING INDEX release_pkey",
+            lock_tables=["release"],
+        )
 
-            # Clean orphan child rows before FK validation. The live LML
-            # service writes child rows for releases NOT in the post-prune
-            # subset; deleting them now keeps the ADD CONSTRAINT step below
-            # from failing on validation. NOT VALID on the constraint itself
-            # tolerates new orphans landing between cleanup and ADD. See
-            # #211 + #188 for the parallel fix in dedup_releases.py.
+        # Clean orphan child rows before FK validation. The live LML
+        # service writes child rows for releases NOT in the post-prune
+        # subset; deleting them now keeps the ADD CONSTRAINT step below
+        # from failing on validation. NOT VALID on the constraint itself
+        # tolerates new orphans landing between cleanup and ADD. See
+        # #211 + #188 for the parallel fix in dedup_releases.py.
+        with conn.cursor() as cur:
             for child_table in (
                 "release_artist",
                 "release_label",
@@ -827,41 +916,121 @@ def _prune_add_base_constraints_and_indexes(db_url: str) -> None:
                     f"(SELECT 1 FROM release r WHERE r.id = {child_table}.release_id)"
                 )
 
-            for stmt in (
+        # FK constraint adds. Each ``ALTER TABLE ... ADD CONSTRAINT FOREIGN
+        # KEY ... REFERENCES release(id) NOT VALID`` takes
+        # ShareRowExclusiveLock on **both** the child (target of the ALTER)
+        # and the parent (FK target) — see PG source
+        # ``tablecmds.c::ATAddForeignKeyConstraint``: ``table_openrv(
+        # fkconstraint->pktable, ShareRowExclusiveLock)``. ``NOT VALID``
+        # skips the existing-row scan but does NOT skip the parent-side
+        # lock acquisition.
+        #
+        # The deadlock fixed by #286: PG's FK creation acquires the child
+        # first (the ``ALTER TABLE`` target) then the parent — opposite of
+        # LML's order (``write_release`` UPSERTs ``release`` first, then
+        # children). RowExclusive ↔ ShareRowExclusive conflict per the PG
+        # lock-mode matrix → classic cycle. The fix here: pre-acquire both
+        # tables via ``LOCK TABLE <parent>, <child> IN ACCESS EXCLUSIVE
+        # MODE`` in parent-first order so the happy path doesn't even
+        # reach PG's deadlock detector — our transaction just waits for
+        # any open LML transaction to commit, then proceeds.
+        for fk_ddl, child_table in (
+            (
                 "ALTER TABLE release_artist ADD CONSTRAINT fk_release_artist_release "
                 "FOREIGN KEY (release_id) REFERENCES release(id) ON DELETE CASCADE NOT VALID",
+                "release_artist",
+            ),
+            (
                 "ALTER TABLE release_label ADD CONSTRAINT fk_release_label_release "
                 "FOREIGN KEY (release_id) REFERENCES release(id) ON DELETE CASCADE NOT VALID",
+                "release_label",
+            ),
+            (
                 "ALTER TABLE release_genre ADD CONSTRAINT fk_release_genre_release "
                 "FOREIGN KEY (release_id) REFERENCES release(id) ON DELETE CASCADE NOT VALID",
+                "release_genre",
+            ),
+            (
                 "ALTER TABLE release_style ADD CONSTRAINT fk_release_style_release "
                 "FOREIGN KEY (release_id) REFERENCES release(id) ON DELETE CASCADE NOT VALID",
+                "release_style",
+            ),
+            (
                 "ALTER TABLE release_track ADD CONSTRAINT fk_release_track_release "
                 "FOREIGN KEY (release_id) REFERENCES release(id) ON DELETE CASCADE NOT VALID",
-                "ALTER TABLE release_track_artist ADD CONSTRAINT fk_release_track_artist_release "
+                "release_track",
+            ),
+            (
+                "ALTER TABLE release_track_artist ADD CONSTRAINT "
+                "fk_release_track_artist_release "
                 "FOREIGN KEY (release_id) REFERENCES release(id) ON DELETE CASCADE NOT VALID",
+                "release_track_artist",
+            ),
+            (
                 "ALTER TABLE cache_metadata ADD CONSTRAINT fk_cache_metadata_release "
                 "FOREIGN KEY (release_id) REFERENCES release(id) ON DELETE CASCADE NOT VALID",
-                "ALTER TABLE cache_metadata ADD PRIMARY KEY (release_id)",
-                "CREATE INDEX idx_release_artist_release_id ON release_artist(release_id)",
-                "CREATE INDEX idx_release_label_release_id ON release_label(release_id)",
-                "CREATE INDEX idx_release_genre_release_id ON release_genre(release_id)",
-                "CREATE INDEX idx_release_style_release_id ON release_style(release_id)",
-                "CREATE INDEX idx_release_track_release_id ON release_track(release_id)",
-                "CREATE INDEX idx_release_track_artist_release_id ON release_track_artist(release_id)",
-                "CREATE INDEX idx_release_artist_name_trgm ON release_artist "
-                "USING gin (lower(f_unaccent(artist_name)) gin_trgm_ops)",
-                "CREATE INDEX idx_release_title_trgm ON release "
-                "USING gin (lower(f_unaccent(title)) gin_trgm_ops)",
-                "CREATE INDEX idx_release_track_title_trgm ON release_track "
-                "USING gin (lower(f_unaccent(title)) gin_trgm_ops)",
-                "CREATE INDEX idx_release_track_artist_name_trgm ON release_track_artist "
-                "USING gin (lower(f_unaccent(artist_name)) gin_trgm_ops)",
-                "CREATE INDEX idx_cache_metadata_cached_at ON cache_metadata(cached_at)",
-                "CREATE INDEX idx_cache_metadata_source ON cache_metadata(source)",
-            ):
-                cur.execute(stmt)
+                "cache_metadata",
+            ),
+        ):
+            add_constraint_safely(
+                conn,
+                fk_ddl,
+                # Parent-first ordering matches LML's ``write_release``
+                # acquisition order.
+                lock_tables=["release", child_table],
+            )
 
+        # PK on cache_metadata via CONCURRENTLY-built index then USING
+        # INDEX attach. ``new_cache_metadata.release_id`` was set NOT NULL
+        # pre-swap so this is a brief catalog flip, not a hidden scan.
+        add_index_concurrently_safely(
+            conn,
+            "CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS cache_metadata_pkey "
+            "ON cache_metadata(release_id)",
+        )
+        add_constraint_safely(
+            conn,
+            "ALTER TABLE cache_metadata ADD CONSTRAINT cache_metadata_pkey "
+            "PRIMARY KEY USING INDEX cache_metadata_pkey",
+            lock_tables=["cache_metadata"],
+        )
+
+        # FK indexes + trigram + cache_metadata side indexes — all built
+        # CONCURRENTLY so the long index build takes only
+        # ShareUpdateExclusive (no conflict with LML's RowExclusive DML)
+        # rather than the Share that non-concurrent CREATE INDEX would
+        # hold for the full duration. CONCURRENTLY must NOT run inside a
+        # transaction block; the helper refuses to do so and the
+        # connection is autocommit at this point.
+        for index_ddl in (
+            "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_release_artist_release_id "
+            "ON release_artist(release_id)",
+            "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_release_label_release_id "
+            "ON release_label(release_id)",
+            "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_release_genre_release_id "
+            "ON release_genre(release_id)",
+            "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_release_style_release_id "
+            "ON release_style(release_id)",
+            "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_release_track_release_id "
+            "ON release_track(release_id)",
+            "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_release_track_artist_release_id "
+            "ON release_track_artist(release_id)",
+            "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_release_artist_name_trgm "
+            "ON release_artist USING gin (lower(f_unaccent(artist_name)) gin_trgm_ops)",
+            "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_release_title_trgm "
+            "ON release USING gin (lower(f_unaccent(title)) gin_trgm_ops)",
+            "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_release_track_title_trgm "
+            "ON release_track USING gin (lower(f_unaccent(title)) gin_trgm_ops)",
+            "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_release_track_artist_name_trgm "
+            "ON release_track_artist USING gin (lower(f_unaccent(artist_name)) gin_trgm_ops)",
+            "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_cache_metadata_cached_at "
+            "ON cache_metadata(cached_at)",
+            "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_cache_metadata_source "
+            "ON cache_metadata(source)",
+        ):
+            add_index_concurrently_safely(conn, index_ddl)
+
+        with conn.cursor() as cur:
             # Backfill any race-window NULLs before SET NOT NULL. The
             # pre-swap DEFAULT restoration in _prune_copy_swap_tables
             # *should* keep this UPDATE a no-op in steady state; we keep
@@ -870,36 +1039,64 @@ def _prune_add_base_constraints_and_indexes(db_url: str) -> None:
             # See #256.
             cur.execute("UPDATE cache_metadata SET cached_at = now() WHERE cached_at IS NULL")
 
-            # Re-apply NOT NULL constraints stripped by ``CREATE TABLE AS
-            # SELECT`` above. CTAS carries column types forward but not
-            # NOT NULL / DEFAULT / CHECK. The corresponding DEFAULTs are
-            # re-applied earlier — in _prune_copy_swap_tables, before the
-            # RENAME makes the new table live — so LML's cache-miss
-            # INSERT (which omits ``cached_at``) never lands a NULL during
-            # the swap window. Pinned by
-            # ``tests/integration/test_copy_swap_preserves_not_null.py``.
-            for stmt in (
-                "ALTER TABLE release ALTER COLUMN title SET NOT NULL",
-                "ALTER TABLE release ALTER COLUMN not_found SET NOT NULL",
+        # Re-apply NOT NULL constraints stripped by ``CREATE TABLE AS
+        # SELECT`` above. CTAS carries column types forward but not
+        # NOT NULL / DEFAULT / CHECK. The corresponding DEFAULTs are
+        # re-applied earlier — in _prune_copy_swap_tables, before the
+        # RENAME makes the new table live — so LML's cache-miss
+        # INSERT (which omits ``cached_at``) never lands a NULL during
+        # the swap window. Pinned by
+        # ``tests/integration/test_copy_swap_preserves_not_null.py``.
+        #
+        # ``ALTER COLUMN ... SET NOT NULL`` takes AccessExclusive and
+        # performs an implicit full-table scan. Wrap each via the helper
+        # so the brief lock window is shared with LML cleanly under the
+        # same retry envelope as the FK adds.
+        for not_null_ddl, target_table in (
+            ("ALTER TABLE release ALTER COLUMN title SET NOT NULL", "release"),
+            ("ALTER TABLE release ALTER COLUMN not_found SET NOT NULL", "release"),
+            (
                 "ALTER TABLE release_artist ALTER COLUMN release_id SET NOT NULL",
+                "release_artist",
+            ),
+            (
                 "ALTER TABLE release_artist ALTER COLUMN artist_name SET NOT NULL",
-                "ALTER TABLE release_label ALTER COLUMN release_id SET NOT NULL",
-                "ALTER TABLE release_label ALTER COLUMN label_name SET NOT NULL",
-                "ALTER TABLE release_genre ALTER COLUMN release_id SET NOT NULL",
-                "ALTER TABLE release_genre ALTER COLUMN genre SET NOT NULL",
-                "ALTER TABLE release_style ALTER COLUMN release_id SET NOT NULL",
-                "ALTER TABLE release_style ALTER COLUMN style SET NOT NULL",
-                "ALTER TABLE release_track ALTER COLUMN release_id SET NOT NULL",
-                "ALTER TABLE release_track ALTER COLUMN sequence SET NOT NULL",
-                "ALTER TABLE release_track ALTER COLUMN title SET NOT NULL",
+                "release_artist",
+            ),
+            ("ALTER TABLE release_label ALTER COLUMN release_id SET NOT NULL", "release_label"),
+            ("ALTER TABLE release_label ALTER COLUMN label_name SET NOT NULL", "release_label"),
+            ("ALTER TABLE release_genre ALTER COLUMN release_id SET NOT NULL", "release_genre"),
+            ("ALTER TABLE release_genre ALTER COLUMN genre SET NOT NULL", "release_genre"),
+            ("ALTER TABLE release_style ALTER COLUMN release_id SET NOT NULL", "release_style"),
+            ("ALTER TABLE release_style ALTER COLUMN style SET NOT NULL", "release_style"),
+            ("ALTER TABLE release_track ALTER COLUMN release_id SET NOT NULL", "release_track"),
+            ("ALTER TABLE release_track ALTER COLUMN sequence SET NOT NULL", "release_track"),
+            ("ALTER TABLE release_track ALTER COLUMN title SET NOT NULL", "release_track"),
+            (
                 "ALTER TABLE release_track_artist ALTER COLUMN release_id SET NOT NULL",
+                "release_track_artist",
+            ),
+            (
                 "ALTER TABLE release_track_artist ALTER COLUMN track_sequence SET NOT NULL",
+                "release_track_artist",
+            ),
+            (
                 "ALTER TABLE release_track_artist ALTER COLUMN artist_name SET NOT NULL",
+                "release_track_artist",
+            ),
+            (
                 "ALTER TABLE cache_metadata ALTER COLUMN cached_at SET NOT NULL",
-                "ALTER TABLE cache_metadata ALTER COLUMN source SET NOT NULL",
-            ):
-                cur.execute(stmt)
+                "cache_metadata",
+            ),
+            ("ALTER TABLE cache_metadata ALTER COLUMN source SET NOT NULL", "cache_metadata"),
+        ):
+            add_constraint_safely(
+                conn,
+                not_null_ddl,
+                lock_tables=[target_table],
+            )
 
+        with conn.cursor() as cur:
             cur.execute("DROP TABLE IF EXISTS _keep_ids")
     finally:
         conn.close()

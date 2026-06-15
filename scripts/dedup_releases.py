@@ -29,6 +29,11 @@ import psycopg
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from lib.observability import init_logger  # noqa: E402
+from lib.pg_concurrent_ddl import (  # noqa: E402
+    add_constraint_safely,
+    add_index_concurrently_safely,
+    extract_index_target_table,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -364,6 +369,21 @@ PRE_SWAP_COLUMN_DEFAULTS: dict[str, dict[str, str]] = {
 }
 
 
+# Columns that must be ``NOT NULL`` on each new_X table *before* the swap, so
+# the post-swap ``ADD CONSTRAINT ... PRIMARY KEY USING INDEX`` step in
+# add_base_constraints_and_indexes is a brief catalog flip rather than a
+# hidden AccessExclusive full-table scan. CTAS strips NOT NULL alongside
+# DEFAULT; applying it now (while the table isn't live) costs a scan that
+# can't conflict with LML's writes. Without this prereq, the post-swap
+# USING INDEX attach would still produce the correct end state but PG would
+# internally run ``SET NOT NULL`` first, defeating the lock-conflict
+# avoidance the helper is supposed to give us. See #286.
+PRE_SWAP_NOT_NULL_COLUMNS: dict[str, tuple[str, ...]] = {
+    "new_release": ("id",),
+    "new_cache_metadata": ("release_id",),
+}
+
+
 def copy_table(conn, old_table: str, new_table: str, columns: str, id_col: str) -> int:
     """Copy rows NOT in dedup_delete_ids to a new table.
 
@@ -383,6 +403,8 @@ def copy_table(conn, old_table: str, new_table: str, columns: str, id_col: str) 
         """)
         for column, default_sql in PRE_SWAP_COLUMN_DEFAULTS.get(new_table, {}).items():
             cur.execute(f"ALTER TABLE {new_table} ALTER COLUMN {column} SET DEFAULT {default_sql}")
+        for column in PRE_SWAP_NOT_NULL_COLUMNS.get(new_table, ()):
+            cur.execute(f"ALTER TABLE {new_table} ALTER COLUMN {column} SET NOT NULL")
         cur.execute(f"SELECT count(*) FROM {new_table}")
         count = int(cur.fetchone()[0])
     conn.commit()
@@ -417,19 +439,55 @@ def _exec_one(db_url: str, stmt: str) -> None:
         conn.close()
 
 
+def _add_constraint_one(db_url: str, ddl: str, lock_tables: tuple[str, ...]) -> None:
+    """Open a connection and run ``add_constraint_safely`` against it.
+
+    Used by the parallel constraint-add executors so each parallel worker has
+    its own autocommit connection. See :mod:`lib.pg_concurrent_ddl` for the
+    retry envelope and the parent-first lock ordering that makes the prune ↔
+    LML deadlock structurally impossible. ``lock_tables`` MUST be in
+    parent-first order — see #286 for the failure mode that reverses it.
+    """
+    conn = psycopg.connect(db_url, autocommit=True)
+    try:
+        add_constraint_safely(conn, ddl, lock_tables=lock_tables)
+    finally:
+        conn.close()
+
+
+def _add_index_concurrently_one(db_url: str, ddl: str) -> None:
+    """Open an autocommit connection and run a CONCURRENTLY index build.
+
+    Each call opens its own connection because ``CREATE INDEX CONCURRENTLY``
+    must run outside a transaction block. The helper enforces that
+    invariant.
+    """
+    conn = psycopg.connect(db_url, autocommit=True)
+    try:
+        add_index_concurrently_safely(conn, ddl)
+    finally:
+        conn.close()
+
+
 def add_base_constraints_and_indexes(conn, db_url: str | None = None) -> None:
     """Add PK, FK constraints and indexes to base tables (no track tables).
 
     Called after dedup copy-swap. Track constraints are added separately
     by create_track_indexes.sql after track import.
 
-    Parallelizes independent index/constraint creation:
-    - Level 1: PK on release (must be first, FK constraints depend on it)
-    - Level 2: FK constraints + FK indexes (parallel, all depend on PK only)
-    - Level 3: GIN trigram indexes + cache metadata indexes (parallel, independent)
+    Wraps every blocking-lock DDL in :func:`lib.pg_concurrent_ddl.
+    add_constraint_safely` (parent-first ``LOCK TABLE ... IN ACCESS EXCLUSIVE
+    MODE`` with bounded ``lock_timeout`` + retry on ``55P03``) and builds
+    every index with :func:`lib.pg_concurrent_ddl.
+    add_index_concurrently_safely` (CONCURRENTLY + INVALID-index
+    precleanup). See #286 for the prune-side outage that drove this fix
+    shape; dedup adopts the same shape to prevent regression here when
+    the prune helper is hardened further.
 
     Args:
-        conn: psycopg connection (used for serial Level 1 PK creation).
+        conn: psycopg connection in autocommit mode. Used for serial setup
+            calls and orphan cleanup; parallel constraint/index workers each
+            open their own short-lived connection against ``db_url``.
         db_url: PostgreSQL connection URL for parallel workers. If None,
             falls back to conn.info.dsn (which may omit password).
     """
@@ -452,12 +510,87 @@ def add_base_constraints_and_indexes(conn, db_url: str | None = None) -> None:
                 future.result()
         logger.info(f"    done in {time.time() - level_start:.1f}s")
 
-    # Level 1: PK on release (serial, must be first)
-    logger.info("  [Level 1] ALTER TABLE release ADD PRIMARY KEY...")
+    def _exec_constraints_parallel(
+        ops: list[tuple[str, tuple[str, ...]]],
+        label: str,
+    ) -> None:
+        """Run a batch of (ddl, lock_tables) constraint ops concurrently.
+
+        Each worker opens its own autocommit connection and goes through
+        :func:`add_constraint_safely`, so they share the same retry envelope
+        and parent-first lock ordering. Multiple workers can serialize on
+        ``LOCK TABLE release`` (the common parent) but that's correct
+        behavior — the locks are exclusive by definition. Order across
+        workers is not preserved.
+        """
+        if not ops:
+            return
+        logger.info(f"  {label} ({len(ops)} constraints)...")
+        level_start = time.time()
+        with ThreadPoolExecutor(max_workers=min(len(ops), 4)) as executor:
+            futures = {
+                executor.submit(_add_constraint_one, db_url, ddl, lock_tables): ddl
+                for ddl, lock_tables in ops
+            }
+            for future in as_completed(futures):
+                future.result()
+        logger.info(f"    done in {time.time() - level_start:.1f}s")
+
+    def _exec_indexes_concurrently_parallel(ddls: list[str], label: str) -> None:
+        """Run a batch of CONCURRENTLY index builds, parallel across distinct
+        target tables and serial within each target table.
+
+        Two ``CREATE INDEX CONCURRENTLY`` calls on the **same** table will
+        deadlock against each other inside Postgres' wait-for-snapshot
+        phase — they each take ShareUpdateExclusive on the table while
+        also waiting on the other's virtual transaction. PG documents
+        this as a one-CONCURRENTLY-per-table limit. Two CONCURRENTLY
+        builds on **different** tables run cleanly in parallel.
+
+        We group ``ddls`` by parsed target table and dispatch one worker
+        per table — within the worker the per-table DDLs run sequentially.
+        Falls back to serial if a DDL can't be parsed (defensive).
+        """
+        if not ddls:
+            return
+        logger.info(f"  {label} ({len(ddls)} indexes)...")
+        level_start = time.time()
+
+        groups: dict[str, list[str]] = {}
+        for ddl in ddls:
+            table = extract_index_target_table(ddl)
+            groups.setdefault(table or ddl, []).append(ddl)
+
+        def _run_serial_per_table(ddl_list: list[str]) -> None:
+            for ddl in ddl_list:
+                _add_index_concurrently_one(db_url, ddl)
+
+        with ThreadPoolExecutor(max_workers=min(len(groups), 4)) as executor:
+            futures = {
+                executor.submit(_run_serial_per_table, ddl_list): table
+                for table, ddl_list in groups.items()
+            }
+            for future in as_completed(futures):
+                future.result()
+        logger.info(f"    done in {time.time() - level_start:.1f}s")
+
+    # Level 1: PK on release. Build via CONCURRENTLY + USING INDEX so the
+    # index scan takes only ShareUpdateExclusive — no conflict with LML's
+    # RowExclusive DML. The post-swap ``release.id`` column was already
+    # set NOT NULL pre-swap (see PRE_SWAP_NOT_NULL_COLUMNS in copy_table),
+    # so the ADD CONSTRAINT USING INDEX step is a brief catalog flip.
+    # See #286 "Prereq for the brief AccessExclusive claim."
+    logger.info("  [Level 1] PK on release (CONCURRENTLY + USING INDEX)...")
     pk_start = time.time()
-    with conn.cursor() as cur:
-        cur.execute("ALTER TABLE release ADD PRIMARY KEY (id)")
-    conn.commit()
+    _add_index_concurrently_one(
+        db_url,
+        "CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS release_pkey ON release(id)",
+    )
+    _add_constraint_one(
+        db_url,
+        "ALTER TABLE release ADD CONSTRAINT release_pkey PRIMARY KEY USING INDEX release_pkey",
+        ("release",),
+    )
     logger.info(f"    done in {time.time() - pk_start:.1f}s")
 
     # Level 1.5: Clean orphan child rows (parallel).
@@ -507,69 +640,148 @@ def add_base_constraints_and_indexes(conn, db_url: str | None = None) -> None:
         "UPDATE cache_metadata SET cached_at = now() WHERE cached_at IS NULL",
     )
 
-    # Level 2: FK constraints + PK on cache_metadata + FK indexes + NOT NULL
-    # restoration (parallel).
+    # Level 2A: FK constraints (parallel, parent-first locks via helper).
     #
-    # FK constraints use NOT VALID so the ADD step itself can't race-fail
-    # on orphans created by LML during the brief Level-1.5 → Level-2 window.
-    # Postgres still enforces the FK on new inserts after the constraint is
-    # added, so the durable behavior is identical to a validated constraint.
-    #
-    # The ``SET NOT NULL`` statements re-assert the constraints that the
-    # ``CREATE TABLE new_X AS SELECT ...`` step strips silently — CTAS
-    # carries column types forward but not NOT NULL / DEFAULT / CHECK. The
-    # schema in ``schema/create_database.sql`` declares the data columns
-    # below as NOT NULL; without explicit re-application every monthly
-    # rebuild ships a discogs-cache where those constraints are gone. The
-    # corresponding DEFAULTs are re-applied earlier — in copy_table() via
-    # ``PRE_SWAP_COLUMN_DEFAULTS``, before swap_tables() makes the new
-    # table live — so LML's cache-miss INSERT (which omits ``cached_at``)
-    # never lands a NULL during the swap window. Pinned by
-    # ``tests/integration/test_copy_swap_preserves_not_null.py``.
-    _exec_parallel(
+    # Each ``ALTER TABLE ... ADD CONSTRAINT FOREIGN KEY ... REFERENCES
+    # release(id) NOT VALID`` takes ShareRowExclusiveLock on **both** the
+    # child (target of the ALTER) and the parent (FK target). NOT VALID
+    # skips existing-row scanning but does NOT skip lock acquisition. PG's
+    # FK creation acquires the child first then the parent — opposite of
+    # LML's parent-first order in ``write_release``. Without the helper's
+    # explicit parent-first ``LOCK TABLE`` envelope, this deadlocks with
+    # an LML cache-miss writer (see #286 — the bug surfaced production-side
+    # in the verify_cache prune; the dedup site has the same shape and
+    # would have surfaced eventually).
+    _exec_constraints_parallel(
         [
-            "ALTER TABLE release_artist ADD CONSTRAINT fk_release_artist_release "
-            "FOREIGN KEY (release_id) REFERENCES release(id) ON DELETE CASCADE NOT VALID",
-            "ALTER TABLE release_label ADD CONSTRAINT fk_release_label_release "
-            "FOREIGN KEY (release_id) REFERENCES release(id) ON DELETE CASCADE NOT VALID",
-            "ALTER TABLE release_genre ADD CONSTRAINT fk_release_genre_release "
-            "FOREIGN KEY (release_id) REFERENCES release(id) ON DELETE CASCADE NOT VALID",
-            "ALTER TABLE release_style ADD CONSTRAINT fk_release_style_release "
-            "FOREIGN KEY (release_id) REFERENCES release(id) ON DELETE CASCADE NOT VALID",
-            "ALTER TABLE cache_metadata ADD CONSTRAINT fk_cache_metadata_release "
-            "FOREIGN KEY (release_id) REFERENCES release(id) ON DELETE CASCADE NOT VALID",
-            "ALTER TABLE cache_metadata ADD PRIMARY KEY (release_id)",
-            "CREATE INDEX idx_release_artist_release_id ON release_artist(release_id)",
-            "CREATE INDEX idx_release_label_release_id ON release_label(release_id)",
-            "CREATE INDEX idx_release_genre_release_id ON release_genre(release_id)",
-            "CREATE INDEX idx_release_style_release_id ON release_style(release_id)",
-            "ALTER TABLE release ALTER COLUMN title SET NOT NULL",
-            "ALTER TABLE release ALTER COLUMN not_found SET NOT NULL",
-            "ALTER TABLE release_artist ALTER COLUMN release_id SET NOT NULL",
-            "ALTER TABLE release_artist ALTER COLUMN artist_name SET NOT NULL",
-            "ALTER TABLE release_label ALTER COLUMN release_id SET NOT NULL",
-            "ALTER TABLE release_label ALTER COLUMN label_name SET NOT NULL",
-            "ALTER TABLE release_genre ALTER COLUMN release_id SET NOT NULL",
-            "ALTER TABLE release_genre ALTER COLUMN genre SET NOT NULL",
-            "ALTER TABLE release_style ALTER COLUMN release_id SET NOT NULL",
-            "ALTER TABLE release_style ALTER COLUMN style SET NOT NULL",
-            "ALTER TABLE cache_metadata ALTER COLUMN cached_at SET NOT NULL",
-            "ALTER TABLE cache_metadata ALTER COLUMN source SET NOT NULL",
+            (
+                "ALTER TABLE release_artist ADD CONSTRAINT fk_release_artist_release "
+                "FOREIGN KEY (release_id) REFERENCES release(id) ON DELETE CASCADE NOT VALID",
+                ("release", "release_artist"),
+            ),
+            (
+                "ALTER TABLE release_label ADD CONSTRAINT fk_release_label_release "
+                "FOREIGN KEY (release_id) REFERENCES release(id) ON DELETE CASCADE NOT VALID",
+                ("release", "release_label"),
+            ),
+            (
+                "ALTER TABLE release_genre ADD CONSTRAINT fk_release_genre_release "
+                "FOREIGN KEY (release_id) REFERENCES release(id) ON DELETE CASCADE NOT VALID",
+                ("release", "release_genre"),
+            ),
+            (
+                "ALTER TABLE release_style ADD CONSTRAINT fk_release_style_release "
+                "FOREIGN KEY (release_id) REFERENCES release(id) ON DELETE CASCADE NOT VALID",
+                ("release", "release_style"),
+            ),
+            (
+                "ALTER TABLE cache_metadata ADD CONSTRAINT fk_cache_metadata_release "
+                "FOREIGN KEY (release_id) REFERENCES release(id) ON DELETE CASCADE NOT VALID",
+                ("release", "cache_metadata"),
+            ),
         ],
-        "Level 2: FK constraints + FK indexes + NOT NULL",
+        "Level 2A: FK constraints (parent-first LOCK TABLE)",
     )
 
-    # Level 3: GIN trigram indexes + cache metadata indexes (parallel)
-    _exec_parallel(
+    # Level 2B: PK on cache_metadata via CONCURRENTLY + USING INDEX.
+    # ``new_cache_metadata.release_id`` was set NOT NULL pre-swap.
+    logger.info("  [Level 2B] PK on cache_metadata (CONCURRENTLY + USING INDEX)...")
+    pk2_start = time.time()
+    _add_index_concurrently_one(
+        db_url,
+        "CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS cache_metadata_pkey "
+        "ON cache_metadata(release_id)",
+    )
+    _add_constraint_one(
+        db_url,
+        "ALTER TABLE cache_metadata ADD CONSTRAINT cache_metadata_pkey "
+        "PRIMARY KEY USING INDEX cache_metadata_pkey",
+        ("cache_metadata",),
+    )
+    logger.info(f"    done in {time.time() - pk2_start:.1f}s")
+
+    # Level 2C: FK indexes built CONCURRENTLY. ShareUpdateExclusive instead
+    # of Share — no conflict with LML's DML.
+    _exec_indexes_concurrently_parallel(
         [
-            "CREATE INDEX idx_release_artist_name_trgm ON release_artist "
-            "USING gin (lower(f_unaccent(artist_name)) gin_trgm_ops)",
-            "CREATE INDEX idx_release_title_trgm ON release "
-            "USING gin (lower(f_unaccent(title)) gin_trgm_ops)",
-            "CREATE INDEX idx_cache_metadata_cached_at ON cache_metadata(cached_at)",
-            "CREATE INDEX idx_cache_metadata_source ON cache_metadata(source)",
+            "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_release_artist_release_id "
+            "ON release_artist(release_id)",
+            "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_release_label_release_id "
+            "ON release_label(release_id)",
+            "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_release_genre_release_id "
+            "ON release_genre(release_id)",
+            "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_release_style_release_id "
+            "ON release_style(release_id)",
         ],
-        "Level 3: GIN trigram + metadata indexes",
+        "Level 2C: FK indexes (CONCURRENTLY)",
+    )
+
+    # Level 2D: NOT NULL restoration. Each takes AccessExclusive on a
+    # single table and performs an implicit full-table scan — wrap via the
+    # helper so it shares the retry envelope and brief-lock semantics.
+    #
+    # ``SET NOT NULL`` here re-asserts the constraints that ``CREATE TABLE
+    # new_X AS SELECT ...`` strips silently (CTAS carries column types
+    # forward but not NOT NULL / DEFAULT / CHECK). The corresponding
+    # DEFAULTs are re-applied earlier — in copy_table() via
+    # ``PRE_SWAP_COLUMN_DEFAULTS`` — so LML's cache-miss INSERT (which
+    # omits ``cached_at``) never lands a NULL during the swap window.
+    # Pinned by ``tests/integration/test_copy_swap_preserves_not_null.py``.
+    _exec_constraints_parallel(
+        [
+            ("ALTER TABLE release ALTER COLUMN title SET NOT NULL", ("release",)),
+            ("ALTER TABLE release ALTER COLUMN not_found SET NOT NULL", ("release",)),
+            (
+                "ALTER TABLE release_artist ALTER COLUMN release_id SET NOT NULL",
+                ("release_artist",),
+            ),
+            (
+                "ALTER TABLE release_artist ALTER COLUMN artist_name SET NOT NULL",
+                ("release_artist",),
+            ),
+            (
+                "ALTER TABLE release_label ALTER COLUMN release_id SET NOT NULL",
+                ("release_label",),
+            ),
+            (
+                "ALTER TABLE release_label ALTER COLUMN label_name SET NOT NULL",
+                ("release_label",),
+            ),
+            (
+                "ALTER TABLE release_genre ALTER COLUMN release_id SET NOT NULL",
+                ("release_genre",),
+            ),
+            ("ALTER TABLE release_genre ALTER COLUMN genre SET NOT NULL", ("release_genre",)),
+            (
+                "ALTER TABLE release_style ALTER COLUMN release_id SET NOT NULL",
+                ("release_style",),
+            ),
+            ("ALTER TABLE release_style ALTER COLUMN style SET NOT NULL", ("release_style",)),
+            (
+                "ALTER TABLE cache_metadata ALTER COLUMN cached_at SET NOT NULL",
+                ("cache_metadata",),
+            ),
+            (
+                "ALTER TABLE cache_metadata ALTER COLUMN source SET NOT NULL",
+                ("cache_metadata",),
+            ),
+        ],
+        "Level 2D: NOT NULL restoration",
+    )
+
+    # Level 3: GIN trigram + cache metadata indexes (CONCURRENTLY, parallel).
+    _exec_indexes_concurrently_parallel(
+        [
+            "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_release_artist_name_trgm "
+            "ON release_artist USING gin (lower(f_unaccent(artist_name)) gin_trgm_ops)",
+            "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_release_title_trgm "
+            "ON release USING gin (lower(f_unaccent(title)) gin_trgm_ops)",
+            "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_cache_metadata_cached_at "
+            "ON cache_metadata(cached_at)",
+            "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_cache_metadata_source "
+            "ON cache_metadata(source)",
+        ],
+        "Level 3: GIN trigram + metadata indexes (CONCURRENTLY)",
     )
 
     elapsed = time.time() - start
@@ -582,9 +794,11 @@ def add_track_constraints_and_indexes(conn, db_url: str | None = None) -> None:
     Called after track import (post-dedup). Equivalent to running
     create_track_indexes.sql.
 
-    Parallelizes independent statements:
-    - Level 1: FK constraints (parallel, both depend on release PK only)
-    - Level 2: FK indexes + GIN trigram indexes (parallel, independent)
+    Wraps blocking-lock DDL via :func:`lib.pg_concurrent_ddl.
+    add_constraint_safely` and indexes via :func:`lib.pg_concurrent_ddl.
+    add_index_concurrently_safely`. See the docstring of
+    :func:`add_base_constraints_and_indexes` and #286 for the full
+    rationale; this is the same fix shape applied to the track tables.
 
     Args:
         conn: psycopg connection (unused but kept for API consistency).
@@ -610,6 +824,53 @@ def add_track_constraints_and_indexes(conn, db_url: str | None = None) -> None:
                 future.result()
         logger.info(f"    done in {time.time() - level_start:.1f}s")
 
+    def _exec_constraints_parallel(
+        ops: list[tuple[str, tuple[str, ...]]],
+        label: str,
+    ) -> None:
+        if not ops:
+            return
+        logger.info(f"  {label} ({len(ops)} constraints)...")
+        level_start = time.time()
+        with ThreadPoolExecutor(max_workers=min(len(ops), 4)) as executor:
+            futures = {
+                executor.submit(_add_constraint_one, db_url, ddl, lock_tables): ddl
+                for ddl, lock_tables in ops
+            }
+            for future in as_completed(futures):
+                future.result()
+        logger.info(f"    done in {time.time() - level_start:.1f}s")
+
+    def _exec_indexes_concurrently_parallel(ddls: list[str], label: str) -> None:
+        """Run CONCURRENTLY index builds, parallel across distinct tables and
+        serial within each table. See the docstring on the version in
+        :func:`add_base_constraints_and_indexes` for the PG-side rationale
+        (two CONCURRENTLY builds on the same table deadlock against each
+        other).
+        """
+        if not ddls:
+            return
+        logger.info(f"  {label} ({len(ddls)} indexes)...")
+        level_start = time.time()
+
+        groups: dict[str, list[str]] = {}
+        for ddl in ddls:
+            table = extract_index_target_table(ddl)
+            groups.setdefault(table or ddl, []).append(ddl)
+
+        def _run_serial_per_table(ddl_list: list[str]) -> None:
+            for ddl in ddl_list:
+                _add_index_concurrently_one(db_url, ddl)
+
+        with ThreadPoolExecutor(max_workers=min(len(groups), 4)) as executor:
+            futures = {
+                executor.submit(_run_serial_per_table, ddl_list): table
+                for table, ddl_list in groups.items()
+            }
+            for future in as_completed(futures):
+                future.result()
+        logger.info(f"    done in {time.time() - level_start:.1f}s")
+
     # Level 0: Clean orphan track rows (parallel). LML writes release_track
     # + release_track_artist rows on every Discogs API miss; during the dedup
     # swap window those land as orphans. Parallel to the base-side cleanup
@@ -625,28 +886,41 @@ def add_track_constraints_and_indexes(conn, db_url: str | None = None) -> None:
         "Level 0: Clean orphan track rows before FK validation",
     )
 
-    # Level 1: FK constraints (parallel, NOT VALID for race tolerance).
-    _exec_parallel(
+    # Level 1: FK constraints (parallel, parent-first locks via helper).
+    # Same shape as add_base_constraints_and_indexes Level 2A — the
+    # ``ADD CONSTRAINT ... NOT VALID`` step takes ShareRowExclusive on
+    # both child and parent and would otherwise race-deadlock against an
+    # open LML ``write_release`` transaction (see #286).
+    _exec_constraints_parallel(
         [
-            "ALTER TABLE release_track ADD CONSTRAINT fk_release_track_release "
-            "FOREIGN KEY (release_id) REFERENCES release(id) ON DELETE CASCADE NOT VALID",
-            "ALTER TABLE release_track_artist ADD CONSTRAINT fk_release_track_artist_release "
-            "FOREIGN KEY (release_id) REFERENCES release(id) ON DELETE CASCADE NOT VALID",
+            (
+                "ALTER TABLE release_track ADD CONSTRAINT fk_release_track_release "
+                "FOREIGN KEY (release_id) REFERENCES release(id) ON DELETE CASCADE NOT VALID",
+                ("release", "release_track"),
+            ),
+            (
+                "ALTER TABLE release_track_artist ADD CONSTRAINT "
+                "fk_release_track_artist_release "
+                "FOREIGN KEY (release_id) REFERENCES release(id) ON DELETE CASCADE NOT VALID",
+                ("release", "release_track_artist"),
+            ),
         ],
-        "Level 1: FK constraints",
+        "Level 1: FK constraints (parent-first LOCK TABLE)",
     )
 
-    # Level 2: FK indexes + GIN trigram indexes (parallel)
-    _exec_parallel(
+    # Level 2: FK indexes + GIN trigram indexes (CONCURRENTLY, parallel).
+    _exec_indexes_concurrently_parallel(
         [
-            "CREATE INDEX idx_release_track_release_id ON release_track(release_id)",
-            "CREATE INDEX idx_release_track_artist_release_id ON release_track_artist(release_id)",
-            "CREATE INDEX idx_release_track_title_trgm ON release_track "
-            "USING gin (lower(f_unaccent(title)) gin_trgm_ops)",
-            "CREATE INDEX idx_release_track_artist_name_trgm ON release_track_artist "
-            "USING gin (lower(f_unaccent(artist_name)) gin_trgm_ops)",
+            "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_release_track_release_id "
+            "ON release_track(release_id)",
+            "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_release_track_artist_release_id "
+            "ON release_track_artist(release_id)",
+            "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_release_track_title_trgm "
+            "ON release_track USING gin (lower(f_unaccent(title)) gin_trgm_ops)",
+            "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_release_track_artist_name_trgm "
+            "ON release_track_artist USING gin (lower(f_unaccent(artist_name)) gin_trgm_ops)",
         ],
-        "Level 2: FK indexes + GIN trigram indexes",
+        "Level 2: FK indexes + GIN trigram (CONCURRENTLY)",
     )
 
     elapsed = time.time() - start

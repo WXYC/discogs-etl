@@ -754,15 +754,22 @@ class TestPruneCopySwapSQL:
         """Create a mock psycopg connection with proper cursor context manager."""
         from unittest.mock import MagicMock
 
+        import psycopg
+
         mock_conn = MagicMock()
         mock_cursor = MagicMock()
-        # fetchone returns (count,) for "SELECT count(*)" queries
+        # fetchone returns (count,) for "SELECT count(*)" queries.
         mock_cursor.fetchone.return_value = (42,)
         # copy context manager
         mock_cursor.copy.return_value.__enter__ = MagicMock()
         mock_cursor.copy.return_value.__exit__ = MagicMock(return_value=False)
         mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
         mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+        # add_index_concurrently_safely's transaction-status guard reads
+        # conn.info.transaction_status; the helper refuses to run inside an
+        # open transaction. Pin the mock to IDLE so the call sites in
+        # _prune_add_base_constraints_and_indexes pass through.
+        mock_conn.info.transaction_status = psycopg.pq.TransactionStatus.IDLE
         return mock_conn, mock_cursor
 
     def test_creates_keep_ids_table(self):
