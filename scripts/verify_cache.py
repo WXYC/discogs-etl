@@ -731,6 +731,21 @@ PRUNE_PRE_SWAP_COLUMN_DEFAULTS: dict[str, dict[str, str]] = {
 }
 
 
+# Columns to apply ``NOT NULL`` to pre-swap so the post-swap
+# ``ADD CONSTRAINT ... PRIMARY KEY USING INDEX`` step is a brief catalog
+# flip rather than a hidden full-table scan under AccessExclusive. CTAS
+# strips NOT NULL alongside DEFAULT; applying it on ``new_X`` (which isn't
+# live yet) costs a scan that can't conflict with LML's writes. Mirror of
+# ``dedup_releases.PRE_SWAP_NOT_NULL_COLUMNS`` — kept in sync so a future
+# schema change adding a new PK doesn't have to be remembered in two
+# places. See WXYC/discogs-etl#286 "Prereq for the brief AccessExclusive
+# claim."
+PRUNE_PRE_SWAP_NOT_NULL_COLUMNS: dict[str, tuple[str, ...]] = {
+    "new_release": ("id",),
+    "new_cache_metadata": ("release_id",),
+}
+
+
 def _prune_copy_swap_tables(
     db_url: str,
     keep_ids: set[int],
@@ -773,19 +788,23 @@ def _prune_copy_swap_tables(
                 count = cur.fetchone()[0]
             logger.info(f"  Copied {old_table} -> {new_table}: {count:,} rows")
 
-        # Pre-swap NOT NULL on PK columns. The new_X tables aren't live yet, so
-        # the implicit full-table scan that ``ALTER COLUMN ... SET NOT NULL``
-        # performs can't conflict with LML's writes — and doing it now is the
-        # prerequisite for the post-swap ``ADD CONSTRAINT ... PRIMARY KEY USING
-        # INDEX`` step in ``_prune_add_base_constraints_and_indexes`` to be the
-        # brief catalog flip CONCURRENTLY promises rather than a hidden
-        # AccessExclusive scan. Without this, CTAS-stripped NULLability would
-        # force PG to run SET NOT NULL internally under AccessExclusive,
-        # defeating the lock-conflict avoidance the helper is supposed to give
-        # us. See #286 "Prereq for the 'brief AccessExclusive' claim".
+        # Pre-swap NOT NULL on PK columns, driven by PRUNE_PRE_SWAP_NOT_NULL_COLUMNS.
+        # The new_X tables aren't live yet, so the implicit full-table scan that
+        # ``ALTER COLUMN ... SET NOT NULL`` performs can't conflict with LML's
+        # writes — and doing it now is the prerequisite for the post-swap
+        # ``ADD CONSTRAINT ... PRIMARY KEY USING INDEX`` step in
+        # ``_prune_add_base_constraints_and_indexes`` to be the brief catalog
+        # flip CONCURRENTLY promises rather than a hidden AccessExclusive scan.
+        # Without this, CTAS-stripped NULLability would force PG to run SET
+        # NOT NULL internally under AccessExclusive, defeating the lock-conflict
+        # avoidance the helper is supposed to give us. See #286 "Prereq for the
+        # 'brief AccessExclusive' claim". The dict form mirrors dedup's
+        # PRE_SWAP_NOT_NULL_COLUMNS so a future PK column addition only has
+        # to be remembered once per script.
         with conn.cursor() as cur:
-            cur.execute("ALTER TABLE new_release ALTER COLUMN id SET NOT NULL")
-            cur.execute("ALTER TABLE new_cache_metadata ALTER COLUMN release_id SET NOT NULL")
+            for new_table, columns in PRUNE_PRE_SWAP_NOT_NULL_COLUMNS.items():
+                for column in columns:
+                    cur.execute(f"ALTER TABLE {new_table} ALTER COLUMN {column} SET NOT NULL")
 
         # DROP CONSTRAINT + RENAME deadlock surface — same lock-acquisition
         # mismatch as the FK-add path below, with the *broader* surface
@@ -1096,9 +1115,20 @@ def _prune_add_base_constraints_and_indexes(db_url: str) -> None:
                 lock_tables=[target_table],
             )
 
-        with conn.cursor() as cur:
-            cur.execute("DROP TABLE IF EXISTS _keep_ids")
     finally:
+        # Drop ``_keep_ids`` whether or not the constraint adds succeeded.
+        # A failed prune that retries (manually or via the outer pipeline)
+        # would otherwise leave the UNLOGGED keep-ids table sitting in the
+        # cache until the next ``_prune_copy_swap_tables`` call drops it.
+        # The DROP at the start of ``_prune_copy_swap_tables`` makes this
+        # belt-and-suspenders, not load-bearing — but the storage overhead
+        # is real (~24MB per ~6M-row keep set) and operator confusion when
+        # auditing the cache schema is avoidable.
+        try:
+            with conn.cursor() as cur:
+                cur.execute("DROP TABLE IF EXISTS _keep_ids")
+        except Exception:  # noqa: BLE001
+            logger.warning("Could not clean up _keep_ids on exit", exc_info=True)
         conn.close()
 
 

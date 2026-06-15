@@ -19,6 +19,7 @@ import psycopg
 import pytest
 
 from lib.pg_concurrent_ddl import (
+    _UNPARSEABLE_GROUP_KEY,
     SQLSTATE_DEADLOCK_DETECTED,
     SQLSTATE_LOCK_NOT_AVAILABLE,
     ConcurrentDDLError,
@@ -27,6 +28,7 @@ from lib.pg_concurrent_ddl import (
     add_constraint_safely,
     add_index_concurrently_safely,
     extract_index_target_table,
+    group_concurrent_index_ddls_by_table,
 )
 
 # ---------------------------------------------------------------------------
@@ -116,6 +118,60 @@ class TestExtractIndexTargetTable:
 
     def test_returns_none_when_shape_not_recognized(self):
         assert extract_index_target_table("ALTER TABLE t ADD CONSTRAINT c PRIMARY KEY") is None
+
+
+class TestGroupConcurrentIndexDDLsByTable:
+    """Pin the grouping helper used by dedup's parallel CONCURRENTLY dispatch.
+
+    The grouping must keep two CONCURRENTLY builds on the same table in
+    the same group (they'll run serially within that group's worker).
+    Unparseable DDLs must NOT each become their own group key — that
+    fallback would re-introduce the same CONCURRENTLY-vs-CONCURRENTLY
+    deadlock the grouping is supposed to prevent.
+    """
+
+    def test_groups_two_indexes_on_same_table(self):
+        groups = group_concurrent_index_ddls_by_table(
+            [
+                "CREATE INDEX CONCURRENTLY idx_a ON release_track(release_id)",
+                "CREATE INDEX CONCURRENTLY idx_b ON release_track USING gin "
+                "(lower(f_unaccent(title)) gin_trgm_ops)",
+            ]
+        )
+        assert set(groups) == {"release_track"}
+        assert len(groups["release_track"]) == 2
+
+    def test_splits_indexes_on_different_tables(self):
+        groups = group_concurrent_index_ddls_by_table(
+            [
+                "CREATE INDEX CONCURRENTLY idx_a ON release_artist(release_id)",
+                "CREATE INDEX CONCURRENTLY idx_b ON release_label(release_id)",
+            ]
+        )
+        assert set(groups) == {"release_artist", "release_label"}
+
+    def test_unparseable_ddls_share_one_serial_group(self):
+        """Pin the #286 round-2 fix: unparseable DDLs must NOT each become
+        their own group key. The old fallback (``groups.setdefault(table or
+        ddl, ...)``) would put two unparseable DDLs that ACTUALLY target the
+        same table into separate groups → parallel dispatch → CONCURRENTLY
+        deadlock against itself.
+        """
+        # Two DDLs the regex doesn't recognize — e.g. quoted identifiers
+        # which ``\w+`` won't match, or any future syntax the helper hasn't
+        # learned. They might actually target the same table but the
+        # grouping can't prove it from the string alone; safest is to run
+        # them serially together rather than dispatch in parallel.
+        groups = group_concurrent_index_ddls_by_table(
+            [
+                'CREATE INDEX CONCURRENTLY idx_a ON "release_track"(release_id)',
+                'CREATE INDEX CONCURRENTLY idx_b ON "release_track"(title)',
+            ]
+        )
+        assert _UNPARSEABLE_GROUP_KEY in groups
+        assert len(groups[_UNPARSEABLE_GROUP_KEY]) == 2
+        # And they're in the SAME group, not split → will run serially.
+        assert len(groups) == 1
 
 
 # ---------------------------------------------------------------------------

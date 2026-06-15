@@ -202,3 +202,62 @@ class TestFkConstraintsUseNotValid:
             assert "ON DELETE CASCADE" in stmt, (
                 f"FK constraint must keep ON DELETE CASCADE; got: {stmt}"
             )
+
+
+class TestFkConstraintLockOrderingIsParentFirst:
+    """Pin the parent-first ``LOCK TABLE`` ordering for every FK add.
+
+    The load-bearing property of the WXYC/discogs-etl#286 fix is that every
+    ``ALTER TABLE ... ADD CONSTRAINT FOREIGN KEY ... REFERENCES release(id)``
+    pre-acquires ``LOCK TABLE release, <child>`` (parent first) — matching
+    LML's ``write_release`` acquisition order. A refactor that reverses
+    this to child-first would re-introduce the deadlock the helper exists
+    to prevent. The SQL capture in ``TestFkConstraintsUseNotValid`` would
+    NOT catch that regression (it inspects the DDL string only); this
+    fixture captures the ``lock_tables`` argument so the ordering
+    invariant is testable.
+    """
+
+    def _captured_ops(self) -> list[tuple[str, tuple[str, ...]]]:
+        """Return ``[(ddl, lock_tables), ...]`` for every constraint-add call."""
+        from unittest.mock import MagicMock, patch
+
+        captured: list[tuple[str, tuple[str, ...]]] = []
+
+        def fake_add_constraint_one(db_url, ddl, lock_tables):
+            captured.append((ddl, tuple(lock_tables)))
+
+        mock_cursor = MagicMock()
+        mock_conn = MagicMock()
+        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
+        mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+        mock_conn.info.dsn = "postgresql:///test"
+
+        with (
+            patch.object(_dr, "_exec_one"),
+            patch.object(_dr, "_add_constraint_one", side_effect=fake_add_constraint_one),
+            patch.object(_dr, "_add_index_concurrently_one"),
+        ):
+            _dr.add_base_constraints_and_indexes(mock_conn, db_url="postgresql:///test")
+        return captured
+
+    def test_every_fk_add_locks_release_before_child(self) -> None:
+        fk_ops = [
+            (ddl, lock_tables)
+            for ddl, lock_tables in self._captured_ops()
+            if "ADD CONSTRAINT fk_" in ddl and "FOREIGN KEY" in ddl
+        ]
+        assert fk_ops, "no FK adds captured — patch targets may have drifted"
+        for ddl, lock_tables in fk_ops:
+            assert len(lock_tables) == 2, (
+                f"FK add must lock exactly (parent, child); got {lock_tables} for {ddl!r}"
+            )
+            assert lock_tables[0] == "release", (
+                f"FK add must lock release (parent) FIRST; got {lock_tables[0]!r} "
+                f"for {ddl!r}. Reversing this ordering reintroduces the #286 "
+                f"deadlock against LML's write_release transaction."
+            )
+            assert lock_tables[1] != "release", (
+                f"FK add's second lock_tables slot is the child, not release; "
+                f"got {lock_tables} for {ddl!r}."
+            )

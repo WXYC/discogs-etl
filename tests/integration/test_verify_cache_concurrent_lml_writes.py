@@ -211,8 +211,15 @@ def _lml_writer_holding_locks(db_url: str, hold_seconds: float, release_id: int)
     finally:
         stop.set()
         thread.join(timeout=hold_seconds + 5.0)
-        if error and not isinstance(error[0], BaseException):
-            raise error[0]  # type: ignore[unreachable]
+        # Surface any error the LML simulator thread captured that wasn't
+        # already raised before the yield. Use sys.exc_info() to avoid
+        # shadowing an in-flight test-body exception (raising here while
+        # an AssertionError is propagating would lose the diagnostic
+        # information the test author actually wanted). Pre-yield errors
+        # are raised directly above; this branch handles LATE failures so
+        # a silent thread crash can't hide as a test pass.
+        if error and sys.exc_info()[0] is None:
+            raise error[0]
 
 
 class TestVerifyCacheConcurrentLMLWrites:
