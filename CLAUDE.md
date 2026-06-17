@@ -50,3 +50,11 @@ WXYC is a freeform station — use representative artists (Stereolab, Juana Moli
 - **[wxyc-etl](https://github.com/WXYC/wxyc-etl)** -- Rust/PyO3 shared library: artist name normalization, compilation detection, artist splitting, pipeline state tracking, DB introspection. Vendored canonical artifacts via `wxyc-etl-pin.txt`
 - **[wxyc-catalog](https://github.com/WXYC/wxyc-catalog)** -- Catalog source protocol (tubafrenzy + Backend-Service backends), `wxyc-export-to-sqlite` / `wxyc-enrich-library-artists` / `wxyc-extract-library-labels` CLIs
 - **[wxyc-shared](https://github.com/WXYC/wxyc-shared)** -- Cross-repo test-utility fixtures (canonical example artists)
+
+## `entity.*` schema ownership
+
+The `entity.*` schema in the cache database is **owned by this repo** and is created/migrated **only** through alembic (`alembic/versions/0012_entity_release_identity.py`, `0013_adopt_entity_identity.py`). It holds the cross-service identity contract (`entity.identity`, `entity.release_identity`, reconciliation logs) read by LML, Backend-Service, and semantic-index. Per [discogs-etl#288](https://github.com/WXYC/discogs-etl/issues/288) (Option 3):
+
+- **discogs-etl does not adopt LML cache tables.** LML owns its application caches in a separate `lml_cache.*` schema that it lifespan-bootstraps itself; this repo never migrates, truncates, backs up, or audits `lml_cache.*`. (The earlier pattern of LML creating `entity.*` cache tables and promising a post-hoc adoption migration — which went unfiled after LML PR #571 — is retired.)
+- **The truncate guard stays.** `scripts/import_csv.py` (`_validate_truncate_lists`) rejects any schema-qualified entry in the truncate lists, so neither `entity.*` nor `lml_cache.*` can be reached by a public-schema cache rebuild. Keep it.
+- New `entity.*` columns/tables (e.g. LML#573's PR-3 `deezer_album_id` on `entity.release_identity`) land here via alembic first, then LML pulls the contract — the three-repo sequence in [WXYC/wiki#83](https://github.com/WXYC/wiki/issues/83).
