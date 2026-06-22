@@ -40,10 +40,30 @@ jobs:
 
       - name: Set up streaming links enrichment
         run: |
+          set -euo pipefail
           git clone --depth 1 --branch main https://github.com/WXYC/library-metadata-lookup.git /tmp/library-metadata-lookup
-          gh release download streaming-data-v1 --repo WXYC/library-metadata-lookup --dir /tmp/library-metadata-lookup
+          # streaming_availability.db is read from the Railway volume (the canonical
+          # copy, LML#672), not the GitHub Release. Hard-fail on a non-200 or an
+          # empty/invalid file: a naive `curl -o` exits 0 on HTTP 404/500 and writes
+          # the error body, which would silently strip all streaming links from prod.
+          # On a Railway outage the step aborts and prod keeps yesterday's library.db.
+          dest=/tmp/library-metadata-lookup/streaming_availability.db
+          http_code=$(curl -sS -w '%{http_code}' -o "$dest" \
+            -H "Authorization: Bearer $ADMIN_TOKEN" \
+            "$PRODUCTION_URL/admin/download-streaming-db")
+          if [ "$http_code" != "200" ]; then
+            echo "::error::download-streaming-db returned HTTP $http_code"
+            head -c 2000 "$dest" || true
+            exit 1
+          fi
+          if [ ! -s "$dest" ]; then
+            echo "::error::downloaded streaming_availability.db is empty"
+            exit 1
+          fi
+          python -c "import sqlite3,sys; n=sqlite3.connect(sys.argv[1]).execute('SELECT count(*) FROM albums').fetchone()[0]; print('volume streaming_availability.db OK: %d albums' % n); sys.exit(0 if n>0 else 'downloaded streaming_availability.db has 0 albums')" "$dest"
         env:
-          GH_TOKEN: ${{ github.token }}
+          ADMIN_TOKEN: ${{ secrets.ADMIN_TOKEN }}
+          PRODUCTION_URL: ${{ secrets.PRODUCTION_URL }}
 
       - name: Run library sync
         run: scripts/sync-library.sh

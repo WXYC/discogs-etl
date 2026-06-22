@@ -162,6 +162,21 @@ else
     log "Skipping streaming links (streaming_availability.db not found)"
 fi
 
+# Post-enrichment floor assertion (LML#672, belt-and-suspenders). A zero/low
+# apple_music_url count means enrichment silently produced a thin library.db
+# (download flake, missing streaming db, export bug); fail BEFORE upload rather
+# than strip prod's streaming links. STREAMING_APPLE_FLOOR is an absolute floor
+# at the consumption layer, complementary to LML's relative upload-coverage guard.
+# Set STREAMING_APPLE_FLOOR=0 to opt out (e.g. a local run with no streaming db).
+STREAMING_APPLE_FLOOR="${STREAMING_APPLE_FLOOR:-100}"
+APPLE_COUNT=$($PYTHON -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); t=c.execute(\"SELECT name FROM sqlite_master WHERE type='table' AND name='streaming_links'\").fetchone(); print(c.execute('SELECT COUNT(apple_music_url) FROM streaming_links').fetchone()[0] if t else 0)" "$DB_PATH" 2>>"$LOG_FILE") || APPLE_COUNT=""
+log "Streaming links apple_music_url count: ${APPLE_COUNT:-<error>} (floor $STREAMING_APPLE_FLOOR)"
+if [[ -z "$APPLE_COUNT" || "$APPLE_COUNT" -lt "$STREAMING_APPLE_FLOOR" ]]; then
+    rm -f "$DB_PATH"
+    notify_error "Streaming enrichment produced only ${APPLE_COUNT:-0} apple_music_url links (< floor $STREAMING_APPLE_FLOOR); aborting before upload to avoid stripping prod streaming links"
+    exit 1
+fi
+
 # Upload to staging (if URL configured)
 if [[ -n "$STAGING_URL" ]]; then
     upload_library_db "$STAGING_URL" "staging" "$DB_PATH" || EXIT_CODE=1
