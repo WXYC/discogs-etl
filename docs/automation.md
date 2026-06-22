@@ -50,6 +50,8 @@ The workflow can also be triggered manually: `gh workflow run sync-library.yml`
 
 The `--notify` flag is always passed, so Slack notifications are sent on failure when `SLACK_MONITORING_WEBHOOK` is configured.
 
+**Streaming-links enrichment (WXYC/library-metadata-lookup#672):** before upload, the exported `library.db` is enriched with streaming URLs from `streaming_availability.db`. That file is read from the LML Railway **volume** via `GET /admin/download-streaming-db` (the canonical copy), not the GitHub Release — the "Set up streaming links enrichment" step authenticates with `ADMIN_TOKEN` against `PRODUCTION_URL`. The download **hard-fails** on a non-200 response, an empty file, or a non-SQLite/zero-albums body (a naive `curl -o` exits 0 on HTTP 404/500 and writes the error body), so a Railway outage at sync time **aborts the run** and production keeps **yesterday's** `library.db` (which still has its streaming links) rather than publishing a zero-link database. After enrichment, `sync-library.sh` asserts the `streaming_links.apple_music_url` count exceeds `STREAMING_APPLE_FLOOR` (default `100`) and aborts before upload if it doesn't; set `STREAMING_APPLE_FLOOR=0` to opt out (e.g. a local run with no streaming db).
+
 **Required GitHub secrets:**
 
 | Secret | Description |
