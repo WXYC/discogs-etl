@@ -103,18 +103,21 @@ BASE_TABLES: list[TableConfig] = [
     {
         "csv_file": "release_artist.csv",
         "table": "release_artist",
-        # The schema has a ``role`` column for extra-credit attribution
-        # ("Producer", "Mixed By", etc.), but the converter
-        # (WXYC/discogs-xml-converter v0.1.0) doesn't emit it. Listing
-        # ``role`` here caused the import to bail out with "Missing
-        # columns" and write zero release_artist rows (see #204). Keep
-        # the schema column nullable so a future converter version can
-        # populate it without a schema migration.
         "csv_columns": ["release_id", "artist_id", "artist_name", "extra"],
         "db_columns": ["release_id", "artist_id", "artist_name", "extra"],
         "required": ["release_id", "artist_name"],
         "transforms": {},
         "unique_key": ["release_id", "artist_name"],
+        # The converter now emits the source ``<role>`` for release-level
+        # extra credits (writer/composer/producer). ``role`` is listed as
+        # OPTIONAL — not in the required ``csv_columns`` above — so the loader
+        # reads it when present and tolerates its absence in older CSVs
+        # (PG default ``role=NULL``) rather than bailing with "Missing
+        # columns" and writing zero rows (the #204 failure mode). Mirrors
+        # ``release_track_artist`` (WXYC/discogs-etl#218); populates
+        # ``release_artist.role`` for the release-level composer fallback
+        # (WXYC/library-metadata-lookup#699).
+        "optional_csv_columns": ["role"],
     },
     {
         "csv_file": "release_label.csv",

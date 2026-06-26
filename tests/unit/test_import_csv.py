@@ -35,29 +35,28 @@ CSV_DIR = FIXTURES_DIR / "csv"
 # ---------------------------------------------------------------------------
 
 
-class TestReleaseArtistColumnsMatchConverterOutput:
-    """The ``release_artist`` table config must NOT include a column the
-    converter doesn't emit.
+class TestReleaseArtistRoleColumn:
+    """``release_artist.role`` is read via ``optional_csv_columns``: present
+    in the converter's CSV header → loaded; absent (older CSV) → PG default
+    NULL. It must stay OUT of the required ``csv_columns`` / ``db_columns``
+    so a pre-role CSV still imports instead of bailing with "Missing columns"
+    and writing zero rows (the #204 failure mode).
 
-    WXYC/discogs-xml-converter v0.1.0 writes release_artist.csv with
-    ``release_id, artist_id, artist_name, extra, anv, position, join_field``.
-    Any column listed in ``csv_columns`` that's missing from the CSV header
-    causes ``import_csv`` to bail out at line 257 with ``return 0`` — the
-    failure mode that left release_artist empty in the 2026-05-13 rebuild
-    (#204). The schema's ``role`` column stays nullable; this test pins
-    that the importer doesn't try to read it.
+    The converter began emitting release-level ``<role>`` so release-level
+    writer/composer credits reach ``release_artist.role`` (the release-level
+    composer fallback, WXYC/library-metadata-lookup#699), mirroring the
+    ``release_track_artist`` handling from WXYC/discogs-etl#218.
     """
 
-    def test_release_artist_csv_columns_exclude_role(self) -> None:
+    def test_role_declared_as_optional_csv_column(self) -> None:
         ra_config = next(t for t in BASE_TABLES if t["table"] == "release_artist")
-        assert "role" not in ra_config["csv_columns"], (
-            "'role' must not appear in csv_columns until the converter writes it; see #204"
-        )
+        assert ra_config.get("optional_csv_columns") == ["role"]
 
-    def test_release_artist_db_columns_exclude_role(self) -> None:
-        """db_columns must mirror csv_columns (positional mapping). The schema's
-        ``role`` column accepts NULL so the import succeeds without it."""
+    def test_role_stays_out_of_required_columns(self) -> None:
+        """Role is optional, not required: keeping it out of csv_columns /
+        db_columns is what lets a pre-role CSV still import (#204)."""
         ra_config = next(t for t in BASE_TABLES if t["table"] == "release_artist")
+        assert "role" not in ra_config["csv_columns"]
         assert "role" not in ra_config["db_columns"]
 
 
@@ -630,6 +629,61 @@ class TestImportCsvOptionalColumns:
         output — a regression of WXYC/discogs-etl#218."""
         rta_config = next(t for t in TRACK_TABLES if t["table"] == "release_track_artist")
         assert rta_config.get("optional_csv_columns") == ["extra", "role"]
+
+    def test_new_release_artist_csv_with_role_appends_it_to_copy(self, tmp_path) -> None:
+        """A ``release_artist`` CSV carrying release-level ``role`` loads it;
+        an empty role coerces to NULL, and main artists (extra=0) carry none.
+        This is the release-level analogue of the per-track case above
+        (WXYC/library-metadata-lookup#699)."""
+        from unittest.mock import MagicMock
+
+        csv_path = tmp_path / "release_artist.csv"
+        csv_path.write_text(
+            "release_id,artist_id,artist_name,extra,role\n"
+            "9100,10,Main Performer,0,\n"
+            "9100,20,Jane Writer,1,Written-By\n"
+        )
+
+        captured_columns: dict[str, str] = {}
+        captured_rows: list[tuple] = []
+
+        class _RecordingCopy:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def write_row(self, row):
+                captured_rows.append(tuple(row))
+
+        def _cur_copy(sql, *_):
+            captured_columns["sql"] = sql
+            return _RecordingCopy()
+
+        mock_cursor = MagicMock()
+        mock_cursor.copy.side_effect = _cur_copy
+        mock_conn = MagicMock()
+        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
+        mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+
+        count = import_csv(
+            mock_conn,
+            csv_path,
+            table="release_artist",
+            csv_columns=["release_id", "artist_id", "artist_name", "extra"],
+            db_columns=["release_id", "artist_id", "artist_name", "extra"],
+            required_columns=["release_id", "artist_name"],
+            transforms={},
+            optional_csv_columns=["role"],
+        )
+
+        assert count == 2
+        # COPY SQL lists the optional role column.
+        assert "release_id, artist_id, artist_name, extra, role" in captured_columns["sql"]
+        # Main artist: empty role → NULL. Writer credit: source role preserved.
+        assert captured_rows[0] == ("9100", "10", "Main Performer", "0", None)
+        assert captured_rows[1] == ("9100", "20", "Jane Writer", "1", "Written-By")
 
 
 class TestImportCsvMissingColumns:
