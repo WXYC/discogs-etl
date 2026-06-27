@@ -14,16 +14,18 @@ When writing inline test data or new fixture rows, use these defaults matching t
 5006,Accepted,Duke Ellington & John Coltrane,US,1963,,Correct,8005,LP
 ```
 
-**`release_artist` table** (release_id, artist_id, artist_name, extra, anv, position, join_field):
+**`release_artist` table** (release_id, artist_id, artist_name, extra, anv, position, join_field, role):
 ```
-5001,101,Juana Molina,0,,1,
-5002,102,Stereolab,0,,1,
-5003,103,Cat Power,0,,1,
-5004,104,Jessica Pratt,0,,1,
-5005,105,Chuquimamani-Condori,0,,1,
-5006,106,Duke Ellington,0,,1,
-5006,107,John Coltrane,0,,2, &
+5001,101,Juana Molina,0,,1,,
+5002,102,Stereolab,0,,1,,
+5003,103,Cat Power,0,,1,,
+5004,104,Jessica Pratt,0,,1,,
+5005,105,Chuquimamani-Condori,0,,1,,
+5006,106,Duke Ellington,0,,1, &,
+5006,107,John Coltrane,0,,2,,
+5006,108,Billy Strayhorn,1,,3,,Written-By
 ```
+Column `role` carries release-level extra-credit attribution (e.g. `Written-By`, `Producer`) for `extra=1` rows; main artists (`extra=0`) have `role` NULL. The loader reads it via `optional_csv_columns`, so a pre-role CSV still imports — the same `(extra, role)` semantics as `release_track_artist` below.
 
 **`release_label` table** (release_id, label, catno):
 ```
