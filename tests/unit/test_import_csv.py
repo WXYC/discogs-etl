@@ -640,8 +640,8 @@ class TestImportCsvOptionalColumns:
         csv_path = tmp_path / "release_artist.csv"
         csv_path.write_text(
             "release_id,artist_id,artist_name,extra,role\n"
-            "9100,10,Main Performer,0,\n"
-            "9100,20,Jane Writer,1,Written-By\n"
+            "9100,10,Stereolab,0,\n"
+            "9100,20,Tim Gane,1,Written-By\n"
         )
 
         captured_columns: dict[str, str] = {}
@@ -682,8 +682,61 @@ class TestImportCsvOptionalColumns:
         # COPY SQL lists the optional role column.
         assert "release_id, artist_id, artist_name, extra, role" in captured_columns["sql"]
         # Main artist: empty role → NULL. Writer credit: source role preserved.
-        assert captured_rows[0] == ("9100", "10", "Main Performer", "0", None)
-        assert captured_rows[1] == ("9100", "20", "Jane Writer", "1", "Written-By")
+        assert captured_rows[0] == ("9100", "10", "Stereolab", "0", None)
+        assert captured_rows[1] == ("9100", "20", "Tim Gane", "1", "Written-By")
+
+    def test_legacy_release_artist_csv_without_role_still_imports(self, tmp_path) -> None:
+        """A pre-role ``release_artist`` CSV (no ``role`` column) must still
+        import: the loader drops ``role`` from the COPY so the schema default
+        (NULL) takes over, instead of bailing with "Missing columns" and
+        writing zero rows. This is the exact #204 failure mode that left
+        ``release_artist`` empty in the 2026-05-13 rebuild, pinned at the
+        behavioral level (the config-pin tests above never run the loader).
+        Release-level analogue of ``test_legacy_csv_without_optional_columns_still_imports``."""
+        from unittest.mock import MagicMock
+
+        csv_path = tmp_path / "release_artist.csv"
+        csv_path.write_text("release_id,artist_id,artist_name,extra\n9100,10,Stereolab,0\n")
+
+        captured_columns: dict[str, str] = {}
+        captured_rows: list[tuple] = []
+
+        class _RecordingCopy:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def write_row(self, row):
+                captured_rows.append(tuple(row))
+
+        def _cur_copy(sql, *_):
+            captured_columns["sql"] = sql
+            return _RecordingCopy()
+
+        mock_cursor = MagicMock()
+        mock_cursor.copy.side_effect = _cur_copy
+        mock_conn = MagicMock()
+        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
+        mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+
+        count = import_csv(
+            mock_conn,
+            csv_path,
+            table="release_artist",
+            csv_columns=["release_id", "artist_id", "artist_name", "extra"],
+            db_columns=["release_id", "artist_id", "artist_name", "extra"],
+            required_columns=["release_id", "artist_name"],
+            transforms={},
+            optional_csv_columns=["role"],
+        )
+
+        assert count == 1
+        # COPY SQL omits the absent optional column; the schema NULL default takes over.
+        assert "role" not in captured_columns["sql"]
+        # Row has only the 4 base columns.
+        assert captured_rows[0] == ("9100", "10", "Stereolab", "0")
 
 
 class TestImportCsvMissingColumns:
