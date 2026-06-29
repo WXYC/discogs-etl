@@ -88,6 +88,14 @@ class TableConfig(TypedDict, total=False):
     # CSVs should fall through to the DB-side default — e.g. ``extra``
     # and ``role`` on ``release_track_artist`` per WXYC/discogs-etl#218.
     optional_csv_columns: list[str]
+    # ``optional_unique_key``: optional columns that should join the dedup
+    # ``unique_key`` *only when present in the CSV header* (i.e. a subset of
+    # ``optional_csv_columns`` that are key-bearing). Lets a table widen its
+    # dedup key for new converter output without crashing legacy CSVs that
+    # lack the column — ``csv_columns.index(col)`` would raise. See
+    # WXYC/discogs-etl#293 and the converter's ``WideTrackArtistDedup``
+    # (discogs-xml-converter#74).
+    optional_unique_key: list[str]
 
 
 BASE_TABLES: list[TableConfig] = [
@@ -107,7 +115,15 @@ BASE_TABLES: list[TableConfig] = [
         "db_columns": ["release_id", "artist_id", "artist_name", "extra"],
         "required": ["release_id", "artist_name"],
         "transforms": {},
-        "unique_key": ["release_id", "artist_name"],
+        # ``extra`` is in the dedup key so a person who is both the main
+        # artist (``extra=0``) and a same-release extra credit (``extra=1``,
+        # e.g. ``Written-By``) keeps *both* rows — the converter writes the
+        # ``extra=0`` row first, and a key without ``extra`` would drop the
+        # role-bearing ``extra=1`` row (WXYC/discogs-etl#293). Safe as a
+        # static key because ``extra`` is always in ``csv_columns`` above
+        # (unlike ``release_track_artist``, where it is optional). Converges
+        # with the converter's ``WideArtistDedup`` (discogs-xml-converter#74).
+        "unique_key": ["release_id", "artist_name", "extra"],
         # The converter now emits the source ``<role>`` for release-level
         # extra credits (writer/composer/producer). ``role`` is listed as
         # OPTIONAL — not in the required ``csv_columns`` above — so the loader
@@ -175,6 +191,12 @@ TRACK_TABLES: list[TableConfig] = [
         # columns, which matches the legacy "everything was main credits"
         # interpretation under which existing consumers were operating.
         "optional_csv_columns": ["extra", "role"],
+        # Widen the dedup key with ``extra`` so a same-track main+extra credit
+        # for one person keeps both rows (WXYC/discogs-etl#293), but *only*
+        # when the column is present — a static ``extra`` key would crash a
+        # legacy 3-column CSV at ``csv_columns.index("extra")``. Mirrors the
+        # converter's ``WideTrackArtistDedup`` (discogs-xml-converter#74).
+        "optional_unique_key": ["extra"],
     },
 ]
 
@@ -372,6 +394,7 @@ def import_csv(
     id_filter: set[int] | None = None,
     id_filter_column: str | None = None,
     optional_csv_columns: list[str] | None = None,
+    optional_unique_key: list[str] | None = None,
 ) -> int:
     """Import a CSV file into a table, selecting only needed columns.
 
@@ -394,6 +417,12 @@ def import_csv(
     fall through to the DB-side default (``DEFAULT`` clause / NULL). Used
     for forward-compatibility with new converter columns (e.g. ``extra``
     / ``role`` on ``release_track_artist`` per WXYC/discogs-etl#218).
+
+    If ``optional_unique_key`` is provided, those columns are appended to
+    ``unique_key`` for the dedup — but only the ones that are actually
+    present in this CSV's header (a subset of ``optional_csv_columns``).
+    This lets a table widen its dedup key for new converter output without
+    crashing on a legacy CSV that lacks the column (WXYC/discogs-etl#293).
     """
     logger.info(f"Importing {csv_path.name} into {table}...")
 
@@ -420,6 +449,13 @@ def import_csv(
         if present_optional:
             csv_columns = list(csv_columns) + present_optional
             db_columns = list(db_columns) + present_optional
+            # Widen the dedup key with any optional key-columns that showed up
+            # this run (WXYC/discogs-etl#293). Scoped to present_optional so a
+            # CSV lacking the column keeps the static key and never hits the
+            # ValueError from csv_columns.index() on a missing column.
+            extra_key_cols = [c for c in (optional_unique_key or []) if c in present_optional]
+            if extra_key_cols and unique_key is not None:
+                unique_key = list(unique_key) + extra_key_cols
 
         db_col_list = ", ".join(db_columns)
 
@@ -831,6 +867,7 @@ def _import_tables(
             id_filter=id_filter,
             id_filter_column=id_filter_column,
             optional_csv_columns=table_config.get("optional_csv_columns"),
+            optional_unique_key=table_config.get("optional_unique_key"),
         )
         total += count
     return total
@@ -872,6 +909,7 @@ def _import_tables_parallel(
             unique_key=table_config.get("unique_key"),
             release_id_filter=release_id_filter,
             optional_csv_columns=table_config.get("optional_csv_columns"),
+            optional_unique_key=table_config.get("optional_unique_key"),
         )
         total += count
     conn.close()
@@ -894,6 +932,7 @@ def _import_tables_parallel(
             unique_key=table_config.get("unique_key"),
             release_id_filter=release_id_filter,
             optional_csv_columns=table_config.get("optional_csv_columns"),
+            optional_unique_key=table_config.get("optional_unique_key"),
         )
         child_conn.close()
         return count
