@@ -739,6 +739,242 @@ class TestImportCsvOptionalColumns:
         assert captured_rows[0] == ("9100", "10", "Stereolab", "0")
 
 
+def _recording_conn():
+    """Build a MagicMock conn whose ``cur.copy(...)`` records the COPY SQL and
+    every written row.
+
+    Returns ``(conn, captured)`` where ``captured["sql"]`` is the COPY
+    statement and ``captured["rows"]`` is the list of written row tuples,
+    both populated as ``import_csv`` runs. Mirrors the inline
+    ``_RecordingCopy`` spy used by ``TestImportCsvOptionalColumns``.
+    """
+    from unittest.mock import MagicMock
+
+    captured: dict = {"sql": None, "rows": []}
+
+    class _RecordingCopy:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def write_row(self, row):
+            captured["rows"].append(tuple(row))
+
+    def _cur_copy(sql, *_):
+        captured["sql"] = sql
+        return _RecordingCopy()
+
+    mock_cursor = MagicMock()
+    mock_cursor.copy.side_effect = _cur_copy
+    mock_conn = MagicMock()
+    mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
+    mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+    return mock_conn, captured
+
+
+class TestImportCsvExtraDedupKey:
+    """WXYC/discogs-etl#293: the loader must keep a role-bearing ``extra=1``
+    row that collides on name with a same-release (or same-track) ``extra=0``
+    main-artist row.
+
+    The converter writes the main-artist row (``extra=0``) before the
+    extra-credit row (``extra=1``); the loader keeps the *first* occurrence of
+    each ``unique_key``. With ``extra`` absent from the key, a singer-songwriter
+    who is also ``Written-By`` lost the ``extra=1`` row — and its ``role``.
+    Widening the dedup key on ``extra`` converges the CSV->loader path (prod)
+    with the converter's direct-PG dedup (discogs-xml-converter#74's
+    ``WideArtistDedup`` / ``WideTrackArtistDedup``).
+
+    The same-name collision is the load-bearing fixture: the existing
+    optional-column tests use *two different* names (``The Orb`` / ``Alex
+    Paterson``), which never collide and so cannot reproduce the loss. These
+    tests use a self-credit collision (``Jessica Pratt`` at both ``extra=0``
+    and ``extra=1``), and pass a real ``unique_key`` so the dedup branch
+    actually runs.
+    """
+
+    def test_release_artist_keeps_same_name_extra_row(self, tmp_path) -> None:
+        """A ``release_artist`` CSV with the same name at ``extra=0`` and
+        ``extra=1`` (role) keeps **both** rows; the writer credit's ``role``
+        survives. Driven from the real config so the static ``unique_key``
+        widening is what makes this pass. RED on current ``main`` (1 row, role
+        lost), GREEN after widening the key with ``extra``."""
+        ra_config = next(t for t in BASE_TABLES if t["table"] == "release_artist")
+
+        csv_path = tmp_path / "release_artist.csv"
+        csv_path.write_text(
+            "release_id,artist_id,artist_name,extra,role\n"
+            "5512,1,Jessica Pratt,0,\n"
+            "5512,1,Jessica Pratt,1,Written-By\n"
+        )
+
+        conn, captured = _recording_conn()
+        count = import_csv(
+            conn,
+            csv_path,
+            table="release_artist",
+            csv_columns=ra_config["csv_columns"],
+            db_columns=ra_config["db_columns"],
+            required_columns=ra_config["required"],
+            transforms=ra_config["transforms"],
+            unique_key=ra_config["unique_key"],
+            optional_csv_columns=ra_config.get("optional_csv_columns"),
+        )
+
+        assert count == 2
+        assert captured["rows"][0] == ("5512", "1", "Jessica Pratt", "0", None)
+        assert captured["rows"][1] == ("5512", "1", "Jessica Pratt", "1", "Written-By")
+
+    def test_release_track_artist_keeps_same_name_extra_row(self, tmp_path) -> None:
+        """A ``release_track_artist`` CSV with the same name at one
+        ``(release_id, track_sequence)`` and both ``extra`` values keeps both
+        rows with the role preserved. Driven from the real config: the static
+        key stays ``(release_id, track_sequence, artist_name)`` and is widened
+        with ``extra`` only because the header carries it and the config opts
+        in via ``optional_unique_key``. RED on current ``main`` (no
+        ``optional_unique_key`` param / config), GREEN after."""
+        rta_config = next(t for t in TRACK_TABLES if t["table"] == "release_track_artist")
+
+        csv_path = tmp_path / "release_track_artist.csv"
+        csv_path.write_text(
+            "release_id,track_sequence,artist_name,extra,role\n"
+            "5512,3,Jessica Pratt,0,\n"
+            "5512,3,Jessica Pratt,1,Written-By\n"
+        )
+
+        conn, captured = _recording_conn()
+        count = import_csv(
+            conn,
+            csv_path,
+            table="release_track_artist",
+            csv_columns=rta_config["csv_columns"],
+            db_columns=rta_config["db_columns"],
+            required_columns=rta_config["required"],
+            transforms=rta_config["transforms"],
+            unique_key=rta_config["unique_key"],
+            optional_csv_columns=rta_config.get("optional_csv_columns"),
+            optional_unique_key=rta_config.get("optional_unique_key"),
+        )
+
+        assert count == 2
+        assert captured["rows"][0] == ("5512", "3", "Jessica Pratt", "0", None)
+        assert captured["rows"][1] == ("5512", "3", "Jessica Pratt", "1", "Written-By")
+
+    def test_release_track_artist_legacy_csv_without_extra_still_imports(self, tmp_path) -> None:
+        """The asymmetry guard: a legacy 3-column ``release_track_artist`` CSV
+        (no ``extra`` column) must still load even though the config now sets
+        ``optional_unique_key=["extra"]``. Because ``extra`` is absent from the
+        header it never joins the dedup key, so ``csv_columns.index("extra")``
+        is never reached and no ``ValueError`` is raised. The key falls back to
+        ``(release_id, track_sequence, artist_name)``, so a genuine duplicate
+        still collapses, and the COPY omits ``extra`` / ``role`` (PG defaults
+        apply). This is RED if anyone reverts the conditional path to a static
+        ``extra`` key."""
+        rta_config = next(t for t in TRACK_TABLES if t["table"] == "release_track_artist")
+
+        csv_path = tmp_path / "release_track_artist.csv"
+        csv_path.write_text(
+            "release_id,track_sequence,artist_name\n5512,3,Jessica Pratt\n5512,3,Jessica Pratt\n"
+        )
+
+        conn, captured = _recording_conn()
+        count = import_csv(
+            conn,
+            csv_path,
+            table="release_track_artist",
+            csv_columns=rta_config["csv_columns"],
+            db_columns=rta_config["db_columns"],
+            required_columns=rta_config["required"],
+            transforms=rta_config["transforms"],
+            unique_key=rta_config["unique_key"],
+            optional_csv_columns=rta_config.get("optional_csv_columns"),
+            optional_unique_key=rta_config.get("optional_unique_key"),
+        )
+
+        # Fallback dedup on (release_id, track_sequence, artist_name) collapses
+        # the two identical rows to one — no crash on the missing column.
+        assert count == 1
+        assert "extra" not in captured["sql"]
+        assert "role" not in captured["sql"]
+        assert captured["rows"][0] == ("5512", "3", "Jessica Pratt")
+
+    def test_release_artist_genuine_duplicate_still_collapses(self, tmp_path) -> None:
+        """Over-widening guard: two rows identical on ``(release_id,
+        artist_name, extra)`` are still a true duplicate and collapse to one.
+        Widening the key on ``extra`` must not turn genuine duplicates into
+        survivors."""
+        ra_config = next(t for t in BASE_TABLES if t["table"] == "release_artist")
+
+        csv_path = tmp_path / "release_artist.csv"
+        csv_path.write_text(
+            "release_id,artist_id,artist_name,extra,role\n"
+            "5512,1,Jessica Pratt,0,\n"
+            "5512,1,Jessica Pratt,0,\n"
+        )
+
+        conn, captured = _recording_conn()
+        count = import_csv(
+            conn,
+            csv_path,
+            table="release_artist",
+            csv_columns=ra_config["csv_columns"],
+            db_columns=ra_config["db_columns"],
+            required_columns=ra_config["required"],
+            transforms=ra_config["transforms"],
+            unique_key=ra_config["unique_key"],
+            optional_csv_columns=ra_config.get("optional_csv_columns"),
+        )
+
+        assert count == 1
+        assert captured["rows"][0] == ("5512", "1", "Jessica Pratt", "0", None)
+
+    def test_release_artist_different_names_kept_distinct(self, tmp_path) -> None:
+        """Sanity: two genuinely different artists at the same ``extra`` are
+        not duplicates and both survive — confirms the key was widened, not
+        broken."""
+        ra_config = next(t for t in BASE_TABLES if t["table"] == "release_artist")
+
+        csv_path = tmp_path / "release_artist.csv"
+        csv_path.write_text(
+            "release_id,artist_id,artist_name,extra,role\n"
+            "5512,1,Stereolab,0,\n"
+            "5512,2,Cat Power,0,\n"
+        )
+
+        conn, captured = _recording_conn()
+        count = import_csv(
+            conn,
+            csv_path,
+            table="release_artist",
+            csv_columns=ra_config["csv_columns"],
+            db_columns=ra_config["db_columns"],
+            required_columns=ra_config["required"],
+            transforms=ra_config["transforms"],
+            unique_key=ra_config["unique_key"],
+            optional_csv_columns=ra_config.get("optional_csv_columns"),
+        )
+
+        assert count == 2
+
+    def test_release_artist_config_unique_key_includes_extra(self) -> None:
+        """Config pin: ``release_artist`` dedups on ``extra`` so a future edit
+        that drops it from the static key trips this test rather than silently
+        reintroducing the loss. ``extra`` is a hard ``csv_columns`` entry, so
+        the static key is safe."""
+        ra_config = next(t for t in BASE_TABLES if t["table"] == "release_artist")
+        assert ra_config["unique_key"] == ["release_id", "artist_name", "extra"]
+
+    def test_release_track_artist_config_declares_optional_unique_key(self) -> None:
+        """Config pin: ``release_track_artist`` opts into widening the dedup key
+        with ``extra`` only when the column is present (the conditional path
+        that keeps legacy 3-column CSVs loading). Mirrors
+        ``WideTrackArtistDedup`` in discogs-xml-converter#74."""
+        rta_config = next(t for t in TRACK_TABLES if t["table"] == "release_track_artist")
+        assert rta_config.get("optional_unique_key") == ["extra"]
+
+
 class TestImportCsvMissingColumns:
     """import_csv reports clear errors when CSV header is missing expected columns."""
 
