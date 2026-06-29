@@ -477,6 +477,116 @@ class TestDuplicateReleaseIds:
         assert title == "DOGA"
 
 
+class TestImportCsvKeepsExtraRows:
+    """Regression for WXYC/discogs-etl#293: a same-name main-performer row
+    (``extra=0``) and a role-bearing extra-credit row (``extra=1``) both land
+    in PostgreSQL, against the real table config.
+
+    The end-to-end PG counterpart of the mocked-COPY unit tests
+    (``TestImportCsvDedupKeepsExtraRows`` in ``tests/unit/test_import_csv.py``):
+    proves the second, role-bearing row actually persists with its ``role`` in a
+    real table, not just that the loader writes two rows. Before the fix the
+    loader deduped on ``(release_id, [track_sequence,] artist_name)`` and dropped
+    the ``extra=1`` row, silently losing its ``role``."""
+
+    @pytest.fixture(autouse=True, scope="class")
+    def _set_up_database(self, db_url):
+        self.__class__._db_url = db_url
+        _clean_db(db_url)
+        conn = psycopg.connect(db_url, autocommit=True)
+        with conn.cursor() as cur:
+            cur.execute(SCHEMA_DIR.joinpath("create_database.sql").read_text())
+            # Parent release rows so the child FKs (release_id -> release.id)
+            # are satisfied.
+            cur.execute("INSERT INTO release (id, title) VALUES (9100, 'Aluminum Tunes')")
+            cur.execute("INSERT INTO release (id, title) VALUES (674529, 'DOGA')")
+        conn.close()
+
+    @pytest.fixture(autouse=True)
+    def _store_url(self):
+        self.db_url = self.__class__._db_url
+
+    def _connect(self):
+        return psycopg.connect(self.db_url)
+
+    def test_release_artist_main_and_extra_both_land_with_role(self, tmp_path) -> None:
+        """release_artist: the writer credit (extra=1, Written-By) survives
+        alongside the same-name main performer (extra=0); the role persists."""
+        csv_path = tmp_path / "release_artist.csv"
+        csv_path.write_text(
+            "release_id,artist_id,artist_name,extra,role\n"
+            "9100,10,Stereolab,0,\n"
+            "9100,10,Stereolab,1,Written-By\n"
+        )
+        ra_config = next(t for t in BASE_TABLES if t["table"] == "release_artist")
+        conn = psycopg.connect(self.db_url)
+        count = import_csv_func(
+            conn,
+            csv_path,
+            ra_config["table"],
+            ra_config["csv_columns"],
+            ra_config["db_columns"],
+            ra_config["required"],
+            ra_config["transforms"],
+            unique_key=ra_config["unique_key"],
+            optional_csv_columns=ra_config.get("optional_csv_columns"),
+        )
+        conn.close()
+
+        assert count == 2
+
+        conn = self._connect()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT extra, role FROM release_artist "
+                "WHERE release_id = 9100 AND artist_name = 'Stereolab' ORDER BY extra"
+            )
+            rows = cur.fetchall()
+        conn.close()
+        # Both the main credit (extra=0, role NULL) and the writer credit
+        # (extra=1, role 'Written-By') survive.
+        assert rows == [(0, None), (1, "Written-By")]
+
+    def test_release_track_artist_main_and_extra_both_land_with_role(self, tmp_path) -> None:
+        """release_track_artist: the same-name extra=1 (role) credit survives
+        alongside the extra=0 main credit at (release_id, track_sequence) scope.
+        ``extra`` is optional here, so the loader folds it into the dedup key
+        only because the CSV header carries it."""
+        csv_path = tmp_path / "release_track_artist.csv"
+        csv_path.write_text(
+            "release_id,track_sequence,artist_name,extra,role\n"
+            "674529,5,Alex Paterson,0,\n"
+            "674529,5,Alex Paterson,1,Producer\n"
+        )
+        rta_config = next(t for t in TRACK_TABLES if t["table"] == "release_track_artist")
+        conn = psycopg.connect(self.db_url)
+        count = import_csv_func(
+            conn,
+            csv_path,
+            rta_config["table"],
+            rta_config["csv_columns"],
+            rta_config["db_columns"],
+            rta_config["required"],
+            rta_config["transforms"],
+            unique_key=rta_config["unique_key"],
+            optional_csv_columns=rta_config.get("optional_csv_columns"),
+        )
+        conn.close()
+
+        assert count == 2
+
+        conn = self._connect()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT extra, role FROM release_track_artist "
+                "WHERE release_id = 674529 AND track_sequence = 5 "
+                "AND artist_name = 'Alex Paterson' ORDER BY extra"
+            )
+            rows = cur.fetchall()
+        conn.close()
+        assert rows == [(0, None), (1, "Producer")]
+
+
 class TestPopulateCacheMetadata:
     """Verify populate_cache_metadata() inserts metadata for all releases via COPY."""
 

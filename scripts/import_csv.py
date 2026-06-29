@@ -107,7 +107,16 @@ BASE_TABLES: list[TableConfig] = [
         "db_columns": ["release_id", "artist_id", "artist_name", "extra"],
         "required": ["release_id", "artist_name"],
         "transforms": {},
-        "unique_key": ["release_id", "artist_name"],
+        # ``extra`` is in the dedup key so a same-name main-performer row
+        # (``extra=0``) and a role-bearing extra-credit row (``extra=1``, e.g.
+        # a ``Written-By`` writer) both survive — the converter writes the
+        # ``extra=0`` row first, and a key of just ``(release_id, artist_name)``
+        # would drop the second, role-bearing row (WXYC/discogs-etl#293).
+        # ``extra`` is a hard ``csv_columns`` entry here, so the static add is
+        # crash-safe; the optional-column ``release_track_artist`` widens its
+        # key at runtime instead (see ``import_csv``). Mirrors the converter's
+        # direct-PG ``WideArtistDedup`` (WXYC/discogs-xml-converter#74).
+        "unique_key": ["release_id", "artist_name", "extra"],
         # The converter now emits the source ``<role>`` for release-level
         # extra credits (writer/composer/producer). ``role`` is listed as
         # OPTIONAL — not in the required ``csv_columns`` above — so the loader
@@ -420,6 +429,24 @@ def import_csv(
         if present_optional:
             csv_columns = list(csv_columns) + present_optional
             db_columns = list(db_columns) + present_optional
+
+            # Widen the dedup key to include ``extra`` when the CSV actually
+            # carries it, so a same-name main-performer row (``extra=0``) and a
+            # role-bearing extra-credit row (``extra=1``) both survive instead
+            # of the second being deduped away (WXYC/discogs-etl#293). This is
+            # the ``release_track_artist`` path: ``extra`` is an OPTIONAL column
+            # there, so a static add to its ``unique_key`` would ``ValueError``
+            # on a CSV that lacks the column (``csv_columns.index("extra")``
+            # below) — the exact backward-compat case ``optional_csv_columns``
+            # exists to tolerate. Adding it here, only when present, falls
+            # through to the 3-column key (and PG ``extra=0`` default) otherwise.
+            # Scoped to ``extra`` (a 0/1 flag), not ``role``, to stay converged
+            # with the converter's ``(release_id, [track_sequence,] artist_name,
+            # extra)`` key (WXYC/discogs-xml-converter#74). ``release_artist``
+            # carries ``extra`` as a hard column and lists it in its static key,
+            # so this branch is a no-op there.
+            if unique_key and "extra" in present_optional and "extra" not in unique_key:
+                unique_key = list(unique_key) + ["extra"]
 
         db_col_list = ", ".join(db_columns)
 

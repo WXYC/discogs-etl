@@ -739,6 +739,160 @@ class TestImportCsvOptionalColumns:
         assert captured_rows[0] == ("9100", "10", "Stereolab", "0")
 
 
+def _make_recording_conn():
+    """Build a MagicMock connection whose ``cursor.copy`` records the COPY SQL
+    and every written row.
+
+    Returns ``(conn, captured)`` where ``captured`` is a dict with ``"sql"``
+    (the COPY statement) and ``"rows"`` (the list of row tuples written). Keeps
+    the COPY-recording boilerplate that the optional-column tests repeat inline
+    in one place for the #293 dedup regression tests.
+    """
+    from unittest.mock import MagicMock
+
+    captured: dict = {"sql": None, "rows": []}
+
+    class _RecordingCopy:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def write_row(self, row):
+            captured["rows"].append(tuple(row))
+
+    def _cur_copy(sql, *_):
+        captured["sql"] = sql
+        return _RecordingCopy()
+
+    mock_cursor = MagicMock()
+    mock_cursor.copy.side_effect = _cur_copy
+    mock_conn = MagicMock()
+    mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
+    mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+    return mock_conn, captured
+
+
+class TestImportCsvDedupKeepsExtraRows:
+    """Regression for WXYC/discogs-etl#293: the loader dedup key must include
+    ``extra`` so a same-name main-performer row (``extra=0``) and a role-bearing
+    extra-credit row (``extra=1``) both survive.
+
+    The converter writes the ``extra=0`` row before the ``extra=1`` row, and the
+    loader keeps the first occurrence per ``unique_key``. With ``extra`` omitted
+    from the key, a person credited as both the main artist and a release- (or
+    track-) level extra — e.g. a singer-songwriter who is also ``Written-By`` —
+    loses the second, role-bearing row. Widening the key on ``extra`` mirrors the
+    converter's direct-PG ``WideArtistDedup`` / ``WideTrackArtistDedup``
+    (WXYC/discogs-xml-converter#74), converging the CSV→loader path with it.
+    """
+
+    def test_release_artist_keeps_same_name_main_and_extra_credit(self, tmp_path) -> None:
+        """``release_artist``: a same-name ``extra=0`` row and ``extra=1`` (role)
+        row both load, against the real table config; the writer role survives."""
+        ra_config = next(t for t in BASE_TABLES if t["table"] == "release_artist")
+        csv_path = tmp_path / "release_artist.csv"
+        # Same person, same name/id: credited as the main performer (extra=0)
+        # and as the release-level writer (extra=1, Written-By).
+        csv_path.write_text(
+            "release_id,artist_id,artist_name,extra,role\n"
+            "9100,10,Stereolab,0,\n"
+            "9100,10,Stereolab,1,Written-By\n"
+        )
+
+        conn, captured = _make_recording_conn()
+        count = import_csv(
+            conn,
+            csv_path,
+            table=ra_config["table"],
+            csv_columns=ra_config["csv_columns"],
+            db_columns=ra_config["db_columns"],
+            required_columns=ra_config["required"],
+            transforms=ra_config["transforms"],
+            unique_key=ra_config["unique_key"],
+            optional_csv_columns=ra_config.get("optional_csv_columns"),
+        )
+
+        assert count == 2
+        assert "release_id, artist_id, artist_name, extra, role" in captured["sql"]
+        assert captured["rows"][0] == ("9100", "10", "Stereolab", "0", None)
+        assert captured["rows"][1] == ("9100", "10", "Stereolab", "1", "Written-By")
+
+    def test_release_track_artist_keeps_same_name_main_and_extra_credit(self, tmp_path) -> None:
+        """``release_track_artist`` at ``(release_id, track_sequence)`` scope: a
+        same-name ``extra=0`` and ``extra=1`` (role) pair both survive; the
+        per-track role lives. Exercises the real config, where ``extra`` is an
+        optional column the loader must fold into the dedup key only when present."""
+        rta_config = next(t for t in TRACK_TABLES if t["table"] == "release_track_artist")
+        csv_path = tmp_path / "release_track_artist.csv"
+        csv_path.write_text(
+            "release_id,track_sequence,artist_name,extra,role\n"
+            "674529,5,Alex Paterson,0,\n"
+            "674529,5,Alex Paterson,1,Producer\n"
+        )
+
+        conn, captured = _make_recording_conn()
+        count = import_csv(
+            conn,
+            csv_path,
+            table=rta_config["table"],
+            csv_columns=rta_config["csv_columns"],
+            db_columns=rta_config["db_columns"],
+            required_columns=rta_config["required"],
+            transforms=rta_config["transforms"],
+            unique_key=rta_config["unique_key"],
+            optional_csv_columns=rta_config.get("optional_csv_columns"),
+        )
+
+        assert count == 2
+        assert "release_id, track_sequence, artist_name, extra, role" in captured["sql"]
+        assert captured["rows"][0] == ("674529", "5", "Alex Paterson", "0", None)
+        assert captured["rows"][1] == ("674529", "5", "Alex Paterson", "1", "Producer")
+
+    def test_release_track_artist_without_extra_column_dedups_three_col(self, tmp_path) -> None:
+        """A ``release_track_artist`` CSV lacking the optional ``extra`` column
+        must still load: the dedup key falls back to ``(release_id,
+        track_sequence, artist_name)`` and absent columns take the PG default.
+
+        Pins that the #293 fix widens the key on ``extra`` only when the header
+        carries it — a static add to this table's ``unique_key`` would
+        ``ValueError`` here, the exact backward-compat case ``optional_csv_columns``
+        exists to tolerate."""
+        rta_config = next(t for t in TRACK_TABLES if t["table"] == "release_track_artist")
+        csv_path = tmp_path / "release_track_artist.csv"
+        csv_path.write_text(
+            "release_id,track_sequence,artist_name\n"
+            "674529,5,Alex Paterson\n"
+            "674529,5,Alex Paterson\n"
+        )
+
+        conn, captured = _make_recording_conn()
+        count = import_csv(
+            conn,
+            csv_path,
+            table=rta_config["table"],
+            csv_columns=rta_config["csv_columns"],
+            db_columns=rta_config["db_columns"],
+            required_columns=rta_config["required"],
+            transforms=rta_config["transforms"],
+            unique_key=rta_config["unique_key"],
+            optional_csv_columns=rta_config.get("optional_csv_columns"),
+        )
+
+        # The 3-column dedup collapses the exact duplicate to a single row.
+        assert count == 1
+        assert "extra" not in captured["sql"]
+        assert captured["rows"][0] == ("674529", "5", "Alex Paterson")
+
+    def test_release_artist_unique_key_includes_extra(self) -> None:
+        """Pin the config: ``release_artist`` dedups on ``(release_id,
+        artist_name, extra)``. ``extra`` is a hard ``csv_columns`` entry here, so
+        the static key add is crash-safe (unlike the optional-column track table)."""
+        ra_config = next(t for t in BASE_TABLES if t["table"] == "release_artist")
+        assert ra_config["unique_key"] == ["release_id", "artist_name", "extra"]
+
+
 class TestImportCsvMissingColumns:
     """import_csv reports clear errors when CSV header is missing expected columns."""
 
