@@ -570,6 +570,7 @@ class TestImportCsvKeepsExtraRows:
             rta_config["transforms"],
             unique_key=rta_config["unique_key"],
             optional_csv_columns=rta_config.get("optional_csv_columns"),
+            dedup_when_present=rta_config.get("dedup_when_present"),
         )
         conn.close()
 

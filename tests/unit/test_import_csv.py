@@ -843,6 +843,7 @@ class TestImportCsvDedupKeepsExtraRows:
             transforms=rta_config["transforms"],
             unique_key=rta_config["unique_key"],
             optional_csv_columns=rta_config.get("optional_csv_columns"),
+            dedup_when_present=rta_config.get("dedup_when_present"),
         )
 
         assert count == 2
@@ -856,9 +857,11 @@ class TestImportCsvDedupKeepsExtraRows:
         track_sequence, artist_name)`` and absent columns take the PG default.
 
         Pins that the #293 fix widens the key on ``extra`` only when the header
-        carries it — a static add to this table's ``unique_key`` would
-        ``ValueError`` here, the exact backward-compat case ``optional_csv_columns``
-        exists to tolerate."""
+        carries it — declaring ``extra`` in this table's static ``unique_key``
+        would ``ValueError`` here, the exact backward-compat case the
+        ``dedup_when_present`` widening exists to tolerate. The config field is
+        passed exactly as the real call sites do, so the fall-back is exercised
+        through the production path."""
         rta_config = next(t for t in TRACK_TABLES if t["table"] == "release_track_artist")
         csv_path = tmp_path / "release_track_artist.csv"
         csv_path.write_text(
@@ -878,6 +881,7 @@ class TestImportCsvDedupKeepsExtraRows:
             transforms=rta_config["transforms"],
             unique_key=rta_config["unique_key"],
             optional_csv_columns=rta_config.get("optional_csv_columns"),
+            dedup_when_present=rta_config.get("dedup_when_present"),
         )
 
         # The 3-column dedup collapses the exact duplicate to a single row.
@@ -891,6 +895,67 @@ class TestImportCsvDedupKeepsExtraRows:
         the static key add is crash-safe (unlike the optional-column track table)."""
         ra_config = next(t for t in BASE_TABLES if t["table"] == "release_artist")
         assert ra_config["unique_key"] == ["release_id", "artist_name", "extra"]
+
+    def test_release_track_artist_declares_extra_as_dedup_when_present(self) -> None:
+        """Pin the config: ``release_track_artist`` declares ``extra`` in
+        ``dedup_when_present`` so the loader folds it into the dedup key at
+        runtime (only when the header carries it), keeping the static
+        ``unique_key`` at the 3-column backward-compatible form. The widening is
+        config-declared, not a column name the loader hardcodes."""
+        rta_config = next(t for t in TRACK_TABLES if t["table"] == "release_track_artist")
+        assert rta_config["dedup_when_present"] == ["extra"]
+        assert "extra" not in rta_config["unique_key"]
+
+    def test_dedup_when_present_widens_key_generically(self, tmp_path) -> None:
+        """The loader widens the dedup key from ``dedup_when_present`` for any
+        declared column the header carries — it does not special-case the name
+        ``extra``. Drive it with a synthetic column ``flag`` to prove the
+        mechanism is generic: two rows identical but for ``flag`` both survive."""
+        csv_path = tmp_path / "widen.csv"
+        csv_path.write_text("release_id,artist_name,flag\n9100,Stereolab,a\n9100,Stereolab,b\n")
+
+        conn, captured = _make_recording_conn()
+        count = import_csv(
+            conn,
+            csv_path,
+            table="release_artist",
+            csv_columns=["release_id", "artist_name"],
+            db_columns=["release_id", "artist_name"],
+            required_columns=["release_id", "artist_name"],
+            transforms={},
+            unique_key=["release_id", "artist_name"],
+            optional_csv_columns=["flag"],
+            dedup_when_present=["flag"],
+        )
+
+        assert count == 2
+        assert captured["rows"][0] == ("9100", "Stereolab", "a")
+        assert captured["rows"][1] == ("9100", "Stereolab", "b")
+
+    def test_dedup_when_present_absent_column_keeps_narrow_key(self, tmp_path) -> None:
+        """A column declared in ``dedup_when_present`` but missing from the CSV
+        header must not widen the key: the loader falls back to the static
+        ``unique_key`` and collapses the exact duplicate. Mirrors the
+        backward-compat path for a pre-``extra`` ``release_track_artist`` CSV."""
+        csv_path = tmp_path / "narrow.csv"
+        csv_path.write_text("release_id,artist_name\n9100,Stereolab\n9100,Stereolab\n")
+
+        conn, captured = _make_recording_conn()
+        count = import_csv(
+            conn,
+            csv_path,
+            table="release_artist",
+            csv_columns=["release_id", "artist_name"],
+            db_columns=["release_id", "artist_name"],
+            required_columns=["release_id", "artist_name"],
+            transforms={},
+            unique_key=["release_id", "artist_name"],
+            optional_csv_columns=["flag"],
+            dedup_when_present=["flag"],
+        )
+
+        assert count == 1
+        assert captured["rows"][0] == ("9100", "Stereolab")
 
 
 class TestImportCsvMissingColumns:
