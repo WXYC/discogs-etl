@@ -522,8 +522,6 @@ class TestImportCsvOptionalColumns:
     def test_new_csv_with_optional_columns_appends_them_to_copy(self, tmp_path) -> None:
         """When the CSV header carries the optional columns, they are
         appended to the COPY column list and the values are written."""
-        from unittest.mock import MagicMock
-
         csv_path = tmp_path / "release_track_artist.csv"
         csv_path.write_text(
             "release_id,track_sequence,artist_name,extra,role\n"
@@ -531,31 +529,9 @@ class TestImportCsvOptionalColumns:
             "674529,5,Alex Paterson,1,Producer\n"
         )
 
-        captured_columns: dict[str, str] = {}
-        captured_rows: list[tuple] = []
-
-        class _RecordingCopy:
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *exc):
-                return False
-
-            def write_row(self, row):
-                captured_rows.append(tuple(row))
-
-        def _cur_copy(sql, *_):
-            captured_columns["sql"] = sql
-            return _RecordingCopy()
-
-        mock_cursor = MagicMock()
-        mock_cursor.copy.side_effect = _cur_copy
-        mock_conn = MagicMock()
-        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
-        mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
-
+        conn, captured = _recording_conn()
         count = import_csv(
-            mock_conn,
+            conn,
             csv_path,
             table="release_track_artist",
             csv_columns=["release_id", "track_sequence", "artist_name"],
@@ -567,45 +543,21 @@ class TestImportCsvOptionalColumns:
 
         assert count == 2
         # COPY SQL lists the optional columns
-        assert "release_id, track_sequence, artist_name, extra, role" in captured_columns["sql"]
+        assert "release_id, track_sequence, artist_name, extra, role" in captured["sql"]
         # Row values include the extra/role data
-        assert captured_rows[0] == ("674529", "5", "The Orb", "0", None)
-        assert captured_rows[1] == ("674529", "5", "Alex Paterson", "1", "Producer")
+        assert captured["rows"][0] == ("674529", "5", "The Orb", "0", None)
+        assert captured["rows"][1] == ("674529", "5", "Alex Paterson", "1", "Producer")
 
     def test_legacy_csv_without_optional_columns_still_imports(self, tmp_path) -> None:
         """A 3-column CSV from a pre-#55 converter must still load. The
         loader drops the optional columns from the COPY so the PG defaults
         (``extra=0``, ``role=NULL``) take over for absent values."""
-        from unittest.mock import MagicMock
-
         csv_path = tmp_path / "release_track_artist.csv"
         csv_path.write_text("release_id,track_sequence,artist_name\n674529,5,Alex Paterson\n")
 
-        captured_columns: dict[str, str] = {}
-        captured_rows: list[tuple] = []
-
-        class _RecordingCopy:
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *exc):
-                return False
-
-            def write_row(self, row):
-                captured_rows.append(tuple(row))
-
-        def _cur_copy(sql, *_):
-            captured_columns["sql"] = sql
-            return _RecordingCopy()
-
-        mock_cursor = MagicMock()
-        mock_cursor.copy.side_effect = _cur_copy
-        mock_conn = MagicMock()
-        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
-        mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
-
+        conn, captured = _recording_conn()
         count = import_csv(
-            mock_conn,
+            conn,
             csv_path,
             table="release_track_artist",
             csv_columns=["release_id", "track_sequence", "artist_name"],
@@ -617,10 +569,10 @@ class TestImportCsvOptionalColumns:
 
         assert count == 1
         # COPY SQL omits the optional columns; PG defaults take over.
-        assert "extra" not in captured_columns["sql"]
-        assert "role" not in captured_columns["sql"]
+        assert "extra" not in captured["sql"]
+        assert "role" not in captured["sql"]
         # Row has only the 3 base columns.
-        assert captured_rows[0] == ("674529", "5", "Alex Paterson")
+        assert captured["rows"][0] == ("674529", "5", "Alex Paterson")
 
     def test_release_track_artist_table_config_declares_extra_and_role(self) -> None:
         """Pin that the table config opts into the optional columns. If a
@@ -635,8 +587,6 @@ class TestImportCsvOptionalColumns:
         an empty role coerces to NULL, and main artists (extra=0) carry none.
         This is the release-level analogue of the per-track case above
         (WXYC/library-metadata-lookup#699)."""
-        from unittest.mock import MagicMock
-
         csv_path = tmp_path / "release_artist.csv"
         csv_path.write_text(
             "release_id,artist_id,artist_name,extra,role\n"
@@ -644,31 +594,9 @@ class TestImportCsvOptionalColumns:
             "9100,20,Tim Gane,1,Written-By\n"
         )
 
-        captured_columns: dict[str, str] = {}
-        captured_rows: list[tuple] = []
-
-        class _RecordingCopy:
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *exc):
-                return False
-
-            def write_row(self, row):
-                captured_rows.append(tuple(row))
-
-        def _cur_copy(sql, *_):
-            captured_columns["sql"] = sql
-            return _RecordingCopy()
-
-        mock_cursor = MagicMock()
-        mock_cursor.copy.side_effect = _cur_copy
-        mock_conn = MagicMock()
-        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
-        mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
-
+        conn, captured = _recording_conn()
         count = import_csv(
-            mock_conn,
+            conn,
             csv_path,
             table="release_artist",
             csv_columns=["release_id", "artist_id", "artist_name", "extra"],
@@ -680,10 +608,10 @@ class TestImportCsvOptionalColumns:
 
         assert count == 2
         # COPY SQL lists the optional role column.
-        assert "release_id, artist_id, artist_name, extra, role" in captured_columns["sql"]
+        assert "release_id, artist_id, artist_name, extra, role" in captured["sql"]
         # Main artist: empty role → NULL. Writer credit: source role preserved.
-        assert captured_rows[0] == ("9100", "10", "Stereolab", "0", None)
-        assert captured_rows[1] == ("9100", "20", "Tim Gane", "1", "Written-By")
+        assert captured["rows"][0] == ("9100", "10", "Stereolab", "0", None)
+        assert captured["rows"][1] == ("9100", "20", "Tim Gane", "1", "Written-By")
 
     def test_legacy_release_artist_csv_without_role_still_imports(self, tmp_path) -> None:
         """A pre-role ``release_artist`` CSV (no ``role`` column) must still
@@ -693,36 +621,12 @@ class TestImportCsvOptionalColumns:
         ``release_artist`` empty in the 2026-05-13 rebuild, pinned at the
         behavioral level (the config-pin tests above never run the loader).
         Release-level analogue of ``test_legacy_csv_without_optional_columns_still_imports``."""
-        from unittest.mock import MagicMock
-
         csv_path = tmp_path / "release_artist.csv"
         csv_path.write_text("release_id,artist_id,artist_name,extra\n9100,10,Stereolab,0\n")
 
-        captured_columns: dict[str, str] = {}
-        captured_rows: list[tuple] = []
-
-        class _RecordingCopy:
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *exc):
-                return False
-
-            def write_row(self, row):
-                captured_rows.append(tuple(row))
-
-        def _cur_copy(sql, *_):
-            captured_columns["sql"] = sql
-            return _RecordingCopy()
-
-        mock_cursor = MagicMock()
-        mock_cursor.copy.side_effect = _cur_copy
-        mock_conn = MagicMock()
-        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
-        mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
-
+        conn, captured = _recording_conn()
         count = import_csv(
-            mock_conn,
+            conn,
             csv_path,
             table="release_artist",
             csv_columns=["release_id", "artist_id", "artist_name", "extra"],
@@ -734,9 +638,9 @@ class TestImportCsvOptionalColumns:
 
         assert count == 1
         # COPY SQL omits the absent optional column; the schema NULL default takes over.
-        assert "role" not in captured_columns["sql"]
+        assert "role" not in captured["sql"]
         # Row has only the 4 base columns.
-        assert captured_rows[0] == ("9100", "10", "Stereolab", "0")
+        assert captured["rows"][0] == ("9100", "10", "Stereolab", "0")
 
 
 def _recording_conn():
@@ -833,8 +737,15 @@ class TestImportCsvExtraDedupKey:
         rows with the role preserved. Driven from the real config: the static
         key stays ``(release_id, track_sequence, artist_name)`` and is widened
         with ``extra`` only because the header carries it and the config opts
-        in via ``optional_unique_key``. RED on current ``main`` (no
-        ``optional_unique_key`` param / config), GREEN after."""
+        in via ``optional_unique_key``.
+
+        Note the RED differs from the ``release_artist`` case: on current
+        ``main`` this raises ``TypeError`` (the ``optional_unique_key`` param
+        does not exist yet), so it is the *missing param*, not the data loss,
+        that reds here. What it pins going forward is the conditional widening
+        itself — drop that logic but keep the param (a partial revert) and the
+        key falls back to ``(release_id, track_sequence, artist_name)``, the
+        two rows collapse, and ``assert count == 2`` fails."""
         rta_config = next(t for t in TRACK_TABLES if t["table"] == "release_track_artist")
 
         csv_path = tmp_path / "release_track_artist.csv"
@@ -901,17 +812,21 @@ class TestImportCsvExtraDedupKey:
         assert captured["rows"][0] == ("5512", "3", "Jessica Pratt")
 
     def test_release_artist_genuine_duplicate_still_collapses(self, tmp_path) -> None:
-        """Over-widening guard: two rows identical on ``(release_id,
-        artist_name, extra)`` are still a true duplicate and collapse to one.
-        Widening the key on ``extra`` must not turn genuine duplicates into
-        survivors."""
+        """Over-widening guard: two rows identical on the key ``(release_id,
+        artist_name, extra)`` collapse to one, keeping the first. The two rows
+        deliberately *differ* on the non-key columns ``artist_id`` (1 vs 2) and
+        ``role`` (``Vocals`` vs ``Guitar``) so that widening the key onto
+        either of those columns by mistake would split them into two rows and
+        fail this test — i.e. this catches over-widening on a column whose
+        value varies, not just on ``extra`` (which is constant here and already
+        in the key)."""
         ra_config = next(t for t in BASE_TABLES if t["table"] == "release_artist")
 
         csv_path = tmp_path / "release_artist.csv"
         csv_path.write_text(
             "release_id,artist_id,artist_name,extra,role\n"
-            "5512,1,Jessica Pratt,0,\n"
-            "5512,1,Jessica Pratt,0,\n"
+            "5512,1,Jessica Pratt,0,Vocals\n"
+            "5512,2,Jessica Pratt,0,Guitar\n"
         )
 
         conn, captured = _recording_conn()
@@ -928,7 +843,8 @@ class TestImportCsvExtraDedupKey:
         )
 
         assert count == 1
-        assert captured["rows"][0] == ("5512", "1", "Jessica Pratt", "0", None)
+        # First occurrence wins: the ``artist_id=1`` / ``role=Vocals`` row.
+        assert captured["rows"][0] == ("5512", "1", "Jessica Pratt", "0", "Vocals")
 
     def test_release_artist_different_names_kept_distinct(self, tmp_path) -> None:
         """Sanity: two genuinely different artists at the same ``extra`` are
@@ -956,7 +872,11 @@ class TestImportCsvExtraDedupKey:
             optional_csv_columns=ra_config.get("optional_csv_columns"),
         )
 
+        # Both distinct artists survive intact — assert the rows, not just the
+        # count, so a bug that wrote one row twice or mangled a name is caught.
         assert count == 2
+        assert captured["rows"][0] == ("5512", "1", "Stereolab", "0", None)
+        assert captured["rows"][1] == ("5512", "2", "Cat Power", "0", None)
 
     def test_release_artist_config_unique_key_includes_extra(self) -> None:
         """Config pin: ``release_artist`` dedups on ``extra`` so a future edit
