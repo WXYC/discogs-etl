@@ -100,6 +100,21 @@ gh auth status
 
 Or set `GH_TOKEN` in the env file (next step).
 
+> **Token expiry is a recurring failure mode — set a reminder.** `GH_TOKEN` is a
+> PAT and expires. When it does, `gh release download` fails with `HTTP 401: Bad
+> credentials` and the rebuild exits before touching the DB (an expired token is
+> *worse* than no token — `gh` sends the bad credential instead of falling back
+> to anonymous access, so even public-repo downloads 401). Nothing alarms on
+> impending expiry, so an expired token silently blocks every monthly tick until
+> someone reads the `:warning:` Slack post or the S3 log. Use a fine-grained PAT
+> with `contents: read` on both `WXYC/library-metadata-lookup` (the
+> `streaming-data-v1` library.db asset) and `WXYC/discogs-xml-converter` (the
+> prebuilt-binary release), and **add a calendar reminder to rotate it a week
+> before it expires.** For the **ephemeral path** the token lives in SSM at
+> `/wxyc/discogs-rebuild/GH_TOKEN` (a SecureString), not in the env file below —
+> rotate it there. See the 401 troubleshooting entry below and
+> [discogs-etl#296](https://github.com/WXYC/discogs-etl/issues/296).
+
 ### 4. Provision secrets
 
 Create `/etc/discogs-rebuild.env` (root-readable only) with:
@@ -226,6 +241,23 @@ or by `rm`-ing the file).
 
 The trap fires before the `tee` redirect could write anything. Run
 manually to see stderr.
+
+### `gh release download` fails with `HTTP 401: Bad credentials`
+
+The `GH_TOKEN` is expired or invalid. An expired PAT makes `gh` send a bad
+credential and get 401 rather than falling back to anonymous access, so this
+fails even against public repos. Rotate the token:
+
+- **Ephemeral path:** replace the SSM SecureString at
+  `/wxyc/discogs-rebuild/GH_TOKEN` with a fresh fine-grained PAT
+  (`contents: read` on `WXYC/library-metadata-lookup` +
+  `WXYC/discogs-xml-converter`), then re-trigger the rebuild.
+- **Legacy path:** update `GH_TOKEN` in `/etc/discogs-rebuild.env`, or re-run
+  `gh auth login --with-token`.
+
+This was the 2026-07-04 failure mode
+([discogs-etl#296](https://github.com/WXYC/discogs-etl/issues/296)); see also the
+token-expiry note under step 3.
 
 ### `gh release download` fails with "release asset not found"
 
