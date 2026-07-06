@@ -33,6 +33,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import psycopg
@@ -60,6 +61,16 @@ SCHEMA_DIR = SCRIPT_DIR.parent / "schema"
 
 # Maximum seconds to wait for Postgres to become ready.
 PG_CONNECT_TIMEOUT = 30
+
+# Minimum fraction of ``release`` rows that must be covered by child-table
+# rows for the reload invariant to hold (discogs-etl#298). Every Discogs
+# release carries >=1 artist credit and (essentially) a tracklist, so a healthy
+# WXYC-filtered cache sits near 100% coverage for both children. The documented
+# catastrophe — a partial-rebuild abort that TRUNCATEd the children but never
+# reloaded them — was 0.7%. This floor sits comfortably between, so it catches
+# the empty-index state without false-positiving a legitimate rebuild (a false
+# positive would hard-fail the whole monthly rebuild).
+MIN_CHILD_COVERAGE_RATIO = 0.5
 
 # Tables managed by the pipeline (shared by run_vacuum, set_tables_unlogged,
 # set_tables_logged).
@@ -533,6 +544,170 @@ def report_sizes(db_url: str) -> None:
         for row in cur.fetchall():
             logger.info("  %-25s %10s rows   %s", row[0], f"{row[1]:,}", row[2])
     conn.close()
+
+
+@dataclass(frozen=True)
+class ReloadInvariantResult:
+    """Outcome of the release-vs-children reload invariant (discogs-etl#298).
+
+    Attributes:
+        ok: True when child coverage meets the floor (or the cache is empty).
+        release_count: rows in ``release``.
+        artist_coverage: distinct-release coverage of ``release_artist``
+            (``distinct release_id / release_count``), or ``None`` when the
+            cache is empty and coverage is undefined.
+        track_coverage: distinct-release coverage of ``release_track``, or
+            ``None`` when undefined.
+        reason: human-readable explanation naming the offending child
+            table(s); empty string when ``ok``.
+    """
+
+    ok: bool
+    release_count: int
+    artist_coverage: float | None
+    track_coverage: float | None
+    reason: str = ""
+
+
+def evaluate_reload_invariant(
+    *,
+    release_count: int,
+    artist_release_count: int,
+    track_release_count: int,
+    min_ratio: float = MIN_CHILD_COVERAGE_RATIO,
+) -> ReloadInvariantResult:
+    """Decide whether the ``release_*`` children cover enough of ``release``.
+
+    A partial-rebuild abort can leave ``release`` fully populated while the
+    child tables sit empty (they are TRUNCATEd up front, then reloaded across
+    later steps). This compares each child's distinct-release coverage against
+    ``release`` and flags the state when either falls below ``min_ratio``.
+
+    An empty cache (``release_count <= 0``) is a legitimate state — a fresh or
+    pre-import DB, or a ``--fresh-rebuild`` — so the invariant holds trivially.
+
+    Args:
+        release_count: rows in ``release``.
+        artist_release_count: distinct ``release_id`` in ``release_artist``.
+        track_release_count: distinct ``release_id`` in ``release_track``.
+        min_ratio: minimum acceptable ``child_releases / release_count``.
+
+    Returns:
+        A ``ReloadInvariantResult``.
+    """
+    if release_count <= 0:
+        return ReloadInvariantResult(
+            ok=True, release_count=release_count, artist_coverage=None, track_coverage=None
+        )
+
+    artist_coverage = artist_release_count / release_count
+    track_coverage = track_release_count / release_count
+
+    problems: list[str] = []
+    if artist_coverage < min_ratio:
+        problems.append(
+            f"release_artist covers {artist_coverage:.1%} of releases "
+            f"({artist_release_count:,}/{release_count:,})"
+        )
+    if track_coverage < min_ratio:
+        problems.append(
+            f"release_track covers {track_coverage:.1%} of releases "
+            f"({track_release_count:,}/{release_count:,})"
+        )
+
+    if problems:
+        return ReloadInvariantResult(
+            ok=False,
+            release_count=release_count,
+            artist_coverage=artist_coverage,
+            track_coverage=track_coverage,
+            reason=(
+                "; ".join(problems)
+                + f" — below the {min_ratio:.0%} floor. A partial-rebuild abort "
+                "likely TRUNCATEd the release_* children without reloading them."
+            ),
+        )
+
+    return ReloadInvariantResult(
+        ok=True,
+        release_count=release_count,
+        artist_coverage=artist_coverage,
+        track_coverage=track_coverage,
+    )
+
+
+def count_child_coverage(db_url: str) -> tuple[int, int, int]:
+    """Return ``(release_count, artist_release_count, track_release_count)``.
+
+    ``artist_release_count`` / ``track_release_count`` are the distinct
+    ``release_id`` counts in ``release_artist`` / ``release_track``. When the
+    ``release`` table does not exist yet (a fresh DB, before create_schema),
+    returns ``(0, 0, 0)`` so the preflight can run unconditionally.
+
+    Queries scan indexed columns on a ≤~260K-release cache — sub-second.
+    """
+    conn = psycopg.connect(db_url)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT to_regclass('release')")
+            if cur.fetchone()[0] is None:
+                return (0, 0, 0)
+            cur.execute("SELECT count(*) FROM release")
+            release_count = cur.fetchone()[0]
+            cur.execute("SELECT count(DISTINCT release_id) FROM release_artist")
+            artist_release_count = cur.fetchone()[0]
+            cur.execute("SELECT count(DISTINCT release_id) FROM release_track")
+            track_release_count = cur.fetchone()[0]
+            return (release_count, artist_release_count, track_release_count)
+    finally:
+        conn.close()
+
+
+def check_reload_invariant(
+    db_url: str,
+    *,
+    raise_on_violation: bool,
+    min_ratio: float = MIN_CHILD_COVERAGE_RATIO,
+) -> ReloadInvariantResult:
+    """Read child coverage and enforce the reload invariant (discogs-etl#298).
+
+    ``raise_on_violation`` picks the failure mode:
+
+    * ``False`` (preflight, before the truncating base step): a violation
+      means a *prior* run left the ``release``-full / children-empty state.
+      This run is about to repopulate, so we log a loud WARNING (operators
+      see recovery is happening) and continue.
+    * ``True`` (post-reload gate, before ``report_sizes`` / the success
+      notification): a violation means *this* run finished with an empty
+      index — e.g. an empty/missing tracks CSV COPYed as zero rows. Raise so
+      the run fails before it reports success.
+    """
+    release_count, artist_release_count, track_release_count = count_child_coverage(db_url)
+    result = evaluate_reload_invariant(
+        release_count=release_count,
+        artist_release_count=artist_release_count,
+        track_release_count=track_release_count,
+        min_ratio=min_ratio,
+    )
+    if result.ok:
+        logger.info(
+            "reload invariant healthy: release=%d artist_cov=%s track_cov=%s",
+            result.release_count,
+            f"{result.artist_coverage:.1%}" if result.artist_coverage is not None else "n/a",
+            f"{result.track_coverage:.1%}" if result.track_coverage is not None else "n/a",
+            extra={"step": "reload_invariant"},
+        )
+        return result
+
+    if raise_on_violation:
+        raise RuntimeError(f"[#298] cache reload invariant violated: {result.reason}")
+
+    logger.warning(
+        "[#298] cache reload invariant violated on entry (recovering this run): %s",
+        result.reason,
+        extra={"step": "reload_invariant"},
+    )
+    return result
 
 
 def convert_and_filter(
@@ -1013,6 +1188,9 @@ def _run_database_build_post_import(
     # -- set_tables_logged (restore WAL durability for consumers)
     set_tables_logged(db_url)
 
+    # -- reload-invariant gate (discogs-etl#298) — see _run_database_build.
+    check_reload_invariant(db_url, raise_on_violation=True)
+
     # -- report
     report_sizes(db_url)
 
@@ -1078,6 +1256,16 @@ def _run_database_build(
         if state:
             state.mark_completed("create_schema")
             _save_state()
+
+    # -- reload-invariant preflight (discogs-etl#298)
+    # The base step below TRUNCATEs the release_* children in a committed
+    # transaction, then reloads them across several later steps. Before we do
+    # that, check whether the *current* DB is already in the release-full /
+    # children-empty state a prior partial-rebuild abort would have left. We
+    # warn rather than raise — this run is about to repopulate — so operators
+    # see that recovery is under way. Runs after create_schema so the tables
+    # exist; count_child_coverage tolerates a not-yet-created schema anyway.
+    check_reload_invariant(db_url, raise_on_violation=False)
 
     # -- set_tables_unlogged (skip WAL writes during bulk import)
     set_tables_unlogged(db_url)
@@ -1272,6 +1460,15 @@ def _run_database_build(
         if state:
             state.mark_completed("set_logged")
             _save_state()
+
+    # -- reload-invariant gate (discogs-etl#298)
+    # Final check on the state consumers will read (the target DB in copy-to
+    # mode, else the source). If release is populated but the children are
+    # empty — e.g. an empty/missing tracks CSV COPYed as zero rows without
+    # error — raise before report_sizes so the run fails loudly instead of
+    # reporting success with an empty track/artist index. Always runs (even on
+    # a fully-resumed build) as a last sanity gate.
+    check_reload_invariant(vacuum_db, raise_on_violation=True)
 
     # -- report
     report_sizes(vacuum_db)
