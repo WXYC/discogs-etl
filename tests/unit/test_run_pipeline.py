@@ -18,6 +18,10 @@ _spec = importlib.util.spec_from_file_location(
     Path(__file__).parent.parent.parent / "scripts" / "run_pipeline.py",
 )
 run_pipeline = importlib.util.module_from_spec(_spec)
+# Register before exec so the module's @dataclass definitions resolve their
+# own __module__ (dataclasses looks it up in sys.modules under
+# `from __future__ import annotations`). Mirrors test_check_cache_drift.py.
+sys.modules["run_pipeline"] = run_pipeline
 _spec.loader.exec_module(run_pipeline)
 
 run_sql_statements_parallel = run_pipeline.run_sql_statements_parallel
@@ -1307,3 +1311,294 @@ class TestParseArgsValidation:
                     "--pair-filter",
                 ]
             )
+
+
+# ---------------------------------------------------------------------------
+# Reload invariant (discogs-etl#298)
+#
+# The base stage TRUNCATEs the release_* child tables in a committed
+# transaction, then reloads them across several later subprocess steps. A run
+# that aborts (or silently COPYs an empty tracks CSV) can leave `release` full
+# while release_artist / release_track are empty — the 0.7%-coverage prod state
+# #298 documents. These guard against that going undetected.
+# ---------------------------------------------------------------------------
+
+
+class TestEvaluateReloadInvariant:
+    """Pure decision logic: child-table release coverage vs the release count."""
+
+    def test_default_min_ratio_is_half(self) -> None:
+        """The floor sits between the 0.7% catastrophe and ~100% healthy."""
+        assert run_pipeline.MIN_CHILD_COVERAGE_RATIO == 0.5
+
+    def test_healthy_cache_is_ok(self) -> None:
+        result = run_pipeline.evaluate_reload_invariant(
+            release_count=258_990,
+            artist_release_count=258_990,
+            track_release_count=248_000,
+        )
+        assert result.ok
+        assert result.reason == ""
+
+    def test_empty_cache_is_ok(self) -> None:
+        """release_count == 0 is a legitimate state (fresh / pre-import DB)."""
+        result = run_pipeline.evaluate_reload_invariant(
+            release_count=0, artist_release_count=0, track_release_count=0
+        )
+        assert result.ok
+        # coverage is undefined when there are no releases to cover
+        assert result.artist_coverage is None
+        assert result.track_coverage is None
+
+    def test_prod_degraded_state_fails_naming_both_children(self) -> None:
+        """The exact #298 state: 1,839 of 258,990 releases have child rows."""
+        result = run_pipeline.evaluate_reload_invariant(
+            release_count=258_990,
+            artist_release_count=1_839,
+            track_release_count=1_839,
+        )
+        assert not result.ok
+        assert "release_artist" in result.reason
+        assert "release_track" in result.reason
+
+    def test_track_empty_but_artist_full_fails_naming_only_track(self) -> None:
+        result = run_pipeline.evaluate_reload_invariant(
+            release_count=250_000,
+            artist_release_count=250_000,
+            track_release_count=1_000,
+        )
+        assert not result.ok
+        assert "release_track" in result.reason
+        assert "release_artist" not in result.reason
+
+    def test_boundary_at_ratio_is_ok(self) -> None:
+        """Exactly at the floor passes (>= min_ratio)."""
+        result = run_pipeline.evaluate_reload_invariant(
+            release_count=1_000,
+            artist_release_count=500,
+            track_release_count=500,
+            min_ratio=0.5,
+        )
+        assert result.ok
+
+    def test_just_below_ratio_fails(self) -> None:
+        result = run_pipeline.evaluate_reload_invariant(
+            release_count=1_000,
+            artist_release_count=499,
+            track_release_count=1_000,
+            min_ratio=0.5,
+        )
+        assert not result.ok
+        assert "release_artist" in result.reason
+
+    def test_coverage_fields_populated(self) -> None:
+        result = run_pipeline.evaluate_reload_invariant(
+            release_count=1_000,
+            artist_release_count=900,
+            track_release_count=800,
+        )
+        assert result.release_count == 1_000
+        assert result.artist_coverage == pytest.approx(0.9)
+        assert result.track_coverage == pytest.approx(0.8)
+
+
+class TestCountChildCoverage:
+    """count_child_coverage() reads (release, artist-releases, track-releases)."""
+
+    def _mock_conn(self, fetchone_side_effect):
+        mock_cursor = MagicMock()
+        mock_cursor.fetchone.side_effect = fetchone_side_effect
+        mock_conn = MagicMock()
+        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
+        mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+        return mock_conn
+
+    def test_missing_release_table_returns_zeros(self) -> None:
+        """A fresh DB (release table absent) short-circuits to (0, 0, 0) so the
+        preflight can run before create_schema without erroring."""
+        mock_conn = self._mock_conn([[None]])  # to_regclass('release') IS NULL
+        with patch.object(run_pipeline.psycopg, "connect", return_value=mock_conn):
+            assert run_pipeline.count_child_coverage("postgresql:///t") == (0, 0, 0)
+        mock_conn.close.assert_called_once()
+
+    def test_counts_returned_when_table_present(self) -> None:
+        mock_conn = self._mock_conn(
+            [["release"], [1_000], [900], [800]]  # regclass, release, artist, track
+        )
+        with patch.object(run_pipeline.psycopg, "connect", return_value=mock_conn):
+            assert run_pipeline.count_child_coverage("postgresql:///t") == (1_000, 900, 800)
+        mock_conn.close.assert_called_once()
+
+
+class TestCheckReloadInvariant:
+    """check_reload_invariant() warns (preflight) or raises (post-reload)."""
+
+    def test_violation_raises_when_strict(self) -> None:
+        with patch.object(
+            run_pipeline, "count_child_coverage", return_value=(258_990, 1_839, 1_839)
+        ):
+            with pytest.raises(RuntimeError, match="invariant"):
+                run_pipeline.check_reload_invariant("postgresql:///t", raise_on_violation=True)
+
+    def test_violation_warns_when_not_strict(self, caplog) -> None:
+        with (
+            patch.object(
+                run_pipeline, "count_child_coverage", return_value=(258_990, 1_839, 1_839)
+            ),
+            caplog.at_level(logging.WARNING, logger=run_pipeline.logger.name),
+        ):
+            result = run_pipeline.check_reload_invariant(
+                "postgresql:///t", raise_on_violation=False
+            )
+        assert not result.ok
+        assert any("invariant" in r.message for r in caplog.records)
+
+    def test_healthy_never_raises(self) -> None:
+        with patch.object(run_pipeline, "count_child_coverage", return_value=(1_000, 1_000, 990)):
+            result = run_pipeline.check_reload_invariant("postgresql:///t", raise_on_violation=True)
+        assert result.ok
+
+    def test_missing_table_is_ok_even_when_strict(self) -> None:
+        with patch.object(run_pipeline, "count_child_coverage", return_value=(0, 0, 0)):
+            result = run_pipeline.check_reload_invariant("postgresql:///t", raise_on_violation=True)
+        assert result.ok
+
+
+class TestReloadInvariantWiring:
+    """_run_database_build brackets the reload with a preflight (warn) before
+    the truncating base step and a strict post-reload gate before report_sizes.
+    """
+
+    def _run_capturing_order(self, *, check_side_effect=None, events=None):
+        import psycopg
+
+        if events is None:
+            events = []
+
+        def fake_run_step(name, cmd, *a, **k):
+            events.append(("run_step", cmd))
+
+        def default_check(db_url, *, raise_on_violation, **k):
+            events.append(("check", raise_on_violation))
+            return run_pipeline.ReloadInvariantResult(
+                ok=True, release_count=1, artist_coverage=1.0, track_coverage=1.0
+            )
+
+        def fake_report(db_url):
+            events.append(("report", db_url))
+
+        mock_cursor = MagicMock()
+        mock_cursor.fetchone.return_value = [True]
+        mock_cursor.fetchall.return_value = [
+            ("idx_release_artist_name_trgm",),
+            ("idx_release_title_trgm",),
+        ]
+        mock_conn = MagicMock()
+        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
+        mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+
+        with (
+            patch.object(run_pipeline, "run_step", side_effect=fake_run_step),
+            patch.object(
+                run_pipeline,
+                "check_reload_invariant",
+                side_effect=check_side_effect or default_check,
+            ),
+            patch.object(run_pipeline, "wait_for_postgres"),
+            patch.object(run_pipeline, "run_sql_file"),
+            patch.object(run_pipeline, "run_sql_statements_parallel"),
+            patch.object(run_pipeline, "set_tables_unlogged"),
+            patch.object(run_pipeline, "set_tables_logged"),
+            patch.object(run_pipeline, "run_vacuum"),
+            patch.object(run_pipeline, "report_sizes", side_effect=fake_report),
+            patch.object(psycopg, "connect", return_value=mock_conn),
+        ):
+            run_pipeline._run_database_build(
+                "postgresql:///test", Path("/tmp/csv"), None, sys.executable
+            )
+        return events
+
+    def test_preflight_runs_before_base_import(self) -> None:
+        events = self._run_capturing_order()
+        checks = [i for i, (kind, _) in enumerate(events) if kind == "check"]
+        base_idx = next(
+            i for i, (kind, v) in enumerate(events) if kind == "run_step" and "--base-only" in v
+        )
+        assert checks, "expected a reload-invariant check"
+        # The first check is the non-strict preflight, and it precedes the
+        # truncating base step.
+        assert events[checks[0]] == ("check", False)
+        assert checks[0] < base_idx
+
+    def test_postreload_gate_is_strict_and_after_tracks_before_report(self) -> None:
+        events = self._run_capturing_order()
+        checks = [i for i, (kind, _) in enumerate(events) if kind == "check"]
+        tracks_idx = next(
+            i for i, (kind, v) in enumerate(events) if kind == "run_step" and "--tracks-only" in v
+        )
+        report_idx = next(i for i, (kind, _) in enumerate(events) if kind == "report")
+        # The last check is the strict post-reload gate: after tracks, before report.
+        assert events[checks[-1]] == ("check", True)
+        assert tracks_idx < checks[-1] < report_idx
+
+    def test_postreload_violation_raises_before_report_sizes(self) -> None:
+        """When the strict gate raises, report_sizes never runs, so the
+        success notification downstream is never reached."""
+        events: list[tuple] = []
+
+        def raising_check(db_url, *, raise_on_violation, **k):
+            events.append(("check", raise_on_violation))
+            if raise_on_violation:
+                raise RuntimeError("[#298] cache reload invariant violated")
+            return run_pipeline.ReloadInvariantResult(
+                ok=True, release_count=1, artist_coverage=1.0, track_coverage=1.0
+            )
+
+        with pytest.raises(RuntimeError, match="invariant"):
+            self._run_capturing_order(check_side_effect=raising_check, events=events)
+
+        assert ("check", True) in events
+        assert not any(kind == "report" for kind, _ in events)
+
+
+class TestPostImportReloadInvariant:
+    """The direct-pg tail (_run_database_build_post_import) also gates on the
+    strict post-reload invariant before report_sizes."""
+
+    def test_post_import_runs_strict_gate_before_report(self) -> None:
+        import psycopg
+
+        events: list[tuple] = []
+
+        def fake_check(db_url, *, raise_on_violation, **k):
+            events.append(("check", raise_on_violation))
+            return run_pipeline.ReloadInvariantResult(
+                ok=True, release_count=1, artist_coverage=1.0, track_coverage=1.0
+            )
+
+        def fake_report(db_url):
+            events.append(("report", db_url))
+
+        mock_cursor = MagicMock()
+        mock_cursor.fetchone.return_value = [True]
+        mock_conn = MagicMock()
+        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
+        mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+
+        with (
+            patch.object(run_pipeline, "run_step"),
+            patch.object(run_pipeline, "check_reload_invariant", side_effect=fake_check),
+            patch.object(run_pipeline, "run_sql_statements_parallel"),
+            patch.object(run_pipeline, "run_vacuum"),
+            patch.object(run_pipeline, "set_tables_logged"),
+            patch.object(run_pipeline, "report_sizes", side_effect=fake_report),
+            patch.object(psycopg, "connect", return_value=mock_conn),
+        ):
+            run_pipeline._run_database_build_post_import(
+                "postgresql:///test", Path("/tmp/csv"), None, sys.executable
+            )
+
+        assert ("check", True) in events
+        check_idx = events.index(("check", True))
+        report_idx = next(i for i, (kind, _) in enumerate(events) if kind == "report")
+        assert check_idx < report_idx
