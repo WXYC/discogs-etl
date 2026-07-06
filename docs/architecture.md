@@ -65,6 +65,8 @@ The monthly rebuild is incremental by default: `release.artwork_url` and `releas
 2. `scripts/import_csv.py:import_release_via_upsert` reloads `release` via staging-table COPY + UPSERT with `artwork_url` + `artwork_checked_at` excluded from the SET list. Releases that fall out of the new dump are pruned via `DELETE … WHERE id NOT IN staging`; FK `ON DELETE CASCADE` removes their child rows. Child tables of `release` (`release_artist` + siblings, plus `cache_metadata`) are TRUNCATEd before re-COPY so duplicates don't accumulate.
 3. `scripts/import_csv.py:import_artwork` also stamps `artwork_checked_at = now()` whenever it sets `artwork_url` from the dump — matches the semantics LML's runtime `write_release` applies (LML#423) so freshly-imported rows aren't treated as "never asked" on the first lookup.
 
+**Reload invariant (discogs-etl#298)**: because the children are TRUNCATEd up front (step 2) and reloaded across several later steps, a run that aborts in that window leaves `release` full but the children empty — a state a naive row-count check reads as healthy. `scripts/run_pipeline.py` brackets the reload with a coverage check (`MIN_CHILD_COVERAGE_RATIO`, `evaluate_reload_invariant`): a **preflight** warning before the truncate if a prior abort left the cache degraded, and a **strict post-reload gate** before `report_sizes` that raises if `release` is populated but `release_track` / `release_artist` fall below the floor. Recovery: [`plan-298-empty-child-index-recovery.md`](plan-298-empty-child-index-recovery.md).
+
 Semantics matrix for `scripts/run_pipeline.py`:
 
 | Flag | Schema | Data | LML back-patches |

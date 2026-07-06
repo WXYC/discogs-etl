@@ -280,6 +280,24 @@ move the cache off Railway.
 The destination DB hasn't been alembic-stamped. Apply the procedure in
 [`docs/migrations-runbook.md`](migrations-runbook.md) once.
 
+### Run fails with `[#298] cache reload invariant violated`
+
+The post-reload gate in `run_pipeline.py` found `release` populated but the
+`release_*` children empty (or below the `MIN_CHILD_COVERAGE_RATIO` floor) — a
+partial reload that would leave LML track search degraded. This is a loud,
+deliberate failure, not a false alarm. Do **not** re-dispatch blindly; the same
+empty-index state would just recur. See
+[`plan-298-empty-child-index-recovery.md`](plan-298-empty-child-index-recovery.md)
+for detection queries and the rotate-token → one-full-rebuild recovery. A
+`[#298] ... violated on entry` WARNING (not a failure) means a *prior* abort
+left the cache degraded and this run is repopulating it — expect the
+`:white_check_mark:` if it completes.
+
+### The cache has a full `release` but an empty track/artist index
+
+Independent of a running rebuild (e.g. reported as degraded LML track search).
+See [`plan-298-empty-child-index-recovery.md`](plan-298-empty-child-index-recovery.md).
+
 ## Decommissioning the legacy cron
 
 After two successful rebuilds via the ephemeral path
