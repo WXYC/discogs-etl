@@ -33,8 +33,8 @@ import subprocess
 import sys
 import tempfile
 import time
-from dataclasses import dataclass
 from pathlib import Path
+from typing import NamedTuple
 
 import psycopg
 from wxyc_etl.state import PipelineState
@@ -546,9 +546,16 @@ def report_sizes(db_url: str) -> None:
     conn.close()
 
 
-@dataclass(frozen=True)
-class ReloadInvariantResult:
+class ReloadInvariantResult(NamedTuple):
     """Outcome of the release-vs-children reload invariant (discogs-etl#298).
+
+    A ``NamedTuple`` rather than a ``@dataclass`` on purpose: several test
+    modules load ``run_pipeline`` via ``importlib`` without registering it in
+    ``sys.modules``, and under ``from __future__ import annotations`` the
+    dataclass machinery looks the module up there (``_is_type`` →
+    ``sys.modules.get(cls.__module__)``) and blows up at class-creation time.
+    ``NamedTuple`` resolves field names without that lookup, so it is robust to
+    any loader.
 
     Attributes:
         ok: True when child coverage meets the floor (or the cache is empty).
