@@ -665,6 +665,21 @@ _RELEASE_CHILD_TABLES: list[str] = [
 ] + ["cache_metadata"]
 
 
+# Prune releases that fell out of the new dump. Written as NOT EXISTS rather
+# than ``id NOT IN (SELECT id FROM release_staging)``: PostgreSQL cannot convert
+# a ``NOT IN (subquery)`` into an anti-join (SQL NULL semantics forbid it), so
+# NOT IN forces an O(n*m) per-row Materialized SubPlan. At ~260k releases that
+# is a ~2.1-billion-cost sequential scan that ran for 1.5-2h+ on-CPU and stalled
+# the monthly rebuild (surfaced during the discogs-etl#298 recovery; the DELETE
+# only exists on the upsert-not-truncate path from #252, and no rebuild had ever
+# completed it at scale). NOT EXISTS plans as a Hash Anti Join (~50,000x cheaper,
+# sub-second). ``release.id`` and ``release_staging.id`` are both NOT NULL, so
+# the two forms delete exactly the same rows.
+PRUNE_STALE_RELEASES_SQL = (
+    "DELETE FROM release r WHERE NOT EXISTS (SELECT 1 FROM release_staging s WHERE s.id = r.id)"
+)
+
+
 def import_release_via_upsert(conn, csv_dir: Path) -> int:
     """Reload ``release`` from CSV while preserving artwork columns.
 
@@ -741,7 +756,7 @@ def import_release_via_upsert(conn, csv_dir: Path) -> int:
                 not_found = EXCLUDED.not_found
             """
         )
-        cur.execute("DELETE FROM release WHERE id NOT IN (SELECT id FROM release_staging)")
+        cur.execute(PRUNE_STALE_RELEASES_SQL)
         pruned = cur.rowcount
         cur.execute("DROP TABLE release_staging")
     conn.commit()
