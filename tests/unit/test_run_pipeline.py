@@ -18,10 +18,6 @@ _spec = importlib.util.spec_from_file_location(
     Path(__file__).parent.parent.parent / "scripts" / "run_pipeline.py",
 )
 run_pipeline = importlib.util.module_from_spec(_spec)
-# Register before exec so the module's @dataclass definitions resolve their
-# own __module__ (dataclasses looks it up in sys.modules under
-# `from __future__ import annotations`). Mirrors test_check_cache_drift.py.
-sys.modules["run_pipeline"] = run_pipeline
 _spec.loader.exec_module(run_pipeline)
 
 run_sql_statements_parallel = run_pipeline.run_sql_statements_parallel
