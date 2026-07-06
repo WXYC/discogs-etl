@@ -719,6 +719,13 @@ def import_release_via_upsert(conn, csv_dir: Path) -> int:
             "cache, rerun with --fresh-rebuild."
         )
 
+    # Index the staging table on id so the prune's anti-join below runs as a
+    # hash/merge anti-join instead of a per-row scan of an unindexed temp table
+    # (release_staging is created LIKE release INCLUDING DEFAULTS — no index).
+    with conn.cursor() as cur:
+        cur.execute("CREATE INDEX ON release_staging (id)")
+        cur.execute("ANALYZE release_staging")
+
     logger.info(f"Upserting {rows:,} releases (preserving artwork columns)...")
     with conn.cursor() as cur:
         # artwork_url, artwork_checked_at intentionally NOT in the SET
@@ -741,7 +748,16 @@ def import_release_via_upsert(conn, csv_dir: Path) -> int:
                 not_found = EXCLUDED.not_found
             """
         )
-        cur.execute("DELETE FROM release WHERE id NOT IN (SELECT id FROM release_staging)")
+        # NOT EXISTS anti-join, not NOT IN (SELECT ...): the NOT IN form
+        # full-scans the (previously unindexed) staging table and is NULL-unsafe.
+        # At ~682K releases it ran 2h20m before Railway admin-killed the
+        # connection mid-rebuild (2026-07-06), aborting after the child-table
+        # TRUNCATE committed and leaving release_track / release_artist empty.
+        # See WXYC/discogs-etl#298.
+        cur.execute(
+            "DELETE FROM release r "
+            "WHERE NOT EXISTS (SELECT 1 FROM release_staging s WHERE s.id = r.id)"
+        )
         pruned = cur.rowcount
         cur.execute("DROP TABLE release_staging")
     conn.commit()

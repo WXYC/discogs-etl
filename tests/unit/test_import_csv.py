@@ -1678,6 +1678,47 @@ class TestImportArtistDetailsProfileCopy:
         )
 
 
+class TestReleasePruneAntiJoin:
+    """Pin the release prune as an indexed anti-join.
+
+    ``DELETE FROM release WHERE id NOT IN (SELECT id FROM release_staging)``
+    full-scans an unindexed temp table and prunes ~nothing (staging is a
+    superset of ``release``). At ~682K releases it ran 2h20m before Railway
+    admin-killed the connection (2026-07-06 rebuild), aborting *after* the
+    child-table TRUNCATE committed and leaving ``release_track`` /
+    ``release_artist`` empty. The prune must be a ``NOT EXISTS`` anti-join
+    against an indexed ``release_staging``.
+    """
+
+    def _mock_conn(self):
+        from unittest.mock import MagicMock
+
+        mock_cursor = MagicMock()
+        mock_cursor.rowcount = 0
+        mock_conn = MagicMock()
+        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
+        mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+        return mock_conn, mock_cursor
+
+    def test_prune_is_indexed_anti_join_not_in_subquery(self, tmp_path) -> None:
+        from unittest.mock import patch
+
+        (tmp_path / "release.csv").write_text("id,title\n1,X\n")
+        mock_conn, mock_cursor = self._mock_conn()
+        with patch.object(_ic, "import_csv", return_value=100):
+            _ic.import_release_via_upsert(mock_conn, tmp_path)
+
+        executed = " ".join(c.args[0] for c in mock_cursor.execute.call_args_list if c.args)
+        norm = " ".join(executed.split()).lower()
+        assert "not in (select" not in norm, (
+            f"prune must not use a NOT IN subquery (unindexed full-scan anti-join); SQL: {executed}"
+        )
+        assert "not exists" in norm, f"prune must use a NOT EXISTS anti-join; SQL: {executed}"
+        assert "create index" in norm and "release_staging" in norm, (
+            f"release_staging must be indexed so the anti-join is fast; SQL: {executed}"
+        )
+
+
 import contextlib  # noqa: E402 — module-level imports already at top; this is for test-only helpers
 
 
