@@ -1366,11 +1366,12 @@ class TestPruneStaleReleasesPlan:
 
     ``DELETE ... WHERE id NOT IN (SELECT id FROM release_staging)`` cannot be
     planned as an anti-join by PostgreSQL (SQL NULL semantics), forcing an
-    O(n*m) per-row Materialized SubPlan. At ~260k releases that plan is a
-    ~2.1-billion-cost sequential scan that ran 1.5-2h+ on-CPU and stalled the
-    monthly rebuild — surfaced during the discogs-etl#298 recovery. The
-    ``NOT EXISTS`` form (``PRUNE_STALE_RELEASES_SQL``) plans as a Hash Anti
-    Join, ~50,000x cheaper. This pins the plan shape so a regression back to
+    O(n*m) per-row Materialized SubPlan — a ~2.1-billion-cost sequential scan
+    on the prod cache that stalled the monthly rebuild. See
+    ``PRUNE_STALE_RELEASES_SQL`` for the incident narrative and release counts
+    (discogs-etl#298 / #302). The ``NOT EXISTS`` form
+    (``PRUNE_STALE_RELEASES_SQL``) plans as a Hash Anti Join (~41K cost,
+    ~50,000x cheaper). This pins the plan shape so a regression back to
     ``NOT IN`` fails loudly instead of silently re-stalling a prod rebuild.
     """
 
