@@ -22,6 +22,7 @@ _spec.loader.exec_module(_ic)
 import_csv_func = _ic.import_csv
 import_artwork = _ic.import_artwork
 import_release_via_upsert = _ic.import_release_via_upsert
+PRUNE_STALE_RELEASES_SQL = _ic.PRUNE_STALE_RELEASES_SQL
 import_artist_details = _ic.import_artist_details
 create_track_count_table = _ic.create_track_count_table
 populate_cache_metadata = _ic.populate_cache_metadata
@@ -1357,4 +1358,58 @@ class TestImportClearsTombstones:
             f"Rebuild must clear the artist tombstone (not_found=FALSE); "
             f"got not_found={not_found!r}. The stub-INSERT in "
             f"import_artist_details must update not_found = FALSE on conflict."
+        )
+
+
+class TestPruneStaleReleasesPlan:
+    """The stale-release prune must plan as an anti-join, not a NOT IN SubPlan.
+
+    ``DELETE ... WHERE id NOT IN (SELECT id FROM release_staging)`` cannot be
+    planned as an anti-join by PostgreSQL (SQL NULL semantics), forcing an
+    O(n*m) per-row Materialized SubPlan. At ~260k releases that plan is a
+    ~2.1-billion-cost sequential scan that ran 1.5-2h+ on-CPU and stalled the
+    monthly rebuild — surfaced during the discogs-etl#298 recovery. The
+    ``NOT EXISTS`` form (``PRUNE_STALE_RELEASES_SQL``) plans as a Hash Anti
+    Join, ~50,000x cheaper. This pins the plan shape so a regression back to
+    ``NOT IN`` fails loudly instead of silently re-stalling a prod rebuild.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _set_up(self, db_url):
+        self.db_url = db_url
+        conn = psycopg.connect(db_url, autocommit=True)
+        with conn.cursor() as cur:
+            cur.execute(SCHEMA_DIR.joinpath("create_database.sql").read_text())
+        conn.close()
+
+    def test_prune_plans_as_anti_join_not_subplan(self) -> None:
+        conn = psycopg.connect(self.db_url)
+        try:
+            with conn.cursor() as cur:
+                # A handful of live releases; staging (the incoming dump) covers
+                # a subset, so the prune has a real anti-join to plan. EXPLAIN
+                # (no ANALYZE) computes the plan without executing the DELETE.
+                cur.execute(
+                    "INSERT INTO release (id, title) VALUES "
+                    "(9001, 'a'), (9002, 'b'), (9003, 'c') ON CONFLICT (id) DO NOTHING"
+                )
+                cur.execute("CREATE TEMP TABLE release_staging (LIKE release INCLUDING DEFAULTS)")
+                cur.execute(
+                    "INSERT INTO release_staging (id, title) VALUES (9001, 'a'), (9002, 'b')"
+                )
+                cur.execute("EXPLAIN " + PRUNE_STALE_RELEASES_SQL)
+                plan = "\n".join(row[0] for row in cur.fetchall())
+        finally:
+            conn.rollback()  # undo the release inserts; temp table drops on close
+            conn.close()
+
+        assert "Anti Join" in plan, (
+            "The stale-release prune must plan as an anti-join. NOT IN forces "
+            "an O(n*m) per-row SubPlan that stalled the rebuild (#298); use "
+            f"NOT EXISTS. Plan was:\n{plan}"
+        )
+        assert "SubPlan" not in plan, (
+            "The prune regressed to a NOT IN SubPlan (O(n*m), ~2.1B cost at "
+            "scale). Rewrite as NOT EXISTS (Hash Anti Join). Plan was:\n"
+            f"{plan}"
         )

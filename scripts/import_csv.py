@@ -665,6 +665,21 @@ _RELEASE_CHILD_TABLES: list[str] = [
 ] + ["cache_metadata"]
 
 
+# Prune of releases absent from the incoming dump's staging table. It MUST use
+# NOT EXISTS (a Hash Anti Join), never NOT IN (SELECT ...): PostgreSQL cannot
+# plan NOT IN as an anti-join (SQL NULL semantics), so it falls back to an
+# O(n*m) per-row Materialized SubPlan. At ~682K releases that SubPlan ran
+# 2h20m on-CPU before Railway admin-killed the connection mid-rebuild
+# (2026-07-06), aborting after the child-table TRUNCATE committed and leaving
+# release_track / release_artist empty. release.id and release_staging.id are
+# both NOT NULL, so the two forms delete identical rows. See
+# WXYC/discogs-etl#298 / #302. TestPruneStaleReleasesPlan pins the plan shape
+# so a regression back to NOT IN fails loudly instead of re-stalling a rebuild.
+PRUNE_STALE_RELEASES_SQL = (
+    "DELETE FROM release r WHERE NOT EXISTS (SELECT 1 FROM release_staging s WHERE s.id = r.id)"
+)
+
+
 def import_release_via_upsert(conn, csv_dir: Path) -> int:
     """Reload ``release`` from CSV while preserving artwork columns.
 
@@ -748,16 +763,9 @@ def import_release_via_upsert(conn, csv_dir: Path) -> int:
                 not_found = EXCLUDED.not_found
             """
         )
-        # NOT EXISTS anti-join, not NOT IN (SELECT ...): the NOT IN form
-        # full-scans the (previously unindexed) staging table and is NULL-unsafe.
-        # At ~682K releases it ran 2h20m before Railway admin-killed the
-        # connection mid-rebuild (2026-07-06), aborting after the child-table
-        # TRUNCATE committed and leaving release_track / release_artist empty.
-        # See WXYC/discogs-etl#298.
-        cur.execute(
-            "DELETE FROM release r "
-            "WHERE NOT EXISTS (SELECT 1 FROM release_staging s WHERE s.id = r.id)"
-        )
+        # Prune releases absent from the new dump. NOT EXISTS, not NOT IN — see
+        # PRUNE_STALE_RELEASES_SQL for the incident rationale (WXYC/discogs-etl#298).
+        cur.execute(PRUNE_STALE_RELEASES_SQL)
         pruned = cur.rowcount
         cur.execute("DROP TABLE release_staging")
     conn.commit()
