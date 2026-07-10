@@ -262,8 +262,27 @@ class LibraryIndex:
         has_format = len(rows) > 0 and len(rows[0]) >= 3
         has_alternate = len(rows) > 0 and len(rows[0]) >= 4
 
-        def _index_pair(norm_artist: str, norm_title: str, raw_format: str | None) -> None:
-            """Index one (artist, title) key, recording format even on dedup."""
+        def _index_pair(
+            norm_artist: str,
+            norm_title: str,
+            raw_format: str | None,
+            index_combined: bool = True,
+        ) -> None:
+            """Index one (artist, title) key, recording format even on dedup.
+
+            ``norm_artist`` is always added to ``artist_set`` (``all_artists``),
+            which is both the exact-match routing key in ``classify_all_releases``
+            *and* the candidate list for the precise two-stage scorer — an alias
+            needs to be there or a Discogs release credited to it can never match.
+
+            ``index_combined`` gates only the ``combined_strings`` membership that
+            feeds the *loose* ``token_set`` / ``token_sort`` scorers. The alias
+            path passes False: a short/generic alias like "Plug" as a combined
+            "plug ||| <title>" string would fuzzy-match unrelated Discogs
+            releases sharing that title, inflating false KEEPs — the two-stage
+            scorer (which requires artist AND title agreement) is the safe way to
+            reach the alias. See discogs-etl#305.
+            """
             pair = (norm_artist, norm_title)
 
             # Build format_by_pair before dedup check — same pair may have multiple formats
@@ -277,6 +296,9 @@ class LibraryIndex:
             exact_pairs.add(pair)
             artist_to_titles.setdefault(norm_artist, set()).add(norm_title)
             artist_set.add(norm_artist)
+
+            if not index_combined:
+                return
 
             combined = f"{norm_artist}{COMBINED_SEPARATOR}{norm_title}"
             combined_to_original[combined] = pair
@@ -298,13 +320,18 @@ class LibraryIndex:
             norm_artist = normalize_artist(raw_artist)
             _index_pair(norm_artist, norm_title, raw_format)
 
-            # Index the library alias / ANV as an additional exact key for the
+            # Index the library alias / ANV as an additional *exact* key for the
             # same title (discogs-etl#305). Skip empties, compilation-style
             # aliases, and aliases that collapse to the canonical artist.
+            # index_combined=False keeps the alias out of combined_strings (the
+            # loose token_set / token_sort scorers) so a short alias doesn't
+            # become a fuzzy magnet for unrelated Discogs releases; it stays in
+            # all_artists for exact-match routing and the precise two-stage
+            # scorer.
             if raw_alternate and not is_compilation_artist(raw_alternate):
                 norm_alternate = normalize_artist(raw_alternate)
                 if norm_alternate and norm_alternate != norm_artist:
-                    _index_pair(norm_alternate, norm_title, raw_format)
+                    _index_pair(norm_alternate, norm_title, raw_format, index_combined=False)
 
         combined_strings = list(combined_to_original.keys())
         all_artists = sorted(artist_set)

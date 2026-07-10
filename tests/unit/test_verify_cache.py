@@ -27,6 +27,7 @@ else:
 # Re-export for cleaner access in tests
 normalize_title = _vc.normalize_title
 normalize_artist = _vc.normalize_artist
+COMBINED_SEPARATOR = _vc.COMBINED_SEPARATOR
 LibraryIndex = _vc.LibraryIndex
 score_exact = _vc.score_exact
 score_token_set = _vc.score_token_set
@@ -1273,12 +1274,33 @@ class TestAlternateArtistNameIndex:
     rather than PRUNE. See discogs-etl#305.
     """
 
-    def test_alternate_name_added_as_artist_key(self):
-        """The alias name appears in all_artists alongside the canonical artist."""
+    def test_alternate_name_in_all_artists_for_exact_routing(self):
+        """The alias must be in all_artists so an alias-credited release routes to exact match.
+
+        ``all_artists`` is both the exact-match routing key in
+        ``classify_all_releases`` and the candidate list for the precise
+        two-stage scorer, so the alias belongs there (discogs-etl#305).
+        """
         rows = [("Luke Vibert", "Drum 'n' Bass for Papa", "CD", "Plug")]
         idx = LibraryIndex.from_rows(rows)
         assert "luke vibert" in idx.all_artists
         assert "plug" in idx.all_artists
+
+    def test_alternate_name_not_in_combined_strings(self):
+        """The alias must NOT enter combined_strings (the loose token_set/sort scorers).
+
+        A short/generic alias as a "alias ||| title" combined string would
+        fuzzy-match unrelated Discogs releases sharing that title, inflating
+        false KEEPs. The alias reaches classification via exact-pair lookup and
+        the precise two-stage scorer instead. See discogs-etl#305.
+        """
+        rows = [("Luke Vibert", "Drum 'n' Bass for Papa", "CD", "Plug")]
+        idx = LibraryIndex.from_rows(rows)
+        norm_title = normalize_title("Drum 'n' Bass for Papa")
+        combined_alias = f"plug{COMBINED_SEPARATOR}{norm_title}"
+        combined_canonical = f"luke vibert{COMBINED_SEPARATOR}{norm_title}"
+        assert combined_alias not in idx.combined_strings
+        assert combined_canonical in idx.combined_strings
 
     def test_alternate_name_pair_in_exact_pairs(self):
         """(alias, title) is an exact-match pair mapping to the same title."""
