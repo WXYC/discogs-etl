@@ -231,13 +231,27 @@ class LibraryIndex:
 
     @classmethod
     def from_rows(
-        cls, rows: list[tuple[str, str]] | list[tuple[str, str, str | None]]
+        cls,
+        rows: list[tuple[str, str]]
+        | list[tuple[str, str, str | None]]
+        | list[tuple[str, str, str | None, str | None]],
     ) -> LibraryIndex:
-        """Build index from (artist, title) or (artist, title, format) row tuples.
+        """Build index from library row tuples.
+
+        Rows may be 2-, 3-, or 4-tuples:
+
+        - ``(raw_artist, raw_title)``
+        - ``(raw_artist, raw_title, raw_format)``
+        - ``(raw_artist, raw_title, raw_format, raw_alternate_artist_name)``
+
+        When present, ``raw_alternate_artist_name`` (the library's alias / ANV
+        for the same release, e.g. "Plug" for "Luke Vibert") is indexed as an
+        **additional exact-match artist key** for the same title, so a Discogs
+        release credited to the alias classifies KEEP rather than PRUNE. This is
+        an exact-key addition, not a fuzzy-threshold change. See discogs-etl#305.
 
         Args:
-            rows: List of (raw_artist, raw_title) or (raw_artist, raw_title, raw_format)
-                tuples from the library.
+            rows: List of library row tuples (see above).
         """
         exact_pairs: set[tuple[str, str]] = set()
         artist_to_titles: dict[str, set[str]] = {}
@@ -246,10 +260,31 @@ class LibraryIndex:
         compilation_titles: set[str] = set()
         format_by_pair: dict[tuple[str, str], set[str | None]] = {}
         has_format = len(rows) > 0 and len(rows[0]) >= 3
+        has_alternate = len(rows) > 0 and len(rows[0]) >= 4
+
+        def _index_pair(norm_artist: str, norm_title: str, raw_format: str | None) -> None:
+            """Index one (artist, title) key, recording format even on dedup."""
+            pair = (norm_artist, norm_title)
+
+            # Build format_by_pair before dedup check — same pair may have multiple formats
+            if has_format:
+                norm_format = normalize_library_format(raw_format)
+                format_by_pair.setdefault(pair, set()).add(norm_format)
+
+            if pair in exact_pairs:
+                return  # deduplicate (artist+title already indexed)
+
+            exact_pairs.add(pair)
+            artist_to_titles.setdefault(norm_artist, set()).add(norm_title)
+            artist_set.add(norm_artist)
+
+            combined = f"{norm_artist}{COMBINED_SEPARATOR}{norm_title}"
+            combined_to_original[combined] = pair
 
         for row in rows:
             raw_artist, raw_title = row[0], row[1]
             raw_format = row[2] if has_format else None
+            raw_alternate = row[3] if has_alternate else None
             if not raw_artist or not raw_title:
                 continue
 
@@ -261,22 +296,15 @@ class LibraryIndex:
                 continue
 
             norm_artist = normalize_artist(raw_artist)
-            pair = (norm_artist, norm_title)
+            _index_pair(norm_artist, norm_title, raw_format)
 
-            # Build format_by_pair before dedup check — same pair may have multiple formats
-            if has_format:
-                norm_format = normalize_library_format(raw_format)
-                format_by_pair.setdefault(pair, set()).add(norm_format)
-
-            if pair in exact_pairs:
-                continue  # deduplicate (artist+title already indexed)
-
-            exact_pairs.add(pair)
-            artist_to_titles.setdefault(norm_artist, set()).add(norm_title)
-            artist_set.add(norm_artist)
-
-            combined = f"{norm_artist}{COMBINED_SEPARATOR}{norm_title}"
-            combined_to_original[combined] = pair
+            # Index the library alias / ANV as an additional exact key for the
+            # same title (discogs-etl#305). Skip empties, compilation-style
+            # aliases, and aliases that collapse to the canonical artist.
+            if raw_alternate and not is_compilation_artist(raw_alternate):
+                norm_alternate = normalize_artist(raw_alternate)
+                if norm_alternate and norm_alternate != norm_artist:
+                    _index_pair(norm_alternate, norm_title, raw_format)
 
         combined_strings = list(combined_to_original.keys())
         all_artists = sorted(artist_set)
@@ -323,7 +351,12 @@ class LibraryIndex:
     def from_sqlite(cls, db_path: Path) -> LibraryIndex:
         """Build index from the library SQLite database.
 
-        Loads format column if present (3-tuples); falls back to artist+title only (2-tuples).
+        Prefers the widest column set available, degrading gracefully:
+
+        - ``artist, title, format, alternate_artist_name`` (4-tuples) — the alias
+          is indexed as an additional exact key (discogs-etl#305)
+        - ``artist, title, format`` (3-tuples)
+        - ``artist, title`` (2-tuples)
 
         Args:
             db_path: Path to library.db
@@ -332,9 +365,12 @@ class LibraryIndex:
         conn = sqlite3.connect(str(db_path))
         cur = conn.cursor()
         try:
-            cur.execute("SELECT artist, title, format FROM library")
+            cur.execute("SELECT artist, title, format, alternate_artist_name FROM library")
         except sqlite3.OperationalError:
-            cur.execute("SELECT artist, title FROM library")
+            try:
+                cur.execute("SELECT artist, title, format FROM library")
+            except sqlite3.OperationalError:
+                cur.execute("SELECT artist, title FROM library")
         rows = cur.fetchall()
         conn.close()
 

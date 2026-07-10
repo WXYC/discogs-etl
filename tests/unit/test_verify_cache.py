@@ -1257,3 +1257,135 @@ class TestFormatFilterClassification:
         releases = [(1, "Autechre", "Confield", None)]
         report = classify_all_releases(releases, idx, matcher)
         assert 1 in report.keep_ids
+
+
+# ---------------------------------------------------------------------------
+# Step N: Alternate artist name (alias / ANV) matching -- discogs-etl#305
+# ---------------------------------------------------------------------------
+
+
+class TestAlternateArtistNameIndex:
+    """LibraryIndex indexes ``alternate_artist_name`` as an additional exact key.
+
+    A library row cataloged under a canonical artist but with an alias in
+    ``alternate_artist_name`` (e.g. Luke Vibert / Plug) must be reachable by
+    the alias, so a Discogs release credited to the alias classifies KEEP
+    rather than PRUNE. See discogs-etl#305.
+    """
+
+    def test_alternate_name_added_as_artist_key(self):
+        """The alias name appears in all_artists alongside the canonical artist."""
+        rows = [("Luke Vibert", "Drum 'n' Bass for Papa", "CD", "Plug")]
+        idx = LibraryIndex.from_rows(rows)
+        assert "luke vibert" in idx.all_artists
+        assert "plug" in idx.all_artists
+
+    def test_alternate_name_pair_in_exact_pairs(self):
+        """(alias, title) is an exact-match pair mapping to the same title."""
+        rows = [("Luke Vibert", "Drum 'n' Bass for Papa", "CD", "Plug")]
+        idx = LibraryIndex.from_rows(rows)
+        norm_title = normalize_title("Drum 'n' Bass for Papa")
+        assert ("plug", norm_title) in idx.exact_pairs
+        assert ("luke vibert", norm_title) in idx.exact_pairs
+
+    def test_alternate_name_maps_to_titles(self):
+        """artist_to_titles resolves the alias to the canonical row's titles."""
+        rows = [("Luke Vibert", "Drum 'n' Bass for Papa", "CD", "Plug")]
+        idx = LibraryIndex.from_rows(rows)
+        norm_title = normalize_title("Drum 'n' Bass for Papa")
+        assert norm_title in idx.artist_to_titles["plug"]
+
+    def test_alternate_name_inherits_format(self):
+        """The alias pair carries the same format data as the canonical pair."""
+        rows = [("Luke Vibert", "Drum 'n' Bass for Papa", "CD", "Plug")]
+        idx = LibraryIndex.from_rows(rows)
+        norm_title = normalize_title("Drum 'n' Bass for Papa")
+        assert idx.format_by_pair.get(("plug", norm_title)) == {"CD"}
+
+    def test_empty_alternate_name_is_noop(self):
+        """A NULL/empty alias does not pollute the index."""
+        rows = [
+            ("Stereolab", "Dots and Loops", "CD", None),
+            ("Cat Power", "Moon Pix", "CD", ""),
+        ]
+        idx = LibraryIndex.from_rows(rows)
+        # Only the two canonical artists, no stray keys.
+        assert set(idx.all_artists) == {"stereolab", "cat power"}
+
+    def test_alternate_equal_to_artist_does_not_duplicate(self):
+        """An alias identical to the canonical artist adds no duplicate pair."""
+        rows = [("Aphex Twin", "Windowlicker", "CD", "Aphex Twin")]
+        idx = LibraryIndex.from_rows(rows)
+        norm_title = normalize_title("Windowlicker")
+        assert ("aphex twin", norm_title) in idx.exact_pairs
+        assert idx.all_artists.count("aphex twin") == 1
+
+    def test_three_tuples_without_alias_unaffected(self):
+        """3-tuple rows (artist, title, format) still work with no alias column."""
+        rows = [("Autechre", "Confield", "CD")]
+        idx = LibraryIndex.from_rows(rows)
+        assert "autechre" in idx.all_artists
+        assert ("autechre", "confield") in idx.exact_pairs
+
+    def test_from_sqlite_reads_alternate_artist_name(self, tmp_path):
+        """from_sqlite indexes alternate_artist_name from library.db."""
+        import sqlite3
+
+        db_path = tmp_path / "library.db"
+        conn = sqlite3.connect(str(db_path))
+        cur = conn.cursor()
+        cur.execute(
+            "CREATE TABLE library (id INTEGER PRIMARY KEY, artist TEXT, title TEXT, "
+            "format TEXT, alternate_artist_name TEXT)"
+        )
+        cur.execute(
+            "INSERT INTO library (artist, title, format, alternate_artist_name) "
+            "VALUES ('Luke Vibert', \"Drum 'n' Bass for Papa\", 'CD', 'Plug')"
+        )
+        conn.commit()
+        conn.close()
+
+        idx = LibraryIndex.from_sqlite(db_path)
+        norm_title = normalize_title("Drum 'n' Bass for Papa")
+        assert "plug" in idx.all_artists
+        assert ("plug", norm_title) in idx.exact_pairs
+
+
+class TestAlternateArtistNameClassification:
+    """End-to-end classification via the alias (AC1 of discogs-etl#305)."""
+
+    def test_alias_credited_release_is_keep(self):
+        """A Discogs release credited to the alias with a matching title -> KEEP."""
+        # Library: canonical "Luke Vibert", alias "Plug".
+        rows = [("Luke Vibert", "Drum 'n' Bass for Papa", "CD", "Plug")]
+        idx = LibraryIndex.from_rows(rows)
+        matcher = MultiIndexMatcher(idx)
+        # Discogs release 3192 is credited to "Plug".
+        releases = [(3192, "Plug", "Drum 'n' Bass for Papa", "CD")]
+        report = classify_all_releases(releases, idx, matcher)
+        assert 3192 in report.keep_ids
+
+    def test_alias_credited_release_subset_title_is_keep(self):
+        """Real 3192 shape: Discogs title is a subset of the library title -> KEEP.
+
+        The library entry is "Drum 'n' Bass for Papa (+ Plug EPs 1,2 & 3)"; the
+        Discogs release drops the bracketed suffix. token_set within the alias's
+        albums recovers it.
+        """
+        rows = [
+            ("Luke Vibert", "Drum 'n' Bass for Papa (+ Plug EPs 1,2 & 3)", "CD", "Plug"),
+        ]
+        idx = LibraryIndex.from_rows(rows)
+        matcher = MultiIndexMatcher(idx)
+        releases = [(3192, "Plug", "Drum 'n' Bass for Papa", "CD")]
+        report = classify_all_releases(releases, idx, matcher)
+        assert 3192 in report.keep_ids
+
+    def test_alias_release_without_library_alias_is_pruned(self):
+        """Control: without the alias column, the same release still prunes."""
+        rows = [("Luke Vibert", "Drum 'n' Bass for Papa", "CD")]
+        idx = LibraryIndex.from_rows(rows)
+        matcher = MultiIndexMatcher(idx)
+        releases = [(3192, "Plug", "Drum 'n' Bass for Papa", "CD")]
+        report = classify_all_releases(releases, idx, matcher)
+        assert 3192 in report.prune_ids
