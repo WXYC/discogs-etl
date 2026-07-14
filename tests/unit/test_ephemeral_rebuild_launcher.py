@@ -41,10 +41,20 @@ def handler_module():
     return _load_handler()
 
 
+def _make_paginator(reservations):
+    """Build a MagicMock paginator whose paginate() yields ``reservations``."""
+    paginator = MagicMock()
+    paginator.paginate.return_value = iter([{"Reservations": reservations}])
+    return paginator
+
+
 @pytest.fixture
 def fake_ec2(handler_module):
     client = MagicMock()
     client.run_instances.return_value = {"Instances": [{"InstanceId": "i-0123456789abcdef0"}]}
+    # Precheck (#304): by default no peer rebuild instance is running, so the
+    # collision guard falls through and the launcher proceeds to RunInstances.
+    client.get_paginator.return_value = _make_paginator(reservations=[])
     return client
 
 
@@ -155,3 +165,96 @@ def test_lambda_handler_tolerates_missing_log_bucket(handler_module, fake_ec2, m
 
     user_data = fake_ec2.run_instances.call_args.kwargs["UserData"]
     assert "export REBUILD_LOG_BUCKET=" in user_data  # empty value, but key is present
+
+
+# ---------------------------------------------------------------------------
+# Collision guard (#304). Two rebuilds against the shared Railway cache DB
+# deadlock (see the 2026-07-06 #298 recovery). Before RunInstances, the
+# launcher prechecks for an already-active rebuild instance and, if one
+# exists, aborts *cleanly* — no RunInstances, no raise (a raise would trip
+# LauncherErrorAlarm and EventBridge's async retries would relaunch), just a
+# LaunchCollisionAborted metric so the guard tripping is observable.
+# ---------------------------------------------------------------------------
+
+
+def test_lambda_handler_aborts_when_active_rebuild_instance_exists(
+    handler_module, fake_ec2, monkeypatch
+):
+    monkeypatch.setenv("LAUNCH_TEMPLATE_ID", "lt-0fab0123456789ab0")
+    fake_ec2.get_paginator.return_value = _make_paginator(
+        reservations=[{"Instances": [{"InstanceId": "i-inflight"}]}]
+    )
+    cw = MagicMock()
+
+    result = handler_module.lambda_handler({}, None, ec2_client=fake_ec2, cloudwatch_client=cw)
+
+    # No second instance is started.
+    fake_ec2.run_instances.assert_not_called()
+    # The abort is observable via a metric, not an exception.
+    cw.put_metric_data.assert_called_once()
+    metric_kwargs = cw.put_metric_data.call_args.kwargs
+    assert metric_kwargs["Namespace"] == "WXYC/DiscogsRebuild"
+    assert metric_kwargs["MetricData"][0]["MetricName"] == "LaunchCollisionAborted"
+    assert metric_kwargs["MetricData"][0]["Value"] == 1.0
+    # Returns cleanly, surfacing the peer that blocked the launch.
+    assert result["aborted"] is True
+    assert result["active_instances"] == ["i-inflight"]
+
+
+def test_lambda_handler_aborts_cleanly_even_if_metric_emit_fails(
+    handler_module, fake_ec2, monkeypatch
+):
+    """A CloudWatch hiccup must not turn a clean abort into a raise — a raise
+    trips LauncherErrorAlarm and EventBridge's async retries would relaunch
+    the very instance the guard is suppressing."""
+    monkeypatch.setenv("LAUNCH_TEMPLATE_ID", "lt-0fab0123456789ab0")
+    fake_ec2.get_paginator.return_value = _make_paginator(
+        reservations=[{"Instances": [{"InstanceId": "i-inflight"}]}]
+    )
+    cw = MagicMock()
+    cw.put_metric_data.side_effect = RuntimeError("cloudwatch throttled")
+
+    result = handler_module.lambda_handler({}, None, ec2_client=fake_ec2, cloudwatch_client=cw)
+
+    fake_ec2.run_instances.assert_not_called()
+    assert result["aborted"] is True
+
+
+def test_lambda_handler_precheck_filters_project_and_running_state(
+    handler_module, fake_ec2, monkeypatch
+):
+    monkeypatch.setenv("LAUNCH_TEMPLATE_ID", "lt-0fab0123456789ab0")
+
+    handler_module.lambda_handler({}, None, ec2_client=fake_ec2, cloudwatch_client=MagicMock())
+
+    paginate = fake_ec2.get_paginator.return_value.paginate
+    paginate.assert_called_once()
+    filters = paginate.call_args.kwargs["Filters"]
+    assert {"Name": "tag:Project", "Values": ["discogs-rebuild"]} in filters
+    state_filter = next(f for f in filters if f["Name"] == "instance-state-name")
+    assert set(state_filter["Values"]) == {"running", "pending"}
+
+
+def test_lambda_handler_proceeds_when_no_active_rebuild_instance(
+    handler_module, fake_ec2, monkeypatch
+):
+    monkeypatch.setenv("LAUNCH_TEMPLATE_ID", "lt-0fab0123456789ab0")
+    cw = MagicMock()
+
+    result = handler_module.lambda_handler({}, None, ec2_client=fake_ec2, cloudwatch_client=cw)
+
+    fake_ec2.run_instances.assert_called_once()
+    cw.put_metric_data.assert_not_called()
+    assert result["instance_id"] == "i-0123456789abcdef0"
+
+
+def test_list_active_rebuild_instances_returns_ids(handler_module):
+    ec2 = MagicMock()
+    ec2.get_paginator.return_value = _make_paginator(
+        reservations=[
+            {"Instances": [{"InstanceId": "i-a"}, {"InstanceId": "i-b"}]},
+            {"Instances": [{"InstanceId": "i-c"}]},
+        ]
+    )
+
+    assert handler_module.list_active_rebuild_instances(ec2) == ["i-a", "i-b", "i-c"]

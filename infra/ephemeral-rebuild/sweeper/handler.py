@@ -30,9 +30,16 @@ def _stale_cutoff(max_age_hours: float) -> datetime:
     return datetime.now(timezone.utc) - timedelta(hours=max_age_hours)
 
 
-def list_stale_instances(ec2_client, max_age_hours: float):
-    """Return instance IDs of running rebuild EC2s older than the cutoff."""
-    cutoff = _stale_cutoff(max_age_hours)
+def list_active_rebuild_instances(ec2_client):
+    """Return every rebuild EC2 currently ``pending`` or ``running``.
+
+    This is the same state filter the launcher's collision guard (#304)
+    applies: the launcher asks "is any rebuild in flight?", the sweeper
+    additionally applies an age cutoff (``list_stale_instances``). The
+    launcher ships as a separate deploy package and keeps a mirror of this
+    query — keep the tag/state filter in sync with ``launcher/handler.py``.
+    Each element is ``{"InstanceId": str, "LaunchTime": datetime}``.
+    """
     paginator = ec2_client.get_paginator("describe_instances")
     pages = paginator.paginate(
         Filters=[
@@ -40,14 +47,20 @@ def list_stale_instances(ec2_client, max_age_hours: float):
             {"Name": "instance-state-name", "Values": ["running", "pending"]},
         ],
     )
-    stale = []
+    active = []
     for page in pages:
         for reservation in page.get("Reservations", []):
             for instance in reservation.get("Instances", []):
-                launch_time = instance["LaunchTime"]
-                if launch_time < cutoff:
-                    stale.append({"InstanceId": instance["InstanceId"], "LaunchTime": launch_time})
-    return stale
+                active.append(
+                    {"InstanceId": instance["InstanceId"], "LaunchTime": instance["LaunchTime"]}
+                )
+    return active
+
+
+def list_stale_instances(ec2_client, max_age_hours: float):
+    """Return running rebuild EC2s older than the cutoff."""
+    cutoff = _stale_cutoff(max_age_hours)
+    return [i for i in list_active_rebuild_instances(ec2_client) if i["LaunchTime"] < cutoff]
 
 
 def lambda_handler(event, context, ec2_client=None, cloudwatch_client=None):
