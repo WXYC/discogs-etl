@@ -145,6 +145,20 @@ Resources:
               - Effect: Allow
                 Action: s3:PutObject
                 Resource: !Sub '${LogBucket.Arn}/*'
+        # ec2:DescribeInstances powers the bootstrap's concurrent-rebuild
+        # guard (#311): before touching the shared cache it queries for peer
+        # rebuild instances and self-terminates if it isn't the winning one.
+        # Describe* has no resource-level scoping, so Resource must be '*'.
+        # Still NO ec2 mutation grant — self-termination is `shutdown -h now`
+        # (InstanceInitiatedShutdownBehavior=terminate releases the instance),
+        # not ec2:TerminateInstances.
+        - PolicyName: ec2-describe-for-collision-guard
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ec2:DescribeInstances
+                Resource: '*'
 
   InstanceProfile:
     Type: AWS::IAM::InstanceProfile
