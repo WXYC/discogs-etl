@@ -57,6 +57,25 @@ def first_line_index(lines: list[str], needle: str) -> int:
     raise AssertionError(f"{needle!r} not found in non-comment lines of {SCRIPT_PATH}")
 
 
+def last_line_index(lines: list[str], needle: str) -> int:
+    """Return the index of the *last* non-comment line containing ``needle``.
+
+    Used to locate a call site when the same symbol also names a function
+    definition earlier in the file (the def is the first match, the call is
+    the last).
+    """
+    found = None
+    for i, line in enumerate(lines):
+        stripped = line.lstrip()
+        if stripped.startswith("#"):
+            continue
+        if needle in line:
+            found = i
+    if found is None:
+        raise AssertionError(f"{needle!r} not found in non-comment lines of {SCRIPT_PATH}")
+    return found
+
+
 def test_trap_on_exit_registered_before_imds_calls(script_lines: list[str]) -> None:
     """#173: trap must be live before the script can early-exit on IMDSv2.
 
@@ -153,4 +172,52 @@ def test_s3_breadcrumb_uses_aws_s3_cp_with_or_true(script_lines: list[str]) -> N
         f"breadcrumb 'aws s3 cp' near line {marker_line + 1} must end with "
         f"'|| true' so a creds/network failure on the breadcrumb itself "
         f"doesn't kill the script. See #174."
+    )
+
+
+def test_collision_guard_runs_after_imds_id_and_before_rebuild_handoff(
+    script_lines: list[str],
+) -> None:
+    """#311: the concurrent-rebuild guard must sit between IMDS instance-id
+    resolution and the ``rebuild-cache.sh`` handoff.
+
+    The guard queries EC2 for peer rebuild instances and self-terminates if
+    it is not the winning (earliest-launched) one. It needs the real
+    ``INSTANCE_ID`` (so it must run *after* the IMDS ``instance-id`` read),
+    and it must bow out *before* any write to the shared cache (so it must
+    run *before* the ``rebuild-cache.sh`` handoff). Two instances that both
+    booted must never both reach the pipeline — that's the 2026-07-06 #298
+    deadlock this closes.
+    """
+    imds_id_line = first_line_index(script_lines, 'INSTANCE_ID="$(imds_get')
+    guard_call_line = last_line_index(script_lines, "abort_if_not_winning_rebuild")
+    handoff_line = first_line_index(script_lines, '"$REPO_DIR/scripts/rebuild-cache.sh"')
+    assert imds_id_line < guard_call_line, (
+        f"the abort_if_not_winning_rebuild guard (line {guard_call_line + 1}) must run "
+        f"after IMDS instance-id resolution (line {imds_id_line + 1}); it needs the real "
+        f"INSTANCE_ID to exclude itself from the peer query. See #311."
+    )
+    assert guard_call_line < handoff_line, (
+        f"the abort_if_not_winning_rebuild guard (line {guard_call_line + 1}) must run "
+        f"before the rebuild-cache.sh handoff (line {handoff_line + 1}); a bowing-out "
+        f"instance must never write to the shared cache. See #311."
+    )
+
+
+def test_collision_guard_uses_same_tag_and_state_filter(script_lines: list[str]) -> None:
+    """#311: the bootstrap peer check must mirror the launcher/sweeper filter
+    (``tag:Project=discogs-rebuild`` + ``pending``/``running``).
+
+    The bootstrap is bash so it can't import the Python helper; the filter is
+    duplicated and must stay in sync. Pin the filter fragments so a drift on
+    either side is caught.
+    """
+    src = "\n".join(script_lines)
+    assert "tag:Project,Values=discogs-rebuild" in src, (
+        "bootstrap peer check must filter on tag:Project=discogs-rebuild, matching "
+        "list_active_rebuild_instances in the launcher/sweeper. See #311."
+    )
+    assert "instance-state-name,Values=pending,running" in src, (
+        "bootstrap peer check must filter on pending/running instance state, matching "
+        "list_active_rebuild_instances in the launcher/sweeper. See #311."
     )

@@ -94,6 +94,59 @@ notify_slack() {
         --max-time 10 || true
 }
 
+# Concurrent-rebuild guard (#311). The launcher's #304 precheck only covers
+# the EventBridge-dispatched path; a rebuild started by calling RunInstances /
+# the launch template directly (as the 2026-07-06 #298 recovery did) slips
+# past it. The bootstrap is the authoritative choke point for *all* launch
+# paths — the last step before the pipeline touches the shared Railway cache.
+#
+# Peer query mirrors the launcher/sweeper `list_active_rebuild_instances`
+# filter (tag:Project=discogs-rebuild + pending/running). Keep it in sync.
+# The bootstrap is bash, so it shells out to `aws ec2 describe-instances`
+# rather than importing the Python helper (needs ec2:DescribeInstances on
+# InstanceRole; Describe has no resource-level scoping).
+#
+# Tie-break — a *total* order so exactly one of N concurrently-booted
+# instances proceeds: earliest LaunchTime wins, ties broken by the
+# lexicographically smaller InstanceId. LaunchTime is ISO-8601 UTC, so a
+# plain `sort` over "<LaunchTime>\t<InstanceId>" lines yields that order and
+# `head -n1` is the winner. The earliest-launched instance sees itself win
+# and proceeds; every later instance sees an earlier peer and bows out. No
+# mutual-suicide path.
+#
+# Fail-open: if the query errors or self isn't yet visible (DescribeInstances
+# is eventually consistent), proceed rather than block the rebuild — the
+# launcher precheck already ran and the >3h sweeper is the backstop. TOCTOU
+# note: DescribeInstances isn't atomic, but this is the *late* authoritative
+# check, a much narrower window than the launcher's.
+abort_if_not_winning_rebuild() {
+    local instances winner
+    instances="$(aws ec2 describe-instances \
+        --filters 'Name=tag:Project,Values=discogs-rebuild' \
+                  'Name=instance-state-name,Values=pending,running' \
+        --query 'Reservations[].Instances[].[LaunchTime,InstanceId]' \
+        --output text 2>/dev/null)" || instances=""
+
+    if [ -z "$instances" ]; then
+        log "WARN: peer check found no active rebuild instances (self not yet visible?); proceeding"
+        return 0
+    fi
+    if ! printf '%s\n' "$instances" | grep -qF "$INSTANCE_ID"; then
+        log "WARN: peer check does not yet list self ${INSTANCE_ID}; cannot rank, proceeding"
+        return 0
+    fi
+
+    winner="$(printf '%s\n' "$instances" | sort | head -n1 | awk '{print $NF}')"
+    if [ "$winner" != "$INSTANCE_ID" ]; then
+        log "BootstrapCollisionAborted: peer ${winner} outranks self ${INSTANCE_ID}; bowing out before any cache write"
+        notify_slack ":no_entry:" "concurrent rebuild detected — ${INSTANCE_ID} bowing out (winner ${winner}); no cache write, self-terminating"
+        # exit 0 → trap on_exit EXIT uploads the log and runs shutdown -h now
+        # (InstanceInitiatedShutdownBehavior=terminate releases the instance).
+        exit 0
+    fi
+    log "peer check: ${INSTANCE_ID} is the winning rebuild instance; proceeding"
+}
+
 # trap EXIT runs on every exit path — clean or panic. It uploads the log
 # and calls shutdown unconditionally so a crashed bootstrap can't leak the
 # instance past the InstanceInitiatedShutdownBehavior=terminate window.
@@ -230,7 +283,15 @@ export REPO_DIR CONVERTER_DIR LOG_DIR
 notify_slack ":hourglass:" "starting on ${INSTANCE_ID}"
 
 # ---------------------------------------------------------------------------
-# 6. Hand off to the existing rebuild-cache.sh. It already handles the
+# 6. Concurrent-rebuild guard (#311). Run as late as possible — right before
+#    the first write to the shared cache — so a peer about to finish and
+#    terminate is reflected. If we're not the winning instance, this exits 0
+#    and never reaches the handoff below.
+# ---------------------------------------------------------------------------
+abort_if_not_winning_rebuild
+
+# ---------------------------------------------------------------------------
+# 7. Hand off to the existing rebuild-cache.sh. It already handles the
 #    streaming download, pipeline run, and drift watchdog. We share its log
 #    directory so the s3 sync at exit picks both up.
 # ---------------------------------------------------------------------------
