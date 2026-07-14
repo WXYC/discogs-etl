@@ -211,6 +211,14 @@ Resources:
               Action: ec2:RunInstances
               Resource: '*'
             - Effect: Allow
+              Action: ec2:DescribeInstances
+              Resource: '*'
+              # DescribeInstances backs the #304 collision precheck — the
+              # launcher queries for an in-flight rebuild (Project=discogs-rebuild,
+              # pending/running) before RunInstances and aborts if one exists.
+              # Describe* has no resource-level scoping in IAM (it's '*'-only),
+              # matching the sweeper role's grant.
+            - Effect: Allow
               Action: ec2:CreateTags
               Resource: '*'
               # CreateTags is intentionally unrestricted: AWS evaluates this
@@ -222,6 +230,14 @@ Resources:
               # PassRole is the only iam:* the launcher gets, and it's
               # scoped to the single role the launch template attaches.
               Resource: !GetAtt InstanceRole.Arn
+            - Effect: Allow
+              Action: cloudwatch:PutMetricData
+              Resource: '*'
+              # Emits LaunchCollisionAborted (#304) when the precheck suppresses
+              # a colliding launch. Namespace-scoped like the sweeper's grant.
+              Condition:
+                StringEquals:
+                  cloudwatch:namespace: WXYC/DiscogsRebuild
       Events:
         Monthly:
           Type: Schedule

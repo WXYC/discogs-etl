@@ -148,6 +148,25 @@ def test_mixed_old_and_young_only_terminates_old(handler_module, monkeypatch):
     ec2.terminate_instances.assert_called_once_with(InstanceIds=["i-stale-1", "i-stale-2"])
 
 
+def test_list_active_rebuild_instances_ignores_age(handler_module):
+    """The launcher's collision guard (#304) reuses this state-filtered query
+    with no age cutoff, so a brand-new instance must still be reported."""
+    ec2 = _make_ec2(
+        reservations=[
+            {
+                "Instances": [
+                    {"InstanceId": "i-fresh", "LaunchTime": _now() - timedelta(minutes=1)},
+                    {"InstanceId": "i-old", "LaunchTime": _now() - timedelta(hours=6)},
+                ]
+            }
+        ]
+    )
+
+    active = handler_module.list_active_rebuild_instances(ec2)
+
+    assert {i["InstanceId"] for i in active} == {"i-fresh", "i-old"}
+
+
 def test_max_age_hours_env_override(handler_module, monkeypatch):
     """A 1h override should sweep instances that a 3h default leaves alone."""
     monkeypatch.setenv("MAX_INSTANCE_AGE_HOURS", "1")

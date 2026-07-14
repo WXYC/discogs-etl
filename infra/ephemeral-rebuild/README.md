@@ -8,7 +8,7 @@ The stack itself does no work — it provisions the infra (Launch Template, two 
 
 | Resource | Purpose |
 |---|---|
-| `LauncherFunction` (Lambda) | Fired by EventBridge `cron(0 6 4 * ? *)`. Calls `RunInstances` on the launch template with a tiny user-data stub. |
+| `LauncherFunction` (Lambda) | Fired by EventBridge `cron(0 6 4 * ? *)`. Prechecks for an already-running rebuild (`Project=discogs-rebuild`, pending/running) and aborts cleanly with a `LaunchCollisionAborted` metric if one exists (#304); otherwise calls `RunInstances` on the launch template with a tiny user-data stub. |
 | `SweeperFunction` (Lambda) | Fired hourly. Force-terminates any rebuild-tagged EC2 older than `MAX_INSTANCE_AGE_HOURS` (default 3) and emits the `StaleInstanceTerminated` metric. |
 | `LaunchTemplate` (EC2) | Pins instance type, AMI (latest AL2023 via SSM public parameter), 100 GB gp3 root, IMDSv2-only, `InstanceInitiatedShutdownBehavior=terminate`. |
 | `InstanceRole` / `InstanceProfile` (IAM) | Attached to the spawned EC2. Grants `ssm:GetParameters` on `${SsmPrefix}/*`, `kms:Decrypt` (scoped via `kms:ViaService`), and `s3:PutObject` on the log bucket. No EC2 mutation grants — shutdown is what releases the instance. |
@@ -128,6 +128,8 @@ aws ec2 terminate-instances --instance-ids i-0xxxxxxx
 |---|---|---|
 | `discogs-rebuild-launcher-errors` | The launcher Lambda errored before completing `RunInstances`. | `aws logs tail /aws/lambda/discogs-rebuild-launcher --since 1h`. Usually IAM scope drift on `iam:PassRole` or a hand-edited launch template. |
 | `discogs-rebuild-stale-instance` | The sweeper terminated a rebuild EC2 that was past its 3h budget. | Pull the log archive from S3 (the sweeper terminates *after* shutdown would have, so the bootstrap's `trap EXIT` upload should have run). Check what step the bootstrap was on when it stalled. |
+
+The launcher also emits a `LaunchCollisionAborted` metric (namespace `WXYC/DiscogsRebuild`) when its #304 precheck suppresses a launch because a rebuild is already in flight. That's the guard working as intended, not a fault, so there's no alarm on it — but a non-zero count is worth a look (usually a manual launch racing the monthly cron). Query it with `aws cloudwatch get-metric-statistics --namespace WXYC/DiscogsRebuild --metric-name LaunchCollisionAborted --statistics Sum --period 86400 --start-time <t0> --end-time <t1>`.
 
 Slack drift / pipeline-failure messages from the bootstrap itself flow through the `SLACK_MONITORING_WEBHOOK` SSM parameter — they're a different channel than CloudWatch alarms.
 
