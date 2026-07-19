@@ -193,6 +193,20 @@ python scripts/verify_cache.py \
 
 `--copy-to` and `--prune` are mutually exclusive.
 
+### Seeding the Cache from a Full Clone (out-of-band)
+
+`scripts/seed_cache_from_clone.py` is a one-off operational tool (not a pipeline step) that **additively** copies an artist-scoped release row-set from a full, unfiltered Discogs clone into an existing target discogs-cache. It exists to backfill a finite, known set of non-library releases into prod without a full rebuild — e.g. the [Backend-Service#1631](https://github.com/WXYC/Backend-Service/issues/1631) Apple-Music-URL "cold tail" of albums whose Discogs releases the library filter never admitted.
+
+```bash
+python scripts/seed_cache_from_clone.py \
+  --source postgresql://localhost:5432/discogs \
+  --target "$DATABASE_URL_DISCOGS" \
+  --ids-file tail_release_ids.txt \
+  --dry-run
+```
+
+Unlike `--copy-to` (which builds a *fresh* lean database and drops target tables), this seeds into a **populated** cache and never overwrites: `release`/`artist` use `ON CONFLICT (id) DO NOTHING`, and the arbiter-less child tables are gated on the new-parent-id set so a re-run inserts no duplicates. `--ids-file` holds the release_ids to seed (one per line), selected upstream via LML's `lower(f_unaccent(artist_name)) % $artist` trigram predicate over the tail artists. Always `--dry-run` first. Never run `verify_cache.py --prune` against the seeded rows — it prunes non-library releases, which is exactly what this seeds. Full procedure in [`docs/seed-cache-from-clone-runbook.md`](docs/seed-cache-from-clone-runbook.md).
+
 ### Resuming a Failed Pipeline
 
 If a pipeline run fails mid-way (e.g., disk full during index creation), you can resume from where it left off instead of restarting from scratch:
