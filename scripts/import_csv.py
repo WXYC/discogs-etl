@@ -278,7 +278,15 @@ MASTER_TABLES: list[TableConfig] = [
         "db_columns": ["master_id", "artist_id", "artist_name"],
         "required": ["master_id", "artist_name"],
         "transforms": {},
-        "unique_key": ["master_id", "artist_id"],
+        # ``artist_name`` is in the dedup key because ``artist_id`` is nullable
+        # (empty cell -> NULL) and the converter serializes an artist with no
+        # Discogs id as ``"0"``: two DISTINCT co-artists on one master that both
+        # lack an id would collapse onto a single ``(master_id, NULL)`` /
+        # ``(master_id, "0")`` key and the second credit would be silently
+        # dropped. Keying on the name too keeps them apart (WXYC/discogs-etl#319;
+        # precedent ``release_artist`` #293). Safe as a static key because
+        # ``artist_name`` is always in ``csv_columns`` above.
+        "unique_key": ["master_id", "artist_id", "artist_name"],
     },
 ]
 

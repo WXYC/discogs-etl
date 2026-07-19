@@ -22,6 +22,7 @@ BASE_TABLES = _ic.BASE_TABLES
 TRACK_TABLES = _ic.TRACK_TABLES
 VIDEO_TABLES = _ic.VIDEO_TABLES
 ARTIST_TABLES = _ic.ARTIST_TABLES
+MASTER_TABLES = _ic.MASTER_TABLES
 TableConfig = _ic.TableConfig
 _import_tables_parallel = _ic._import_tables_parallel
 import_artist_details = _ic.import_artist_details
@@ -893,6 +894,115 @@ class TestImportCsvExtraDedupKey:
         ``WideTrackArtistDedup`` in discogs-xml-converter#74."""
         rta_config = next(t for t in TRACK_TABLES if t["table"] == "release_track_artist")
         assert rta_config.get("optional_unique_key") == ["extra"]
+
+
+class TestImportCsvMasterArtistDedupKey:
+    """WXYC/discogs-etl#319: the loader must keep two DISTINCT co-credited
+    artists on one master even when both lack an ``artist_id``.
+
+    ``master_artist.artist_id`` is nullable (the Discogs artist id can be
+    absent) and ``import_csv`` maps an empty cell to ``None``, so two different
+    co-artists sharing a NULL/empty ``artist_id`` collapse onto one
+    ``(master_id, NULL)`` dedup key — first-wins — and the second credit is
+    silently dropped. In the converter's actual output the missing id is
+    serialized as ``"0"`` rather than an empty cell (``MasterArtist.id`` is a
+    non-nullable ``u64`` that defaults to 0), which collapses just the same on
+    the shared ``(master_id, "0")`` key. Adding ``artist_name`` to the key keeps
+    both distinct. Mirrors the ``release_artist`` precedent #293.
+    """
+
+    def test_master_artist_keeps_distinct_null_artist_id_coartists(self, tmp_path) -> None:
+        """Two co-artists on one master with an EMPTY ``artist_id`` and
+        different names both survive. Driven from the real ``MASTER_TABLES``
+        config so the widened static key is what makes this pass. RED on the
+        current ``(master_id, artist_id)`` key (collapses to 1), GREEN after
+        adding ``artist_name``."""
+        ma_config = next(t for t in MASTER_TABLES if t["table"] == "master_artist")
+
+        csv_path = tmp_path / "master_artist.csv"
+        csv_path.write_text(
+            "master_id,artist_id,artist_name\n300,,Duke Ellington\n300,,John Coltrane\n"
+        )
+
+        conn, captured = _recording_conn()
+        count = import_csv(
+            conn,
+            csv_path,
+            table="master_artist",
+            csv_columns=ma_config["csv_columns"],
+            db_columns=ma_config["db_columns"],
+            required_columns=ma_config["required"],
+            transforms=ma_config["transforms"],
+            unique_key=ma_config["unique_key"],
+        )
+
+        assert count == 2
+        assert captured["rows"][0] == ("300", None, "Duke Ellington")
+        assert captured["rows"][1] == ("300", None, "John Coltrane")
+
+    def test_master_artist_keeps_distinct_zero_artist_id_coartists(self, tmp_path) -> None:
+        """The converter's real vector: an artist lacking a Discogs id is
+        emitted with ``artist_id="0"`` (non-nullable ``u64`` default), so two
+        distinct co-artists share ``(master_id, "0")``. Both must survive.
+        RED on the current key (collapses to 1), GREEN after adding
+        ``artist_name``."""
+        ma_config = next(t for t in MASTER_TABLES if t["table"] == "master_artist")
+
+        csv_path = tmp_path / "master_artist.csv"
+        csv_path.write_text(
+            "master_id,artist_id,artist_name\n300,0,Duke Ellington\n300,0,John Coltrane\n"
+        )
+
+        conn, captured = _recording_conn()
+        count = import_csv(
+            conn,
+            csv_path,
+            table="master_artist",
+            csv_columns=ma_config["csv_columns"],
+            db_columns=ma_config["db_columns"],
+            required_columns=ma_config["required"],
+            transforms=ma_config["transforms"],
+            unique_key=ma_config["unique_key"],
+        )
+
+        assert count == 2
+        assert captured["rows"][0] == ("300", "0", "Duke Ellington")
+        assert captured["rows"][1] == ("300", "0", "John Coltrane")
+
+    def test_master_artist_genuine_duplicate_still_collapses(self, tmp_path) -> None:
+        """Over-widening guard: two rows identical on ``(master_id, artist_id,
+        artist_name)`` still collapse to one, keeping the first — the widened
+        key must not stop deduplicating true duplicate credits."""
+        ma_config = next(t for t in MASTER_TABLES if t["table"] == "master_artist")
+
+        csv_path = tmp_path / "master_artist.csv"
+        csv_path.write_text(
+            "master_id,artist_id,artist_name\n300,,Duke Ellington\n300,,Duke Ellington\n"
+        )
+
+        conn, captured = _recording_conn()
+        count = import_csv(
+            conn,
+            csv_path,
+            table="master_artist",
+            csv_columns=ma_config["csv_columns"],
+            db_columns=ma_config["db_columns"],
+            required_columns=ma_config["required"],
+            transforms=ma_config["transforms"],
+            unique_key=ma_config["unique_key"],
+        )
+
+        assert count == 1
+        assert captured["rows"][0] == ("300", None, "Duke Ellington")
+
+    def test_master_artist_config_unique_key_includes_artist_name(self) -> None:
+        """Config pin: ``master_artist`` dedups on ``artist_name`` so a future
+        edit that drops it from the static key trips this test rather than
+        silently reintroducing the NULL-``artist_id`` collapse (#319).
+        ``artist_name`` is a hard ``csv_columns`` entry, so the static key is
+        safe."""
+        ma_config = next(t for t in MASTER_TABLES if t["table"] == "master_artist")
+        assert ma_config["unique_key"] == ["master_id", "artist_id", "artist_name"]
 
 
 class TestImportCsvMissingColumns:

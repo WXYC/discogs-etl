@@ -1515,6 +1515,35 @@ class TestImportMasters:
         assert rows == [(100, "Stereolab"), (300, "Stereolab")]
         assert main_release_id == 1001
 
+    def test_distinct_null_artist_id_coartists_both_survive(self, tmp_path) -> None:
+        """Two DISTINCT co-credited artists on one master that BOTH lack an
+        ``artist_id`` must both survive the import. The empty ``artist_id`` cell
+        maps to NULL, so a dedup key of ``(master_id, artist_id)`` collapses
+        both credits onto a single ``(master_id, NULL)`` key and silently drops
+        the second artist. Keying on ``artist_name`` too keeps both distinct
+        (WXYC/discogs-etl#319; mirrors the ``release_artist`` fix #293). Uses the
+        real ``Duke Ellington & John Coltrane`` two-artist master."""
+        self._seed_releases([(1001, 300)])
+        self._write_master_csvs(
+            tmp_path,
+            masters=[(300, "Duke Ellington & John Coltrane", 1001, 1963)],
+            master_artists=[
+                (300, None, "Duke Ellington"),
+                (300, None, "John Coltrane"),
+            ],
+        )
+        conn = psycopg.connect(self.db_url)
+        _ic.import_masters(conn, tmp_path)
+        conn.close()
+        conn = psycopg.connect(self.db_url)
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT artist_name FROM master_artist WHERE master_id = 300 ORDER BY artist_name"
+            )
+            names = [r[0] for r in cur.fetchall()]
+        conn.close()
+        assert names == ["Duke Ellington", "John Coltrane"]
+
     def test_rerun_is_idempotent(self, tmp_path) -> None:
         """A second run neither duplicates rows nor raises a PK violation —
         the truncate-and-reload is authoritative. Guards the monthly rerun."""
