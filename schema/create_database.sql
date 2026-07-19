@@ -273,8 +273,12 @@ CREATE INDEX IF NOT EXISTS idx_artist_name_variation_artist_id ON artist_name_va
 CREATE INDEX IF NOT EXISTS idx_artist_member_artist_id ON artist_member(artist_id);
 CREATE INDEX IF NOT EXISTS idx_artist_url_artist_id ON artist_url(artist_id);
 
--- Partial index on master_id for dedup performance.
--- Transient: dropped automatically by dedup copy-swap (which excludes master_id).
+-- Partial index on master_id: speeds the dedup partition scan.
+-- The INDEX is transient — the copy-swap rebuilds `release` via CTAS (CREATE
+-- TABLE new_release AS SELECT ...), which carries no indexes, and
+-- add_base_constraints_and_indexes does not recreate it, so it is gone
+-- post-swap. The master_id COLUMN itself persists (it is in DEDUP_TABLES; see
+-- L64 and scripts/dedup_releases.py) — the swap does not exclude it.
 CREATE INDEX IF NOT EXISTS idx_release_master_id ON release(master_id) WHERE master_id IS NOT NULL;
 
 -- Master indexes
