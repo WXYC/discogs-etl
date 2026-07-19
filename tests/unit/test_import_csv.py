@@ -1105,6 +1105,90 @@ class TestMainArgParsing:
         assert call_args[1]["child_tables"] == TRACK_TABLES + VIDEO_TABLES
         assert call_args[1]["release_id_filter"] == {5001, 5002, 5003}
 
+    def test_masters_only_mode_calls_import_masters(self, tmp_path) -> None:
+        """``--masters-only`` imports ONLY masters — none of the
+        release/artist/label helpers run. This is the mode the one-time prod
+        import + any ad-hoc masters refresh use (WXYC/discogs-etl#317)."""
+        from unittest.mock import MagicMock, patch
+
+        csv_dir = tmp_path / "csv"
+        csv_dir.mkdir()
+
+        mock_conn = MagicMock()
+
+        with (
+            patch(
+                "sys.argv",
+                ["import_csv.py", "--masters-only", str(csv_dir), "postgresql:///test"],
+            ),
+            patch.object(_ic.psycopg, "connect", return_value=mock_conn),
+            patch.object(_ic, "import_masters", return_value=42) as mock_masters,
+            patch.object(_ic, "_import_tables") as mock_import_tables,
+            patch.object(_ic, "_import_tables_parallel") as mock_parallel,
+            patch.object(_ic, "import_release_via_upsert") as mock_upsert,
+            patch.object(_ic, "import_artist_details") as mock_artist,
+        ):
+            _ic.main()
+
+        mock_masters.assert_called_once()
+        mc_args = mock_masters.call_args
+        assert mc_args[0][0] is mock_conn
+        assert mc_args[0][1] == csv_dir
+        # Nothing that writes release/artist/label runs in masters-only mode.
+        mock_import_tables.assert_not_called()
+        mock_parallel.assert_not_called()
+        mock_upsert.assert_not_called()
+        mock_artist.assert_not_called()
+
+    def test_masters_only_is_mutually_exclusive_with_base_only(self, tmp_path) -> None:
+        """``--masters-only`` joins the existing mode group, so combining it with
+        another mode is an argparse error (SystemExit 2)."""
+        from unittest.mock import patch
+
+        csv_dir = tmp_path / "csv"
+        csv_dir.mkdir()
+
+        with (
+            patch(
+                "sys.argv",
+                ["import_csv.py", "--masters-only", "--base-only", str(csv_dir)],
+            ),
+            pytest.raises(SystemExit),
+        ):
+            _ic.main()
+
+    def test_masters_only_with_truncate_existing_does_not_wipe_base(self, tmp_path) -> None:
+        """``import_masters`` self-truncates only its two tables, so the
+        top-level ``--truncate-existing`` base wipe — which includes
+        ``release`` — must NOT fire in ``--masters-only`` mode. Guards against
+        an ad-hoc ``--masters-only --truncate-existing`` blowing away the cache
+        (WXYC/discogs-etl#317)."""
+        from unittest.mock import MagicMock, patch
+
+        csv_dir = tmp_path / "csv"
+        csv_dir.mkdir()
+
+        mock_conn = MagicMock()
+
+        with (
+            patch(
+                "sys.argv",
+                [
+                    "import_csv.py",
+                    "--masters-only",
+                    "--truncate-existing",
+                    str(csv_dir),
+                    "postgresql:///test",
+                ],
+            ),
+            patch.object(_ic.psycopg, "connect", return_value=mock_conn),
+            patch.object(_ic, "import_masters", return_value=42),
+            patch.object(_ic, "_truncate_tables") as mock_truncate,
+        ):
+            _ic.main()
+
+        mock_truncate.assert_not_called()
+
 
 # ---------------------------------------------------------------------------
 # --truncate-existing flag

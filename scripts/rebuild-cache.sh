@@ -203,12 +203,18 @@ both_reachable() {
 
 url="$(dump_url "$year" "${year}${month}" releases)"
 artists_url="$(dump_url "$year" "${year}${month}" artists)"
+# Masters tracks whichever month the releases/artists gate resolves to, but is
+# NOT part of the gate itself — masters is the least time-critical of the four
+# dumps, so a masters publish lag must not drag the releases/artists rebuild
+# back a month. The masters fetch below is best-effort. See #317.
+masters_url="$(dump_url "$year" "${year}${month}" masters)"
 if ! both_reachable "$url" "$artists_url"; then
     prev=$(date -u -d "1 month ago" +%Y%m 2>/dev/null \
         || date -u -v-1m +%Y%m)
     prev_year=${prev:0:4}
     url="$(dump_url "$prev_year" "$prev" releases)"
     artists_url="$(dump_url "$prev_year" "$prev" artists)"
+    masters_url="$(dump_url "$prev_year" "$prev" masters)"
     if ! both_reachable "$url" "$artists_url"; then
         fail "neither current nor previous month has both releases.xml.gz and artists.xml.gz reachable"
     fi
@@ -216,6 +222,7 @@ if ! both_reachable "$url" "$artists_url"; then
 fi
 echo "    releases URL: $url"
 echo "    artists URL:  $artists_url"
+echo "    masters URL:  $masters_url"
 
 # ---------------------------------------------------------------------------
 # 5. Spool dump to disk + run pipeline
@@ -256,6 +263,20 @@ if [ "${REBUILD_SMOKE:-}" = "1" ]; then
         fail "smoke mode read only ${artists_smoke_bytes} bytes from artists URL"
     fi
     echo "    artists smoke OK: read ${artists_smoke_bytes} bytes"
+    # Masters is best-effort (see the download phase below): validate the URL
+    # when reachable, but a not-yet-published masters dump must not fail the
+    # smoke test. Probe with a HEAD inside `if` so a 404/403 is non-fatal.
+    if curl -sIfL --max-time 15 -o /dev/null "$masters_url"; then
+        masters_smoke_file="$WORK_DIR/masters-smoke.xml.gz"
+        curl -fL --max-time 30 -r 0-65535 -o "$masters_smoke_file" "$masters_url"
+        masters_smoke_bytes=$(wc -c < "$masters_smoke_file" | tr -d ' ')
+        if [ "$masters_smoke_bytes" -lt 1024 ]; then
+            fail "smoke mode read only ${masters_smoke_bytes} bytes from masters URL"
+        fi
+        echo "    masters smoke OK: read ${masters_smoke_bytes} bytes"
+    else
+        echo "    masters smoke SKIP: masters dump not reachable (best-effort phase)"
+    fi
     notify_slack ":mag:" "smoke test passed (no DB write performed)"
     exit 0
 fi
@@ -303,6 +324,26 @@ curl -fL --continue-at - --retry 5 --retry-delay 30 --retry-all-errors \
 assert_min_size "$WORK_DIR/artists.xml.gz" $((100 * 1024 * 1024)) "artists.xml.gz"
 echo "    artists download complete ($(du -h "$WORK_DIR/artists.xml.gz" | cut -f1))"
 
+# Masters dump is ~590 MB compressed — the smallest of the four monthly files.
+# Best-effort: masters is the least time-critical dump, so a not-yet-published
+# masters file must not fail the releases/artists rebuild (a masters publish lag
+# would otherwise abort here under `set -e`). Probe reachability with a HEAD
+# first; if present, download under the same #181 resilience flags and land it
+# in $WORK_DIR so directory-mode auto-dispatch runs process_masters. A
+# reachable-but-failing GET (or a truncated file) still fails hard, matching
+# releases/artists. If the probe fails, skip — import_csv.py's import_masters
+# no-ops on the absent master.csv, leaving the masters tables unchanged. See #317.
+if curl -sIfL --max-time 15 -o /dev/null "$masters_url"; then
+    echo "[$(date -u +%H:%M:%SZ)] download masters dump → $WORK_DIR/masters.xml.gz"
+    curl -fL --continue-at - --retry 5 --retry-delay 30 --retry-all-errors \
+        -o "$WORK_DIR/masters.xml.gz" \
+        "$masters_url"
+    assert_min_size "$WORK_DIR/masters.xml.gz" $((50 * 1024 * 1024)) "masters.xml.gz"
+    echo "    masters download complete ($(du -h "$WORK_DIR/masters.xml.gz" | cut -f1))"
+else
+    echo "    masters dump for the resolved month not reachable; skipping masters phase (tables unchanged)"
+fi
+
 echo "[$(date -u +%H:%M:%SZ)] start pipeline"
 # Default mode (no --truncate-existing): the import path is idempotent via
 # `import_release_via_upsert` (staging-table COPY + UPSERT excluding the
@@ -315,11 +356,16 @@ echo "[$(date -u +%H:%M:%SZ)] start pipeline"
 #
 # Directory mode (--xml "$WORK_DIR"): the converter scans the directory for
 # .xml / .xml.gz files and dispatches each by root-element auto-detection
-# (run_directory in main.rs). With both releases.xml.gz and artists.xml.gz
-# present, process_artists runs alongside the release scanner, writing the
-# artist-side CSVs (artist.csv, artist_alias.csv, artist_name_variation.csv,
+# (run_directory in main.rs). With releases.xml.gz and artists.xml.gz present,
+# process_artists runs alongside the release scanner, writing the artist-side
+# CSVs (artist.csv, artist_alias.csv, artist_name_variation.csv,
 # artist_member.csv) into the CSV staging dir; import_csv.py --base-only's
-# inline import_artist_details call then loads them. LML#497.
+# inline import_artist_details call then loads them (LML#497). When
+# masters.xml.gz is also present (the best-effort fetch above succeeded),
+# process_masters writes master.csv + master_artist.csv and import_csv.py
+# --base-only's inline import_masters call loads them, scoped to
+# release.master_id (#317). A missing masters.xml.gz leaves master.csv absent
+# and import_masters no-ops.
 # --xml-type is intentionally absent — it forces single-file mode and would
 # skip artist processing.
 python "$REPO_DIR/scripts/run_pipeline.py" \
