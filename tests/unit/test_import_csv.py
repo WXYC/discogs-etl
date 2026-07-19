@@ -1142,7 +1142,8 @@ class TestMainArgParsing:
 
     def test_masters_only_is_mutually_exclusive_with_base_only(self, tmp_path) -> None:
         """``--masters-only`` joins the existing mode group, so combining it with
-        another mode is an argparse error (SystemExit 2)."""
+        another mode is an argparse error (SystemExit 2 specifically — not some
+        later runtime SystemExit, which would let a broken mode group pass)."""
         from unittest.mock import patch
 
         csv_dir = tmp_path / "csv"
@@ -1153,9 +1154,10 @@ class TestMainArgParsing:
                 "sys.argv",
                 ["import_csv.py", "--masters-only", "--base-only", str(csv_dir)],
             ),
-            pytest.raises(SystemExit),
+            pytest.raises(SystemExit) as exc_info,
         ):
             _ic.main()
+        assert exc_info.value.code == 2  # argparse "not allowed with argument" error
 
     def test_masters_only_with_truncate_existing_does_not_wipe_base(self, tmp_path) -> None:
         """``import_masters`` self-truncates only its two tables, so the
@@ -1188,6 +1190,94 @@ class TestMainArgParsing:
             _ic.main()
 
         mock_truncate.assert_not_called()
+
+    def test_base_only_mode_calls_import_masters(self, tmp_path) -> None:
+        """``--base-only`` is the production monthly path (run_pipeline.py runs
+        ``import_csv.py --base-only``), so masters MUST be loaded there. Pinning
+        the call guards against silently dropping it — reintroducing the exact
+        #317 defect (masters never loaded by the monthly rebuild) with a green
+        suite (WXYC/discogs-etl#317)."""
+        from unittest.mock import MagicMock, patch
+
+        csv_dir = tmp_path / "csv"
+        csv_dir.mkdir()
+
+        mock_conn = MagicMock()
+
+        with (
+            patch(
+                "sys.argv",
+                ["import_csv.py", "--base-only", str(csv_dir), "postgresql:///test"],
+            ),
+            patch.object(_ic.psycopg, "connect", return_value=mock_conn),
+            patch.object(_ic, "_import_tables_parallel", return_value=100),
+            patch.object(_ic, "import_release_via_upsert", return_value=50),
+            patch.object(_ic, "import_artwork", return_value=10),
+            patch.object(_ic, "populate_release_year", return_value=50),
+            patch.object(_ic, "populate_cache_metadata", return_value=50),
+            patch.object(_ic, "create_track_count_table", return_value=20),
+            patch.object(_ic, "import_artist_details", return_value=20),
+            patch.object(_ic, "import_masters", return_value=7) as mock_masters,
+        ):
+            _ic.main()
+
+        mock_masters.assert_called_once()
+        assert mock_masters.call_args[0][1] == csv_dir
+
+    def test_base_only_masters_failure_is_non_fatal(self, tmp_path) -> None:
+        """A raising ``import_masters`` must NOT abort the ``--base-only`` monthly
+        run: it's the last step of the import phase, which precedes dedup/prune
+        in run_pipeline, so a raise would leave releases un-deduped/un-pruned.
+        The failure is caught, the transaction rolled back, and the run
+        continues (WXYC/discogs-etl#317)."""
+        from unittest.mock import MagicMock, patch
+
+        csv_dir = tmp_path / "csv"
+        csv_dir.mkdir()
+
+        mock_conn = MagicMock()
+
+        with (
+            patch(
+                "sys.argv",
+                ["import_csv.py", "--base-only", str(csv_dir), "postgresql:///test"],
+            ),
+            patch.object(_ic.psycopg, "connect", return_value=mock_conn),
+            patch.object(_ic, "_import_tables_parallel", return_value=100),
+            patch.object(_ic, "import_release_via_upsert", return_value=50),
+            patch.object(_ic, "import_artwork", return_value=10),
+            patch.object(_ic, "populate_release_year", return_value=50),
+            patch.object(_ic, "populate_cache_metadata", return_value=50),
+            patch.object(_ic, "create_track_count_table", return_value=20),
+            patch.object(_ic, "import_artist_details", return_value=20),
+            patch.object(_ic, "import_masters", side_effect=RuntimeError("bad master.csv")),
+        ):
+            _ic.main()  # must NOT raise — masters is best-effort on the monthly path
+
+        # The aborted masters transaction is rolled back so conn.close() is clean.
+        mock_conn.rollback.assert_called_once()
+
+    def test_masters_only_masters_failure_propagates(self, tmp_path) -> None:
+        """``--masters-only`` is an explicit operator action, so a masters failure
+        there must surface (propagate), not be swallowed like the best-effort
+        monthly path (WXYC/discogs-etl#317)."""
+        from unittest.mock import MagicMock, patch
+
+        csv_dir = tmp_path / "csv"
+        csv_dir.mkdir()
+
+        mock_conn = MagicMock()
+
+        with (
+            patch(
+                "sys.argv",
+                ["import_csv.py", "--masters-only", str(csv_dir), "postgresql:///test"],
+            ),
+            patch.object(_ic.psycopg, "connect", return_value=mock_conn),
+            patch.object(_ic, "import_masters", side_effect=RuntimeError("bad master.csv")),
+            pytest.raises(RuntimeError, match="bad master.csv"),
+        ):
+            _ic.main()
 
 
 # ---------------------------------------------------------------------------

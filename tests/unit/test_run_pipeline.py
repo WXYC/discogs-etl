@@ -944,6 +944,23 @@ class TestReportSizes:
         assert any("release_artist" in msg and "80,000" in msg for msg in logged)
         mock_conn.close.assert_called_once()
 
+    def test_query_includes_master_tables(self) -> None:
+        """``master`` / ``master_artist`` counts must be in the report so a
+        silently-empty masters load surfaces in the monthly run's final state
+        rather than passing as an unqualified success (WXYC/discogs-etl#317)."""
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_cursor.fetchall.return_value = []
+        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
+        mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+
+        with patch.object(run_pipeline.psycopg, "connect", return_value=mock_conn):
+            run_pipeline.report_sizes("postgresql:///test")
+
+        sql = mock_cursor.execute.call_args[0][0]
+        assert "'master'" in sql, "report_sizes must report the master table count"
+        assert "'master_artist'" in sql, "report_sizes must report master_artist too"
+
 
 # ---------------------------------------------------------------------------
 # convert_and_filter
