@@ -1108,18 +1108,34 @@ def import_masters(conn, csv_dir: Path) -> int:
     how ``import_artist_details`` scopes the artist child tables to the artist
     ids that survived release filtering (WXYC/discogs-etl#317).
 
-    Authoritative truncate-and-reload of the two masters tables, so a monthly
-    rerun is idempotent (a plain COPY would hit ``master``'s PK on the second
-    run). The TRUNCATE is safe: ``release.master_id`` is a plain integer, NOT a
-    foreign key, so it cannot cascade into ``release``; ``master_artist``
-    references ``master(id) ON DELETE CASCADE`` and nothing references
-    ``master_artist``. So ``TRUNCATE master, master_artist CASCADE`` touches
-    exactly those two tables.
+    Truncate-and-reload of the two masters tables, so a monthly rerun is
+    idempotent (a plain COPY would hit ``master``'s PK on the second run). The
+    TRUNCATE is safe: ``release.master_id`` is a plain integer, NOT a foreign
+    key, so it cannot cascade into ``release``; ``master_artist`` references
+    ``master(id) ON DELETE CASCADE`` and nothing references ``master_artist``.
+    So ``TRUNCATE master, master_artist CASCADE`` touches exactly those two
+    tables.
 
-    Skips entirely (no truncate, no-op) when ``master.csv`` is absent, so a
-    rebuild that didn't fetch a masters dump leaves the tables untouched — the
-    "additive, safe by omission" property the monthly best-effort masters fetch
-    relies on.
+    The truncate is NOT committed on its own: it shares a transaction with the
+    ``master`` COPY (``import_csv`` commits at the end of that load), so a
+    reload that raises rolls the truncate back and the previously-loaded masters
+    survive. Without this, a mid-load failure (e.g. an out-of-range ``year`` in
+    the dump) would leave the tables committed-empty. See WXYC/discogs-etl#317.
+
+    Two guards keep the destructive truncate from silently wiping populated
+    tables:
+
+    * Absent ``master.csv`` → no truncate, no-op, so a rebuild that didn't
+      fetch a masters dump leaves the tables untouched ("additive, safe by
+      omission").
+    * An empty library scope (no ``release.master_id`` references) → skip the
+      truncate, so running against a half-built cache (or one whose release
+      rows all have NULL ``master_id``) doesn't wipe a populated masters table.
+
+    A present-but-empty/malformed ``master.csv`` that yields zero rows despite a
+    non-empty scope still truncates (the reload can't tell "legitimately zero"
+    from "malformed"), so that case is surfaced with a warning for the
+    post-run observability path rather than passing silently.
 
     Returns total rows imported.
     """
@@ -1137,13 +1153,24 @@ def import_masters(conn, csv_dir: Path) -> int:
     with conn.cursor() as cur:
         cur.execute("SELECT DISTINCT master_id FROM release WHERE master_id IS NOT NULL")
         library_master_ids = {row[0] for row in cur.fetchall()}
+
+    if not library_master_ids:
+        logger.warning(
+            "No masters referenced by release.master_id (scope is empty); skipping "
+            "masters import and leaving master/master_artist unchanged, to avoid "
+            "wiping populated tables when run against a half-built cache. See #317."
+        )
+        return 0
+
     logger.info(
         f"  Filtering masters to {len(library_master_ids):,} referenced by release.master_id"
     )
 
+    # No standalone commit here: the TRUNCATE folds into the master COPY's
+    # transaction (import_csv commits at the end of that load), so a raising
+    # reload rolls the truncate back and preserves the prior masters. See #317.
     with conn.cursor() as cur:
         cur.execute("TRUNCATE master, master_artist CASCADE")
-    conn.commit()
 
     total = import_csv(
         conn,
@@ -1156,6 +1183,8 @@ def import_masters(conn, csv_dir: Path) -> int:
         unique_key=master_config.get("unique_key"),
         id_filter=library_master_ids,
         id_filter_column="id",
+        optional_csv_columns=master_config.get("optional_csv_columns"),
+        optional_unique_key=master_config.get("optional_unique_key"),
     )
 
     # Filter master_artist to the master ids ACTUALLY loaded (not the raw
@@ -1164,6 +1193,17 @@ def import_masters(conn, csv_dir: Path) -> int:
     with conn.cursor() as cur:
         cur.execute("SELECT id FROM master")
         imported_master_ids = {row[0] for row in cur.fetchall()}
+
+    if not imported_master_ids:
+        # Scope was non-empty (guarded above) yet 0 masters loaded — the dump's
+        # master.csv is empty/malformed, or none of the referenced masters are
+        # in this month's dump. The tables are now empty; surface it loudly so
+        # the run's observability (report_sizes) isn't a silent success. See #317.
+        logger.warning(
+            "0 master rows loaded despite a non-empty library scope "
+            f"({len(library_master_ids):,} referenced) — master.csv may be empty or "
+            "malformed; master/master_artist are now empty. See #317."
+        )
 
     master_artist_csv = csv_dir / master_artist_config["csv_file"]
     if master_artist_csv.exists():
@@ -1178,11 +1218,39 @@ def import_masters(conn, csv_dir: Path) -> int:
             unique_key=master_artist_config.get("unique_key"),
             id_filter=imported_master_ids,
             id_filter_column="master_id",
+            optional_csv_columns=master_artist_config.get("optional_csv_columns"),
+            optional_unique_key=master_artist_config.get("optional_unique_key"),
         )
     else:
         logger.warning("No master_artist.csv found, skipping master_artist import")
 
     return total
+
+
+def _import_masters_best_effort(conn, csv_dir: Path) -> None:
+    """Run ``import_masters`` on the monthly (``--base-only`` / default) paths
+    without ever letting a masters failure abort the rebuild.
+
+    ``import_masters`` is the last step of the import phase, which in
+    ``run_pipeline.py`` precedes the ``dedup`` and ``prune`` steps. A raise here
+    would exit the ``import_csv.py`` subprocess non-zero and abort the pipeline
+    *after* the (idempotent) release upsert already committed but *before*
+    dedup/prune run — leaving the cache serving un-deduped, un-pruned releases.
+    Masters is best-effort (see WXYC/discogs-etl#317), so a masters problem must
+    not have that blast radius: catch it, roll back the aborted transaction (the
+    truncate shares it, so existing masters are preserved), log, and continue.
+
+    ``--masters-only`` deliberately does NOT use this wrapper — an explicit
+    operator refresh should surface its errors.
+    """
+    try:
+        import_masters(conn, csv_dir)
+    except Exception:
+        conn.rollback()
+        logger.exception(
+            "Masters import failed; continuing without updating masters "
+            "(best-effort, existing masters preserved). See #317."
+        )
 
 
 def main():
@@ -1302,7 +1370,7 @@ def main():
         import_artist_details(conn, csv_dir)
         logger.info("Artist details complete")
         logger.info("Importing masters...")
-        import_masters(conn, csv_dir)
+        _import_masters_best_effort(conn, csv_dir)
         logger.info("Masters complete")
         conn.close()
     else:
@@ -1318,7 +1386,7 @@ def main():
         import_artist_details(conn, csv_dir)
         logger.info("Artist details complete")
         logger.info("Importing masters...")
-        import_masters(conn, csv_dir)
+        _import_masters_best_effort(conn, csv_dir)
         logger.info("Masters complete")
         conn.close()
 

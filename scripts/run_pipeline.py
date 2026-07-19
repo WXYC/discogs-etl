@@ -537,7 +537,8 @@ def report_sizes(db_url: str) -> None:
             FROM pg_stat_user_tables
             WHERE relname IN (
                 'release', 'release_artist', 'release_label',
-                'release_track', 'release_track_artist', 'cache_metadata'
+                'release_track', 'release_track_artist', 'cache_metadata',
+                'master', 'master_artist'
             )
             ORDER BY pg_total_relation_size(relid) DESC
         """)

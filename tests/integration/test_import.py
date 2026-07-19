@@ -1603,3 +1603,75 @@ class TestImportMasters:
         conn.close()
         assert release_count == 2  # release untouched by masters-only
         assert master_count == 2
+
+    def test_empty_scope_leaves_masters_untouched(self, tmp_path) -> None:
+        """When ``release.master_id`` yields no referenced masters (empty scope),
+        ``import_masters`` must skip the destructive truncate and leave existing
+        masters intact — running against a half-built cache (or one whose release
+        rows all have NULL master_id) must not wipe a populated masters table.
+        Guards the empty-scope facet of the review's silent-wipe finding (#317)."""
+        # Release rows exist, but none carry a master_id → scope is empty.
+        self._seed_releases([(1001, None), (1002, None)])
+        conn = psycopg.connect(self.db_url)
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO master (id, title, main_release_id) VALUES (100, 'Prior', 1001)"
+            )
+        conn.commit()
+        conn.close()
+        self._write_master_csvs(
+            tmp_path,
+            masters=[(100, "Aluminum Tunes", 1001, 1998), (300, "Dots and Loops", 1002, 1997)],
+        )
+        conn = psycopg.connect(self.db_url)
+        result = _ic.import_masters(conn, tmp_path)
+        conn.close()
+        assert result == 0
+        assert self._master_ids() == [100]  # untouched, NOT truncated to empty
+
+    def test_failed_master_load_preserves_existing_masters(self, tmp_path) -> None:
+        """A mid-load failure must not destroy the previously-loaded masters:
+        the truncate shares the reload's transaction (no standalone commit), so a
+        raising COPY rolls the truncate back. Guards the non-atomic-truncate
+        data-loss finding (#317)."""
+        self._seed_releases([(1001, 100), (1002, 300)])
+        conn = psycopg.connect(self.db_url)
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO master (id, title, main_release_id) VALUES (100, 'Prior', 1001)"
+            )
+        conn.commit()
+        conn.close()
+        # master 300 carries a year past smallint range → the COPY raises.
+        self._write_master_csvs(
+            tmp_path,
+            masters=[(100, "Aluminum Tunes", 1001, 1998), (300, "Dots and Loops", 1002, 99999)],
+        )
+        conn = psycopg.connect(self.db_url)
+        with pytest.raises(psycopg.Error):  # smallint-out-of-range on the COPY
+            _ic.import_masters(conn, tmp_path)
+        conn.rollback()  # clear the aborted transaction before closing
+        conn.close()
+        # The prior master row survives — the failed reload rolled back the truncate.
+        assert self._master_ids() == [100]
+
+    def test_zero_master_rows_from_nonempty_scope_warns(self, tmp_path, caplog) -> None:
+        """A present ``master.csv`` that yields zero master rows despite a
+        non-empty scope (e.g. a header-only/malformed converter output) must emit
+        a warning so the empty load is not silent. Observability facet of the
+        review's silent-empty finding (#317)."""
+        import logging
+
+        self._seed_releases([(1001, 100)])
+        # master.csv references only master 500, which no release points at, so
+        # the scope {100} filters every row out → 0 masters loaded.
+        self._write_master_csvs(tmp_path, masters=[(500, "Unreferenced", None, None)])
+        conn = psycopg.connect(self.db_url)
+        with caplog.at_level(logging.WARNING):
+            _ic.import_masters(conn, tmp_path)
+        conn.close()
+        assert self._master_ids() == []
+        assert any(
+            "0 master" in rec.message.lower() or "no master rows" in rec.message.lower()
+            for rec in caplog.records
+        ), f"expected a zero-masters-loaded warning; got {[r.message for r in caplog.records]}"

@@ -84,13 +84,55 @@ def test_masters_download_uses_continue_at_and_retry_all_errors(script_text: str
     )
 
 
-def test_masters_download_asserts_min_size(script_text: str) -> None:
-    """A truncated/partial masters download must fail loudly, same as the other
-    dumps. ``assert_min_size`` on the spooled masters file is the floor."""
+def test_masters_download_enforces_min_size_floor(script_text: str) -> None:
+    """A truncated/partial masters download must be rejected by a minimum on-disk
+    size floor. Because masters is best-effort (see the non-fatal test below), it
+    uses an inline byte-count guard rather than ``assert_min_size`` (which calls
+    ``fail`` → exit + Slack page — the wrong outcome for a best-effort dump)."""
     code = "\n".join(_non_comment_lines(script_text.splitlines()))
-    assert 'assert_min_size "$WORK_DIR/masters.xml.gz"' in code, (
-        "rebuild-cache.sh must assert a minimum on-disk size for "
-        "'$WORK_DIR/masters.xml.gz' so a truncated download fails loudly. See #317."
+    masters_blocks = [b for b in code.split("\n\n") if '-o "$WORK_DIR/masters.xml.gz"' in b]
+    assert len(masters_blocks) == 1, (
+        f"expected exactly one masters download block; got {len(masters_blocks)}."
+    )
+    block = masters_blocks[0]
+    assert "50 * 1024 * 1024" in block, (
+        "the masters download must enforce a ~50MB minimum-size floor so a "
+        f"truncated download is rejected. Block:\n{block}"
+    )
+    assert 'wc -c < "$WORK_DIR/masters.xml.gz"' in block, (
+        f"the masters min-size floor must read the spooled file's byte count. Block:\n{block}"
+    )
+
+
+def test_masters_download_is_non_fatal(script_text: str) -> None:
+    """A reachable-but-failing masters GET (or a sub-floor file) must NOT abort
+    the rebuild — that would discard the already-downloaded releases/artists and
+    defeat the decoupling. The block must skip (warn + drop the partial file) on
+    failure, and must NOT call ``assert_min_size``/``fail`` (which exit). #317."""
+    code = "\n".join(_non_comment_lines(script_text.splitlines()))
+    masters_blocks = [b for b in code.split("\n\n") if '-o "$WORK_DIR/masters.xml.gz"' in b]
+    assert len(masters_blocks) == 1
+    block = masters_blocks[0]
+    assert 'rm -f "$WORK_DIR/masters.xml.gz"' in block, (
+        "on a masters download failure the block must drop the partial file so "
+        f"directory-mode sees no masters and import_masters no-ops. Block:\n{block}"
+    )
+    assert "assert_min_size" not in block and "fail " not in block, (
+        "the masters download must not use assert_min_size/fail (they exit the "
+        f"whole rebuild) — masters is best-effort. Block:\n{block}"
+    )
+
+
+def test_masters_reachability_probe_retries(script_text: str) -> None:
+    """The masters reachability HEAD probe must retry so a single transient CDN
+    5xx doesn't skip masters for the whole month (unlike the retry-less original;
+    the releases/artists GETs already retry). See #317."""
+    code = "\n".join(_non_comment_lines(script_text.splitlines()))
+    probe_lines = [ln for ln in code.splitlines() if "-sIfL" in ln and "masters_url" in ln]
+    assert probe_lines, "expected a masters reachability probe line"
+    assert any("--retry" in ln for ln in probe_lines), (
+        "the masters '-sIfL ... \"$masters_url\"' HEAD probe must pass --retry so a "
+        f"transient failure doesn't skip masters for the month. Lines: {probe_lines}"
     )
 
 

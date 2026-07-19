@@ -325,21 +325,27 @@ assert_min_size "$WORK_DIR/artists.xml.gz" $((100 * 1024 * 1024)) "artists.xml.g
 echo "    artists download complete ($(du -h "$WORK_DIR/artists.xml.gz" | cut -f1))"
 
 # Masters dump is ~590 MB compressed — the smallest of the four monthly files.
-# Best-effort: masters is the least time-critical dump, so a not-yet-published
-# masters file must not fail the releases/artists rebuild (a masters publish lag
-# would otherwise abort here under `set -e`). Probe reachability with a HEAD
-# first; if present, download under the same #181 resilience flags and land it
-# in $WORK_DIR so directory-mode auto-dispatch runs process_masters. A
-# reachable-but-failing GET (or a truncated file) still fails hard, matching
-# releases/artists. If the probe fails, skip — import_csv.py's import_masters
-# no-ops on the absent master.csv, leaving the masters tables unchanged. See #317.
-if curl -sIfL --max-time 15 -o /dev/null "$masters_url"; then
+# Best-effort, end-to-end: masters is the least time-critical dump, so NO masters
+# problem may abort the releases/artists rebuild. The reachability HEAD retries
+# (a single transient CDN 5xx must not skip masters for the whole month), and —
+# unlike releases/artists — a reachable-but-failing GET or a sub-floor file does
+# NOT hard-fail (that would trip `set -e`/the trap and discard the already-
+# downloaded ~12 GB, defeating the decoupling). Instead we warn, drop the partial
+# file, and continue: directory-mode then sees no masters and import_csv.py's
+# import_masters no-ops, leaving the masters tables unchanged. On success the file
+# lands in $WORK_DIR so directory-mode auto-dispatch runs process_masters. #317.
+if curl -sIfL --max-time 15 --retry 3 -o /dev/null "$masters_url"; then
     echo "[$(date -u +%H:%M:%SZ)] download masters dump → $WORK_DIR/masters.xml.gz"
-    curl -fL --continue-at - --retry 5 --retry-delay 30 --retry-all-errors \
-        -o "$WORK_DIR/masters.xml.gz" \
-        "$masters_url"
-    assert_min_size "$WORK_DIR/masters.xml.gz" $((50 * 1024 * 1024)) "masters.xml.gz"
-    echo "    masters download complete ($(du -h "$WORK_DIR/masters.xml.gz" | cut -f1))"
+    masters_min=$((50 * 1024 * 1024))
+    if curl -fL --continue-at - --retry 5 --retry-delay 30 --retry-all-errors \
+            -o "$WORK_DIR/masters.xml.gz" "$masters_url" \
+        && [ "$(wc -c < "$WORK_DIR/masters.xml.gz" | tr -d ' ')" -ge "$masters_min" ]; then
+        echo "    masters download complete ($(du -h "$WORK_DIR/masters.xml.gz" | cut -f1))"
+    else
+        echo "    WARN: masters download failed or below the ${masters_min}-byte floor;" \
+            "skipping masters phase (best-effort, tables unchanged). See #317."
+        rm -f "$WORK_DIR/masters.xml.gz"
+    fi
 else
     echo "    masters dump for the resolved month not reachable; skipping masters phase (tables unchanged)"
 fi
