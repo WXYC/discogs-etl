@@ -91,9 +91,13 @@ def _apply_schema(db_url: str) -> None:
 def _make_clone_source(db_url: str) -> None:
     """Prod-shaped schema, then mutated to mirror the real clone:
 
-    the clone predates release.artwork_checked_at / release.not_found and has no
-    release_video table. Dropping them here forces the seed's column-intersection
-    path (a bare COPY_TABLE_SPEC COPY would fail with 'column does not exist').
+    * the clone predates release.artwork_checked_at / release.not_found -> forces
+      the seed's column-intersection path (a bare COPY_TABLE_SPEC COPY would fail
+      with 'column does not exist');
+    * the clone has no release_video table -> forces the absent-table skip path;
+    * the clone's cache_metadata.cached_at is NULLABLE and carries NULLs (the real
+      clone does) -> a straight column copy into prod's NOT NULL cached_at would
+      fail, so the seed must NOT copy the clone's freshness timestamps.
     """
     _apply_schema(db_url)
     conn = psycopg.connect(db_url, autocommit=True)
@@ -101,7 +105,7 @@ def _make_clone_source(db_url: str) -> None:
         cur.execute("ALTER TABLE release DROP COLUMN artwork_checked_at")
         cur.execute("ALTER TABLE release DROP COLUMN not_found")
         cur.execute("DROP TABLE IF EXISTS release_video CASCADE")
-        cur.execute("DROP TABLE IF EXISTS cache_metadata CASCADE")
+        cur.execute("ALTER TABLE cache_metadata ALTER COLUMN cached_at DROP NOT NULL")
     conn.close()
 
 
@@ -164,12 +168,19 @@ class TestSeedCacheFromClone:
         self.__class__._source_url = source_url
         self.__class__._target_url = target_url
 
-        # Source = mini clone (missing prod-only columns).
+        # Source = mini clone (missing prod-only columns; nullable cache_metadata).
         _make_clone_source(source_url)
         conn = psycopg.connect(source_url)
         with conn.cursor() as cur:
             for rid, artist, title in CLONE_RELEASES:
                 _insert_release(cur, rid, artist, title, artwork_url=f"http://art/{rid}.jpg")
+                # Clone freshness rows carry NULL cached_at (the real clone does);
+                # copying these into prod's NOT NULL column must not happen.
+                cur.execute(
+                    "INSERT INTO cache_metadata (release_id, source, cached_at) "
+                    "VALUES (%s, 'bulk_import', NULL)",
+                    (rid,),
+                )
         conn.commit()
         conn.close()
 
@@ -248,6 +259,25 @@ class TestSeedCacheFromClone:
         # Children present for the new releases.
         assert self._child_count(self.target_url, "release_track", 101) == 2
         assert self._child_count(self.target_url, "release_artist", 200) == 1
+
+    # --- cache_metadata seeded fresh, not copied ------------------------
+
+    def test_cache_metadata_seeded_fresh(self) -> None:
+        """The clone's NULL cached_at must never reach prod's NOT NULL column;
+        each new release gets a fresh bulk_import row with cached_at defaulted."""
+        conn = psycopg.connect(self.target_url)
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT release_id, source, cached_at FROM cache_metadata "
+                "WHERE release_id = ANY(%s::integer[])",
+                ([101, 102, 200],),
+            )
+            rows = cur.fetchall()
+        conn.close()
+        assert len(rows) == 3, "each new release should get one fresh cache_metadata row"
+        for _rid, source, cached_at in rows:
+            assert source == "bulk_import"
+            assert cached_at is not None, "cached_at must default (not copy the clone's NULL)"
 
     # --- (e) prod-only columns default ----------------------------------
 

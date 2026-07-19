@@ -81,6 +81,15 @@ _ARTIST_SPEC = [
 # arbiter-less child, gated on the new-parent-id set.
 _CONFLICT_TARGET = {"release": "id", "cache_metadata": "release_id", "artist": "id"}
 
+# Freshness tables that are seeded FRESH rather than copied from the clone: the
+# clone's cache_metadata.cached_at is nullable and carries NULLs, which would
+# violate prod's NOT NULL on a straight copy — and a vintage cached_at would
+# misreport freshness anyway. Each newly-seeded release instead gets a fresh
+# ``(release_id, source='bulk_import', cached_at=now())`` row (prod defaults),
+# matching this repo's bulk-import convention (see verify_cache column tests /
+# test_copy_to_target._fresh_import).
+_FRESH_SEED = {"cache_metadata"}
+
 
 def _table_exists(conn: psycopg.Connection, table: str) -> bool:
     with conn.cursor() as cur:
@@ -188,9 +197,27 @@ def _copy_table(source_conn, target_conn, table: str, filter_col: str, columns: 
     return inserted
 
 
-def _dry_run_counts(source_conn, spec) -> dict[str, int]:
+def _seed_fresh_cache_metadata(target_conn, new_ids: set[int]) -> int:
+    """Insert a fresh cache_metadata row per newly-seeded release (source
+    bulk_import, cached_at defaulted to now()), instead of copying the clone's
+    unreliable/nullable freshness rows. Idempotent via the release_id PK."""
+    with target_conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO cache_metadata (release_id, source) "
+            "SELECT id, 'bulk_import' FROM release WHERE id = ANY(%s::integer[]) "
+            "ON CONFLICT (release_id) DO NOTHING",
+            (list(new_ids),),
+        )
+        return cur.rowcount
+
+
+def _dry_run_counts(source_conn, spec, new_ids: set[int]) -> dict[str, int]:
     counts: dict[str, int] = {}
     for table, filter_col, _cols in spec:
+        if table in _FRESH_SEED:
+            # Seeded fresh (one row per new parent), not copied from the clone.
+            counts[table] = len(new_ids)
+            continue
         if not _table_exists(source_conn, table):
             counts[table] = 0
             continue
@@ -240,14 +267,16 @@ def _seed_family(
         _load_seed_ids(source_conn, new_ids)
 
         if dry_run:
-            counts = _dry_run_counts(source_conn, spec)
+            counts = _dry_run_counts(source_conn, spec, new_ids)
             for table, n in counts.items():
-                logger.info("  [dry-run] %s: would copy %s rows", table, f"{n:,}")
+                logger.info("  [dry-run] %s: would seed %s rows", table, f"{n:,}")
             return counts
 
         target_conn = psycopg.connect(target_url)
         try:
             for table, filter_col, spec_cols in spec:
+                if table in _FRESH_SEED:
+                    continue  # seeded fresh after the copy loop
                 if not _table_exists(source_conn, table):
                     logger.info("  %s: absent on source clone, skipping", table)
                     continue
@@ -258,6 +287,11 @@ def _seed_family(
                 inserted = _copy_table(source_conn, target_conn, table, filter_col, columns)
                 result[table] = inserted
                 logger.info("  %s: inserted %s rows", table, f"{inserted:,}")
+            for table, _f, _c in spec:
+                if table == "cache_metadata":
+                    n = _seed_fresh_cache_metadata(target_conn, new_ids)
+                    result[table] = n
+                    logger.info("  %s: seeded %s fresh rows", table, f"{n:,}")
             target_conn.commit()
         except Exception:
             target_conn.rollback()
