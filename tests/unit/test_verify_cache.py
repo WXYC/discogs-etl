@@ -1411,3 +1411,31 @@ class TestAlternateArtistNameClassification:
         releases = [(3192, "Plug", "Drum 'n' Bass for Papa", "CD")]
         report = classify_all_releases(releases, idx, matcher)
         assert 3192 in report.prune_ids
+
+
+class TestMastersNotPruned:
+    """``verify_cache.py --prune`` must never touch ``master`` /
+    ``master_artist``.
+
+    The prune copy-swap rebuilds only the tables named in ``PRUNE_COPY_TABLES``
+    / ``COPY_TABLE_SPEC`` and drops everything else from those relations. Masters
+    are intentionally absent: they're loaded independently by
+    ``import_csv.py::import_masters`` (scoped to ``release.master_id``), and
+    LML#858 relies on masters surviving even where no cached release references
+    them. Pinning their absence guards against a future edit that adds them to a
+    prune list and silently deletes referenced masters — the ANV-recall failure
+    mode (Plug/Luke Vibert) but for the master table. See WXYC/discogs-etl#317.
+    """
+
+    def test_masters_absent_from_prune_copy_tables(self) -> None:
+        pruned = {spec[0] for spec in _vc.PRUNE_COPY_TABLES}
+        assert "master" not in pruned, (
+            "master must not be in PRUNE_COPY_TABLES — the prune would drop "
+            "masters not carried by a surviving release. See #317."
+        )
+        assert "master_artist" not in pruned
+
+    def test_masters_absent_from_copy_table_spec(self) -> None:
+        copied = {spec[0] for spec in _vc.COPY_TABLE_SPEC}
+        assert "master" not in copied
+        assert "master_artist" not in copied

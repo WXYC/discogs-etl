@@ -1099,12 +1099,90 @@ def import_artist_details(conn, csv_dir: Path) -> int:
 
 
 def import_masters(conn, csv_dir: Path) -> int:
-    """Import master tables from CSV.
+    """Import ``master`` + ``master_artist`` from CSV, scoped to the library.
 
-    Imports master.csv first (parent), then master_artist.csv (child).
+    The converter does not pre-filter masters (``process_masters`` writes every
+    master in the dump — ~2.3M rows), so library scope is applied here: only
+    masters referenced by ``release.master_id`` are loaded — the same
+    library-artist scope the ``release`` table already enforces. This mirrors
+    how ``import_artist_details`` scopes the artist child tables to the artist
+    ids that survived release filtering (WXYC/discogs-etl#317).
+
+    Authoritative truncate-and-reload of the two masters tables, so a monthly
+    rerun is idempotent (a plain COPY would hit ``master``'s PK on the second
+    run). The TRUNCATE is safe: ``release.master_id`` is a plain integer, NOT a
+    foreign key, so it cannot cascade into ``release``; ``master_artist``
+    references ``master(id) ON DELETE CASCADE`` and nothing references
+    ``master_artist``. So ``TRUNCATE master, master_artist CASCADE`` touches
+    exactly those two tables.
+
+    Skips entirely (no truncate, no-op) when ``master.csv`` is absent, so a
+    rebuild that didn't fetch a masters dump leaves the tables untouched — the
+    "additive, safe by omission" property the monthly best-effort masters fetch
+    relies on.
+
     Returns total rows imported.
     """
-    return _import_tables(conn, csv_dir, MASTER_TABLES)
+    master_config = next(t for t in MASTER_TABLES if t["table"] == "master")
+    master_artist_config = next(t for t in MASTER_TABLES if t["table"] == "master_artist")
+
+    master_csv = csv_dir / master_config["csv_file"]
+    if not master_csv.exists():
+        logger.warning("No master.csv found, skipping masters import (tables unchanged)")
+        return 0
+
+    # Library scope: the master ids referenced by the (already library-filtered)
+    # release table. Computed BEFORE the truncate — the truncate touches only
+    # the masters tables, never release.
+    with conn.cursor() as cur:
+        cur.execute("SELECT DISTINCT master_id FROM release WHERE master_id IS NOT NULL")
+        library_master_ids = {row[0] for row in cur.fetchall()}
+    logger.info(
+        f"  Filtering masters to {len(library_master_ids):,} referenced by release.master_id"
+    )
+
+    with conn.cursor() as cur:
+        cur.execute("TRUNCATE master, master_artist CASCADE")
+    conn.commit()
+
+    total = import_csv(
+        conn,
+        master_csv,
+        master_config["table"],
+        master_config["csv_columns"],
+        master_config["db_columns"],
+        master_config["required"],
+        master_config["transforms"],
+        unique_key=master_config.get("unique_key"),
+        id_filter=library_master_ids,
+        id_filter_column="id",
+    )
+
+    # Filter master_artist to the master ids ACTUALLY loaded (not the raw
+    # release set): a release.master_id can point at a master absent from this
+    # month's dump, and COPYing its master_artist rows would violate the FK.
+    with conn.cursor() as cur:
+        cur.execute("SELECT id FROM master")
+        imported_master_ids = {row[0] for row in cur.fetchall()}
+
+    master_artist_csv = csv_dir / master_artist_config["csv_file"]
+    if master_artist_csv.exists():
+        total += import_csv(
+            conn,
+            master_artist_csv,
+            master_artist_config["table"],
+            master_artist_config["csv_columns"],
+            master_artist_config["db_columns"],
+            master_artist_config["required"],
+            master_artist_config["transforms"],
+            unique_key=master_artist_config.get("unique_key"),
+            id_filter=imported_master_ids,
+            id_filter_column="master_id",
+        )
+    else:
+        logger.warning("No master_artist.csv found, skipping master_artist import")
+
+    return total
 
 
 def main():
@@ -1133,6 +1211,15 @@ def main():
         action="store_true",
         help="Import only track tables, filtered to surviving release IDs",
     )
+    mode.add_argument(
+        "--masters-only",
+        action="store_true",
+        help="Import only master + master_artist, scoped to masters referenced "
+        "by release.master_id. Idempotent (import_masters truncates + reloads "
+        "just those two tables), so it's safe to run against a live cache "
+        "without disturbing release/artist/label data. Used by the one-time "
+        "prod import and any ad-hoc masters refresh (WXYC/discogs-etl#317).",
+    )
     parser.add_argument(
         "--truncate-existing",
         action="store_true",
@@ -1153,7 +1240,10 @@ def main():
     logger.info(f"Connecting to {db_url}")
     conn = psycopg.connect(db_url)
 
-    if args.truncate_existing:
+    # --masters-only self-truncates its two tables inside import_masters, so it
+    # must NOT trigger the base wipe here (which includes `release`). Guarding
+    # keeps an accidental `--masters-only --truncate-existing` safe. See #317.
+    if args.truncate_existing and not args.masters_only:
         truncate_set = (
             CACHE_TABLES_TO_TRUNCATE_TRACKS if args.tracks_only else CACHE_TABLES_TO_TRUNCATE_BASE
         )
@@ -1174,6 +1264,14 @@ def main():
             child_tables=TRACK_TABLES + VIDEO_TABLES,
             release_id_filter=release_ids,
         )
+    elif args.masters_only:
+        # Masters-only: import_masters reads release.master_id, self-truncates
+        # the two masters tables, and reloads the filtered set. Nothing that
+        # writes release/artist/label runs. See #317.
+        logger.info("Importing masters...")
+        total = import_masters(conn, csv_dir)
+        logger.info("Masters complete")
+        conn.close()
     elif args.base_only:
         # --truncate-existing wipes release; default path upserts to preserve LML back-patches.
         if args.truncate_existing:

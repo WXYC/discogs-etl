@@ -1414,3 +1414,192 @@ class TestPruneStaleReleasesPlan:
             "scale). Rewrite as NOT EXISTS (Hash Anti Join). Plan was:\n"
             f"{plan}"
         )
+
+
+class TestImportMasters:
+    """``import_masters`` (WXYC/discogs-etl#317): masters loaded from CSV,
+    scoped to ``release.master_id``, idempotent across reruns, and free of
+    FK orphans in ``master_artist``.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _fresh_schema(self, fresh_db_url):
+        self.db_url = fresh_db_url
+        conn = psycopg.connect(fresh_db_url, autocommit=True)
+        with conn.cursor() as cur:
+            cur.execute(SCHEMA_DIR.joinpath("create_database.sql").read_text())
+        conn.close()
+
+    def _seed_releases(self, pairs: list[tuple[int, int | None]]) -> None:
+        """Insert (release_id, master_id) rows into the already-filtered
+        release table — the source of masters' library scope."""
+        conn = psycopg.connect(self.db_url)
+        with conn.cursor() as cur:
+            for rid, mid in pairs:
+                cur.execute(
+                    "INSERT INTO release (id, title, master_id) VALUES (%s, %s, %s)",
+                    (rid, f"Release {rid}", mid),
+                )
+        conn.commit()
+        conn.close()
+
+    def _write_master_csvs(
+        self,
+        tmp_path: Path,
+        masters: list[tuple],
+        master_artists: list[tuple] | None = None,
+    ) -> None:
+        m_lines = ["id,title,main_release_id,year"]
+        for row in masters:
+            m_lines.append(",".join("" if v is None else str(v) for v in row))
+        (tmp_path / "master.csv").write_text("\n".join(m_lines) + "\n")
+        if master_artists is not None:
+            ma_lines = ["master_id,artist_id,artist_name"]
+            for row in master_artists:
+                ma_lines.append(",".join("" if v is None else str(v) for v in row))
+            (tmp_path / "master_artist.csv").write_text("\n".join(ma_lines) + "\n")
+
+    def _master_ids(self) -> list[int]:
+        conn = psycopg.connect(self.db_url)
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM master ORDER BY id")
+            ids = [r[0] for r in cur.fetchall()]
+        conn.close()
+        return ids
+
+    def test_masters_scoped_to_release_master_id(self, tmp_path) -> None:
+        """Only masters referenced by ``release.master_id`` are loaded; the
+        converter's unfiltered dump rows for unreferenced masters are dropped."""
+        self._seed_releases([(1001, 100), (1002, 300), (1003, None)])
+        self._write_master_csvs(
+            tmp_path,
+            masters=[
+                (100, "Aluminum Tunes", 1001, 1998),
+                (300, "Dots and Loops", 1002, 1997),
+                (500, "Unreferenced A", None, None),
+                (999, "Unreferenced B", 9990, 2001),
+            ],
+        )
+        conn = psycopg.connect(self.db_url)
+        _ic.import_masters(conn, tmp_path)
+        conn.close()
+        assert self._master_ids() == [100, 300]
+
+    def test_master_artist_scoped_to_loaded_masters(self, tmp_path) -> None:
+        """``master_artist`` is filtered to masters actually loaded, and
+        ``main_release_id`` (the column LML#858 needs) survives the round-trip."""
+        self._seed_releases([(1001, 100), (1002, 300)])
+        self._write_master_csvs(
+            tmp_path,
+            masters=[
+                (100, "Aluminum Tunes", 1001, 1998),
+                (300, "Dots and Loops", 1002, 1997),
+                (500, "Unreferenced", None, None),
+            ],
+            master_artists=[
+                (100, 3000, "Stereolab"),
+                (300, 3000, "Stereolab"),
+                (500, 7777, "Nobody"),  # master 500 not loaded → row filtered out
+            ],
+        )
+        conn = psycopg.connect(self.db_url)
+        _ic.import_masters(conn, tmp_path)
+        conn.close()
+        conn = psycopg.connect(self.db_url)
+        with conn.cursor() as cur:
+            cur.execute("SELECT master_id, artist_name FROM master_artist ORDER BY master_id")
+            rows = cur.fetchall()
+            cur.execute("SELECT main_release_id FROM master WHERE id = 100")
+            main_release_id = cur.fetchone()[0]
+        conn.close()
+        assert rows == [(100, "Stereolab"), (300, "Stereolab")]
+        assert main_release_id == 1001
+
+    def test_rerun_is_idempotent(self, tmp_path) -> None:
+        """A second run neither duplicates rows nor raises a PK violation —
+        the truncate-and-reload is authoritative. Guards the monthly rerun."""
+        self._seed_releases([(1001, 100), (1002, 300)])
+        self._write_master_csvs(
+            tmp_path,
+            masters=[
+                (100, "Aluminum Tunes", 1001, 1998),
+                (300, "Dots and Loops", 1002, 1997),
+            ],
+            master_artists=[(100, 3000, "Stereolab"), (300, 3000, "Stereolab")],
+        )
+        conn = psycopg.connect(self.db_url)
+        first = _ic.import_masters(conn, tmp_path)
+        conn.close()
+        conn = psycopg.connect(self.db_url)
+        second = _ic.import_masters(conn, tmp_path)
+        conn.close()
+        assert first == second == 4  # 2 master + 2 master_artist each run
+        assert self._master_ids() == [100, 300]
+
+    def test_release_master_id_absent_from_dump_does_not_orphan(self, tmp_path) -> None:
+        """A ``release.master_id`` pointing at a master missing from this dump
+        must not FK-violate: the master isn't loaded and its master_artist rows
+        are filtered by the LOADED-master set, not the raw release set."""
+        self._seed_releases([(1001, 100), (1002, 700)])
+        self._write_master_csvs(
+            tmp_path,
+            masters=[(100, "Aluminum Tunes", 1001, 1998)],  # no master 700
+            master_artists=[
+                (100, 3000, "Stereolab"),
+                (700, 8888, "Ghost"),  # parent 700 absent from the dump
+            ],
+        )
+        conn = psycopg.connect(self.db_url)
+        _ic.import_masters(conn, tmp_path)  # must not raise a FK violation
+        conn.close()
+        assert self._master_ids() == [100]
+        conn = psycopg.connect(self.db_url)
+        with conn.cursor() as cur:
+            cur.execute("SELECT count(*) FROM master_artist WHERE master_id = 700")
+            orphan = cur.fetchone()[0]
+        conn.close()
+        assert orphan == 0
+
+    def test_absent_master_csv_leaves_tables_untouched(self, tmp_path) -> None:
+        """No ``master.csv`` → no truncate, no-op. A rebuild that didn't fetch a
+        masters dump must leave existing masters intact (additive by omission)."""
+        self._seed_releases([(1001, 100)])
+        conn = psycopg.connect(self.db_url)
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO master (id, title, main_release_id) VALUES (100, 'Prior', 1001)"
+            )
+        conn.commit()
+        conn.close()
+        # tmp_path has no master.csv.
+        conn = psycopg.connect(self.db_url)
+        result = _ic.import_masters(conn, tmp_path)
+        conn.close()
+        assert result == 0
+        assert self._master_ids() == [100]  # untouched, NOT truncated
+
+    def test_masters_only_cli_preserves_release_rows(self, tmp_path) -> None:
+        """``--masters-only`` against a live DB loads masters and leaves the
+        release table untouched — the one-time prod import's safety contract."""
+        from unittest.mock import patch
+
+        self._seed_releases([(1001, 100), (1002, 300)])
+        self._write_master_csvs(
+            tmp_path,
+            masters=[
+                (100, "Aluminum Tunes", 1001, 1998),
+                (300, "Dots and Loops", 1002, 1997),
+            ],
+            master_artists=[(100, 3000, "Stereolab")],
+        )
+        with patch("sys.argv", ["import_csv.py", "--masters-only", str(tmp_path), self.db_url]):
+            _ic.main()
+        conn = psycopg.connect(self.db_url)
+        with conn.cursor() as cur:
+            cur.execute("SELECT count(*) FROM release")
+            release_count = cur.fetchone()[0]
+            cur.execute("SELECT count(*) FROM master")
+            master_count = cur.fetchone()[0]
+        conn.close()
+        assert release_count == 2  # release untouched by masters-only
+        assert master_count == 2
