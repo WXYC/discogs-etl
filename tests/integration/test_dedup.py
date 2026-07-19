@@ -25,6 +25,12 @@ assert _dspec is not None and _dspec.loader is not None
 _dd = importlib.util.module_from_spec(_dspec)
 _dspec.loader.exec_module(_dd)
 
+_RUN_PIPELINE_PATH = Path(__file__).parent.parent.parent / "scripts" / "run_pipeline.py"
+_rpspec = importlib.util.spec_from_file_location("run_pipeline", _RUN_PIPELINE_PATH)
+assert _rpspec is not None and _rpspec.loader is not None
+_rp = importlib.util.module_from_spec(_rpspec)
+_rpspec.loader.exec_module(_rp)
+
 import_csv_func = _ic.import_csv
 import_artwork = _ic.import_artwork
 create_track_count_table = _ic.create_track_count_table
@@ -40,6 +46,7 @@ load_library_labels = _dd.load_library_labels
 load_label_hierarchy = _dd.load_label_hierarchy
 create_label_match_table = _dd.create_label_match_table
 DEDUP_TABLES = _dd.DEDUP_TABLES
+_infer_pipeline_state = _rp._infer_pipeline_state
 
 pytestmark = pytest.mark.pg
 
@@ -267,8 +274,10 @@ class TestDedup:
     def test_master_id_column_persists_when_no_dedup(self) -> None:
         """master_id persists when no duplicates found (copy-swap not triggered).
 
-        With format-aware dedup, each (master_id, format) group in fixtures has one member,
-        so no copy-swap occurs and master_id stays in the schema.
+        With format-aware dedup, each (master_id, format) group in these fixtures has one
+        member, so no copy-swap occurs — the base schema is untouched and master_id is
+        trivially present. (master_id also persists *through* a real copy-swap, since it
+        is in DEDUP_TABLES; see TestDedupCopySwapPreservesMasterId.)
         """
         conn = self._connect()
         with conn.cursor() as cur:
@@ -307,7 +316,7 @@ class TestDedup:
         assert expected.issubset(fk_tables)
 
     def test_format_column_persists_after_dedup(self) -> None:
-        """format column exists after dedup copy-swap (unlike master_id which is dropped)."""
+        """format column exists after dedup copy-swap (it is in DEDUP_TABLES, like master_id)."""
         conn = self._connect()
         with conn.cursor() as cur:
             cur.execute(
@@ -1319,3 +1328,24 @@ class TestDedupCopySwapPreservesMasterId:
                 "WXYC/discogs-etl#239 / WXYC/library-metadata-lookup#423"
             )
         conn.close()
+
+    def test_infer_pipeline_state_marks_dedup_complete_post_swap(self, tmp_path) -> None:
+        """Resume without a state file infers ``dedup`` complete after a real copy-swap.
+
+        Regression for WXYC/discogs-etl#320. ``_infer_pipeline_state`` used to key
+        the dedup-completion signal on ``release.master_id`` being *absent* — a stale
+        contract from before #129/#317, when the copy-swap dropped the column. Now that
+        ``master_id`` persists post-swap (it is in ``DEDUP_TABLES`` and load-bearing for
+        the #317 masters phase / ``--masters-only``), that signal never fires and dedup
+        is wrongly inferred as pending. The durable post-swap artifact this class already
+        produces is the named FK ``fk_release_artist_release`` (added only by
+        ``add_base_constraints_and_indexes``; the pre-dedup schema's inline FK is
+        auto-named ``release_artist_release_id_fkey`` and is dropped by the swap's
+        ``DROP TABLE ... CASCADE``).
+        """
+        state = _infer_pipeline_state(self.db_url, str(tmp_path))
+        assert state.is_completed("dedup"), (
+            "dedup not inferred complete after a real copy-swap — the master_id column "
+            "persists post-swap (WXYC/discogs-etl#320), so the completion signal must key "
+            "off the post-swap fk_release_artist_release constraint, not master_id absence"
+        )

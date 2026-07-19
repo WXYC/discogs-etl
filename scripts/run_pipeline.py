@@ -766,7 +766,7 @@ def convert_and_filter(
 def _infer_pipeline_state(db_url: str, csv_dir: str) -> PipelineState:
     """Infer pipeline state from database structure.
 
-    Inspects table existence, row counts, column presence, and index names
+    Inspects table existence, row counts, index names, and constraint names
     to determine which pipeline steps have already completed. Steps that
     cannot be inferred (prune, vacuum) are left as pending since they are
     safe to re-run.
@@ -804,14 +804,29 @@ def _infer_pipeline_state(db_url: str, csv_dir: str) -> PipelineState:
                 return state
             state.mark_completed("create_indexes")
 
-            # dedup: master_id column gone?
+            # dedup: post-swap FK constraint present?
+            #
+            # The dedup copy-swap does NOT drop release.master_id — the column is
+            # in DEDUP_TABLES (scripts/dedup_releases.py) and is load-bearing for the
+            # #317 masters phase (import_masters / --masters-only do
+            # SELECT DISTINCT master_id FROM release), so it MUST persist. The old
+            # "master_id column gone?" signal was a stale pre-#129 contract that never
+            # fires now, wrongly forcing a resume to re-run dedup.
+            #
+            # The durable post-swap artifact is the NAMED FK fk_release_artist_release,
+            # which add_base_constraints_and_indexes adds only after the swap
+            # (scripts/dedup_releases.py). Before dedup the base schema's inline FK on
+            # release_artist is auto-named release_artist_release_id_fkey (a different
+            # name) and is dropped by the swap's DROP TABLE ... CASCADE, so this
+            # constraint name is absent pre-dedup and present post-dedup.
             cur.execute(
                 "SELECT EXISTS ("
-                "  SELECT 1 FROM information_schema.columns"
-                "  WHERE table_name = 'release' AND column_name = 'master_id'"
+                "  SELECT 1 FROM information_schema.table_constraints"
+                "  WHERE constraint_name = 'fk_release_artist_release'"
+                "    AND constraint_type = 'FOREIGN KEY'"
                 ")"
             )
-            if cur.fetchone()[0]:
+            if not cur.fetchone()[0]:
                 return state
             state.mark_completed("dedup")
 
