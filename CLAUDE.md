@@ -58,3 +58,13 @@ The `entity.*` schema in the cache database is **owned by this repo** and is cre
 - **discogs-etl does not adopt LML cache tables.** LML owns its application caches in a separate `lml_cache.*` schema that it lifespan-bootstraps itself; this repo never migrates, truncates, backs up, or audits `lml_cache.*`. (The earlier pattern of LML creating `entity.*` cache tables and promising a post-hoc adoption migration — which went unfiled after LML PR #571 — is retired.)
 - **The truncate guard stays.** `scripts/import_csv.py` (`_validate_truncate_lists`) rejects any schema-qualified entry in the truncate lists, so neither `entity.*` nor `lml_cache.*` can be reached by a public-schema cache rebuild. Keep it.
 - New `entity.*` columns/tables (e.g. LML#573's PR-3 `deezer_album_id` on `entity.release_identity`) land here via alembic first, then LML pulls the contract — the three-repo sequence in [WXYC/wiki#83](https://github.com/WXYC/wiki/issues/83).
+
+### Advisory lock keys (shared-PG registry)
+
+`pg_advisory_xact_lock` keys are database-global on the shared discogs-cache PG, so every repo that takes one must register it here before shipping — an accidental key collision serializes (or deadlocks) unrelated work across services with no error to debug from. Current allocations:
+
+| Key | Owner | Purpose |
+|---|---|---|
+| `842001` | library-metadata-lookup | `lml_cache.*` streaming-catalog bootstrap transaction (`entity/streaming_catalog.py`, LML#842 PR A) — serializes concurrent boots around its `CREATE OR REPLACE FUNCTION` / constraint-widen DDL |
+
+Convention for new keys: `<issue-number> * 1000 + sequence` in the owning repo (842001 = LML#842, first key), which keeps keys human-traceable and collision-free without central coordination beyond this table.
