@@ -12,21 +12,23 @@ Do not run while a bulk job is hammering LML on the shared Discogs token — thi
 
 ## Guarantees (why it is safe against a populated prod cache)
 
-- **Additive only.** `release` (id PK) and `cache_metadata` (release_id PK) insert with `ON CONFLICT DO NOTHING`. The arbiter-less child tables (`release_artist`, `release_label`, `release_genre`, `release_style`, `release_track`, `release_track_artist`, `release_video`; and `artist_name_variation` on the artist side) have no PK/UNIQUE, so idempotency is driven off the parent: children are inserted only for the **new-parent-id set** = (requested ids) − (ids already on the target). A parent id is in that set only if it was absent, so its children were necessarily absent too — no duplicate rows, fully re-runnable.
+- **Additive only.** `release` (id PK), `cache_metadata` (release_id PK), and `artist` (id PK) insert with `ON CONFLICT DO NOTHING`. The arbiter-less child tables (`release_artist`, `release_label`, `release_genre`, `release_style`, `release_track`, `release_track_artist`, `release_video`; and `artist_name_variation` on the artist side) have no PK/UNIQUE, so idempotency is driven off the parent: children are inserted only for the **new-parent-id set** = (requested ids) − (ids already on the target). A parent id is in that set only if it was absent, so its children were necessarily absent too — no duplicate rows, fully re-runnable. A `pg_advisory_xact_lock` (key `330001`, registered in this repo's `CLAUDE.md` "Advisory lock keys" table) spans the new-id computation through the write for every real run, so two overlapping invocations against the same target serialize instead of racing into duplicate child rows.
 - **Never overwrites.** No UPDATE, no DELETE, no TRUNCATE. Existing prod rows are byte-identical before and after.
-- **Column-drift tolerant.** Column lists come from `verify_cache.COPY_TABLE_SPEC` (the canonical source of truth) intersected with the columns actually present on both databases. The clone predates `release.artwork_checked_at` / `release.not_found` / `artist.not_found` and has no `release_video` table; those simply fall out of the copy and default on the target.
+- **Column-drift tolerant.** Column lists come from `verify_cache.COPY_TABLE_SPEC` (the canonical source of truth) intersected with the columns actually present on both databases. The clone predates `release.artwork_checked_at` / `release.not_found` / `artist.not_found` and has no `release_video` table; those simply fall out of the copy and default on the target. `artist.fetched_at` (NOT NULL on prod) is `COALESCE`d to `now()` on the copy in case the clone carries a NULL.
+- **`--source` is genuinely read-only.** The source connection only ever runs `SELECT` / `COPY … TO STDOUT`; the new-id set is embedded as an `ANY(ARRAY[...]::integer[])` literal in each query rather than staged into a source-side temp table, so `--source` works against a strictly read-only role or a hot standby.
 - **`verify_cache.py --prune` is prohibited against the seeded rows.** It classifies releases against WXYC library membership and DELETEs non-matches — tail artists are non-library by definition, so it would delete exactly what was seeded. Post-seed verification is a separate read-only integrity check.
 
 ## Inputs
 
 | Flag | Required | Notes |
 |---|---|---|
-| `--source` | yes | Clone DSN, read-only (`SELECT` / `COPY … TO STDOUT` only). e.g. `postgresql://localhost:5432/discogs`. |
-| `--target` | yes | Target discogs-cache DSN. For prod, the Railway `Postgres` service `DATABASE_PUBLIC_URL` (reading prod requires explicit approval; writing is heavier — gate on a green dry-run first). |
-| `--ids-file` | yes | Release_ids to seed, one per line (blank lines and `#` comments ignored). Selected upstream via LML's `lower(f_unaccent(artist_name)) % $artist` trigram predicate over the tail artists — artist-scoped (keep all releases by a tail artist), not album-scoped. |
+| `--source` | yes | Clone DSN, read-only (`SELECT` / `COPY … TO STDOUT` only — the script never writes to `--source`). e.g. `postgresql://localhost:5432/discogs`. |
+| `--target` | yes | Target discogs-cache DSN. For prod, the Railway `Postgres` service `DATABASE_PUBLIC_URL` (reading prod requires explicit approval; writing is heavier — gate on a green dry-run first). Must differ from `--source`; the script refuses an identical `--source`/`--target` pair (a transposed pair would otherwise silently no-op). |
+| `--ids-file` | yes | Release_ids (or, with `--seed-artists`, artist_ids) to seed, one per line (blank lines and `#` comments ignored). Selected upstream via LML's `lower(f_unaccent(artist_name)) % $artist` trigram predicate over the tail artists — artist-scoped (keep all releases by a tail artist), not album-scoped. |
+| `--seed-artists` | no | Seed the `artist` family (see "Artist seeding" below) from `--ids-file` instead of the default `release` family. |
 | `--dry-run` | no | Report per-table row-set sizes without writing. **Always run first.** |
 
-The script depends only on `psycopg` and `lib.observability` (installable via `pip install -e .`) and imports `COPY_TABLE_SPEC` from `verify_cache`.
+The script depends only on `psycopg` and `lib.observability` (installable via `pip install -e .`), imports `COPY_TABLE_SPEC` from `verify_cache`, and imports `parse_keep_release_ids` from `lib.keep_release_ids` for `--ids-file` parsing.
 
 ## Procedure
 
@@ -46,7 +48,18 @@ The script depends only on `psycopg` and `lib.observability` (installable via `p
 
 ## Artist seeding
 
-`seed_artists_additive` (same guarantees) copies tail `artist` rows + their `artist_name_variation` children when LML enrichment JOINs them and they are absent on the target. `artist` (id PK) uses `ON CONFLICT`; `artist_name_variation` is arbiter-less and parent-gated on the new-artist-id set. Only seed artists if the column-diff/enrichment step confirms they are needed.
+`seed_artists_additive` (same guarantees, invoked via `--seed-artists`) copies tail `artist` rows + their `artist_name_variation` children when LML enrichment JOINs them and they are absent on the target. `artist` (id PK) uses `ON CONFLICT`; `artist_name_variation` is arbiter-less and parent-gated on the new-artist-id set. Only seed artists if the column-diff/enrichment step confirms they are needed.
+
+```bash
+python scripts/seed_cache_from_clone.py \
+  --source postgresql://localhost:5432/discogs \
+  --target "$DATABASE_URL_DISCOGS" \
+  --ids-file tail_artist_ids.txt \
+  --seed-artists \
+  --dry-run
+```
+
+Drop `--dry-run` to write. `--ids-file` here holds artist_ids, one per line, in the same format as the release-id file.
 
 ## Rollback
 

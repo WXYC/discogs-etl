@@ -21,8 +21,10 @@ simulate the real clone's missing prod-only columns.
 from __future__ import annotations
 
 import importlib.util
+import logging
 import os
 import sys as _sys
+import threading
 import uuid
 from pathlib import Path
 
@@ -317,6 +319,130 @@ class TestSeedCacheFromClone:
         assert self._child_count(self.target_url, "release_track", 101) == 2
         assert self._child_count(self.target_url, "release_artist", 200) == 1
 
+    # --- candidate_ids materialization (finding #7) ----------------------
+
+    def test_generator_candidate_ids_not_exhausted_prematurely(self, caplog) -> None:
+        """A one-shot iterable (e.g. a generator) must not be silently exhausted
+        by internal reuse -- by this point in the class all CLONE_RELEASES are
+        already seeded, so this exercises the "no new ids" logging branch, which
+        re-reads candidate_ids after _compute_new_ids has already consumed it."""
+        ids_gen = (rid for rid, _, _ in CLONE_RELEASES)
+        with caplog.at_level(logging.INFO, logger="seed_cache_from_clone"):
+            seed_releases_additive(self.source_url, self.target_url, ids_gen)
+        assert any(
+            f"all {len(CLONE_RELEASES)} candidates already present" in r.message
+            for r in caplog.records
+        ), (
+            "candidate count in the log must reflect the materialized list, not an exhausted generator"
+        )
+
+    # --- dry-run cache_metadata mirrors the real release count (finding #6) -
+
+    def test_dry_run_cache_metadata_mirrors_release_source_count(self) -> None:
+        """cache_metadata's dry-run count must mirror release's real source-side
+        count for the same id set, not echo len(new_ids) -- a candidate id absent
+        from source (e.g. a stale/bogus id) must not inflate the fresh-seed
+        count."""
+        bogus_id = 999999  # not present on either database
+        planned = seed_releases_additive(self.source_url, self.target_url, [bogus_id], dry_run=True)
+        assert planned["release"] == 0
+        assert planned["cache_metadata"] == 0, (
+            "cache_metadata dry-run count must mirror the real (zero) release count, "
+            "not len(new_ids)=1"
+        )
+
+    # --- --source needs no write access (finding #5) ----------------------
+
+    def test_source_connection_never_writes(self) -> None:
+        """The seed must work against a --source held under
+        default_transaction_read_only -- proving it never CREATEs or COPYs INTO
+        anything on the source, matching the runbook's read-only contract."""
+        new_id = 901
+        prep_conn = psycopg.connect(self.source_url)
+        with prep_conn.cursor() as cur:
+            _insert_release(
+                cur,
+                new_id,
+                "Chuquimamani-Condori",
+                "Nunca Estuve Sola",
+                artwork_url=f"http://art/{new_id}.jpg",
+            )
+            cur.execute(
+                "INSERT INTO cache_metadata (release_id, source, cached_at) "
+                "VALUES (%s, 'bulk_import', NULL)",
+                (new_id,),
+            )
+        prep_conn.commit()
+        prep_conn.close()
+
+        source_db_name = self.source_url.rsplit("/", 1)[-1]
+        admin_conn = psycopg.connect(ADMIN_URL, autocommit=True)
+        with admin_conn.cursor() as cur:
+            cur.execute(
+                sql.SQL("ALTER DATABASE {} SET default_transaction_read_only = on").format(
+                    sql.Identifier(source_db_name)
+                )
+            )
+        admin_conn.close()
+        try:
+            counts = seed_releases_additive(self.source_url, self.target_url, [new_id])
+        finally:
+            admin_conn = psycopg.connect(ADMIN_URL, autocommit=True)
+            with admin_conn.cursor() as cur:
+                cur.execute(
+                    sql.SQL("ALTER DATABASE {} RESET default_transaction_read_only").format(
+                        sql.Identifier(source_db_name)
+                    )
+                )
+            admin_conn.close()
+
+        assert counts["release"] == 1
+
+    # --- concurrent-run serialization via advisory lock (finding #2) ------
+
+    def test_advisory_lock_serializes_concurrent_seed_writes(self) -> None:
+        """A holder of pg_advisory_xact_lock(330001) on the target must block a
+        concurrent seed_releases_additive real run until the holder releases --
+        otherwise two overlapping invocations could both compute the same
+        release as "new" and double-insert its arbiter-less child rows."""
+        new_id = 902
+        prep_conn = psycopg.connect(self.source_url)
+        with prep_conn.cursor() as cur:
+            _insert_release(
+                cur, new_id, "Cat Power", "Moon Pix", artwork_url=f"http://art/{new_id}.jpg"
+            )
+            cur.execute(
+                "INSERT INTO cache_metadata (release_id, source, cached_at) "
+                "VALUES (%s, 'bulk_import', NULL)",
+                (new_id,),
+            )
+        prep_conn.commit()
+        prep_conn.close()
+
+        holder = psycopg.connect(self.target_url)
+        with holder.cursor() as cur:
+            cur.execute("SELECT pg_advisory_xact_lock(330001)")
+
+        result_box: dict = {}
+
+        def run_seed() -> None:
+            result_box["counts"] = seed_releases_additive(
+                self.source_url, self.target_url, [new_id]
+            )
+
+        t = threading.Thread(target=run_seed)
+        t.start()
+        try:
+            t.join(timeout=1.0)
+            assert t.is_alive(), "seed must block while the advisory lock is held"
+        finally:
+            holder.rollback()  # releases pg_advisory_xact_lock
+            holder.close()
+
+        t.join(timeout=5.0)
+        assert not t.is_alive(), "seed must proceed once the lock is released"
+        assert result_box["counts"]["release"] == 1
+
 
 def _insert_artist(
     cur: psycopg.Cursor,
@@ -342,6 +468,12 @@ CLONE_ARTISTS = [
 PREEXISTING_ARTIST = 500
 PROD_ARTIST_500 = "PROD-SIDE ARTIST (must survive)"
 
+# A clone-side artist row with a NULL fetched_at (e.g. legacy/backfilled data).
+# artist.fetched_at is NOT NULL DEFAULT now() on prod; a straight copy of a NULL
+# value must not raise -- it must default on the target instead.
+NULL_FETCHED_AT_ARTIST_ID = 502
+NULL_FETCHED_AT_ARTIST_NAME = "Hermanos Gutiérrez"
+
 
 class TestSeedArtistsFromClone:
     """artist / artist_name_variation seeding: id-PK ON CONFLICT for artist,
@@ -354,16 +486,22 @@ class TestSeedArtistsFromClone:
         self.__class__._source_url = source_url
         self.__class__._target_url = target_url
 
-        # Source clone: artist lacks the prod-only not_found column.
+        # Source clone: artist lacks the prod-only not_found column, and (like
+        # the real clone) can carry a NULL fetched_at.
         _apply_schema(source_url)
         conn = psycopg.connect(source_url, autocommit=True)
         with conn.cursor() as cur:
             cur.execute("ALTER TABLE artist DROP COLUMN not_found")
+            cur.execute("ALTER TABLE artist ALTER COLUMN fetched_at DROP NOT NULL")
         conn.close()
         conn = psycopg.connect(source_url)
         with conn.cursor() as cur:
             for aid, name, variations in CLONE_ARTISTS:
                 _insert_artist(cur, aid, name, variations)
+            cur.execute(
+                "INSERT INTO artist (id, name, fetched_at) VALUES (%s, %s, NULL)",
+                (NULL_FETCHED_AT_ARTIST_ID, NULL_FETCHED_AT_ARTIST_NAME),
+            )
         conn.commit()
         conn.close()
 
@@ -447,3 +585,19 @@ class TestSeedArtistsFromClone:
         )
         assert counts["artist"] == 0
         assert self._variation_count(501) == 1
+
+    # --- artist.fetched_at NOT NULL guard (finding #3) --------------------
+
+    def test_null_fetched_at_defaults_on_target(self) -> None:
+        """The clone can carry a NULL artist.fetched_at; the target's NOT NULL
+        column must default (COALESCE to now()) rather than raising."""
+        counts = seed_artists_additive(
+            self.source_url, self.target_url, [NULL_FETCHED_AT_ARTIST_ID]
+        )
+        assert counts["artist"] == 1
+        conn = psycopg.connect(self.target_url)
+        with conn.cursor() as cur:
+            cur.execute("SELECT fetched_at FROM artist WHERE id = %s", (NULL_FETCHED_AT_ARTIST_ID,))
+            fetched_at = cur.fetchone()[0]
+        conn.close()
+        assert fetched_at is not None
