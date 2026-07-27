@@ -709,12 +709,17 @@ def load_keep_release_ids(path: Path | None) -> set[int]:
 def apply_release_overrides(report: ClassificationReport, override_ids: set[int]) -> None:
     """Exempt WXYC library pinned overrides from pruning.
 
-    Moves every id in *override_ids* into report.keep_ids and out of
-    report.prune_ids, regardless of what fuzzy-match classification decided.
-    A no-op when override_ids is empty.
+    Moves every id in *override_ids* into report.keep_ids and out of BOTH
+    report.prune_ids and report.review_ids, regardless of what fuzzy-match
+    classification decided. Subtracting from review_ids too preserves the
+    keep/prune/review partition: without it a pinned REVIEW release would sit
+    in keep_ids and review_ids at once -- double-counted in the report, and
+    ambiguous to the copy-swap prune path that rebuilds from keep_ids ∪
+    review_ids. A no-op when override_ids is empty.
     """
     report.keep_ids |= override_ids
     report.prune_ids -= override_ids
+    report.review_ids -= override_ids
 
 
 def save_artist_mappings(path: Path, mappings: dict) -> None:

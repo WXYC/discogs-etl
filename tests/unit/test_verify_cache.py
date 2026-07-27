@@ -1013,16 +1013,17 @@ class TestLoadKeepReleaseIds:
 
 
 class TestApplyReleaseOverrides:
-    """Test apply_release_overrides -- moves pinned ids from prune_ids to keep_ids."""
+    """Test apply_release_overrides -- moves pinned ids into keep_ids and out of
+    both prune_ids and review_ids, preserving the keep/prune/review partition."""
 
-    def _make_report(self, keep_ids, prune_ids):
+    def _make_report(self, keep_ids, prune_ids, review_ids=()):
         return ClassificationReport(
             keep_ids=set(keep_ids),
             prune_ids=set(prune_ids),
-            review_ids=set(),
+            review_ids=set(review_ids),
             review_by_artist={},
             artist_originals={},
-            total_releases=len(keep_ids) + len(prune_ids),
+            total_releases=len(keep_ids) + len(prune_ids) + len(review_ids),
         )
 
     def test_override_moved_from_prune_to_keep(self):
@@ -1032,6 +1033,27 @@ class TestApplyReleaseOverrides:
         assert 10001 not in report.prune_ids
         assert 5001 in report.prune_ids
 
+    def test_override_moved_from_review_to_keep(self):
+        """A pinned release the fuzzy matcher parked in REVIEW must land in
+        keep_ids AND leave review_ids, so the copy-swap prune path (which copies
+        keep_ids ∪ review_ids) and the report both see a clean partition -- no
+        id counted as both KEEP and REVIEW."""
+        report = self._make_report(keep_ids=set(), prune_ids=set(), review_ids={7001, 8001})
+        apply_release_overrides(report, {7001})
+        assert 7001 in report.keep_ids
+        assert 7001 not in report.review_ids
+        assert 8001 in report.review_ids
+
+    def test_pinned_prune_release_lands_in_copy_swap_keep_set(self):
+        """The large-prune path (prune_releases_copy_swap) rebuilds the release
+        table from keep_ids ∪ review_ids, not prune_ids. A pinned release the
+        classifier put in PRUNE must therefore appear in keep_ids afterwards, or
+        the copy-swap would silently drop it."""
+        report = self._make_report(keep_ids={1, 2}, prune_ids={9001}, review_ids={3})
+        apply_release_overrides(report, {9001})
+        copy_swap_survivors = report.keep_ids | report.review_ids
+        assert 9001 in copy_swap_survivors
+
     def test_override_already_in_keep_is_noop(self):
         report = self._make_report(keep_ids={101}, prune_ids=set())
         apply_release_overrides(report, {101})
@@ -1039,10 +1061,11 @@ class TestApplyReleaseOverrides:
         assert report.prune_ids == set()
 
     def test_empty_override_set_is_noop(self):
-        report = self._make_report(keep_ids={101}, prune_ids={102})
+        report = self._make_report(keep_ids={101}, prune_ids={102}, review_ids={103})
         apply_release_overrides(report, set())
         assert report.keep_ids == {101}
         assert report.prune_ids == {102}
+        assert report.review_ids == {103}
 
 
 # ---------------------------------------------------------------------------

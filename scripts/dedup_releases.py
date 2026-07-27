@@ -1074,14 +1074,19 @@ def main():
 
         create_label_match_table(conn)
 
-    # Step 0.5 (optional): Load WXYC library pinned overrides exempt from dedup
+    # Step 0.5 (optional): Load WXYC library pinned overrides exempt from dedup.
+    # Only engage the exemption path when the allowlist is non-empty: it
+    # force-recreates dedup_delete_ids (forfeiting the reuse-verbatim
+    # short-circuit), which is wasted work when there are no ids to exempt. An
+    # empty allowlist -- the only case in production until Seam A lands -- must
+    # stay byte-identical to the no-flag path.
     keep_ids_loaded = False
     if args.keep_release_ids:
         if not args.keep_release_ids.exists():
             logger.error("Keep-release-ids file not found: %s", args.keep_release_ids)
             sys.exit(1)
-        load_keep_release_ids(conn, args.keep_release_ids)
-        keep_ids_loaded = True
+        loaded = load_keep_release_ids(conn, args.keep_release_ids)
+        keep_ids_loaded = loaded > 0
 
     # Step 1: Ensure dedup IDs exist
     delete_count = ensure_dedup_ids(conn, keep_ids_loaded=keep_ids_loaded)

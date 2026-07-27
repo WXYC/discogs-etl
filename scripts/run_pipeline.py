@@ -677,28 +677,38 @@ def write_keep_release_ids(db_url: str, output_path: Path) -> int:
     dedup_releases.py and verify_cache.py's --keep-release-ids (discogs-etl#327).
 
     Read-only against lml_cache -- never creates, migrates, or truncates it
-    (CLAUDE.md "entity.* schema ownership"). If the table doesn't exist (no
-    LML bootstrap yet, or a local/CI DB), writes an empty file and returns 0:
-    a no-op exemption, not an error. If the table exists but the expected
-    discogs_release_id column doesn't, this raises (UndefinedColumn) rather
-    than silently degrading -- a column-name typo must fail loudly, not
-    surface only as a parity failure at the next rebuild.
+    (CLAUDE.md "entity.* schema ownership").
+
+    The degrade-to-empty path is scoped precisely to the table or schema being
+    absent (``UndefinedTable`` / ``InvalidSchemaName`` -- no LML bootstrap yet,
+    or a local/CI DB): writes an empty file and returns 0, a no-op exemption.
+    Every other error propagates and aborts the rebuild -- a column-name typo
+    (``UndefinedColumn``) or a missing SELECT/USAGE grant
+    (``InsufficientPrivilege``) must fail loudly here, not surface only as a
+    parity failure at the next rebuild or, worse, silently evict every pinned
+    release. (This is why we query the table directly and catch narrow errors
+    rather than gate on ``to_regclass``, which returns NULL indistinguishably
+    for "absent" and "not visible to this role".)
+
+    A NULL ``discogs_release_id`` can't pin anything, so it is skipped rather
+    than written as the literal ``"None"`` (which would ValueError at the
+    consuming ``int()`` and abort the pipeline).
     """
     conn = psycopg.connect(db_url)
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT to_regclass('lml_cache.library_release_override')")
-            if cur.fetchone()[0] is None:
+            try:
+                cur.execute(
+                    "SELECT DISTINCT discogs_release_id FROM lml_cache.library_release_override"
+                )
+                ids = [row[0] for row in cur.fetchall() if row[0] is not None]
+            except (psycopg.errors.UndefinedTable, psycopg.errors.InvalidSchemaName):
                 logger.info(
                     "lml_cache.library_release_override not found; "
                     "writing empty release-id allowlist"
                 )
                 output_path.write_text("")
                 return 0
-            cur.execute(
-                "SELECT DISTINCT discogs_release_id FROM lml_cache.library_release_override"
-            )
-            ids = [row[0] for row in cur.fetchall()]
     finally:
         conn.close()
 

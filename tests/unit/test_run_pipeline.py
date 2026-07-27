@@ -1576,14 +1576,21 @@ class TestCountChildCoverage:
 
 class TestWriteKeepReleaseIds:
     """write_keep_release_ids() reads lml_cache.library_release_override
-    (read-only, existence-gated via to_regclass) and writes a newline-
-    separated allowlist file consumed by dedup_releases.py / verify_cache.py.
+    (read-only) and writes a newline-separated allowlist file consumed by
+    dedup_releases.py / verify_cache.py.
+
+    The degrade-to-empty path is scoped to the table/schema genuinely being
+    absent (UndefinedTable / InvalidSchemaName). Any other error -- a column
+    typo (UndefinedColumn) or a missing grant (InsufficientPrivilege) -- must
+    propagate and abort the rebuild, never silently produce an empty allowlist
+    that would let the dedup/prune seams evict every pinned release.
     """
 
-    def _mock_conn(self, *, regclass_row, fetchall_rows=None):
+    def _mock_conn(self, *, fetchall_rows=None, execute_side_effect=None):
         mock_cursor = MagicMock()
-        mock_cursor.fetchone.return_value = regclass_row
         mock_cursor.fetchall.return_value = fetchall_rows or []
+        if execute_side_effect is not None:
+            mock_cursor.execute.side_effect = execute_side_effect
         mock_conn = MagicMock()
         mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
         mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
@@ -1593,31 +1600,78 @@ class TestWriteKeepReleaseIds:
         """No lml_cache.library_release_override (every DB today) degrades to
         an empty allowlist -- read-only, never creates/migrates the table."""
         output_path = tmp_path / "keep_ids.txt"
-        mock_conn = self._mock_conn(regclass_row=[None])
+        mock_conn = self._mock_conn(
+            execute_side_effect=run_pipeline.psycopg.errors.UndefinedTable("no such table")
+        )
         with patch.object(run_pipeline.psycopg, "connect", return_value=mock_conn):
             count = run_pipeline.write_keep_release_ids("postgresql:///t", output_path)
         assert count == 0
         assert output_path.read_text() == ""
         mock_conn.close.assert_called_once()
 
-    def test_existing_table_writes_ids(self, tmp_path) -> None:
+    def test_missing_schema_writes_empty_file(self, tmp_path) -> None:
+        """A DB with no lml_cache schema at all (fresh/CI) also degrades."""
         output_path = tmp_path / "keep_ids.txt"
         mock_conn = self._mock_conn(
-            regclass_row=["library_release_override"],
-            fetchall_rows=[(101,), (202,)],
+            execute_side_effect=run_pipeline.psycopg.errors.InvalidSchemaName("no schema")
         )
+        with patch.object(run_pipeline.psycopg, "connect", return_value=mock_conn):
+            count = run_pipeline.write_keep_release_ids("postgresql:///t", output_path)
+        assert count == 0
+        assert output_path.read_text() == ""
+        mock_conn.close.assert_called_once()
+
+    def test_permission_error_propagates(self, tmp_path) -> None:
+        """A missing SELECT/USAGE grant must fail loudly, not silently degrade
+        to an empty allowlist -- otherwise every pinned release is evicted with
+        no error to debug from."""
+        output_path = tmp_path / "keep_ids.txt"
+        mock_conn = self._mock_conn(
+            execute_side_effect=run_pipeline.psycopg.errors.InsufficientPrivilege("denied")
+        )
+        with patch.object(run_pipeline.psycopg, "connect", return_value=mock_conn):
+            with pytest.raises(run_pipeline.psycopg.errors.InsufficientPrivilege):
+                run_pipeline.write_keep_release_ids("postgresql:///t", output_path)
+        assert not output_path.exists()
+        mock_conn.close.assert_called_once()
+
+    def test_column_typo_propagates(self, tmp_path) -> None:
+        """A renamed/typo'd column surfaces as UndefinedColumn, not a silent
+        empty set that only shows up as a parity failure at the next rebuild."""
+        output_path = tmp_path / "keep_ids.txt"
+        mock_conn = self._mock_conn(
+            execute_side_effect=run_pipeline.psycopg.errors.UndefinedColumn("no column")
+        )
+        with patch.object(run_pipeline.psycopg, "connect", return_value=mock_conn):
+            with pytest.raises(run_pipeline.psycopg.errors.UndefinedColumn):
+                run_pipeline.write_keep_release_ids("postgresql:///t", output_path)
+        mock_conn.close.assert_called_once()
+
+    def test_existing_table_writes_ids(self, tmp_path) -> None:
+        output_path = tmp_path / "keep_ids.txt"
+        mock_conn = self._mock_conn(fetchall_rows=[(101,), (202,)])
         with patch.object(run_pipeline.psycopg, "connect", return_value=mock_conn):
             count = run_pipeline.write_keep_release_ids("postgresql:///t", output_path)
         assert count == 2
         assert output_path.read_text() == "101\n202"
         mock_conn.close.assert_called_once()
 
+    def test_null_ids_are_skipped(self, tmp_path) -> None:
+        """A NULL discogs_release_id can't pin anything and must be dropped, not
+        written as the literal 'None' (which would ValueError on int() at the
+        consuming end and abort the pipeline)."""
+        output_path = tmp_path / "keep_ids.txt"
+        mock_conn = self._mock_conn(fetchall_rows=[(101,), (None,), (202,)])
+        with patch.object(run_pipeline.psycopg, "connect", return_value=mock_conn):
+            count = run_pipeline.write_keep_release_ids("postgresql:///t", output_path)
+        assert count == 2
+        assert output_path.read_text() == "101\n202"
+
     def test_queries_discogs_release_id_column(self, tmp_path) -> None:
         """Column is discogs_release_id, not release_id -- verified against
-        prod (issue #327) and the source design doc. A future rename would
-        surface as an unhandled UndefinedColumn, not a silent empty set."""
+        prod (issue #327) and the source design doc."""
         output_path = tmp_path / "keep_ids.txt"
-        mock_conn = self._mock_conn(regclass_row=["library_release_override"], fetchall_rows=[])
+        mock_conn = self._mock_conn(fetchall_rows=[])
         with patch.object(run_pipeline.psycopg, "connect", return_value=mock_conn):
             run_pipeline.write_keep_release_ids("postgresql:///t", output_path)
         select_calls = [
