@@ -212,6 +212,35 @@ class TestSeedCacheFromClone:
         self.source_url = self.__class__._source_url
         self.target_url = self.__class__._target_url
 
+    @pytest.fixture(autouse=True)
+    def _reset_target(self):
+        """Reset the shared target to its pristine pre-seed baseline before each
+        test, so tests are order-independent: every test starts with only the
+        preexisting prod release (100) present, and an assertion-only test that
+        needs seeded rows performs the (idempotent) seed itself rather than
+        relying on an earlier test having run."""
+        conn = psycopg.connect(self.__class__._target_url, autocommit=True)
+        with conn.cursor() as cur:
+            # CASCADE empties every table that FK-references release(id)
+            # (release_artist/label/genre/style/track/track_artist/video,
+            # cache_metadata) in one shot.
+            cur.execute("TRUNCATE release CASCADE")
+            _insert_release(
+                cur,
+                PREEXISTING_ID,
+                "Juana Molina",
+                PROD_TITLE_100,
+                artwork_url="http://prod/100.jpg",
+                include_prod_cols=True,
+            )
+        conn.close()
+
+    def _seed_all(self) -> dict[str, int]:
+        """Run the (idempotent) release seed for every CLONE_RELEASES id."""
+        return seed_releases_additive(
+            self.source_url, self.target_url, [rid for rid, _, _ in CLONE_RELEASES]
+        )
+
     def _child_count(self, url: str, table: str, rid: int) -> int:
         conn = psycopg.connect(url)
         with conn.cursor() as cur:
@@ -267,6 +296,7 @@ class TestSeedCacheFromClone:
     def test_cache_metadata_seeded_fresh(self) -> None:
         """The clone's NULL cached_at must never reach prod's NOT NULL column;
         each new release gets a fresh bulk_import row with cached_at defaulted."""
+        self._seed_all()
         conn = psycopg.connect(self.target_url)
         with conn.cursor() as cur:
             cur.execute(
@@ -284,6 +314,7 @@ class TestSeedCacheFromClone:
     # --- (e) prod-only columns default ----------------------------------
 
     def test_prod_only_columns_default(self) -> None:
+        self._seed_all()
         conn = psycopg.connect(self.target_url)
         with conn.cursor() as cur:
             cur.execute("SELECT artwork_checked_at, not_found FROM release WHERE id = 101")
@@ -295,6 +326,7 @@ class TestSeedCacheFromClone:
     # --- (b) pre-existing rows byte-identical ---------------------------
 
     def test_preexisting_release_not_overwritten(self) -> None:
+        self._seed_all()
         conn = psycopg.connect(self.target_url)
         with conn.cursor() as cur:
             cur.execute("SELECT title, artwork_url FROM release WHERE id = %s", (PREEXISTING_ID,))
@@ -309,11 +341,8 @@ class TestSeedCacheFromClone:
     # --- (c) second run is a no-op --------------------------------------
 
     def test_second_run_is_noop(self) -> None:
-        counts = seed_releases_additive(
-            self.source_url,
-            self.target_url,
-            [rid for rid, _, _ in CLONE_RELEASES],
-        )
+        self._seed_all()  # first run populates the new releases + children
+        counts = self._seed_all()  # second run must be a pure no-op
         assert counts["release"] == 0, "re-run must insert no new releases"
         # No duplicate child rows for an already-seeded release.
         assert self._child_count(self.target_url, "release_track", 101) == 2
@@ -323,9 +352,11 @@ class TestSeedCacheFromClone:
 
     def test_generator_candidate_ids_not_exhausted_prematurely(self, caplog) -> None:
         """A one-shot iterable (e.g. a generator) must not be silently exhausted
-        by internal reuse -- by this point in the class all CLONE_RELEASES are
-        already seeded, so this exercises the "no new ids" logging branch, which
-        re-reads candidate_ids after _compute_new_ids has already consumed it."""
+        by internal reuse. Seed once up front so all CLONE_RELEASES are already
+        present, then re-seed passing a generator: this exercises the "no new
+        ids" logging branch, which re-reads candidate_ids after _compute_new_ids
+        has already consumed it."""
+        self._seed_all()
         ids_gen = (rid for rid, _, _ in CLONE_RELEASES)
         with caplog.at_level(logging.INFO, logger="seed_cache_from_clone"):
             seed_releases_additive(self.source_url, self.target_url, ids_gen)
@@ -529,6 +560,31 @@ class TestSeedArtistsFromClone:
         self.source_url = self.__class__._source_url
         self.target_url = self.__class__._target_url
 
+    @pytest.fixture(autouse=True)
+    def _reset_target(self):
+        """Reset the shared target to its pristine pre-seed baseline before each
+        test (only preexisting artist 500 present), so tests are
+        order-independent; an assertion-only test seeds itself first."""
+        conn = psycopg.connect(self.__class__._target_url, autocommit=True)
+        with conn.cursor() as cur:
+            # CASCADE empties artist_name_variation (and any other artist child)
+            # alongside artist in one shot.
+            cur.execute("TRUNCATE artist CASCADE")
+            _insert_artist(
+                cur,
+                PREEXISTING_ARTIST,
+                PROD_ARTIST_500,
+                ["prod-only variation"],
+                include_prod_cols=True,
+            )
+        conn.close()
+
+    def _seed_all(self) -> dict[str, int]:
+        """Run the (idempotent) artist seed for every CLONE_ARTISTS id."""
+        return seed_artists_additive(
+            self.source_url, self.target_url, [a for a, _, _ in CLONE_ARTISTS]
+        )
+
     def _variation_count(self, aid: int) -> int:
         conn = psycopg.connect(self.target_url)
         with conn.cursor() as cur:
@@ -562,6 +618,7 @@ class TestSeedArtistsFromClone:
         assert self._variation_count(501) == 1
 
     def test_prod_only_column_defaults(self) -> None:
+        self._seed_all()
         conn = psycopg.connect(self.target_url)
         with conn.cursor() as cur:
             cur.execute("SELECT not_found FROM artist WHERE id = 501")
@@ -570,6 +627,7 @@ class TestSeedArtistsFromClone:
         assert not_found is False
 
     def test_preexisting_artist_not_overwritten(self) -> None:
+        self._seed_all()
         conn = psycopg.connect(self.target_url)
         with conn.cursor() as cur:
             cur.execute("SELECT name FROM artist WHERE id = %s", (PREEXISTING_ARTIST,))
@@ -580,9 +638,8 @@ class TestSeedArtistsFromClone:
         assert self._variation_count(PREEXISTING_ARTIST) == 1
 
     def test_second_run_no_duplicate_variations(self) -> None:
-        counts = seed_artists_additive(
-            self.source_url, self.target_url, [a for a, _, _ in CLONE_ARTISTS]
-        )
+        self._seed_all()  # first run populates the new artist + variations
+        counts = self._seed_all()  # second run must be a pure no-op
         assert counts["artist"] == 0
         assert self._variation_count(501) == 1
 

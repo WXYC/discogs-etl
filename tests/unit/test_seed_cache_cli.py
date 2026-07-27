@@ -8,19 +8,18 @@ from __future__ import annotations
 
 import importlib.util
 import sys
-import sys as _sys
 from pathlib import Path
 
 import pytest
 
 _SEED_PATH = Path(__file__).parent.parent.parent / "scripts" / "seed_cache_from_clone.py"
-if "seed_cache_from_clone" in _sys.modules:
-    _seed = _sys.modules["seed_cache_from_clone"]
+if "seed_cache_from_clone" in sys.modules:
+    _seed = sys.modules["seed_cache_from_clone"]
 else:
     _spec = importlib.util.spec_from_file_location("seed_cache_from_clone", _SEED_PATH)
     assert _spec is not None and _spec.loader is not None
     _seed = importlib.util.module_from_spec(_spec)
-    _sys.modules["seed_cache_from_clone"] = _seed
+    sys.modules["seed_cache_from_clone"] = _seed
     _spec.loader.exec_module(_seed)
 
 
