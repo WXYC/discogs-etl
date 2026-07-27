@@ -61,6 +61,7 @@ classify_all_releases = _vc.classify_all_releases
 get_table_sizes = _vc.get_table_sizes
 count_rows_to_delete = _vc.count_rows_to_delete
 prune_releases = _vc.prune_releases
+apply_release_overrides = _vc.apply_release_overrides
 
 pytestmark = [pytest.mark.pg]
 
@@ -157,6 +158,38 @@ class TestPruneClassification:
     def test_amnesiac_kept(self) -> None:
         """Autechre 'Tri Repetae' should be KEEP."""
         assert 4001 in self.report.keep_ids
+
+
+class TestPruneClassificationWithKeepReleaseIds:
+    """A pinned release_id (--keep-release-ids) survives even a PRUNE fuzzy-match."""
+
+    @pytest.fixture(autouse=True, scope="class")
+    def _set_up(self, db_url):
+        self.__class__._db_url = db_url
+        _fresh_import(db_url)
+        index = LibraryIndex.from_sqlite(FIXTURE_LIBRARY_DB)
+        matcher = MultiIndexMatcher(index)
+        releases = _load_releases_sync(db_url)
+        self.__class__._report = classify_all_releases(releases, index, matcher)
+        # Sanity precondition: 10001 must actually be a fuzzy-match PRUNE
+        # candidate before the override is applied, or this test proves nothing.
+        assert 10001 in self.__class__._report.prune_ids
+        apply_release_overrides(self.__class__._report, {10001})
+
+    @pytest.fixture(autouse=True)
+    def _store_attrs(self):
+        self.db_url = self.__class__._db_url
+        self.report = self.__class__._report
+
+    def test_override_release_moved_to_keep(self) -> None:
+        """Release 10001 ('Random Artist X', non-library) is pinned -> KEEP, not PRUNE."""
+        assert 10001 in self.report.keep_ids
+        assert 10001 not in self.report.prune_ids
+
+    def test_non_override_release_unaffected(self) -> None:
+        """Release 5001 (not pinned) stays PRUNE -- the exemption is targeted."""
+        assert 5001 in self.report.prune_ids
+        assert 5001 not in self.report.keep_ids
 
 
 class TestPruneExecution:

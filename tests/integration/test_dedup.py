@@ -45,6 +45,7 @@ add_constraints_and_indexes = _dd.add_constraints_and_indexes
 load_library_labels = _dd.load_library_labels
 load_label_hierarchy = _dd.load_label_hierarchy
 create_label_match_table = _dd.create_label_match_table
+load_keep_release_ids = _dd.load_keep_release_ids
 DEDUP_TABLES = _dd.DEDUP_TABLES
 _infer_pipeline_state = _rp._infer_pipeline_state
 
@@ -68,6 +69,7 @@ def _drop_all_tables(conn) -> None:
         # Also drop dedup artifacts
         cur.execute("DROP TABLE IF EXISTS dedup_delete_ids CASCADE")
         cur.execute("DROP TABLE IF EXISTS release_track_count CASCADE")
+        cur.execute("DROP TABLE IF EXISTS keep_release_ids CASCADE")
         for prefix in ("new_", ""):
             for table in ALL_TABLES:
                 cur.execute(f"DROP TABLE IF EXISTS {prefix}{table}_old CASCADE")
@@ -1349,3 +1351,190 @@ class TestDedupCopySwapPreservesMasterId:
             "persists post-swap (WXYC/discogs-etl#320), so the completion signal must key "
             "off the post-swap fk_release_artist_release constraint, not master_id absence"
         )
+
+
+class TestLoadKeepReleaseIds:
+    """load_keep_release_ids loads a newline-separated allowlist file into a staging table."""
+
+    @pytest.fixture(autouse=True, scope="class")
+    def _set_up(self, db_url):
+        self.__class__._db_url = db_url
+        conn = psycopg.connect(db_url, autocommit=True)
+        _drop_all_tables(conn)
+        with conn.cursor() as cur:
+            cur.execute(SCHEMA_DIR.joinpath("create_database.sql").read_text())
+        conn.close()
+
+    @pytest.fixture(autouse=True)
+    def _store_url(self):
+        self.db_url = self.__class__._db_url
+
+    def test_loads_ids_from_file(self, tmp_path) -> None:
+        path = tmp_path / "keep_ids.txt"
+        path.write_text("101\n202\n")
+        conn = psycopg.connect(self.db_url, autocommit=True)
+        count = load_keep_release_ids(conn, path)
+        with conn.cursor() as cur:
+            cur.execute("SELECT release_id FROM keep_release_ids ORDER BY release_id")
+            ids = [row[0] for row in cur.fetchall()]
+        conn.close()
+        assert count == 2
+        assert ids == [101, 202]
+
+    def test_pk_constraint_present(self, tmp_path) -> None:
+        path = tmp_path / "keep_ids.txt"
+        path.write_text("101\n")
+        conn = psycopg.connect(self.db_url, autocommit=True)
+        load_keep_release_ids(conn, path)
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT EXISTS (
+                    SELECT 1 FROM pg_constraint
+                    WHERE conrelid = 'keep_release_ids'::regclass AND contype = 'p'
+                )
+            """)
+            has_pk = cur.fetchone()[0]
+        conn.close()
+        assert has_pk is True
+
+    def test_empty_file_creates_empty_table(self, tmp_path) -> None:
+        path = tmp_path / "keep_ids.txt"
+        path.write_text("")
+        conn = psycopg.connect(self.db_url, autocommit=True)
+        count = load_keep_release_ids(conn, path)
+        with conn.cursor() as cur:
+            cur.execute("SELECT count(*) FROM keep_release_ids")
+            table_count = cur.fetchone()[0]
+        conn.close()
+        assert count == 0
+        assert table_count == 0
+
+    def test_table_dropped_and_recreated_on_reload(self, tmp_path) -> None:
+        path1 = tmp_path / "keep_ids_1.txt"
+        path1.write_text("101\n")
+        path2 = tmp_path / "keep_ids_2.txt"
+        path2.write_text("202\n303\n")
+        conn = psycopg.connect(self.db_url, autocommit=True)
+        load_keep_release_ids(conn, path1)
+        load_keep_release_ids(conn, path2)
+        with conn.cursor() as cur:
+            cur.execute("SELECT release_id FROM keep_release_ids ORDER BY release_id")
+            ids = [row[0] for row in cur.fetchall()]
+        conn.close()
+        # Second load's contents win — 101 from the first load must be gone.
+        assert ids == [202, 303]
+
+
+class TestEnsureDedupIdsWithKeepReleaseIds:
+    """A pinned release_id in --keep-release-ids survives dedup even at rn > 1."""
+
+    @pytest.fixture(autouse=True, scope="class")
+    def _set_up(self, db_url):
+        self.__class__._db_url = db_url
+        conn = psycopg.connect(db_url, autocommit=True)
+        _drop_all_tables(conn)
+        with conn.cursor() as cur:
+            cur.execute(SCHEMA_DIR.joinpath("create_database.sql").read_text())
+            # Two CD releases sharing master_id 100 — release 1 (UK) would
+            # normally lose to release 2 (US) on country preference.
+            cur.execute(
+                "INSERT INTO release (id, title, master_id, format, country) "
+                "VALUES (1, 'Album', 100, 'CD', 'UK')"
+            )
+            cur.execute(
+                "INSERT INTO release (id, title, master_id, format, country) "
+                "VALUES (2, 'Album', 100, 'CD', 'US')"
+            )
+            # Unrelated pair (master_id 200, NULL format) — release 5 loses to
+            # release 4 and is NOT in the keep-ids file, so it must still be
+            # deleted: the exemption must be targeted, not a blanket bypass.
+            cur.execute(
+                "INSERT INTO release (id, title, master_id, country) "
+                "VALUES (4, 'Album B', 200, 'US')"
+            )
+            cur.execute(
+                "INSERT INTO release (id, title, master_id, country) "
+                "VALUES (5, 'Album B', 200, 'UK')"
+            )
+            cur.execute("""
+                CREATE UNLOGGED TABLE release_track_count (
+                    release_id integer PRIMARY KEY,
+                    track_count integer NOT NULL
+                )
+            """)
+            cur.execute("INSERT INTO release_track_count VALUES (1, 5), (2, 3), (4, 2), (5, 1)")
+        conn.close()
+
+    @pytest.fixture(autouse=True)
+    def _store_url(self):
+        self.db_url = self.__class__._db_url
+
+    def _reset_dedup_state(self, conn) -> None:
+        with conn.cursor() as cur:
+            cur.execute("DROP TABLE IF EXISTS dedup_delete_ids")
+            cur.execute("DROP TABLE IF EXISTS keep_release_ids")
+
+    def test_pinned_release_excluded_from_delete_ids(self, tmp_path) -> None:
+        keep_ids_path = tmp_path / "keep_ids.txt"
+        keep_ids_path.write_text("1\n")
+        conn = psycopg.connect(self.db_url, autocommit=True)
+        self._reset_dedup_state(conn)
+        load_keep_release_ids(conn, keep_ids_path)
+        ensure_dedup_ids(conn, keep_ids_loaded=True)
+        with conn.cursor() as cur:
+            cur.execute("SELECT release_id FROM dedup_delete_ids ORDER BY release_id")
+            deleted = {row[0] for row in cur.fetchall()}
+        conn.close()
+        assert 1 not in deleted, "pinned release 1 must survive despite rn > 1"
+
+    def test_sibling_ranking_unaffected_by_exemption(self, tmp_path) -> None:
+        """Release 5 (not pinned) is still deleted — the exemption doesn't perturb
+        unrelated (master_id, format) partitions' ROW_NUMBER ranking."""
+        keep_ids_path = tmp_path / "keep_ids.txt"
+        keep_ids_path.write_text("1\n")
+        conn = psycopg.connect(self.db_url, autocommit=True)
+        self._reset_dedup_state(conn)
+        load_keep_release_ids(conn, keep_ids_path)
+        ensure_dedup_ids(conn, keep_ids_loaded=True)
+        with conn.cursor() as cur:
+            cur.execute("SELECT release_id FROM dedup_delete_ids ORDER BY release_id")
+            deleted = {row[0] for row in cur.fetchall()}
+        conn.close()
+        assert 5 in deleted
+        assert 4 not in deleted
+
+    def test_force_recreates_stale_dedup_delete_ids_table(self, tmp_path) -> None:
+        """A stale dedup_delete_ids from a prior (non-exempting) run must be dropped
+        and recreated when keep_ids_loaded=True, not reused verbatim."""
+        keep_ids_path = tmp_path / "keep_ids.txt"
+        keep_ids_path.write_text("1\n")
+        conn = psycopg.connect(self.db_url, autocommit=True)
+        self._reset_dedup_state(conn)
+        # Simulate a stale table from a prior run that does NOT reflect the
+        # exemption (release 1 present, as a plain rn>1 run would produce).
+        with conn.cursor() as cur:
+            cur.execute("CREATE UNLOGGED TABLE dedup_delete_ids (release_id integer PRIMARY KEY)")
+            cur.execute("INSERT INTO dedup_delete_ids (release_id) VALUES (1), (5)")
+        load_keep_release_ids(conn, keep_ids_path)
+        ensure_dedup_ids(conn, keep_ids_loaded=True)
+        with conn.cursor() as cur:
+            cur.execute("SELECT release_id FROM dedup_delete_ids ORDER BY release_id")
+            deleted = {row[0] for row in cur.fetchall()}
+        conn.close()
+        assert 1 not in deleted, (
+            "stale table must be force-recreated, not reused verbatim, when keep_ids_loaded=True"
+        )
+        assert 5 in deleted
+
+    def test_omitted_flag_matches_todays_behavior(self, tmp_path) -> None:
+        """Without keep_ids_loaded, behavior is byte-identical to today: release 1
+        is deleted just like before this feature existed (AC2 regression pin)."""
+        conn = psycopg.connect(self.db_url, autocommit=True)
+        self._reset_dedup_state(conn)
+        ensure_dedup_ids(conn)
+        with conn.cursor() as cur:
+            cur.execute("SELECT release_id FROM dedup_delete_ids ORDER BY release_id")
+            deleted = {row[0] for row in cur.fetchall()}
+        conn.close()
+        assert 1 in deleted
+        assert 5 in deleted

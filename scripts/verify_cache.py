@@ -62,6 +62,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from wxyc_etl.text import is_compilation_artist, split_artist_name_contextual
 
 from lib.format_normalization import format_matches, normalize_library_format
+from lib.keep_release_ids import parse_keep_release_ids
 from lib.observability import init_logger
 from lib.pg_concurrent_ddl import (
     SWAP_PATH_ATTEMPTS,
@@ -691,6 +692,29 @@ def load_artist_mappings(path: Path) -> dict:
     with open(path, encoding="utf-8") as f:
         data = json.load(f)
     return {"keep": data.get("keep", {}), "prune": data.get("prune", {})}
+
+
+def load_keep_release_ids(path: Path | None) -> set[int]:
+    """Load an allowlist of release_ids exempt from pruning.
+
+    Returns an empty set if *path* is None or the file doesn't exist --
+    tolerant like load_artist_mappings, so a missing/omitted allowlist
+    degrades to a no-op rather than a hard failure.
+    """
+    if path is None:
+        return set()
+    return parse_keep_release_ids(path)
+
+
+def apply_release_overrides(report: ClassificationReport, override_ids: set[int]) -> None:
+    """Exempt WXYC library pinned overrides from pruning.
+
+    Moves every id in *override_ids* into report.keep_ids and out of
+    report.prune_ids, regardless of what fuzzy-match classification decided.
+    A no-op when override_ids is empty.
+    """
+    report.keep_ids |= override_ids
+    report.prune_ids -= override_ids
 
 
 def save_artist_mappings(path: Path, mappings: dict) -> None:
@@ -1673,6 +1697,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=0.75,
         help="Keep threshold for 2-of-3 agreement (0.0-1.0, default: 0.75)",
     )
+    parser.add_argument(
+        "--keep-release-ids",
+        type=Path,
+        default=None,
+        metavar="FILE",
+        help="Path to a newline-separated file of release_ids that must never "
+        "be pruned, regardless of fuzzy-match result (e.g. WXYC library "
+        "pinned overrides from lml_cache.library_release_override). "
+        "Omit for today's behavior.",
+    )
     return parser.parse_args(argv)
 
 
@@ -2150,6 +2184,11 @@ async def async_main():
             keep_threshold=args.score_cutoff,
         )
         report = classify_all_releases(releases, index, matcher)
+
+        override_ids = load_keep_release_ids(args.keep_release_ids)
+        if override_ids:
+            logger.info(f"Applying {len(override_ids):,} pinned release_id override(s)")
+        apply_release_overrides(report, override_ids)
 
         # Step 6: Get table sizes for the report
         logger.info("Measuring table sizes...")

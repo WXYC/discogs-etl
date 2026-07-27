@@ -671,6 +671,42 @@ def count_child_coverage(db_url: str) -> tuple[int, int, int]:
         conn.close()
 
 
+def write_keep_release_ids(db_url: str, output_path: Path) -> int:
+    """Read WXYC's pinned-release overrides from lml_cache.library_release_override
+    (if present) and write them as a newline-separated allowlist file consumed by
+    dedup_releases.py and verify_cache.py's --keep-release-ids (discogs-etl#327).
+
+    Read-only against lml_cache -- never creates, migrates, or truncates it
+    (CLAUDE.md "entity.* schema ownership"). If the table doesn't exist (no
+    LML bootstrap yet, or a local/CI DB), writes an empty file and returns 0:
+    a no-op exemption, not an error. If the table exists but the expected
+    discogs_release_id column doesn't, this raises (UndefinedColumn) rather
+    than silently degrading -- a column-name typo must fail loudly, not
+    surface only as a parity failure at the next rebuild.
+    """
+    conn = psycopg.connect(db_url)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT to_regclass('lml_cache.library_release_override')")
+            if cur.fetchone()[0] is None:
+                logger.info(
+                    "lml_cache.library_release_override not found; "
+                    "writing empty release-id allowlist"
+                )
+                output_path.write_text("")
+                return 0
+            cur.execute(
+                "SELECT DISTINCT discogs_release_id FROM lml_cache.library_release_override"
+            )
+            ids = [row[0] for row in cur.fetchall()]
+    finally:
+        conn.close()
+
+    output_path.write_text("\n".join(str(i) for i in ids))
+    logger.info("Wrote %d pinned release_id override(s) to %s", len(ids), output_path)
+    return len(ids)
+
+
 def check_reload_invariant(
     db_url: str,
     *,
@@ -1101,6 +1137,13 @@ def _run_database_build_post_import(
     (set in _run_xml_pipeline before the converter). Runs create_indexes
     through SET LOGGED.
     """
+    # -- read WXYC library pinned overrides once, threaded into every dedup
+    # and verify_cache.py invocation below (discogs-etl#327)
+    keep_release_ids_path = (
+        Path(tempfile.mkdtemp(prefix="discogs_keep_release_ids_")) / "keep_release_ids.txt"
+    )
+    write_keep_release_ids(db_url, keep_release_ids_path)
+
     # -- create_indexes (base trigram indexes, run in parallel)
     conn = psycopg.connect(db_url, autocommit=True)
     with conn.cursor() as cur:
@@ -1140,6 +1183,7 @@ def _run_database_build_post_import(
         dedup_cmd.extend(["--library-labels", str(labels_csv)])
     if label_hierarchy is not None:
         dedup_cmd.extend(["--label-hierarchy", str(label_hierarchy)])
+    dedup_cmd.extend(["--keep-release-ids", str(keep_release_ids_path)])
     dedup_cmd.append(db_url)
 
     run_step("Deduplicate releases", dedup_cmd)
@@ -1200,7 +1244,15 @@ def _run_database_build_post_import(
     if library_db:
         run_step(
             "Prune to library matches",
-            [python, str(SCRIPT_DIR / "verify_cache.py"), "--prune", str(library_db), db_url],
+            [
+                python,
+                str(SCRIPT_DIR / "verify_cache.py"),
+                "--prune",
+                str(library_db),
+                db_url,
+                "--keep-release-ids",
+                str(keep_release_ids_path),
+            ],
         )
     else:
         logger.info("Skipping prune step (no library.db provided)")
@@ -1253,6 +1305,13 @@ def _run_database_build(
             state.save(str(state_file))
 
     wait_for_postgres(db_url)
+
+    # -- read WXYC library pinned overrides once, threaded into every dedup
+    # and verify_cache.py invocation below (discogs-etl#327)
+    keep_release_ids_path = (
+        Path(tempfile.mkdtemp(prefix="discogs_keep_release_ids_")) / "keep_release_ids.txt"
+    )
+    write_keep_release_ids(db_url, keep_release_ids_path)
 
     # -- create_schema
     if state and state.is_completed("create_schema"):
@@ -1357,6 +1416,7 @@ def _run_database_build(
             dedup_cmd.extend(["--library-labels", str(labels_csv)])
         if label_hierarchy is not None:
             dedup_cmd.extend(["--label-hierarchy", str(label_hierarchy)])
+        dedup_cmd.extend(["--keep-release-ids", str(keep_release_ids_path)])
         dedup_cmd.append(db_url)
 
         run_step("Deduplicate releases", dedup_cmd)
@@ -1446,6 +1506,8 @@ def _run_database_build(
                 target_db_url,
                 str(library_db),
                 db_url,
+                "--keep-release-ids",
+                str(keep_release_ids_path),
             ],
         )
         if state:
@@ -1454,7 +1516,15 @@ def _run_database_build(
     elif library_db:
         run_step(
             "Prune to library matches",
-            [python, str(SCRIPT_DIR / "verify_cache.py"), "--prune", str(library_db), db_url],
+            [
+                python,
+                str(SCRIPT_DIR / "verify_cache.py"),
+                "--prune",
+                str(library_db),
+                db_url,
+                "--keep-release-ids",
+                str(keep_release_ids_path),
+            ],
         )
         if state:
             state.mark_completed("prune")

@@ -412,6 +412,137 @@ class TestTruncateExistingPropagation:
         assert args.keep_csv == Path("/tmp/kept")
 
 
+class TestKeepReleaseIdsPropagation:
+    """run_pipeline.py always threads --keep-release-ids into every dedup and
+    verify_cache.py subprocess invocation, computed once per pipeline run via
+    write_keep_release_ids -- no CLI flag of its own (issue #327)."""
+
+    def _mock_conn(self):
+        mock_cursor = MagicMock()
+        mock_cursor.fetchone.return_value = [True]
+        mock_cursor.fetchall.return_value = [
+            ("idx_release_artist_name_trgm",),
+            ("idx_release_title_trgm",),
+        ]
+        mock_conn = MagicMock()
+        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
+        mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+        return mock_conn
+
+    def _invoke_database_build_capturing_run_step(
+        self, *, library_db=None, target_db_url=None
+    ) -> list[list[str]]:
+        import psycopg
+
+        captured_cmds: list[list[str]] = []
+
+        def fake_run_step(step_name, cmd, *args, **kwargs):
+            captured_cmds.append(cmd)
+
+        with (
+            patch.object(run_pipeline, "run_step", side_effect=fake_run_step),
+            patch.object(run_pipeline, "wait_for_postgres"),
+            patch.object(run_pipeline, "run_sql_file"),
+            patch.object(run_pipeline, "run_sql_statements_parallel"),
+            patch.object(run_pipeline, "set_tables_unlogged"),
+            patch.object(run_pipeline, "set_tables_logged"),
+            patch.object(run_pipeline, "run_vacuum"),
+            patch.object(run_pipeline, "report_sizes"),
+            patch.object(run_pipeline, "check_reload_invariant") as mock_check,
+            patch.object(
+                run_pipeline,
+                "write_keep_release_ids",
+                return_value=0,
+            ) as mock_write,
+            patch.object(psycopg, "connect", return_value=self._mock_conn()),
+        ):
+            mock_check.return_value = run_pipeline.ReloadInvariantResult(
+                ok=True, release_count=1, artist_coverage=1.0, track_coverage=1.0
+            )
+            run_pipeline._run_database_build(
+                "postgresql:///test",
+                Path("/tmp/csv"),
+                library_db,
+                sys.executable,
+                target_db_url=target_db_url,
+            )
+
+        self._last_mock_write = mock_write
+        return captured_cmds
+
+    def _invoke_post_import_capturing_run_step(self, *, library_db=None) -> list[list[str]]:
+        import psycopg
+
+        captured_cmds: list[list[str]] = []
+
+        def fake_run_step(step_name, cmd, *args, **kwargs):
+            captured_cmds.append(cmd)
+
+        with (
+            patch.object(run_pipeline, "run_step", side_effect=fake_run_step),
+            patch.object(run_pipeline, "run_sql_statements_parallel"),
+            patch.object(run_pipeline, "run_vacuum"),
+            patch.object(run_pipeline, "set_tables_logged"),
+            patch.object(run_pipeline, "report_sizes"),
+            patch.object(run_pipeline, "check_reload_invariant") as mock_check,
+            patch.object(
+                run_pipeline,
+                "write_keep_release_ids",
+                return_value=0,
+            ) as mock_write,
+            patch.object(psycopg, "connect", return_value=self._mock_conn()),
+        ):
+            mock_check.return_value = run_pipeline.ReloadInvariantResult(
+                ok=True, release_count=1, artist_coverage=1.0, track_coverage=1.0
+            )
+            run_pipeline._run_database_build_post_import(
+                "postgresql:///test", Path("/tmp/csv"), library_db, sys.executable
+            )
+
+        self._last_mock_write = mock_write
+        return captured_cmds
+
+    def test_flag_propagates_to_dedup_step(self) -> None:
+        cmds = self._invoke_database_build_capturing_run_step(library_db=Path("/tmp/library.db"))
+        dedup_cmds = [c for c in cmds if "dedup_releases.py" in c[1]]
+        assert len(dedup_cmds) == 1
+        assert "--keep-release-ids" in dedup_cmds[0]
+
+    def test_flag_propagates_to_prune_step(self) -> None:
+        cmds = self._invoke_database_build_capturing_run_step(library_db=Path("/tmp/library.db"))
+        prune_cmds = [c for c in cmds if "--prune" in c]
+        assert len(prune_cmds) == 1
+        assert "--keep-release-ids" in prune_cmds[0]
+
+    def test_flag_propagates_to_copy_to_step(self) -> None:
+        cmds = self._invoke_database_build_capturing_run_step(
+            library_db=Path("/tmp/library.db"), target_db_url="postgresql:///target"
+        )
+        copy_to_cmds = [c for c in cmds if "--copy-to" in c]
+        assert len(copy_to_cmds) == 1
+        assert "--keep-release-ids" in copy_to_cmds[0]
+
+    def test_write_keep_release_ids_called_once_per_pipeline_run(self) -> None:
+        self._invoke_database_build_capturing_run_step(library_db=Path("/tmp/library.db"))
+        assert self._last_mock_write.call_count == 1
+
+    def test_post_import_flag_propagates_to_dedup_step(self) -> None:
+        cmds = self._invoke_post_import_capturing_run_step(library_db=Path("/tmp/library.db"))
+        dedup_cmds = [c for c in cmds if "dedup_releases.py" in c[1]]
+        assert len(dedup_cmds) == 1
+        assert "--keep-release-ids" in dedup_cmds[0]
+
+    def test_post_import_flag_propagates_to_prune_step(self) -> None:
+        cmds = self._invoke_post_import_capturing_run_step(library_db=Path("/tmp/library.db"))
+        prune_cmds = [c for c in cmds if "--prune" in c]
+        assert len(prune_cmds) == 1
+        assert "--keep-release-ids" in prune_cmds[0]
+
+    def test_post_import_write_keep_release_ids_called_once(self) -> None:
+        self._invoke_post_import_capturing_run_step(library_db=Path("/tmp/library.db"))
+        assert self._last_mock_write.call_count == 1
+
+
 class TestRunSqlStatementsParallel:
     """Test parallel SQL statement execution."""
 
@@ -1441,6 +1572,59 @@ class TestCountChildCoverage:
         with patch.object(run_pipeline.psycopg, "connect", return_value=mock_conn):
             assert run_pipeline.count_child_coverage("postgresql:///t") == (1_000, 900, 800)
         mock_conn.close.assert_called_once()
+
+
+class TestWriteKeepReleaseIds:
+    """write_keep_release_ids() reads lml_cache.library_release_override
+    (read-only, existence-gated via to_regclass) and writes a newline-
+    separated allowlist file consumed by dedup_releases.py / verify_cache.py.
+    """
+
+    def _mock_conn(self, *, regclass_row, fetchall_rows=None):
+        mock_cursor = MagicMock()
+        mock_cursor.fetchone.return_value = regclass_row
+        mock_cursor.fetchall.return_value = fetchall_rows or []
+        mock_conn = MagicMock()
+        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
+        mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+        return mock_conn
+
+    def test_missing_table_writes_empty_file(self, tmp_path) -> None:
+        """No lml_cache.library_release_override (every DB today) degrades to
+        an empty allowlist -- read-only, never creates/migrates the table."""
+        output_path = tmp_path / "keep_ids.txt"
+        mock_conn = self._mock_conn(regclass_row=[None])
+        with patch.object(run_pipeline.psycopg, "connect", return_value=mock_conn):
+            count = run_pipeline.write_keep_release_ids("postgresql:///t", output_path)
+        assert count == 0
+        assert output_path.read_text() == ""
+        mock_conn.close.assert_called_once()
+
+    def test_existing_table_writes_ids(self, tmp_path) -> None:
+        output_path = tmp_path / "keep_ids.txt"
+        mock_conn = self._mock_conn(
+            regclass_row=["library_release_override"],
+            fetchall_rows=[(101,), (202,)],
+        )
+        with patch.object(run_pipeline.psycopg, "connect", return_value=mock_conn):
+            count = run_pipeline.write_keep_release_ids("postgresql:///t", output_path)
+        assert count == 2
+        assert output_path.read_text() == "101\n202"
+        mock_conn.close.assert_called_once()
+
+    def test_queries_discogs_release_id_column(self, tmp_path) -> None:
+        """Column is discogs_release_id, not release_id -- verified against
+        prod (issue #327) and the source design doc. A future rename would
+        surface as an unhandled UndefinedColumn, not a silent empty set."""
+        output_path = tmp_path / "keep_ids.txt"
+        mock_conn = self._mock_conn(regclass_row=["library_release_override"], fetchall_rows=[])
+        with patch.object(run_pipeline.psycopg, "connect", return_value=mock_conn):
+            run_pipeline.write_keep_release_ids("postgresql:///t", output_path)
+        select_calls = [
+            c.args[0] if c.args else c.kwargs.get("query", "")
+            for c in mock_conn.cursor.return_value.__enter__.return_value.execute.call_args_list
+        ]
+        assert any("discogs_release_id" in stmt for stmt in select_calls)
 
 
 class TestCheckReloadInvariant:
