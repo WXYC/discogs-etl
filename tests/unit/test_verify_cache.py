@@ -666,6 +666,8 @@ classify_fuzzy_batch = _vc.classify_fuzzy_batch
 _init_fuzzy_worker = _vc._init_fuzzy_worker
 _classify_fuzzy_chunk = _vc._classify_fuzzy_chunk
 prune_releases_copy_swap = _vc.prune_releases_copy_swap
+load_keep_release_ids = _vc.load_keep_release_ids
+apply_release_overrides = _vc.apply_release_overrides
 
 parse_args = _vc.parse_args
 
@@ -977,6 +979,93 @@ class TestParseArgsCopyTo:
         lib_db.touch()
         args = parse_args([str(lib_db)])
         assert args.copy_to is None
+
+
+class TestKeepReleaseIdsArg:
+    """Test --keep-release-ids argument parsing."""
+
+    def test_default_none(self, tmp_path):
+        lib_db = tmp_path / "library.db"
+        lib_db.touch()
+        args = parse_args([str(lib_db)])
+        assert args.keep_release_ids is None
+
+    def test_parsed_as_path(self, tmp_path):
+        lib_db = tmp_path / "library.db"
+        lib_db.touch()
+        args = parse_args([str(lib_db), "--keep-release-ids", "/tmp/keep_ids.txt"])
+        assert args.keep_release_ids == Path("/tmp/keep_ids.txt")
+
+
+class TestLoadKeepReleaseIds:
+    """Test load_keep_release_ids -- tolerant like load_artist_mappings."""
+
+    def test_none_path_returns_empty_set(self):
+        assert load_keep_release_ids(None) == set()
+
+    def test_missing_file_returns_empty_set(self, tmp_path):
+        assert load_keep_release_ids(tmp_path / "nope.txt") == set()
+
+    def test_existing_file_returns_ids(self, tmp_path):
+        path = tmp_path / "keep_ids.txt"
+        path.write_text("101\n202\n")
+        assert load_keep_release_ids(path) == {101, 202}
+
+
+class TestApplyReleaseOverrides:
+    """Test apply_release_overrides -- moves pinned ids into keep_ids and out of
+    both prune_ids and review_ids, preserving the keep/prune/review partition."""
+
+    def _make_report(self, keep_ids, prune_ids, review_ids=()):
+        return ClassificationReport(
+            keep_ids=set(keep_ids),
+            prune_ids=set(prune_ids),
+            review_ids=set(review_ids),
+            review_by_artist={},
+            artist_originals={},
+            total_releases=len(keep_ids) + len(prune_ids) + len(review_ids),
+        )
+
+    def test_override_moved_from_prune_to_keep(self):
+        report = self._make_report(keep_ids=set(), prune_ids={10001, 5001})
+        apply_release_overrides(report, {10001})
+        assert 10001 in report.keep_ids
+        assert 10001 not in report.prune_ids
+        assert 5001 in report.prune_ids
+
+    def test_override_moved_from_review_to_keep(self):
+        """A pinned release the fuzzy matcher parked in REVIEW must land in
+        keep_ids AND leave review_ids, so the copy-swap prune path (which copies
+        keep_ids ∪ review_ids) and the report both see a clean partition -- no
+        id counted as both KEEP and REVIEW."""
+        report = self._make_report(keep_ids=set(), prune_ids=set(), review_ids={7001, 8001})
+        apply_release_overrides(report, {7001})
+        assert 7001 in report.keep_ids
+        assert 7001 not in report.review_ids
+        assert 8001 in report.review_ids
+
+    def test_pinned_prune_release_lands_in_copy_swap_keep_set(self):
+        """The large-prune path (prune_releases_copy_swap) rebuilds the release
+        table from keep_ids ∪ review_ids, not prune_ids. A pinned release the
+        classifier put in PRUNE must therefore appear in keep_ids afterwards, or
+        the copy-swap would silently drop it."""
+        report = self._make_report(keep_ids={1, 2}, prune_ids={9001}, review_ids={3})
+        apply_release_overrides(report, {9001})
+        copy_swap_survivors = report.keep_ids | report.review_ids
+        assert 9001 in copy_swap_survivors
+
+    def test_override_already_in_keep_is_noop(self):
+        report = self._make_report(keep_ids={101}, prune_ids=set())
+        apply_release_overrides(report, {101})
+        assert report.keep_ids == {101}
+        assert report.prune_ids == set()
+
+    def test_empty_override_set_is_noop(self):
+        report = self._make_report(keep_ids={101}, prune_ids={102}, review_ids={103})
+        apply_release_overrides(report, set())
+        assert report.keep_ids == {101}
+        assert report.prune_ids == {102}
+        assert report.review_ids == {103}
 
 
 # ---------------------------------------------------------------------------

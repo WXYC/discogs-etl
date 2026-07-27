@@ -28,6 +28,7 @@ from pathlib import Path
 import psycopg
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from lib.keep_release_ids import parse_keep_release_ids  # noqa: E402
 from lib.observability import init_logger  # noqa: E402
 from lib.pg_concurrent_ddl import (  # noqa: E402
     add_constraint_safely,
@@ -224,14 +225,62 @@ def create_label_match_table(conn) -> int:
     return count
 
 
-def ensure_dedup_ids(conn) -> int:
+def load_keep_release_ids(conn, path: Path) -> int:
+    """Load a newline-separated release_id allowlist into an UNLOGGED table.
+
+    Creates ``keep_release_ids (release_id integer PRIMARY KEY)``. The PK
+    constraint guarantees NOT NULL, which matters: ``NOT IN`` against a
+    subquery containing NULL evaluates to NULL for every row, silently
+    keeping 100% of duplicates. Loading zero ids is a harmless no-op filter.
+
+    Args:
+        conn: psycopg connection (autocommit=True).
+        path: Path to a newline-separated release_id allowlist file (see
+            lib.keep_release_ids for the file format).
+
+    Returns:
+        Number of ids loaded.
+    """
+    ids = parse_keep_release_ids(path)
+    logger.info("Loaded %d release_id override(s) from %s", len(ids), path)
+
+    with conn.cursor() as cur:
+        cur.execute("DROP TABLE IF EXISTS keep_release_ids")
+        cur.execute("""
+            CREATE UNLOGGED TABLE keep_release_ids (
+                release_id integer PRIMARY KEY
+            )
+        """)
+        if ids:
+            with cur.copy("COPY keep_release_ids (release_id) FROM STDIN") as copy:
+                for rid in ids:
+                    copy.write_row((rid,))
+
+    return len(ids)
+
+
+def ensure_dedup_ids(conn, *, keep_ids_loaded: bool = False) -> int:
     """Ensure dedup_delete_ids table exists. Create if needed.
 
     Uses release_track_count table for track counts if available (v2 pipeline),
     falling back to counting from release_track directly (v1 / standalone usage).
 
+    Args:
+        conn: psycopg connection (autocommit=True).
+        keep_ids_loaded: When True, a ``keep_release_ids`` table (from
+            load_keep_release_ids) is assumed to exist, and no release_id it
+            contains may land in dedup_delete_ids -- even if its ROW_NUMBER
+            rank within its (master_id, format) partition is rn > 1. Any
+            pre-existing dedup_delete_ids is force-recreated in this case, so
+            a stale table from a prior (non-exempting) run can't silently
+            skip the exemption.
+
     Returns number of IDs to delete.
     """
+    if keep_ids_loaded:
+        with conn.cursor() as cur:
+            cur.execute("DROP TABLE IF EXISTS dedup_delete_ids")
+
     with conn.cursor() as cur:
         cur.execute("""
             SELECT EXISTS (
@@ -284,21 +333,47 @@ def ensure_dedup_ids(conn) -> int:
 
     with conn.cursor() as cur:
         # All SQL fragments are built from trusted internal constants, not user input
-        cur.execute(f"""
-            CREATE UNLOGGED TABLE dedup_delete_ids AS
-            SELECT id AS release_id FROM (
-                SELECT r.id, r.master_id,
-                       ROW_NUMBER() OVER (
-                           PARTITION BY r.master_id, r.format
-                           ORDER BY {order_by}
-                       ) as rn
-                FROM release r
-                {track_count_join}
-                {label_join}
-                WHERE r.master_id IS NOT NULL
-            ) ranked
-            WHERE rn > 1
-        """)
+        if keep_ids_loaded:
+            # The keep-ids filter wraps the entire, unmodified ranking query as an
+            # inner subquery and only excludes rows at this outer level, so the
+            # ROW_NUMBER ranking (and every sibling's rn) is bit-for-bit identical
+            # to the no-flag path -- only the pinned row's delete-list membership
+            # changes. keep_release_ids.release_id is NOT NULL (PK), so this NOT IN
+            # can never be NULL-poisoned into keeping every row.
+            cur.execute(f"""
+                CREATE UNLOGGED TABLE dedup_delete_ids AS
+                SELECT release_id FROM (
+                    SELECT id AS release_id FROM (
+                        SELECT r.id, r.master_id,
+                               ROW_NUMBER() OVER (
+                                   PARTITION BY r.master_id, r.format
+                                   ORDER BY {order_by}
+                               ) as rn
+                        FROM release r
+                        {track_count_join}
+                        {label_join}
+                        WHERE r.master_id IS NOT NULL
+                    ) ranked
+                    WHERE rn > 1
+                ) candidates
+                WHERE release_id NOT IN (SELECT release_id FROM keep_release_ids)
+            """)
+        else:
+            cur.execute(f"""
+                CREATE UNLOGGED TABLE dedup_delete_ids AS
+                SELECT id AS release_id FROM (
+                    SELECT r.id, r.master_id,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY r.master_id, r.format
+                               ORDER BY {order_by}
+                           ) as rn
+                    FROM release r
+                    {track_count_join}
+                    {label_join}
+                    WHERE r.master_id IS NOT NULL
+                ) ranked
+                WHERE rn > 1
+            """)
         cur.execute("ALTER TABLE dedup_delete_ids ADD PRIMARY KEY (release_id)")
     conn.commit()
 
@@ -961,6 +1036,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "Enables sublabel resolution during label matching "
         "(e.g., Parlophone matches EMI).",
     )
+    parser.add_argument(
+        "--keep-release-ids",
+        type=Path,
+        default=None,
+        metavar="FILE",
+        help="Path to a newline-separated file of release_ids exempt from "
+        "dedup deletion, even if ROW_NUMBER ranks them rn>1 (e.g. WXYC "
+        "library pinned overrides from lml_cache.library_release_override). "
+        "Omit for today's behavior.",
+    )
     return parser.parse_args(argv)
 
 
@@ -989,14 +1074,29 @@ def main():
 
         create_label_match_table(conn)
 
+    # Step 0.5 (optional): Load WXYC library pinned overrides exempt from dedup.
+    # Only engage the exemption path when the allowlist is non-empty: it
+    # force-recreates dedup_delete_ids (forfeiting the reuse-verbatim
+    # short-circuit), which is wasted work when there are no ids to exempt. An
+    # empty allowlist -- the only case in production until Seam A lands -- must
+    # stay byte-identical to the no-flag path.
+    keep_ids_loaded = False
+    if args.keep_release_ids:
+        if not args.keep_release_ids.exists():
+            logger.error("Keep-release-ids file not found: %s", args.keep_release_ids)
+            sys.exit(1)
+        loaded = load_keep_release_ids(conn, args.keep_release_ids)
+        keep_ids_loaded = loaded > 0
+
     # Step 1: Ensure dedup IDs exist
-    delete_count = ensure_dedup_ids(conn)
+    delete_count = ensure_dedup_ids(conn, keep_ids_loaded=keep_ids_loaded)
     if delete_count == 0:
         logger.info("No duplicates found, nothing to do")
         with conn.cursor() as cur:
             cur.execute("DROP TABLE IF EXISTS release_track_count")
             cur.execute("DROP TABLE IF EXISTS wxyc_label_pref")
             cur.execute("DROP TABLE IF EXISTS release_label_match")
+            cur.execute("DROP TABLE IF EXISTS keep_release_ids")
         conn.close()
         return
 
@@ -1035,6 +1135,7 @@ def main():
         cur.execute("DROP TABLE IF EXISTS wxyc_label_pref")
         cur.execute("DROP TABLE IF EXISTS release_label_match")
         cur.execute("DROP TABLE IF EXISTS label_hierarchy")
+        cur.execute("DROP TABLE IF EXISTS keep_release_ids")
 
     # Step 7: Report
     with conn.cursor() as cur:
