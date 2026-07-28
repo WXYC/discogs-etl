@@ -1,8 +1,8 @@
 """Unit tests for scripts/tsv_to_sqlite.py.
 
-Each TSV row has 10 tab-separated fields matching the MySQL SELECT output:
+Each TSV row has 11 tab-separated fields matching the MySQL SELECT output:
 id, title, artist, call_letters, artist_call_number, release_call_number,
-genre, format, alternate_artist_name, album_artist.
+genre, format, alternate_artist_name, album_artist, cross_reference_names.
 """
 
 from __future__ import annotations
@@ -37,9 +37,45 @@ class TestTsvToSqlite:
         """3-row TSV produces a library table with 3 rows and correct data."""
         tsv = _make_tsv(
             [
-                ["1", "Aluminum Tunes", "Stereolab", "ST", "100", "1", "Rock", "CD", "\\N", "\\N"],
-                ["2", "DOGA", "Juana Molina", "MO", "200", "2", "Rock", "LP", "\\N", "\\N"],
-                ["3", "Confield", "Autechre", "AU", "300", "3", "Electronic", "CD", "\\N", "\\N"],
+                [
+                    "1",
+                    "Aluminum Tunes",
+                    "Stereolab",
+                    "ST",
+                    "100",
+                    "1",
+                    "Rock",
+                    "CD",
+                    "\\N",
+                    "\\N",
+                    "\\N",
+                ],
+                [
+                    "2",
+                    "DOGA",
+                    "Juana Molina",
+                    "MO",
+                    "200",
+                    "2",
+                    "Rock",
+                    "LP",
+                    "\\N",
+                    "\\N",
+                    "\\N",
+                ],
+                [
+                    "3",
+                    "Confield",
+                    "Autechre",
+                    "AU",
+                    "300",
+                    "3",
+                    "Electronic",
+                    "CD",
+                    "\\N",
+                    "\\N",
+                    "\\N",
+                ],
             ]
         )
         tsv_file = tmp_path / "input.tsv"
@@ -72,6 +108,7 @@ class TestTsvToSqlite:
                     "CD",
                     "\\N",
                     "\\N",
+                    "\\N",
                 ],
             ]
         )
@@ -90,12 +127,12 @@ class TestTsvToSqlite:
         assert row[0] is None
         assert row[1] is None
 
-    def test_ten_column_validation(self, tmp_path: Path) -> None:
-        """Rows with != 10 fields are skipped; valid rows are still imported."""
+    def test_eleven_column_validation(self, tmp_path: Path) -> None:
+        """Rows with != 11 fields are skipped; valid rows are still imported."""
         tsv = (
-            "1\tAluminum Tunes\tStereolab\tST\t100\t1\tRock\tCD\t\\N\t\\N\n"
+            "1\tAluminum Tunes\tStereolab\tST\t100\t1\tRock\tCD\t\\N\t\\N\t\\N\n"
             "bad\trow\twith\ttoo\tfew\n"
-            "2\tDOGA\tJuana Molina\tMO\t200\t2\tRock\tLP\t\\N\t\\N\n"
+            "2\tDOGA\tJuana Molina\tMO\t200\t2\tRock\tLP\t\\N\t\\N\t\\N\n"
             "3\textra\tfields\there\t1\t2\t3\t4\t5\t6\t7\t8\n"
         )
         tsv_file = tmp_path / "input.tsv"
@@ -115,9 +152,45 @@ class TestTsvToSqlite:
         """After import, FTS MATCH queries work against artist and title."""
         tsv = _make_tsv(
             [
-                ["1", "Aluminum Tunes", "Stereolab", "ST", "100", "1", "Rock", "CD", "\\N", "\\N"],
-                ["2", "DOGA", "Juana Molina", "MO", "200", "2", "Rock", "LP", "\\N", "\\N"],
-                ["3", "Confield", "Autechre", "AU", "300", "3", "Electronic", "CD", "\\N", "\\N"],
+                [
+                    "1",
+                    "Aluminum Tunes",
+                    "Stereolab",
+                    "ST",
+                    "100",
+                    "1",
+                    "Rock",
+                    "CD",
+                    "\\N",
+                    "\\N",
+                    "\\N",
+                ],
+                [
+                    "2",
+                    "DOGA",
+                    "Juana Molina",
+                    "MO",
+                    "200",
+                    "2",
+                    "Rock",
+                    "LP",
+                    "\\N",
+                    "\\N",
+                    "\\N",
+                ],
+                [
+                    "3",
+                    "Confield",
+                    "Autechre",
+                    "AU",
+                    "300",
+                    "3",
+                    "Electronic",
+                    "CD",
+                    "\\N",
+                    "\\N",
+                    "\\N",
+                ],
             ]
         )
         tsv_file = tmp_path / "input.tsv"
@@ -146,7 +219,19 @@ class TestTsvToSqlite:
         """idx_artist, idx_title, and idx_alternate_artist indexes exist."""
         tsv = _make_tsv(
             [
-                ["1", "Aluminum Tunes", "Stereolab", "ST", "100", "1", "Rock", "CD", "\\N", "\\N"],
+                [
+                    "1",
+                    "Aluminum Tunes",
+                    "Stereolab",
+                    "ST",
+                    "100",
+                    "1",
+                    "Rock",
+                    "CD",
+                    "\\N",
+                    "\\N",
+                    "\\N",
+                ],
             ]
         )
         tsv_file = tmp_path / "input.tsv"
@@ -196,7 +281,19 @@ class TestTsvToSqlite:
         """Unicode characters (accents, non-Latin scripts) round-trip correctly."""
         tsv = _make_tsv(
             [
-                ["1", "DOGA", "Juana Molina", "MO", "200", "2", "Rock", "LP", "\\N", "\\N"],
+                [
+                    "1",
+                    "DOGA",
+                    "Juana Molina",
+                    "MO",
+                    "200",
+                    "2",
+                    "Rock",
+                    "LP",
+                    "\\N",
+                    "\\N",
+                    "\\N",
+                ],
                 [
                     "2",
                     "Pequena Vertigem de Amor",
@@ -206,6 +303,7 @@ class TestTsvToSqlite:
                     "1",
                     "Latin",
                     "LP",
+                    "\\N",
                     "\\N",
                     "\\N",
                 ],
@@ -219,6 +317,7 @@ class TestTsvToSqlite:
                     "Rock",
                     "CD",
                     "Sigur R\u00f3s",
+                    "\\N",
                     "\\N",
                 ],
             ]
@@ -243,9 +342,45 @@ class TestTsvToSqlite:
         """Return value matches the number of rows inserted."""
         tsv = _make_tsv(
             [
-                ["1", "Aluminum Tunes", "Stereolab", "ST", "100", "1", "Rock", "CD", "\\N", "\\N"],
-                ["2", "DOGA", "Juana Molina", "MO", "200", "2", "Rock", "LP", "\\N", "\\N"],
-                ["3", "Confield", "Autechre", "AU", "300", "3", "Electronic", "CD", "\\N", "\\N"],
+                [
+                    "1",
+                    "Aluminum Tunes",
+                    "Stereolab",
+                    "ST",
+                    "100",
+                    "1",
+                    "Rock",
+                    "CD",
+                    "\\N",
+                    "\\N",
+                    "\\N",
+                ],
+                [
+                    "2",
+                    "DOGA",
+                    "Juana Molina",
+                    "MO",
+                    "200",
+                    "2",
+                    "Rock",
+                    "LP",
+                    "\\N",
+                    "\\N",
+                    "\\N",
+                ],
+                [
+                    "3",
+                    "Confield",
+                    "Autechre",
+                    "AU",
+                    "300",
+                    "3",
+                    "Electronic",
+                    "CD",
+                    "\\N",
+                    "\\N",
+                    "\\N",
+                ],
                 [
                     "4",
                     "Pequena Vertigem de Amor",
@@ -255,6 +390,7 @@ class TestTsvToSqlite:
                     "1",
                     "Latin",
                     "LP",
+                    "\\N",
                     "\\N",
                     "\\N",
                 ],
@@ -285,8 +421,32 @@ class TestTsvToSqlite:
         """Running as a subprocess produces a valid SQLite database."""
         tsv = _make_tsv(
             [
-                ["1", "Aluminum Tunes", "Stereolab", "ST", "100", "1", "Rock", "CD", "\\N", "\\N"],
-                ["2", "DOGA", "Juana Molina", "MO", "200", "2", "Rock", "LP", "\\N", "\\N"],
+                [
+                    "1",
+                    "Aluminum Tunes",
+                    "Stereolab",
+                    "ST",
+                    "100",
+                    "1",
+                    "Rock",
+                    "CD",
+                    "\\N",
+                    "\\N",
+                    "\\N",
+                ],
+                [
+                    "2",
+                    "DOGA",
+                    "Juana Molina",
+                    "MO",
+                    "200",
+                    "2",
+                    "Rock",
+                    "LP",
+                    "\\N",
+                    "\\N",
+                    "\\N",
+                ],
             ]
         )
         tsv_file = tmp_path / "input.tsv"
@@ -325,8 +485,8 @@ class TestTsvToSqlite:
         zwj_family = f"\U0001f468{zwj}\U0001f469{zwj}\U0001f467{zwj}\U0001f466"
         tsv = _make_tsv(
             [
-                ["1", "Hello", "\U0001f44b", "EM", "100", "1", "Rock", "CD", "\\N", "\\N"],
-                ["2", "Family", zwj_family, "FA", "200", "2", "Rock", "CD", "\\N", "\\N"],
+                ["1", "Hello", "\U0001f44b", "EM", "100", "1", "Rock", "CD", "\\N", "\\N", "\\N"],
+                ["2", "Family", zwj_family, "FA", "200", "2", "Rock", "CD", "\\N", "\\N", "\\N"],
             ]
         )
         tsv_file = tmp_path / "input.tsv"
@@ -350,12 +510,85 @@ class TestTsvToSqlite:
         finally:
             conn.close()
 
+    def test_cross_reference_names_column(self, tmp_path: Path) -> None:
+        """The 11th TSV field populates cross_reference_names (WXYC/discogs-etl#334).
+
+        Mirrors library.db row 57833: filed under the band name "Burning Star
+        Core" with alternate_artist_name "C.S. Yeh". The WXYC catalog's
+        LIBRARY_CODE_CROSS_REFERENCE table also links it to the personal name
+        "C. Spencer Yeh", which the daily sync now carries through as a
+        pipe-joined cross_reference_names value so LML can match a typed
+        "C. Spencer Yeh" lookup against this row.
+        """
+        tsv = _make_tsv(
+            [
+                [
+                    "57833",
+                    '"In The Blink of an Eye" 7-inch',
+                    "Burning Star Core",
+                    "BU",
+                    "110",
+                    "6",
+                    "Rock",
+                    'vinyl - 7"',
+                    "C.S. Yeh",
+                    "\\N",
+                    "C. Spencer Yeh",
+                ],
+            ]
+        )
+        tsv_file = tmp_path / "input.tsv"
+        tsv_file.write_text(tsv, encoding="utf-8")
+        db_path = tmp_path / "library.db"
+
+        tsv_to_sqlite(str(tsv_file), str(db_path))
+
+        conn = sqlite3.connect(str(db_path))
+        row = conn.execute(
+            "SELECT artist, alternate_artist_name, cross_reference_names "
+            "FROM library WHERE id = 57833"
+        ).fetchone()
+        conn.close()
+
+        assert row == ("Burning Star Core", "C.S. Yeh", "C. Spencer Yeh")
+
+    def test_cross_reference_names_null_when_absent(self, tmp_path: Path) -> None:
+        """A row with no cross-reference (11th field is \\N) stores SQL NULL."""
+        tsv = _make_tsv(
+            [
+                [
+                    "1",
+                    "Aluminum Tunes",
+                    "Stereolab",
+                    "ST",
+                    "100",
+                    "1",
+                    "Rock",
+                    "CD",
+                    "\\N",
+                    "\\N",
+                    "\\N",
+                ],
+            ]
+        )
+        tsv_file = tmp_path / "input.tsv"
+        tsv_file.write_text(tsv, encoding="utf-8")
+        db_path = tmp_path / "library.db"
+
+        tsv_to_sqlite(str(tsv_file), str(db_path))
+
+        conn = sqlite3.connect(str(db_path))
+        row = conn.execute("SELECT cross_reference_names FROM library WHERE id = 1").fetchone()
+        conn.close()
+
+        assert row[0] is None
+
     def test_tab_in_field_value(self, tmp_path: Path) -> None:
         r"""MySQL escapes literal tabs in fields as \t; they should be unescaped."""
         # MySQL -B -N escapes real tabs inside data as the two-char sequence \t.
         # Our code splits on real tabs (\t), so literal \t in the data arrives as
         # the two characters backslash-t, which are preserved as-is in the field.
-        tsv = "1\tAluminum\\tTunes\tStereolab\tST\t100\t1\tRock\tCD\t\\N\t\\N\n"
+        tsv = "1\tAluminum\\tTunes\tStereolab\tST\t100\t1\tRock\tCD\t\\N\t\\N\t\\N\n"
         tsv_file = tmp_path / "input.tsv"
         tsv_file.write_text(tsv, encoding="utf-8")
         db_path = tmp_path / "library.db"
@@ -373,7 +606,7 @@ class TestTsvToSqlite:
         r"""MySQL escapes literal newlines in fields as \n; they should be preserved."""
         # Similar to tabs: MySQL -B outputs literal \n (two chars) for embedded newlines.
         # Since we split on real newlines, the two-char sequence stays intact.
-        tsv = "1\tNotes\\nMore notes\tAutechre\tAU\t300\t3\tElectronic\tCD\t\\N\t\\N\n"
+        tsv = "1\tNotes\\nMore notes\tAutechre\tAU\t300\t3\tElectronic\tCD\t\\N\t\\N\t\\N\n"
         tsv_file = tmp_path / "input.tsv"
         tsv_file.write_text(tsv, encoding="utf-8")
         db_path = tmp_path / "library.db"

@@ -35,8 +35,9 @@ def test_tsv_to_sqlite_roundtrip(
     tsv_path = tmp_path / "library.tsv"
     db_path = tmp_path / "library.db"
 
-    # Schema (10 columns): id, title, artist, call_letters, artist_call_number,
-    # release_call_number, genre, format, alternate_artist_name, album_artist
+    # Schema (11 columns): id, title, artist, call_letters, artist_call_number,
+    # release_call_number, genre, format, alternate_artist_name, album_artist,
+    # cross_reference_names
     fields = [
         "1",
         entry["input"],  # title
@@ -48,6 +49,7 @@ def test_tsv_to_sqlite_roundtrip(
         "CD",
         "\\N",  # alternate_artist_name
         "\\N",  # album_artist
+        "\\N",  # cross_reference_names
     ]
     tsv_path.write_text("\t".join(fields) + "\n", encoding="utf-8")
 
