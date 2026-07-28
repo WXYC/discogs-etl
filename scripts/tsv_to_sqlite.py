@@ -89,7 +89,16 @@ def _import_compilation_track_artists(cta_tsv_path: str, cur: sqlite3.Cursor) ->
                     file=sys.stderr,
                 )
                 continue
-            rows.append((int(library_release_id_raw), artist_name, track_title))
+            try:
+                library_release_id = int(library_release_id_raw)
+            except ValueError:
+                print(
+                    "WARNING: skipping compilation_track_artist row with "
+                    f"non-integer library_release_id {library_release_id_raw!r}",
+                    file=sys.stderr,
+                )
+                continue
+            rows.append((library_release_id, artist_name, track_title))
 
     if not rows:
         return 0

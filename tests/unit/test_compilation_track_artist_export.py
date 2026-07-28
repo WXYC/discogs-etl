@@ -166,6 +166,40 @@ class TestCompilationTrackArtistExport:
         conn.close()
         assert count == 2
 
+    def test_non_integer_library_release_id_skipped_with_warning(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture
+    ) -> None:
+        """A CTA row whose library_release_id isn't an integer is skipped and logged
+        (WARNING on stderr), not raised as an uncaught ValueError. Since CTA import
+        runs before the library table's conn.commit(), an uncaught exception here
+        would abort the entire library.db build -- CTA must never take LIBRARY_RELEASE
+        down with it. The valid CTA row and the library rows still import."""
+        cta_file = tmp_path / "cta.tsv"
+        cta_file.write_text(
+            "NOTANINT\tKoo Nimo\todo akosomo\n1\tT.O. Jazz\tYaa Amponsah\n",
+            encoding="utf-8",
+        )
+        db_path = tmp_path / "library.db"
+
+        count = tsv_to_sqlite(str(_make_library_tsv(tmp_path)), str(db_path), str(cta_file))
+
+        captured = capsys.readouterr()
+        assert "WARNING" in captured.err
+
+        # The library table still builds and commits with the correct count --
+        # the CTA failure must not abort the whole export.
+        assert count == 1
+
+        conn = sqlite3.connect(str(db_path))
+        cta_rows = conn.execute(
+            "SELECT library_release_id, artist_name, track_title FROM compilation_track_artist"
+        ).fetchall()
+        library_count = conn.execute("SELECT COUNT(*) FROM library").fetchone()[0]
+        conn.close()
+
+        assert cta_rows == [(1, "T.O. Jazz", "Yaa Amponsah")]
+        assert library_count == 1
+
     def test_library_row_count_unaffected_by_cta(self, tmp_path: Path) -> None:
         """The function's return value stays the library row count -- CTA is supplementary
         and does not change tsv_to_sqlite's existing return contract."""
