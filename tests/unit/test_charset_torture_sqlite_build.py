@@ -63,3 +63,47 @@ def test_tsv_to_sqlite_roundtrip(
     assert row is not None, f"{entry['category']}: row missing after import"
     assert row[0] == entry["input"], f"{entry['category']}: title corrupted ({entry['notes']})"
     assert row[1] == entry["input"], f"{entry['category']}: artist corrupted ({entry['notes']})"
+
+
+def test_compilation_track_artist_tab_newline_unicode_survives(tmp_path) -> None:
+    r"""A CTA track_title carrying an embedded tab, an embedded newline, AND unicode
+    must survive the compilation_track_artist import intact -- not get silently
+    dropped by the 3-column field-count guard.
+
+    mysql -B -N already escapes embedded tab/newline/backslash bytes in field
+    values into the two-char sequences \\t / \\n / \\\\ before they ever reach the
+    TSV (this is why the `library` table survives such data -- see
+    test_tab_in_field_value / test_newline_in_field_value in
+    test_tsv_to_sqlite.py). So a literal DB-column tab/newline never appears as a
+    raw tab/newline byte in the TSV; splitting on real tab/newline bytes is safe,
+    and the escaped 2-char sequences are stored as-is (not unescaped back to a
+    real tab/newline), same as the `library` table's existing behavior. See
+    WXYC/discogs-etl#332.
+    """
+    # Simulates mysql -B -N output for a track_title that originally contained a
+    # real tab, a real newline, and unicode: the tab/newline arrive pre-escaped
+    # as the two-char sequences below; the unicode passes through untouched.
+    track_title = "Side A\\tTrack 1\\nEncore éà 中文 موسيقى"
+    cta_path = tmp_path / "cta.tsv"
+    cta_path.write_text(f"1\tVarious Artists\t{track_title}\n", encoding="utf-8")
+
+    # 11 fields (WXYC/discogs-etl#334 appended cross_reference_names as the
+    # 11th column); the trailing \N keeps this row valid under the current
+    # schema so it isn't silently skipped by the field-count guard.
+    library_path = tmp_path / "library.tsv"
+    library_path.write_text(
+        "1\tVintage Palmwine\tVarious Artists\tZX\t1\t1\tWorld\tCD\t\\N\t\\N\t\\N\n",
+        encoding="utf-8",
+    )
+    db_path = tmp_path / "library.db"
+
+    tsv_to_sqlite(str(library_path), str(db_path), str(cta_path))
+
+    conn = sqlite3.connect(str(db_path))
+    row = conn.execute(
+        "SELECT track_title FROM compilation_track_artist WHERE library_release_id = 1"
+    ).fetchone()
+    conn.close()
+
+    assert row is not None, "CTA row silently dropped"
+    assert row[0] == track_title
