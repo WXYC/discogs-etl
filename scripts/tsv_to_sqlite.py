@@ -20,6 +20,18 @@ subquery in ``sync-library.sh``. See WXYC/discogs-etl#334.
 
 MySQL ``\\N`` values are converted to SQL NULL. Rows that do not contain
 exactly 11 tab-separated fields are skipped with a warning on stderr.
+
+Optionally also imports a ``compilation_track_artist`` table from a second,
+3-column TSV (``library_release_id``, ``artist_name``, ``track_title``)
+sourced from tubafrenzy's ``COMPILATION_TRACK_ARTIST`` table. This restores
+the export dropped in the #65 slim-down (see WXYC/discogs-etl#332); LML's
+``library/db.py`` detects the table at connect time and UNIONs in
+compilations featuring a searched track artist. ``artist_name`` and
+``track_title`` are free text and can themselves contain embedded
+tab/newline/backslash bytes -- ``mysql -B -N`` escapes those into two-char
+``\\t``/``\\n``/``\\\\`` sequences before they ever reach the TSV, which is
+why splitting on real tab/newline bytes (the same approach the ``library``
+table above already relies on) is safe here too.
 """
 
 from __future__ import annotations
@@ -32,15 +44,87 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from lib.observability import init_logger  # noqa: E402
 
 
-def tsv_to_sqlite(tsv_path: str, db_path: str) -> int:
+def _import_compilation_track_artists(cta_tsv_path: str, cur: sqlite3.Cursor) -> int:
+    """Import compilation_track_artist rows from a MySQL TSV dump into SQLite.
+
+    Reads a 3-column TSV (library_release_id, artist_name, track_title) as
+    produced by ``mysql -B -N`` against tubafrenzy's COMPILATION_TRACK_ARTIST
+    table. track_title is nullable (MySQL ``\\N``); library_release_id and
+    artist_name are not.
+
+    The table (plus its indexes) is created only if at least one row parses
+    successfully. This is the graceful-degradation path: when the source
+    table doesn't exist (pre-V008 fixtures, the Backend-Service catalog
+    source) or the query fails, callers pass no ``cta_tsv_path`` at all, and
+    when it's genuinely empty this function is a no-op -- either way, no
+    ``compilation_track_artist`` table is created, so LML's
+    ``_has_compilation_track_artist`` presence check stays False rather than
+    seeing a stray empty table.
+
+    Rows with the wrong field count are skipped with a WARNING on stderr
+    (never silently dropped), matching the ``library`` table's malformed-row
+    handling above.
+
+    Returns:
+        The number of compilation_track_artist rows imported.
+    """
+    rows: list[tuple[int, str, str | None]] = []
+    with open(cta_tsv_path, encoding="utf-8") as f:
+        for line in f:
+            fields = line.rstrip("\n").split("\t")
+            if len(fields) != 3:
+                print(
+                    f"WARNING: skipping malformed compilation_track_artist row with "
+                    f"{len(fields)} fields",
+                    file=sys.stderr,
+                )
+                continue
+            library_release_id_raw, artist_name, track_title = (
+                None if v == "\\N" else v for v in fields
+            )
+            if library_release_id_raw is None or artist_name is None:
+                print(
+                    "WARNING: skipping compilation_track_artist row with NULL "
+                    "library_release_id or artist_name",
+                    file=sys.stderr,
+                )
+                continue
+            rows.append((int(library_release_id_raw), artist_name, track_title))
+
+    if not rows:
+        return 0
+
+    cur.execute("""CREATE TABLE compilation_track_artist (
+        library_release_id INTEGER NOT NULL,
+        artist_name TEXT NOT NULL,
+        track_title TEXT
+    )""")
+    cur.executemany(
+        "INSERT INTO compilation_track_artist"
+        " (library_release_id, artist_name, track_title) VALUES (?,?,?)",
+        rows,
+    )
+    cur.execute("CREATE INDEX idx_cta_release ON compilation_track_artist(library_release_id)")
+    cur.execute("CREATE INDEX idx_cta_artist ON compilation_track_artist(artist_name)")
+
+    releases = len({row[0] for row in rows})
+    print(f"Exported {len(rows)} compilation track artists across {releases} releases")
+    return len(rows)
+
+
+def tsv_to_sqlite(tsv_path: str, db_path: str, cta_tsv_path: str | None = None) -> int:
     """Import a MySQL TSV dump into a new SQLite database.
 
     Args:
         tsv_path: Path to the tab-separated input file.
         db_path: Path where the SQLite database will be created.
+        cta_tsv_path: Optional path to a compilation_track_artist TSV (3
+            columns: library_release_id, artist_name, track_title). Omit to
+            skip the compilation_track_artist table entirely.
 
     Returns:
-        The number of rows successfully imported.
+        The number of library rows successfully imported (unaffected by
+        compilation_track_artist import counts).
     """
     conn = sqlite3.connect(db_path)
     cur = conn.cursor()
@@ -99,15 +183,41 @@ def tsv_to_sqlite(tsv_path: str, db_path: str) -> int:
     cur.execute("CREATE INDEX idx_title ON library(title)")
     cur.execute("CREATE INDEX idx_alternate_artist ON library(alternate_artist_name)")
     cur.execute("CREATE INDEX idx_album_artist ON library(album_artist)")
+
+    if cta_tsv_path:
+        _import_compilation_track_artists(cta_tsv_path, cur)
+
     conn.commit()
     conn.close()
     return count
 
 
+def _parse_args(argv: list[str]) -> tuple[str, str, str | None]:
+    """Parse CLI args: <tsv_path> <db_path> [--cta-tsv PATH]."""
+    cta_tsv_path: str | None = None
+    if "--cta-tsv" in argv:
+        flag_index = argv.index("--cta-tsv")
+        try:
+            cta_tsv_path = argv[flag_index + 1]
+        except IndexError:
+            print("Usage: --cta-tsv requires a path argument", file=sys.stderr)
+            sys.exit(1)
+        positional = argv[:flag_index] + argv[flag_index + 2 :]
+    else:
+        positional = list(argv)
+
+    if len(positional) != 2:
+        print(
+            f"Usage: {sys.argv[0]} <tsv_path> <db_path> [--cta-tsv <cta_tsv_path>]",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    return positional[0], positional[1], cta_tsv_path
+
+
 if __name__ == "__main__":
     init_logger(repo="discogs-etl", tool="discogs-etl tsv_to_sqlite")
-    if len(sys.argv) != 3:
-        print(f"Usage: {sys.argv[0]} <tsv_path> <db_path>", file=sys.stderr)
-        sys.exit(1)
-    n = tsv_to_sqlite(sys.argv[1], sys.argv[2])
-    print(f"Exported {n} rows to {sys.argv[2]}")
+    tsv_path, db_path, cta_tsv_path = _parse_args(sys.argv[1:])
+    n = tsv_to_sqlite(tsv_path, db_path, cta_tsv_path)
+    print(f"Exported {n} rows to {db_path}")

@@ -146,13 +146,46 @@ rm -f "$ETL_OUTPUT"
 ROW_COUNT=$(wc -l < "$CSV_FILE" | tr -d ' ')
 log "Fetched $ROW_COUNT rows from MySQL"
 
-# Build SQLite database from TSV output
-if ! $PYTHON scripts/tsv_to_sqlite.py "$CSV_FILE" "$DB_PATH" 2>&1 | tee -a "$LOG_FILE"; then
-    rm -f "$CSV_FILE" "$DB_PATH"
+# Fetch compilation track artists (supplementary to LIBRARY_RELEASE; restores the
+# export dropped in the #65 slim-down -- WXYC/discogs-etl#332). Reuses the same
+# MySQL auth as the query above. artist_name/track_title are free text but mysql
+# -B -N already escapes embedded tab/newline/backslash bytes in field values, so
+# tsv_to_sqlite.py's tab/newline-based TSV parser (shared with the LIBRARY_RELEASE
+# export above) is safe to reuse unchanged.
+# Degrades gracefully: pre-V008 fixtures / the Backend-Service catalog source have
+# no COMPILATION_TRACK_ARTIST table, so a "doesn't exist" failure here is expected
+# and must not fail the overall library sync (or any other CTA-fetch error, since
+# CTA is supplementary -- LIBRARY_RELEASE must never be blocked by it).
+CTA_CSV_FILE=$(mktemp)
+CTA_ETL_OUTPUT=$(mktemp)
+CTA_TSV_ARGS=()
+if MYSQL_PWD="$LIBRARY_DB_PASSWORD" mysql -h "$MYSQL_HOST" -P "$MYSQL_PORT" -u "$LIBRARY_DB_USER" \
+    --default-character-set=utf8 -B -N "$LIBRARY_DB_NAME" \
+    -e "SELECT LIBRARY_RELEASE_ID, ARTIST_NAME, TRACK_TITLE FROM COMPILATION_TRACK_ARTIST ORDER BY LIBRARY_RELEASE_ID" \
+    > "$CTA_CSV_FILE" 2> "$CTA_ETL_OUTPUT"; then
+    CTA_ROW_COUNT=$(wc -l < "$CTA_CSV_FILE" | tr -d ' ')
+    log "Fetched $CTA_ROW_COUNT compilation track artist rows from MySQL"
+    if [[ "$CTA_ROW_COUNT" -gt 0 ]]; then
+        CTA_TSV_ARGS=(--cta-tsv "$CTA_CSV_FILE")
+    fi
+else
+    CTA_STDERR=$(cat "$CTA_ETL_OUTPUT")
+    if echo "$CTA_STDERR" | grep -qi "doesn't exist"; then
+        log "COMPILATION_TRACK_ARTIST table not found, skipping compilation track artist export"
+    else
+        log "WARNING: compilation track artist query failed, continuing without it: $(echo "$CTA_STDERR" | tail -1)"
+    fi
+fi
+cat "$CTA_ETL_OUTPUT" >> "$LOG_FILE"
+rm -f "$CTA_ETL_OUTPUT"
+
+# Build SQLite database from TSV output (plus compilation_track_artist, if fetched)
+if ! $PYTHON scripts/tsv_to_sqlite.py "$CSV_FILE" "$DB_PATH" "${CTA_TSV_ARGS[@]}" 2>&1 | tee -a "$LOG_FILE"; then
+    rm -f "$CSV_FILE" "$CTA_CSV_FILE" "$DB_PATH"
     notify_error "SQLite export failed"
     exit 1
 fi
-rm -f "$CSV_FILE"
+rm -f "$CSV_FILE" "$CTA_CSV_FILE"
 
 # Enrich with streaming links (optional — skipped if streaming_availability.db unavailable)
 LML_DIR="${LML_REPO_DIR:-$(dirname "$REPO_DIR")/library-metadata-lookup}"

@@ -363,8 +363,8 @@ In addition to the monthly Discogs ETL, this repo orchestrates a **daily library
 
 ### How it works
 
-1. **MySQL query** via the MariaDB `mysql` CLI (required — Kattare runs MySQL 4.1.22 with old-format password hashes that no Python driver supports)
-2. **TSV → SQLite** conversion via `scripts/tsv_to_sqlite.py` (creates library table, FTS5 index, and lookup indexes)
+1. **MySQL query** via the MariaDB `mysql` CLI (required — Kattare runs MySQL 4.1.22 with old-format password hashes that no Python driver supports), plus a second query for the `COMPILATION_TRACK_ARTIST` table (per-track artist credits on compilations; skipped gracefully if the source table is absent)
+2. **TSV → SQLite** conversion via `scripts/tsv_to_sqlite.py` (creates the `library` table, FTS5 index, and lookup indexes, plus a `compilation_track_artist` table + indexes when CTA data was fetched)
 3. **Streaming links enrichment** from `streaming_availability.db` (downloaded from a [GitHub Release](https://github.com/WXYC/library-metadata-lookup/releases/tag/streaming-data-v1) in library-metadata-lookup)
 4. **Upload** to LML staging and production via `POST /admin/upload-library-db`
 
