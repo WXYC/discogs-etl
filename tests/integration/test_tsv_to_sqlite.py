@@ -23,22 +23,23 @@ class TestTsvToSqliteIntegration:
         """TSV mimicking real MySQL -B -N output imports correctly and FTS search works."""
         # Realistic MySQL batch-mode output with mix of NULLs, Unicode, and varied genres
         lines = [
-            "10001\tAluminum Tunes\tStereolab\tST\t1234\t1\tRock\tCD\t\\N\t\\N",
-            "10002\tDOGA\tJuana Molina\tMO\t5678\t2\tRock\tLP\t\\N\t\\N",
-            "10003\tConfield\tAutechre\tAU\t9012\t3\tElectronic\tCD\t\\N\t\\N",
-            "10004\tMoon Pix\tCat Power\tCA\t3456\t1\tRock\tLP\tCharlyn Marie Marshall\t\\N",
-            "10005\tPequena Vertigem de Amor\tSessa\tSE\t7890\t1\tLatin\tLP\t\\N\t\\N",
-            "10006\tDuke Ellington & John Coltrane\tDuke Ellington\tEL\t2345\t1\tJazz\tLP\tEdward Kennedy Ellington\t\\N",
-            "10007\tOn Your Own Love Again\tJessica Pratt\tPR\t6789\t1\tRock\tLP\t\\N\t\\N",
-            "10008\tEdits\tChuquimamani-Condori\tCH\t\\N\t\\N\tElectronic\tCD\t\\N\t\\N",
-            "10009\tDJ-Kicks\tVarious Artists\tZ-\t\\N\t1\tElectronic\tCD\t\\N\tKruder & Dorfmeister",
+            "10001\tAluminum Tunes\tStereolab\tST\t1234\t1\tRock\tCD\t\\N\t\\N\t\\N",
+            "10002\tDOGA\tJuana Molina\tMO\t5678\t2\tRock\tLP\t\\N\t\\N\t\\N",
+            "10003\tConfield\tAutechre\tAU\t9012\t3\tElectronic\tCD\t\\N\t\\N\t\\N",
+            "10004\tMoon Pix\tCat Power\tCA\t3456\t1\tRock\tLP\tCharlyn Marie Marshall\t\\N\t\\N",
+            "10005\tPequena Vertigem de Amor\tSessa\tSE\t7890\t1\tLatin\tLP\t\\N\t\\N\t\\N",
+            "10006\tDuke Ellington & John Coltrane\tDuke Ellington\tEL\t2345\t1\tJazz\tLP\tEdward Kennedy Ellington\t\\N\t\\N",
+            "10007\tOn Your Own Love Again\tJessica Pratt\tPR\t6789\t1\tRock\tLP\t\\N\t\\N\t\\N",
+            "10008\tEdits\tChuquimamani-Condori\tCH\t\\N\t\\N\tElectronic\tCD\t\\N\t\\N\t\\N",
+            "10009\tDJ-Kicks\tVarious Artists\tZ-\t\\N\t1\tElectronic\tCD\t\\N\tKruder & Dorfmeister\t\\N",
+            '57833\t"In The Blink of an Eye" 7-inch\tBurning Star Core\tBU\t110\t6\tRock\tvinyl - 7"\tC.S. Yeh\t\\N\tC. Spencer Yeh',
         ]
         tsv_file = tmp_path / "mysql_output.tsv"
         tsv_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
         db_path = tmp_path / "library.db"
 
         count = tsv_to_sqlite(str(tsv_file), str(db_path))
-        assert count == 9
+        assert count == 10
 
         conn = sqlite3.connect(str(db_path))
 
@@ -86,6 +87,17 @@ class TestTsvToSqliteIntegration:
         assert row[0] is None
         assert row[1] is None
 
+        # cross_reference_names round-trips for a cataloger-linked alias row
+        # (WXYC/discogs-etl#334) and stays NULL for rows without one.
+        row = conn.execute(
+            "SELECT artist, alternate_artist_name, cross_reference_names "
+            "FROM library WHERE id = 57833"
+        ).fetchone()
+        assert row == ("Burning Star Core", "C.S. Yeh", "C. Spencer Yeh")
+
+        row = conn.execute("SELECT cross_reference_names FROM library WHERE id = 10001").fetchone()
+        assert row[0] is None
+
         conn.close()
 
     def test_schema_matches_wxyc_catalog(self, tmp_path: Path) -> None:
@@ -112,6 +124,7 @@ class TestTsvToSqliteIntegration:
             (8, "alternate_artist_name", "TEXT", 0, None, 0),
             (9, "album_artist", "TEXT", 0, None, 0),
             (10, "label", "TEXT", 0, None, 0),
+            (11, "cross_reference_names", "TEXT", 0, None, 0),
         ]
 
         assert columns == expected_columns

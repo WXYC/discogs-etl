@@ -119,11 +119,20 @@ DB_PATH=$(mktemp -d)/library.db
 MYSQL_HOST="${DB_HOST:-$LIBRARY_DB_HOST}"
 MYSQL_PORT="${DB_PORT:-3306}"
 
+# The 11th SELECT column is CROSS_REFERENCE_NAMES: a correlated subquery over
+# LIBRARY_CODE_CROSS_REFERENCE that pipe-joins (" | ") the PRESENTATION_NAMEs
+# of any LIBRARY_CODEs cataloger-cross-referenced to this row's own code, in
+# either FK direction (CROSS_REFERENCING_ARTIST_ID / CROSS_REFERENCED_LIBRARY_
+# CODE_ID both -> LIBRARY_CODE.ID), excluding the row's own name. This is the
+# same alias link wxyc-catalog's TubafrenzySource.fetch_cross_referenced_artists
+# reads for the XML-converter artist filter -- here it rides along on every
+# library.db row instead of only feeding that allowlist. See
+# WXYC/discogs-etl#334.
 ETL_OUTPUT=$(mktemp)
 CSV_FILE=$(mktemp)
 if ! MYSQL_PWD="$LIBRARY_DB_PASSWORD" mysql -h "$MYSQL_HOST" -P "$MYSQL_PORT" -u "$LIBRARY_DB_USER" \
     --default-character-set=utf8 -B -N "$LIBRARY_DB_NAME" \
-    -e "SELECT r.ID, r.TITLE, lc.PRESENTATION_NAME, lc.CALL_LETTERS, lc.CALL_NUMBERS, r.CALL_NUMBERS, g.REFERENCE_NAME, f.REFERENCE_NAME, r.ALTERNATE_ARTIST_NAME, r.ALBUM_ARTIST FROM LIBRARY_RELEASE r JOIN LIBRARY_CODE lc ON r.LIBRARY_CODE_ID = lc.ID JOIN FORMAT f ON r.FORMAT_ID = f.ID JOIN GENRE g ON lc.GENRE_ID = g.ID" \
+    -e "SELECT r.ID, r.TITLE, lc.PRESENTATION_NAME, lc.CALL_LETTERS, lc.CALL_NUMBERS, r.CALL_NUMBERS, g.REFERENCE_NAME, f.REFERENCE_NAME, r.ALTERNATE_ARTIST_NAME, r.ALBUM_ARTIST, (SELECT GROUP_CONCAT(DISTINCT xlc.PRESENTATION_NAME SEPARATOR ' | ') FROM LIBRARY_CODE_CROSS_REFERENCE xcr, LIBRARY_CODE xlc WHERE xlc.ID = CASE WHEN xcr.CROSS_REFERENCING_ARTIST_ID = lc.ID THEN xcr.CROSS_REFERENCED_LIBRARY_CODE_ID WHEN xcr.CROSS_REFERENCED_LIBRARY_CODE_ID = lc.ID THEN xcr.CROSS_REFERENCING_ARTIST_ID ELSE NULL END AND (xcr.CROSS_REFERENCING_ARTIST_ID = lc.ID OR xcr.CROSS_REFERENCED_LIBRARY_CODE_ID = lc.ID) AND xlc.ID != lc.ID) FROM LIBRARY_RELEASE r JOIN LIBRARY_CODE lc ON r.LIBRARY_CODE_ID = lc.ID JOIN FORMAT f ON r.FORMAT_ID = f.ID JOIN GENRE g ON lc.GENRE_ID = g.ID" \
     > "$CSV_FILE" 2> "$ETL_OUTPUT"; then
     ERROR_DETAILS=$(cat "$ETL_OUTPUT" | tail -1 | sed 's/"/\\"/g')
     cat "$ETL_OUTPUT" >> "$LOG_FILE"

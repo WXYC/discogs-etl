@@ -1,19 +1,25 @@
 """Convert a MySQL TSV dump to a SQLite database with FTS5 index.
 
-Reads a tab-separated file (as produced by ``mysql -B -N``) with 10 columns
+Reads a tab-separated file (as produced by ``mysql -B -N``) with 11 columns
 corresponding to the WXYC library catalog schema and creates a SQLite
 database containing:
 
 - A ``library`` table with id, title, artist, call_letters,
   artist_call_number, release_call_number, genre, format,
-  alternate_artist_name, album_artist, and label columns (label is always
-  NULL since the MySQL query doesn't include it).
+  alternate_artist_name, album_artist, cross_reference_names, and label
+  columns (label is always NULL since the MySQL query doesn't include it).
 - An FTS5 virtual table (``library_fts``) for full-text search on title,
   artist, alternate_artist_name, and album_artist.
 - Indexes on artist, title, alternate_artist_name, and album_artist.
 
+``cross_reference_names`` holds the pipe-joined (``" | "``) PRESENTATION_NAMEs
+of any WXYC ``LIBRARY_CODE``s cataloger-cross-referenced to this row's own
+code (e.g. a release filed under a band name carries its member's personal
+name), sourced from ``LIBRARY_CODE_CROSS_REFERENCE`` via the correlated
+subquery in ``sync-library.sh``. See WXYC/discogs-etl#334.
+
 MySQL ``\\N`` values are converted to SQL NULL. Rows that do not contain
-exactly 10 tab-separated fields are skipped with a warning on stderr.
+exactly 11 tab-separated fields are skipped with a warning on stderr.
 """
 
 from __future__ import annotations
@@ -42,7 +48,7 @@ def tsv_to_sqlite(tsv_path: str, db_path: str) -> int:
         id INTEGER PRIMARY KEY, title TEXT, artist TEXT, call_letters TEXT,
         artist_call_number INTEGER, release_call_number INTEGER,
         genre TEXT, format TEXT, alternate_artist_name TEXT,
-        album_artist TEXT, label TEXT
+        album_artist TEXT, label TEXT, cross_reference_names TEXT
     )""")
     # FTS5 tokenizer extends unicode61 with the Symbol category and U+200D ZWJ so
     # bare-emoji rows (waving-hand, musical-note) and ZWJ graphemes (family,
@@ -70,7 +76,7 @@ def tsv_to_sqlite(tsv_path: str, db_path: str) -> int:
     with open(tsv_path, encoding="utf-8") as f:
         for line in f:
             fields = line.rstrip("\n").split("\t")
-            if len(fields) != 10:
+            if len(fields) != 11:
                 print(
                     f"WARNING: skipping malformed row with {len(fields)} fields",
                     file=sys.stderr,
@@ -81,7 +87,8 @@ def tsv_to_sqlite(tsv_path: str, db_path: str) -> int:
             cur.execute(
                 "INSERT INTO library (id, title, artist, call_letters,"
                 " artist_call_number, release_call_number, genre, format,"
-                " alternate_artist_name, album_artist) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                " alternate_artist_name, album_artist, cross_reference_names)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                 row,
             )
             count += 1
