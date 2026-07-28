@@ -6,7 +6,7 @@ database containing:
 
 - A ``library`` table with id, title, artist, call_letters,
   artist_call_number, release_call_number, genre, format,
-  alternate_artist_name, album_artist, cross_reference_names, and label
+  alternate_artist_name, album_artist, label, and cross_reference_names
   columns (label is always NULL since the MySQL query doesn't include it).
 - An FTS5 virtual table (``library_fts``) for full-text search on title,
   artist, alternate_artist_name, and album_artist.
