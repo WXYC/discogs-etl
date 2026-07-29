@@ -73,6 +73,7 @@ The `entity.*` schema in the cache database is **owned by this repo** and is cre
 | Key | Owner | Purpose |
 |---|---|---|
 | `842001` | library-metadata-lookup | `lml_cache.*` streaming-catalog bootstrap transaction (`entity/streaming_catalog.py`, LML#842 PR A) — serializes concurrent boots around its `CREATE OR REPLACE FUNCTION` / constraint-widen DDL |
+| `886001` | library-metadata-lookup | `lml_cache.album_streaming_url_cache` bootstrap transaction (`entity/streaming_url_cache.py`, LML#886) — serializes concurrent boots around its widen-only service-CHECK DO block |
 | `330001` | discogs-etl | `scripts/seed_cache_from_clone.py` `_seed_family` real (non-dry-run) writes — serializes concurrent `seed_releases_additive`/`seed_artists_additive` invocations against the same target so two overlapping runs can't both compute the same release/artist as "new" and double-insert the arbiter-less child rows (PR#330) |
 
 Convention for new keys: `<issue-number> * 1000 + sequence` in the owning repo (842001 = LML#842, first key), which keeps keys human-traceable and collision-free without central coordination beyond this table.
