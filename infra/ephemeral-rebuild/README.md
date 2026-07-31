@@ -39,7 +39,9 @@ The script hard-fails before any write if the caller's AWS account isn't `503977
 aws ssm put-parameter --name /wxyc/discogs-rebuild/PRUNE_AUDIT_ENABLED --value true --type String
 ```
 
-When present and truthy (`true` or `1`), the bootstrap exports `PRUNE_AUDIT_DUMP_DIR=$LOG_DIR/prune-audit` before handing off to `rebuild-cache.sh`, so `run_pipeline.py` writes the prune classification artifacts under that path. `$LOG_DIR` is what the `trap EXIT` handler syncs to S3 on shutdown, so the dump survives instance termination and lands at `s3://<REBUILD_LOG_BUCKET>/<instance-id>/prune-audit/prune-audit-<UTC-date>/`.
+The `/wxyc/discogs-rebuild` prefix above is the default `SsmPrefix`. If you deployed the stack with a non-default `SsmPrefix`, substitute it here (and in the `delete-parameter` below) — it must match the `${SSM_PREFIX}` the bootstrap reads, or the flag lands at a path the bootstrap never looks at and silently has no effect.
+
+When present and truthy (`true` or `1`, case-insensitive), the bootstrap exports `PRUNE_AUDIT_DUMP_DIR=$LOG_DIR/prune-audit` before handing off to `rebuild-cache.sh`, so `run_pipeline.py` writes the prune classification artifacts under that path. A value that is set but not truthy (a typo, `false`, `0`) logs a `WARN: PRUNE_AUDIT_ENABLED=… is not truthy … DISABLED` line and leaves the dump off, so a mistake is visible in the bootstrap log rather than silently dropped. `$LOG_DIR` is what the `trap EXIT` handler syncs to S3 on shutdown, so the dump survives instance termination and lands at `s3://<REBUILD_LOG_BUCKET>/<instance-id>/prune-audit/prune-audit-<UTC-date>/`.
 
 **Delete the param after the run** so subsequent (normal) rebuilds go back to default-off:
 
