@@ -31,6 +31,24 @@ cd infra/ephemeral-rebuild
 
 The script hard-fails before any write if the caller's AWS account isn't `503977661500` (the rebuild account), then displays account/region/prefix/caller-arn and asks for an explicit `y` confirmation as the second line of defence. `--overwrite` makes it safe to re-run for rotations. The final summary table lists parameter names + types only — never the decrypted values. Three env-var overrides are honored: `SSM_PREFIX=/some/other/path` if you deployed the stack with a non-default `SsmPrefix`, `AWS_REGION=…` if you deployed it outside the default `us-east-1`, and `EXPECTED_ACCOUNT=<id>` to deliberately target a sandbox/test account.
 
+### 1a. Optional: enable the prune-coverage audit dump for one run
+
+`scripts/rebuild-cache-bootstrap.sh` reads an optional `${SSM_PREFIX}/PRUNE_AUDIT_ENABLED` parameter (discogs-etl#217 Phase 1). It is unset by default and a missing param is the steady state — the bootstrap treats that exactly like the other optional params (`SENTRY_DSN`) and proceeds normally. Set it only on the deliberate audit rebuild that #217 Phase 1 calls for:
+
+```bash
+aws ssm put-parameter --name /wxyc/discogs-rebuild/PRUNE_AUDIT_ENABLED --value true --type String
+```
+
+When present and truthy (`true` or `1`), the bootstrap exports `PRUNE_AUDIT_DUMP_DIR=$LOG_DIR/prune-audit` before handing off to `rebuild-cache.sh`, so `run_pipeline.py` writes the prune classification artifacts under that path. `$LOG_DIR` is what the `trap EXIT` handler syncs to S3 on shutdown, so the dump survives instance termination and lands at `s3://<REBUILD_LOG_BUCKET>/<instance-id>/prune-audit/prune-audit-<UTC-date>/`.
+
+**Delete the param after the run** so subsequent (normal) rebuilds go back to default-off:
+
+```bash
+aws ssm delete-parameter --name /wxyc/discogs-rebuild/PRUNE_AUDIT_ENABLED
+```
+
+Leaving it set would make every future monthly rebuild dump the audit artifacts, which is harmless to cache data but wastes the extra classification pass and S3 storage.
+
 ### 2. Deploy the stack
 
 CI deploys on push to `main` via [`.github/workflows/deploy-ephemeral-rebuild.yml`](../../.github/workflows/deploy-ephemeral-rebuild.yml) when this directory or `scripts/rebuild-cache-bootstrap.sh` changes. For the first deploy or any out-of-band change, do it locally:

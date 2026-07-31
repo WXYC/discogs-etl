@@ -267,6 +267,10 @@ DATABASE_URL_DISCOGS="$(ssm_param "${SSM_PREFIX}/DATABASE_URL_DISCOGS")"
 GH_TOKEN="$(ssm_param "${SSM_PREFIX}/GH_TOKEN")"
 SLACK_MONITORING_WEBHOOK="$(ssm_param "${SSM_PREFIX}/SLACK_MONITORING_WEBHOOK")"
 SENTRY_DSN="$(ssm_param "${SSM_PREFIX}/SENTRY_DSN")"
+# Optional, default-off (discogs-etl#217 Phase 1). A missing param is the
+# steady state — ssm_param's `2>/dev/null || true` returns empty, exactly
+# like SENTRY_DSN above, so this never aborts a normal rebuild.
+PRUNE_AUDIT_ENABLED="$(ssm_param "${SSM_PREFIX}/PRUNE_AUDIT_ENABLED")"
 
 if [ -z "$DATABASE_URL_DISCOGS" ]; then
     echo "::error:: DATABASE_URL_DISCOGS missing from SSM at ${SSM_PREFIX}/" >&2
@@ -289,6 +293,22 @@ notify_slack ":hourglass:" "starting on ${INSTANCE_ID}"
 #    and never reaches the handoff below.
 # ---------------------------------------------------------------------------
 abort_if_not_winning_rebuild
+
+# ---------------------------------------------------------------------------
+# Optional prune-audit dump wiring (discogs-etl#217 Phase 1). Off by
+# default; only takes effect when the operator has deliberately set
+# ${SSM_PREFIX}/PRUNE_AUDIT_ENABLED for a one-off audit rebuild (see
+# infra/ephemeral-rebuild/README.md). When absent, PRUNE_AUDIT_ENABLED is
+# empty and this whole block no-ops — PRUNE_AUDIT_DUMP_DIR stays unset and
+# run_pipeline.py runs exactly as it does today. $LOG_DIR is the only
+# directory the trap-EXIT S3 sync picks up, so nesting the dump under it is
+# what lets the artifact survive instance termination; run_pipeline.py
+# appends its own prune-audit-<UTC-date>/ subdirectory underneath.
+# ---------------------------------------------------------------------------
+if [ "$PRUNE_AUDIT_ENABLED" = "true" ] || [ "$PRUNE_AUDIT_ENABLED" = "1" ]; then
+    export PRUNE_AUDIT_DUMP_DIR="$LOG_DIR/prune-audit"
+    log "prune-audit dump ENABLED -> $PRUNE_AUDIT_DUMP_DIR (will upload to S3 with logs)"
+fi
 
 # ---------------------------------------------------------------------------
 # 7. Hand off to the existing rebuild-cache.sh. It already handles the
