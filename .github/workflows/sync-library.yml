@@ -65,6 +65,35 @@ jobs:
           ADMIN_TOKEN: ${{ secrets.ADMIN_TOKEN }}
           PRODUCTION_URL: ${{ secrets.PRODUCTION_URL }}
 
+      # WXYC/discogs-etl#339: scripts/build_compilation_track_location.py (run
+      # at the end of sync-library.sh, below) imports LML's own application
+      # package and third-party dependencies (aiosqlite, asyncpg, fastapi,
+      # wxyc_etl, ...) that this repo's own Python environment does not carry.
+      # Without a venv here, sync-library.sh's $LML_DIR/.venv/bin/python check
+      # falls through to this repo's own interpreter, which import-fails and
+      # trips the script's soft-fail WARN-and-continue branch -- the build
+      # silently produces zero rows every day (the bug this step fixes).
+      # Mirrors the venv provisioning in rebuild-cache.yml's "Rebuild
+      # compilation-track recall index (full)" step for consistency.
+      #
+      # Best-effort, like the build step itself: this runs *before* "Run
+      # library sync" below, so a hard failure here (GitHub Actions skips
+      # subsequent steps after a failed one by default) would silently take
+      # the core library.db sync/upload down with it. Never let that happen --
+      # on any provisioning error, warn and continue; sync-library.sh's own
+      # $LML_DIR/.venv/bin/python check then falls back to its pre-existing
+      # WARN-and-continue soft-fail path for the build itself.
+      - name: Provision LML venv for compilation-track recall index build
+        run: |
+          set +e
+          python3 -m venv /tmp/library-metadata-lookup/.venv \
+            && /tmp/library-metadata-lookup/.venv/bin/pip install --quiet -e /tmp/library-metadata-lookup
+          rc=$?
+          set -e
+          if [ "$rc" -ne 0 ]; then
+            echo "::warning::Failed to provision LML venv (exit $rc); the compilation-track recall index build will fall back to this job's own interpreter and soft-fail inside sync-library.sh -- the library.db sync/upload is unaffected"
+          fi
+
       - name: Run library sync
         run: scripts/sync-library.sh
         env:
