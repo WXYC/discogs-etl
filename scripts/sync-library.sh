@@ -229,6 +229,41 @@ if [[ -n "$PRODUCTION_URL" ]]; then
     upload_library_db "$PRODUCTION_URL" "production" "$DB_PATH" || EXIT_CODE=1
 fi
 
+# Build the V/A compilation-track recall index (lml_cache.compilation_track_location,
+# LML#1019 / WXYC/discogs-etl#339). Best-effort, mirroring the streaming-links
+# enrichment block above: a failure here must never strip or block the library.db
+# upload that already succeeded, so it only runs once uploads are known-good and any
+# failure just warns and continues.
+#
+# Unlike export_streaming_links.py, this script imports LML's own application
+# package (entity/lookup/config/discogs/scripts) and third-party dependencies
+# (aiosqlite, asyncpg, wxyc_etl, ...) that $PYTHON (this repo's own venv) does not
+# have installed. Prefer $LML_DIR/.venv/bin/python -- the interpreter LML's own
+# checkout is normally developed/provisioned with -- and fall back to $PYTHON so an
+# unprovisioned LML checkout (e.g. a bare CI clone with no venv) fails the same
+# soft-fail WARN-and-continue path below instead of aborting the sync.
+#
+# Runs as a module (`-m scripts...`), not a bare script path, because the script
+# itself does `from scripts.match_compilations import ...` -- a package-relative
+# import that only resolves when $LML_DIR is on sys.path, which `-m` does via cwd.
+if [[ $EXIT_CODE -ne 0 ]]; then
+    log "Skipping compilation-track recall index build (library.db upload did not fully succeed)"
+elif [[ ! -f "$LML_DIR/scripts/build_compilation_track_location.py" ]]; then
+    log "Skipping compilation-track recall index build (build script not found in LML checkout)"
+else
+    log "Building compilation-track recall index (incremental)..."
+    LML_PYTHON="$LML_DIR/.venv/bin/python"
+    if ! command -v "$LML_PYTHON" &>/dev/null; then
+        LML_PYTHON="$PYTHON"
+    fi
+    if (cd "$LML_DIR" && "$LML_PYTHON" -m scripts.build_compilation_track_location \
+        --incremental --library-db "$DB_PATH" 2>&1 | tee -a "$LOG_FILE"); then
+        log "Compilation-track recall index build complete"
+    else
+        log "WARNING: Compilation-track recall index build failed (continuing without)"
+    fi
+fi
+
 # Copy library.db to LIBRARY_DB_OUTPUT if set (for CI to upload as artifact)
 if [[ -n "$LIBRARY_DB_OUTPUT" && -f "$DB_PATH" ]]; then
     cp "$DB_PATH" "$LIBRARY_DB_OUTPUT"

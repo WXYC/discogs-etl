@@ -84,6 +84,15 @@ jobs:
           # events to Sentry via wxyc_etl.logger. Unset → Sentry stays inactive,
           # JSON logging still emits to stderr.
           SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
+          # WXYC/discogs-etl#339: the incremental compilation_track_location build
+          # (scripts/build_compilation_track_location.py, run at the end of
+          # sync-library.sh) reads these via LML's own config.settings -- PG
+          # connection for lml_cache.compilation_track_location + the discogs-cache
+          # tables it matches against, and the Discogs token for the artwork
+          # precompute. Both already exist as repo secrets (used elsewhere in this
+          # workflow / in rebuild-cache.yml).
+          DATABASE_URL_DISCOGS: ${{ secrets.DATABASE_URL_DISCOGS }}
+          DISCOGS_TOKEN: ${{ secrets.DISCOGS_TOKEN }}
 
       - name: Update library.db in LML release
         if: success()
