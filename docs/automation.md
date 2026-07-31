@@ -37,6 +37,17 @@ After the pipeline succeeds, the workflow runs `scripts/check_cache_drift.py` ag
 |---------|-------------|
 | `PRUNE_AUDIT_DUMP_DIR` | Opt-in for the prune-coverage audit ([discogs-etl#217](https://github.com/WXYC/discogs-etl/issues/217) Phase 0). **Default unset — leave it unset for normal rebuilds.** When set, `run_pipeline.py` appends `--dump-classification $PRUNE_AUDIT_DUMP_DIR/prune-audit-<UTC-date>` to the `verify_cache.py` prune step. That step then writes the prune classification (keep/prune/review id sets, the pruned releases' raw artist/title, the applied pinned-override ids, and a second no-ANV classification pass for the #305 uplift diff) to that directory, and runs one extra classification pass. It is read-only with respect to cache **data** — only local artifact files are written. Set this (to a path that survives the run, e.g. under the EC2 work dir) only on the deliberate audit rebuild that Phase 1 of #217 calls for. |
 
+**Analyzing the dump (#217 Phase 2):** once a `prune-audit-<date>/` directory exists, `scripts/analyze_prune_audit.py` turns it into the Phase 2 answers — counts with the pinned/non-pinned split, the dedup delta, the #305 uplift (`prune_ids_no_anv − prune_ids`), and a residual false-negative rate (a seeded 200-sample of pruned releases re-scored against the library index, with a Wilson interval). It's read-only apart from the report/CSV it emits (and, with `--write-dedup-note`, the dump's `counts.json`):
+
+```
+python scripts/analyze_prune_audit.py <prune-audit-dir> \
+    --library-db data/library.db \
+    --final-release-count <post-rebuild release count> \
+    --output-dir ./phase2-out --write-dedup-note
+```
+
+Confirm the comparable-to-history series (non-pinned `bulk_import` survivors, vs 38,662 / 39,016) against prod with the `SELECT` the report prints. The comparable series is `bulk_import` minus override ids — a bare `release` count is **not** comparable to converter output. Pass the **same `library.db` snapshot the rebuild used** to `--library-db` (the daily `sync-library.yml` mutates it) so the false-negative re-scoring matches the classification it's auditing; a drifted snapshot can flip borderline calls.
+
 **Upstream dependency**: a successful `sync-library.yml` run must have uploaded `library.db` to the `streaming-data-v1` release on `WXYC/library-metadata-lookup` before this workflow fires, or the `Download library.db from LML release artifact` step fails with `release asset not found`. The default `${{ github.token }}` has read scope on the public LML repo; no extra PAT required.
 
 **Interpreting a failed run** (#219):
