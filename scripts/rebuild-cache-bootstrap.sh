@@ -7,7 +7,8 @@
 # Responsibilities:
 #   1. Install runtime deps (Python 3.11, Rust, git, postgres client, gh, AWS CLI v2)
 #   2. Clone discogs-xml-converter and build its release binary
-#   3. Pull DATABASE_URL_DISCOGS / GH_TOKEN / SLACK_MONITORING_WEBHOOK from SSM
+#   3. Pull DATABASE_URL_DISCOGS / GH_TOKEN / SLACK_MONITORING_WEBHOOK / SENTRY_DSN
+#      (and the optional PRUNE_AUDIT_ENABLED flag) from SSM
 #   4. Invoke scripts/rebuild-cache.sh (the same script the legacy host runs)
 #   5. Upload the rebuild log to the S3 bucket named in $REBUILD_LOG_BUCKET
 #   6. shutdown -h now — the launch template sets
@@ -295,23 +296,31 @@ notify_slack ":hourglass:" "starting on ${INSTANCE_ID}"
 abort_if_not_winning_rebuild
 
 # ---------------------------------------------------------------------------
-# Optional prune-audit dump wiring (discogs-etl#217 Phase 1). Off by
-# default; only takes effect when the operator has deliberately set
-# ${SSM_PREFIX}/PRUNE_AUDIT_ENABLED for a one-off audit rebuild (see
-# infra/ephemeral-rebuild/README.md). When absent, PRUNE_AUDIT_ENABLED is
-# empty and this whole block no-ops — PRUNE_AUDIT_DUMP_DIR stays unset and
-# run_pipeline.py runs exactly as it does today. $LOG_DIR is the only
-# directory the trap-EXIT S3 sync picks up, so nesting the dump under it is
-# what lets the artifact survive instance termination; run_pipeline.py
-# appends its own prune-audit-<UTC-date>/ subdirectory underneath.
+# 7. Optional prune-audit dump wiring (discogs-etl#217 Phase 1). Off by
+#    default; only takes effect when the operator has deliberately set
+#    ${SSM_PREFIX}/PRUNE_AUDIT_ENABLED for a one-off audit rebuild (see
+#    infra/ephemeral-rebuild/README.md). When absent, PRUNE_AUDIT_ENABLED is
+#    empty and this whole block no-ops — PRUNE_AUDIT_DUMP_DIR stays unset and
+#    run_pipeline.py runs exactly as it does today. $LOG_DIR is the only
+#    directory the trap-EXIT S3 sync picks up, so nesting the dump under it is
+#    what lets the artifact survive instance termination; run_pipeline.py
+#    appends its own prune-audit-<UTC-date>/ subdirectory underneath.
+#
+#    The value is lowercased before the truthy test so a hand-typed True/TRUE
+#    matches the documented `true`, and a set-but-non-truthy value (a typo,
+#    `false`, `0`, `yes`) is logged rather than silently dropped — the operator
+#    writes this SSM value by hand and would otherwise only discover a case slip
+#    after the multi-hour rebuild finishes leaving no dump in S3.
 # ---------------------------------------------------------------------------
-if [ "$PRUNE_AUDIT_ENABLED" = "true" ] || [ "$PRUNE_AUDIT_ENABLED" = "1" ]; then
+if [ "${PRUNE_AUDIT_ENABLED,,}" = "true" ] || [ "$PRUNE_AUDIT_ENABLED" = "1" ]; then
     export PRUNE_AUDIT_DUMP_DIR="$LOG_DIR/prune-audit"
     log "prune-audit dump ENABLED -> $PRUNE_AUDIT_DUMP_DIR (will upload to S3 with logs)"
+elif [ -n "$PRUNE_AUDIT_ENABLED" ]; then
+    log "WARN: PRUNE_AUDIT_ENABLED='${PRUNE_AUDIT_ENABLED}' is not truthy (expected 'true' or '1'); prune-audit dump DISABLED"
 fi
 
 # ---------------------------------------------------------------------------
-# 7. Hand off to the existing rebuild-cache.sh. It already handles the
+# 8. Hand off to the existing rebuild-cache.sh. It already handles the
 #    streaming download, pipeline run, and drift watchdog. We share its log
 #    directory so the s3 sync at exit picks both up.
 # ---------------------------------------------------------------------------

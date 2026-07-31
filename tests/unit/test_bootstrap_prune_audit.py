@@ -53,6 +53,24 @@ def first_line_index(lines: list[str], needle: str) -> int:
     raise AssertionError(f"{needle!r} not found in non-comment lines of {SCRIPT_PATH}")
 
 
+def guard_line_index(lines: list[str]) -> int:
+    """Return the index of the ``if ... PRUNE_AUDIT_ENABLED ... then`` guard line.
+
+    Located structurally (an ``if`` line mentioning the flag and ending in
+    ``then``) rather than by a literal string so the test survives changes to
+    the exact comparison expression — e.g. lowercasing the value.
+    """
+    for i, line in enumerate(lines):
+        stripped = line.lstrip()
+        if (
+            stripped.startswith("if ")
+            and "PRUNE_AUDIT_ENABLED" in line
+            and line.rstrip().endswith("then")
+        ):
+            return i
+    raise AssertionError(f"prune-audit guard `if` line not found in {SCRIPT_PATH}")
+
+
 def test_prune_audit_enabled_read_via_ssm_param_helper(script_lines: list[str]) -> None:
     """The new param must be read through the same tolerant ``ssm_param`` helper
     used for ``SENTRY_DSN``, not a bespoke ``aws ssm get-parameter`` call that
@@ -97,17 +115,25 @@ def test_prune_audit_dump_dir_export_is_conditional(script_lines: list[str]) -> 
     ``PRUNE_AUDIT_ENABLED`` — never unconditionally, which would turn every
     rebuild into an audit-dump run.
     """
-    guard_line = first_line_index(script_lines, 'if [ "$PRUNE_AUDIT_ENABLED" = "true" ]')
+    guard_line = guard_line_index(script_lines)
     export_line = first_line_index(script_lines, "export PRUNE_AUDIT_DUMP_DIR=")
     assert guard_line < export_line, (
         "the PRUNE_AUDIT_ENABLED guard must precede the PRUNE_AUDIT_DUMP_DIR "
         "export so the export only runs when the flag is truthy."
     )
-    # The export must be the guard's own body, not some unrelated later line.
-    window = "\n".join(script_lines[guard_line : export_line + 1])
-    assert "fi" not in "\n".join(script_lines[guard_line:export_line]), (
-        "export PRUNE_AUDIT_DUMP_DIR must sit inside the if-block it's guarded "
-        f"by, not after a stray 'fi'. window={window!r}"
+    # The export must be indented as the guard's body (not a sibling at the
+    # guard's own level), and the if-block must be closed by a matching `fi`
+    # somewhere after it. This is a structural check — a bare ``"fi" in ...``
+    # substring test would false-positive on ordinary words (config, verify,
+    # prefix) if lines were ever inserted between the guard and the export.
+    guard_indent = len(script_lines[guard_line]) - len(script_lines[guard_line].lstrip())
+    export_indent = len(script_lines[export_line]) - len(script_lines[export_line].lstrip())
+    assert export_indent > guard_indent, (
+        "export PRUNE_AUDIT_DUMP_DIR must be indented inside the if-block body; "
+        f"got guard_indent={guard_indent}, export_indent={export_indent}"
+    )
+    assert any(line.strip() == "fi" for line in script_lines[export_line + 1 :]), (
+        "the if-block guarding the export must be closed by a matching `fi`."
     )
 
 
@@ -153,9 +179,38 @@ def test_prune_audit_enabled_logs_when_enabled(script_lines: list[str]) -> None:
     """A clear log line should announce the dump is active, for operators
     tailing the bootstrap log mid-run or reading it back from S3.
     """
-    guard_line = first_line_index(script_lines, 'if [ "$PRUNE_AUDIT_ENABLED" = "true" ]')
+    guard_line = guard_line_index(script_lines)
     export_line = first_line_index(script_lines, "export PRUNE_AUDIT_DUMP_DIR=")
     window = "\n".join(script_lines[guard_line : export_line + 3])
     assert 'log "prune-audit dump ENABLED' in window, (
         f"expected a log() call announcing the enabled dump near the export; window={window!r}"
+    )
+
+
+def test_prune_audit_truthy_check_is_case_insensitive(script_lines: list[str]) -> None:
+    """``True``/``TRUE`` (case variants of the documented ``true``) must still
+    enable the dump. The SSM value is written by hand by an operator, so a case
+    slip should not silently cost a whole monthly rebuild's audit — the guard
+    lowercases the value before comparing.
+    """
+    guard = script_lines[guard_line_index(script_lines)]
+    assert "${PRUNE_AUDIT_ENABLED,,}" in guard, (
+        "the PRUNE_AUDIT_ENABLED truthy test must lowercase the value "
+        f"(e.g. ${{PRUNE_AUDIT_ENABLED,,}}) so True/TRUE match 'true'; got: {guard!r}"
+    )
+
+
+def test_prune_audit_set_but_not_truthy_is_logged(script_text: str) -> None:
+    """A set-but-non-truthy value (a typo, ``false``, ``0``, ``yes``) must be
+    logged, not silently ignored. Otherwise an operator who fat-fingers the flag
+    only discovers the miss after the multi-hour rebuild finishes and leaves no
+    dump in S3 — an expensive round trip to redo.
+    """
+    assert 'elif [ -n "$PRUNE_AUDIT_ENABLED" ]' in script_text, (
+        'expected an `elif [ -n "$PRUNE_AUDIT_ENABLED" ]` branch that fires '
+        "when the flag is non-empty but not truthy, so the ignored value is logged."
+    )
+    assert 'log "WARN: PRUNE_AUDIT_ENABLED' in script_text, (
+        "the non-truthy branch should log a WARN naming PRUNE_AUDIT_ENABLED so "
+        "the dropped flag is visible in the bootstrap log."
     )
