@@ -42,6 +42,7 @@ import sqlite3
 import sys
 import time
 import unicodedata
+from collections.abc import Sequence
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
@@ -376,7 +377,7 @@ class LibraryIndex:
         )
 
     @classmethod
-    def from_sqlite(cls, db_path: Path) -> LibraryIndex:
+    def from_sqlite(cls, db_path: Path, use_alternate: bool = True) -> LibraryIndex:
         """Build index from the library SQLite database.
 
         Prefers the widest column set available, degrading gracefully:
@@ -388,13 +389,28 @@ class LibraryIndex:
 
         Args:
             db_path: Path to library.db
+            use_alternate: When ``True`` (default), select ``alternate_artist_name``
+                and index it as an extra exact key (post-#305 behavior). When
+                ``False``, skip that column entirely so ``has_alternate`` stays
+                False and the alias is never indexed — reproducing pre-#305
+                matching. The prune audit (discogs-etl#217 Phase 0) builds a
+                second index with ``use_alternate=False`` to measure the #305
+                recall uplift as a file diff.
         """
-        logger.info(f"Building LibraryIndex from {db_path}")
+        logger.info(f"Building LibraryIndex from {db_path} (use_alternate={use_alternate})")
         conn = sqlite3.connect(str(db_path))
         cur = conn.cursor()
-        try:
-            cur.execute("SELECT artist, title, format, alternate_artist_name FROM library")
-        except sqlite3.OperationalError:
+        if use_alternate:
+            try:
+                cur.execute("SELECT artist, title, format, alternate_artist_name FROM library")
+            except sqlite3.OperationalError:
+                try:
+                    cur.execute("SELECT artist, title, format FROM library")
+                except sqlite3.OperationalError:
+                    cur.execute("SELECT artist, title FROM library")
+        else:
+            # Pre-#305 reproduction: never select the alias column, so
+            # from_rows sees at most 3-tuples and has_alternate is False.
             try:
                 cur.execute("SELECT artist, title, format FROM library")
             except sqlite3.OperationalError:
@@ -720,6 +736,139 @@ def apply_release_overrides(report: ClassificationReport, override_ids: set[int]
     report.keep_ids |= override_ids
     report.prune_ids -= override_ids
     report.review_ids -= override_ids
+
+
+def _write_release_ids(path: Path, ids: set[int]) -> None:
+    """Write *ids* to *path*, sorted, one release_id per line."""
+    with open(path, "w", encoding="utf-8") as f:
+        for release_id in sorted(ids):
+            f.write(f"{release_id}\n")
+
+
+def _partition_report(report: ClassificationReport) -> tuple[set[int], set[int], set[int]]:
+    """Resolve a report's keep/prune/review to a true partition by release_id.
+
+    ``classify_all_releases`` classifies each release once per primary-artist
+    group, so a release credited to several ``extra=0`` artists can land in more
+    than one bucket — e.g. KEEP via an in-library artist and PRUNE via a junk
+    co-credit. Resolve those collisions with the production precedence
+    ``KEEP > REVIEW > PRUNE`` (the prune copy-swap rebuilds from
+    ``keep_ids ∪ review_ids``, so any keep/review membership means the release is
+    retained). The returned prune set is therefore exactly what the rebuild
+    removes — the coverage gap the audit measures — not the raw per-group prunes.
+
+    Returns ``(keep, review, prune)`` as disjoint sets covering every classified
+    release_id.
+    """
+    keep = set(report.keep_ids)
+    review = report.review_ids - keep
+    prune = report.prune_ids - keep - report.review_ids
+    return keep, review, prune
+
+
+def dump_classification(
+    out_dir: Path,
+    report: ClassificationReport,
+    report_no_anv: ClassificationReport,
+    override_ids: set[int],
+    releases: Sequence[tuple[int, str, str, str | None]],
+) -> None:
+    """Persist the prune classification for the coverage audit (discogs-etl#217).
+
+    The keep/prune/review id sets exist only in memory during a rebuild and are
+    otherwise reported as counts only; in ``--prune`` mode the pre-prune
+    population is deleted immediately after classification, so it cannot be
+    recovered post-hoc. This writes everything Phase 2 of the audit needs, all
+    from state already in memory (no extra query):
+
+    - ``keep_ids.txt`` / ``prune_ids.txt`` / ``review_ids.txt`` — sorted,
+      newline-delimited ``release_id``s, resolved to a true partition by
+      ``_partition_report`` (KEEP > REVIEW > PRUNE). Post-override: they reflect
+      the ``apply_release_overrides`` pass, so pinned releases have already moved
+      into ``keep_ids``. ``prune_ids.txt`` is exactly the set the rebuild
+      removes, so it never lists a release that is retained via another credit.
+    - ``override_ids.txt`` — the pinned ids that were exempted, so the
+      pinned/non-pinned split needs no live join later.
+    - ``prune_ids_no_anv.txt`` — the (partitioned) prune set from a second
+      classification pass built *without* ``alternate_artist_name`` indexing
+      (pre-#305), with the SAME pinned-override exemption applied. Because both
+      sides are post-override, the #305 recall uplift is a clean file diff
+      (``prune_ids_no_anv − prune_ids``) with no pin contamination. Note the
+      uplift this measures is *marginal over pins*: a release that ANV rescues
+      but that is also pinned is retained either way, so it is intentionally
+      excluded — the diff counts releases ANV saves that a pin did not already
+      save, not the total ANV alias-match count.
+    - ``prune_releases.jsonl`` — one ``{"id", "artist", "title", "format"}``
+      object per pruned id, so the false-negative sample can read raw
+      artist/title without a DB round-trip. A release fans out to several rows in
+      ``releases`` (the ``extra=0`` join); the row with the lexicographically
+      smallest artist is kept so the output is deterministic across runs.
+    - ``counts.json`` — headline counts plus a ``dedup_note`` slot left null for
+      Phase 2 to fill with the post-prune dedup delta. ``total_release_rows`` is
+      the fan-out row count (a multi-artist release counts once per credit), so
+      it is ``>=`` the number of distinct ids in the partitioned sets.
+
+    Every write is a local file; the cache database is untouched.
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    keep_ids, review_ids, prune_ids = _partition_report(report)
+    _, _, prune_ids_no_anv = _partition_report(report_no_anv)
+
+    _write_release_ids(out_dir / "keep_ids.txt", keep_ids)
+    _write_release_ids(out_dir / "prune_ids.txt", prune_ids)
+    _write_release_ids(out_dir / "review_ids.txt", review_ids)
+    _write_release_ids(out_dir / "override_ids.txt", override_ids)
+    _write_release_ids(out_dir / "prune_ids_no_anv.txt", prune_ids_no_anv)
+
+    # One (artist, title, format) per release_id. A release with multiple primary
+    # artists fans out to several rows in ``releases`` (the extra=0 join in
+    # load_discogs_releases, ordered only by r.id); keep the row with the
+    # smallest artist name so the dump is reproducible regardless of row order.
+    release_by_id: dict[int, tuple[str | None, str | None, str | None]] = {}
+    for release in releases:
+        rid = release[0]
+        artist = release[1]
+        existing = release_by_id.get(rid)
+        if existing is None or (artist or "") < (existing[0] or ""):
+            fmt = release[3] if len(release) > 3 else None
+            release_by_id[rid] = (artist, release[2], fmt)
+
+    with open(out_dir / "prune_releases.jsonl", "w", encoding="utf-8") as f:
+        for rid in sorted(prune_ids):
+            artist, title, fmt = release_by_id.get(rid, (None, None, None))
+            f.write(
+                json.dumps(
+                    {"id": rid, "artist": artist, "title": title, "format": fmt},
+                    ensure_ascii=False,
+                )
+                + "\n"
+            )
+
+    counts = {
+        "keep": len(keep_ids),
+        "prune": len(prune_ids),
+        "review": len(review_ids),
+        "override_applied": len(override_ids),
+        "total_release_rows": report.total_releases,
+        # Filled by Phase 2: (keep + review) − final `release` count, the
+        # dedup_releases.py collapse that happens after the prune.
+        "dedup_note": None,
+    }
+    with open(out_dir / "counts.json", "w", encoding="utf-8") as f:
+        json.dump(counts, f, indent=2)
+        f.write("\n")
+
+    logger.info(
+        "Wrote prune-audit classification to %s "
+        "(keep=%d prune=%d review=%d override=%d prune_no_anv=%d)",
+        out_dir,
+        len(keep_ids),
+        len(prune_ids),
+        len(review_ids),
+        len(override_ids),
+        len(prune_ids_no_anv),
+    )
 
 
 def save_artist_mappings(path: Path, mappings: dict) -> None:
@@ -1712,6 +1861,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "pinned overrides from lml_cache.library_release_override). "
         "Omit for today's behavior.",
     )
+    parser.add_argument(
+        "--dump-classification",
+        type=Path,
+        default=None,
+        metavar="DIR",
+        help="Write the prune classification to DIR for the coverage audit "
+        "(discogs-etl#217 Phase 0): keep/prune/review id sets, the pruned "
+        "releases' raw artist/title, the applied override ids, and a second "
+        "prune set computed without alternate_artist_name indexing (pre-#305) "
+        "for the #305-uplift diff. Read-only with respect to cache data (only "
+        "writes local files); adds one extra classification pass. Omit for "
+        "normal rebuilds.",
+    )
     return parser.parse_args(argv)
 
 
@@ -2194,6 +2356,36 @@ async def async_main():
         if override_ids:
             logger.info(f"Applying {len(override_ids):,} pinned release_id override(s)")
         apply_release_overrides(report, override_ids)
+
+        # Step 5b (audit only): dump the prune classification for discogs-etl#217
+        # Phase 0. Runs a second classification pass with alternate_artist_name
+        # indexing disabled (pre-#305) so the #305 recall uplift is recoverable
+        # as a pure file diff in Phase 2. Guarded by --dump-classification, so it
+        # never runs on a normal rebuild. Read-only w.r.t. cache data.
+        if args.dump_classification is not None:
+            logger.info(
+                "Prune-audit mode: running a second no-ANV classification pass "
+                "for the #305 uplift diff (discogs-etl#217)"
+            )
+            index_no_anv = LibraryIndex.from_sqlite(args.library_db, use_alternate=False)
+            matcher_no_anv = MultiIndexMatcher(
+                index_no_anv,
+                artist_mappings=mappings,
+                keep_threshold=args.score_cutoff,
+            )
+            report_no_anv = classify_all_releases(releases, index_no_anv, matcher_no_anv)
+            # Apply the SAME pin exemption to the no-ANV report. This keeps
+            # prune_ids_no_anv − prune_ids a pure #305 (alias) signal: a pinned
+            # release that would prune under BOTH passes is removed from both
+            # sets and never pollutes the uplift diff.
+            apply_release_overrides(report_no_anv, override_ids)
+            dump_classification(
+                args.dump_classification,
+                report,
+                report_no_anv,
+                override_ids,
+                releases,
+            )
 
         # Step 6: Get table sizes for the report
         logger.info("Measuring table sizes...")

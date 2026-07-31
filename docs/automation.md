@@ -31,6 +31,12 @@ After the pipeline succeeds, the workflow runs `scripts/check_cache_drift.py` ag
 | `SENTRY_DSN` | Sentry DSN for error reporting (optional; JSON logging still works without it) |
 | `SLACK_MONITORING_WEBHOOK` | Slack incoming webhook for failure + drift alerts. **Required for production-grade alerting**: when this secret is unset the `Notify Slack on failure` step *itself* fails (with an `::error::` annotation explaining the missing-secret state) instead of silently skipping, so a workflow-level failure can't fall silent the way the 2026-05-05 runs did (#219). The dispatcher's GitHub failure-notification email is the sole signal in that degraded state. |
 
+**Optional instrumentation env:**
+
+| Env var | Description |
+|---------|-------------|
+| `PRUNE_AUDIT_DUMP_DIR` | Opt-in for the prune-coverage audit ([discogs-etl#217](https://github.com/WXYC/discogs-etl/issues/217) Phase 0). **Default unset — leave it unset for normal rebuilds.** When set, `run_pipeline.py` appends `--dump-classification $PRUNE_AUDIT_DUMP_DIR/prune-audit-<UTC-date>` to the `verify_cache.py` prune step. That step then writes the prune classification (keep/prune/review id sets, the pruned releases' raw artist/title, the applied pinned-override ids, and a second no-ANV classification pass for the #305 uplift diff) to that directory, and runs one extra classification pass. It is read-only with respect to cache **data** — only local artifact files are written. Set this (to a path that survives the run, e.g. under the EC2 work dir) only on the deliberate audit rebuild that Phase 1 of #217 calls for. |
+
 **Upstream dependency**: a successful `sync-library.yml` run must have uploaded `library.db` to the `streaming-data-v1` release on `WXYC/library-metadata-lookup` before this workflow fires, or the `Download library.db from LML release artifact` step fails with `release asset not found`. The default `${{ github.token }}` has read scope on the public LML repo; no extra PAT required.
 
 **Interpreting a failed run** (#219):

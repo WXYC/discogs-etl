@@ -668,6 +668,7 @@ _classify_fuzzy_chunk = _vc._classify_fuzzy_chunk
 prune_releases_copy_swap = _vc.prune_releases_copy_swap
 load_keep_release_ids = _vc.load_keep_release_ids
 apply_release_overrides = _vc.apply_release_overrides
+dump_classification = _vc.dump_classification
 
 parse_args = _vc.parse_args
 
@@ -1068,6 +1069,165 @@ class TestApplyReleaseOverrides:
         assert report.review_ids == {103}
 
 
+class TestDumpClassificationArg:
+    """--dump-classification parses to a Path (discogs-etl#217 Phase 0)."""
+
+    def test_default_none(self, tmp_path):
+        db = tmp_path / "library.db"
+        db.touch()
+        args = parse_args([str(db)])
+        assert args.dump_classification is None
+
+    def test_parsed_as_path(self, tmp_path):
+        db = tmp_path / "library.db"
+        db.touch()
+        out = tmp_path / "prune-audit"
+        args = parse_args([str(db), "--dump-classification", str(out)])
+        assert args.dump_classification == out
+
+
+class TestDumpClassification:
+    """dump_classification writes the prune-audit artifact (discogs-etl#217)."""
+
+    def _make_report(self, keep_ids, prune_ids, review_ids=()):
+        return ClassificationReport(
+            keep_ids=set(keep_ids),
+            prune_ids=set(prune_ids),
+            review_ids=set(review_ids),
+            review_by_artist={},
+            artist_originals={},
+            total_releases=len(keep_ids) + len(prune_ids) + len(review_ids),
+        )
+
+    def test_writes_all_artifact_files(self, tmp_path):
+        report = self._make_report(keep_ids={1}, prune_ids={2, 3}, review_ids={4})
+        report_no_anv = self._make_report(keep_ids={1}, prune_ids={2, 3}, review_ids={4})
+        releases = [
+            (1, "Luke Vibert", "Drum 'n' Bass for Papa", "CD"),
+            (2, "Plug", "Drum 'n' Bass for Papa", "CD"),
+            (3, "Zzyzx Qxqxqx", "Xyzzy Plugh", None),
+            (4, "Juana Molina", "DOGA", "LP"),
+        ]
+        out = tmp_path / "prune-audit"
+        dump_classification(out, report, report_no_anv, {5001}, releases)
+
+        for name in (
+            "keep_ids.txt",
+            "prune_ids.txt",
+            "review_ids.txt",
+            "override_ids.txt",
+            "prune_ids_no_anv.txt",
+            "prune_releases.jsonl",
+            "counts.json",
+        ):
+            assert (out / name).exists(), f"missing {name}"
+
+    def test_id_files_are_sorted_newline_delimited(self, tmp_path):
+        report = self._make_report(keep_ids={30, 10, 20}, prune_ids=set())
+        dump_classification(tmp_path, report, self._make_report(set(), set()), set(), [])
+        assert (tmp_path / "keep_ids.txt").read_text() == "10\n20\n30\n"
+
+    def test_override_ids_file_reflects_passed_set(self, tmp_path):
+        report = self._make_report(keep_ids={9001}, prune_ids=set())
+        dump_classification(tmp_path, report, self._make_report(set(), set()), {9001}, [])
+        assert (tmp_path / "override_ids.txt").read_text() == "9001\n"
+
+    def test_prune_releases_jsonl_has_raw_fields(self, tmp_path):
+        report = self._make_report(keep_ids={1}, prune_ids={2, 3})
+        releases = [
+            (1, "Luke Vibert", "Drum 'n' Bass for Papa", "CD"),
+            (2, "Plug", "Drum 'n' Bass for Papa", "CD"),
+            (3, "Zzyzx Qxqxqx", "Xyzzy Plugh", None),
+        ]
+        dump_classification(tmp_path, report, self._make_report(set(), set()), set(), releases)
+        lines = (tmp_path / "prune_releases.jsonl").read_text().splitlines()
+        objs = [json.loads(line) for line in lines]
+        # One object per pruned id, sorted by id.
+        assert [o["id"] for o in objs] == [2, 3]
+        assert objs[0] == {
+            "id": 2,
+            "artist": "Plug",
+            "title": "Drum 'n' Bass for Papa",
+            "format": "CD",
+        }
+        assert objs[1]["format"] is None
+
+    def test_prune_releases_jsonl_dedupes_multi_artist_fanout(self, tmp_path):
+        """A release credited to multiple primary artists appears once, and the
+        chosen artist is the lexicographically smallest for reproducibility."""
+        report = self._make_report(keep_ids=set(), prune_ids={7})
+        # Row order is reversed vs. alphabetical to prove min-artist wins.
+        releases = [
+            (7, "John Coltrane", "In a Sentimental Mood", "LP"),
+            (7, "Duke Ellington", "In a Sentimental Mood", "LP"),
+        ]
+        dump_classification(tmp_path, report, self._make_report(set(), set()), set(), releases)
+        lines = (tmp_path / "prune_releases.jsonl").read_text().splitlines()
+        assert len(lines) == 1
+        obj = json.loads(lines[0])
+        assert obj["id"] == 7
+        assert obj["artist"] == "Duke Ellington"
+
+    def test_counts_json_shape(self, tmp_path):
+        report = self._make_report(keep_ids={1, 2}, prune_ids={3}, review_ids={4})
+        report_no_anv = self._make_report(keep_ids={1, 2}, prune_ids={3}, review_ids={4})
+        dump_classification(tmp_path, report, report_no_anv, {9001}, [])
+        counts = json.loads((tmp_path / "counts.json").read_text())
+        assert counts == {
+            "keep": 2,
+            "prune": 1,
+            "review": 1,
+            "override_applied": 1,
+            "total_release_rows": 4,
+            "dedup_note": None,
+        }
+
+    def test_creates_output_dir(self, tmp_path):
+        report = self._make_report(keep_ids={1}, prune_ids=set())
+        nested = tmp_path / "a" / "b" / "prune-audit"
+        dump_classification(nested, report, self._make_report(set(), set()), set(), [])
+        assert (nested / "counts.json").exists()
+
+    def test_multi_artist_overlap_resolves_to_keep(self, tmp_path):
+        """A release in both keep_ids and prune_ids (KEEP via one artist, PRUNE
+        via another) is written as KEEP and excluded from the pruned set and the
+        prune_releases.jsonl — matching what the copy-swap actually removes."""
+        report = self._make_report(keep_ids={6}, prune_ids={5, 6}, review_ids=set())
+        releases = [
+            (5, "Junk Artist", "Nowhere", "CD"),
+            (6, "Juana Molina", "DOGA", "CD"),
+        ]
+        dump_classification(tmp_path, report, self._make_report(set(), set()), set(), releases)
+        keep = set(map(int, (tmp_path / "keep_ids.txt").read_text().split()))
+        prune = set(map(int, (tmp_path / "prune_ids.txt").read_text().split()))
+        assert keep == {6}
+        assert prune == {5}
+        pruned_ids = [
+            json.loads(line)["id"]
+            for line in (tmp_path / "prune_releases.jsonl").read_text().splitlines()
+        ]
+        assert pruned_ids == [5]
+
+    def test_review_wins_over_prune_on_overlap(self, tmp_path):
+        """KEEP > REVIEW > PRUNE precedence: an id in both review and prune is
+        review (retained), not pruned."""
+        report = self._make_report(keep_ids=set(), prune_ids={8, 9}, review_ids={8})
+        dump_classification(tmp_path, report, self._make_report(set(), set()), set(), [])
+        review = set(map(int, (tmp_path / "review_ids.txt").read_text().split()))
+        prune = set(map(int, (tmp_path / "prune_ids.txt").read_text().split()))
+        assert review == {8}
+        assert prune == {9}
+
+    def test_no_anv_prune_set_is_partitioned(self, tmp_path):
+        """prune_ids_no_anv is resolved with the same precedence, so a no-ANV
+        overlap release doesn't inflate the #305 uplift diff."""
+        report = self._make_report(keep_ids=set(), prune_ids=set())
+        report_no_anv = self._make_report(keep_ids={6}, prune_ids={2, 6}, review_ids=set())
+        dump_classification(tmp_path, report, report_no_anv, set(), [])
+        prune_no_anv = set(map(int, (tmp_path / "prune_ids_no_anv.txt").read_text().split()))
+        assert prune_no_anv == {2}
+
+
 # ---------------------------------------------------------------------------
 # format_bytes
 # ---------------------------------------------------------------------------
@@ -1460,6 +1620,44 @@ class TestAlternateArtistNameIndex:
         norm_title = normalize_title("Drum 'n' Bass for Papa")
         assert "plug" in idx.all_artists
         assert ("plug", norm_title) in idx.exact_pairs
+
+    def test_from_sqlite_use_alternate_false_skips_alias(self, tmp_path):
+        """from_sqlite(use_alternate=False) reproduces pre-#305 matching.
+
+        Selecting only ``artist, title, format`` (3 columns) leaves
+        ``has_alternate`` False, so the alias is never indexed. The canonical
+        artist pair still resolves; only the ANV/alias key is dropped. This is
+        the second-pass index the prune audit uses to measure the #305 uplift
+        (discogs-etl#217 Phase 0).
+        """
+        import sqlite3
+
+        db_path = tmp_path / "library.db"
+        conn = sqlite3.connect(str(db_path))
+        cur = conn.cursor()
+        cur.execute(
+            "CREATE TABLE library (id INTEGER PRIMARY KEY, artist TEXT, title TEXT, "
+            "format TEXT, alternate_artist_name TEXT)"
+        )
+        cur.execute(
+            "INSERT INTO library (artist, title, format, alternate_artist_name) "
+            "VALUES ('Luke Vibert', \"Drum 'n' Bass for Papa\", 'CD', 'Plug')"
+        )
+        conn.commit()
+        conn.close()
+
+        norm_title = normalize_title("Drum 'n' Bass for Papa")
+        norm_canonical = normalize_artist("Luke Vibert")
+
+        # Default path indexes the alias (post-#305).
+        idx_default = LibraryIndex.from_sqlite(db_path)
+        assert ("plug", norm_title) in idx_default.exact_pairs
+
+        # use_alternate=False drops the alias but keeps the canonical pair.
+        idx_no_anv = LibraryIndex.from_sqlite(db_path, use_alternate=False)
+        assert ("plug", norm_title) not in idx_no_anv.exact_pairs
+        assert "plug" not in idx_no_anv.all_artists
+        assert (norm_canonical, norm_title) in idx_no_anv.exact_pairs
 
 
 class TestAlternateArtistNameClassification:
