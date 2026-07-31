@@ -33,6 +33,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import NamedTuple
 
@@ -717,6 +718,28 @@ def write_keep_release_ids(db_url: str, output_path: Path) -> int:
     return len(ids)
 
 
+def prune_audit_dump_args() -> list[str]:
+    """Extra ``verify_cache.py`` args to capture the prune classification, or [].
+
+    Opt-in instrumentation for the discogs-etl#217 coverage audit. When the
+    ``PRUNE_AUDIT_DUMP_DIR`` environment variable is set, the prune step also
+    dumps its keep/prune/review id sets (plus a second, no-ANV classification
+    pass for the #305 uplift diff) under
+    ``$PRUNE_AUDIT_DUMP_DIR/prune-audit-<UTC-date>``. Default off: a normal
+    monthly rebuild leaves the env unset and ``verify_cache.py`` runs unchanged
+    with no extra classification pass.
+
+    The UTC date stamp (matching the rebuild's UTC scheduling) keeps a re-run on
+    a later day from clobbering an earlier capture. The dump is read-only with
+    respect to cache data — it only writes local artifact files.
+    """
+    base = os.environ.get("PRUNE_AUDIT_DUMP_DIR")
+    if not base:
+        return []
+    date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    return ["--dump-classification", str(Path(base) / f"prune-audit-{date}")]
+
+
 def check_reload_invariant(
     db_url: str,
     *,
@@ -1262,6 +1285,7 @@ def _run_database_build_post_import(
                 db_url,
                 "--keep-release-ids",
                 str(keep_release_ids_path),
+                *prune_audit_dump_args(),
             ],
         )
     else:
@@ -1518,6 +1542,7 @@ def _run_database_build(
                 db_url,
                 "--keep-release-ids",
                 str(keep_release_ids_path),
+                *prune_audit_dump_args(),
             ],
         )
         if state:
@@ -1534,6 +1559,7 @@ def _run_database_build(
                 db_url,
                 "--keep-release-ids",
                 str(keep_release_ids_path),
+                *prune_audit_dump_args(),
             ],
         )
         if state:

@@ -1853,3 +1853,162 @@ class TestPostImportReloadInvariant:
         check_idx = events.index(("check", True))
         report_idx = next(i for i, (kind, _) in enumerate(events) if kind == "report")
         assert check_idx < report_idx
+
+
+class TestPruneAuditDumpArgs:
+    """prune_audit_dump_args() opt-in via PRUNE_AUDIT_DUMP_DIR (discogs-etl#217 Phase 0)."""
+
+    def test_unset_env_returns_empty(self, monkeypatch) -> None:
+        monkeypatch.delenv("PRUNE_AUDIT_DUMP_DIR", raising=False)
+        assert run_pipeline.prune_audit_dump_args() == []
+
+    def test_empty_env_returns_empty(self, monkeypatch) -> None:
+        monkeypatch.setenv("PRUNE_AUDIT_DUMP_DIR", "")
+        assert run_pipeline.prune_audit_dump_args() == []
+
+    def test_set_env_returns_dated_dump_flag(self, monkeypatch) -> None:
+        import re
+
+        monkeypatch.setenv("PRUNE_AUDIT_DUMP_DIR", "/data/audit")
+        args = run_pipeline.prune_audit_dump_args()
+        assert args[0] == "--dump-classification"
+        assert re.fullmatch(r"/data/audit/prune-audit-\d{4}-\d{2}-\d{2}", args[1]), args[1]
+
+
+class TestPruneAuditDumpWiring:
+    """PRUNE_AUDIT_DUMP_DIR plumbs --dump-classification into the verify_cache prune step.
+
+    Default off (env unset) leaves the prune invocation exactly as before, so a
+    normal monthly rebuild pays no extra classification pass.
+    """
+
+    def _capture_prune_cmd(self, *, dump_env, monkeypatch) -> list[str]:
+        import psycopg
+
+        if dump_env is None:
+            monkeypatch.delenv("PRUNE_AUDIT_DUMP_DIR", raising=False)
+        else:
+            monkeypatch.setenv("PRUNE_AUDIT_DUMP_DIR", dump_env)
+
+        captured: list[list[str]] = []
+
+        def fake_run_step(step_name, cmd, *a, **k):
+            captured.append(cmd)
+
+        mock_cursor = MagicMock()
+        mock_cursor.fetchone.return_value = [True]
+        mock_cursor.fetchall.return_value = []
+        mock_conn = MagicMock()
+        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
+        mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+
+        with (
+            patch.object(run_pipeline, "run_step", side_effect=fake_run_step),
+            patch.object(run_pipeline, "check_reload_invariant"),
+            patch.object(run_pipeline, "run_sql_statements_parallel"),
+            patch.object(run_pipeline, "run_vacuum"),
+            patch.object(run_pipeline, "set_tables_logged"),
+            patch.object(run_pipeline, "report_sizes"),
+            patch.object(psycopg, "connect", return_value=mock_conn),
+        ):
+            run_pipeline._run_database_build_post_import(
+                "postgresql:///test",
+                Path("/tmp/csv"),
+                Path("/tmp/library.db"),
+                sys.executable,
+            )
+
+        prune_cmds = [
+            c for c in captured if any("verify_cache.py" in str(x) for x in c) and "--prune" in c
+        ]
+        assert len(prune_cmds) == 1, f"expected one prune invocation, got {len(prune_cmds)}"
+        return prune_cmds[0]
+
+    def _capture_stateful_verify_cmds(
+        self, *, dump_env, monkeypatch, target_db_url=None
+    ) -> list[list[str]]:
+        """Drive the stateful _run_database_build and return its verify_cache cmds.
+
+        Covers the two call sites that _run_database_build_post_import doesn't:
+        the copy-to arm and the stateful prune arm.
+        """
+        import psycopg
+
+        if dump_env is None:
+            monkeypatch.delenv("PRUNE_AUDIT_DUMP_DIR", raising=False)
+        else:
+            monkeypatch.setenv("PRUNE_AUDIT_DUMP_DIR", dump_env)
+
+        captured: list[list[str]] = []
+
+        def fake_run_step(step_name, cmd, *a, **k):
+            captured.append(cmd)
+
+        mock_cursor = MagicMock()
+        mock_cursor.fetchone.return_value = [True]
+        mock_cursor.fetchall.return_value = [
+            ("idx_release_artist_name_trgm",),
+            ("idx_release_title_trgm",),
+        ]
+        mock_conn = MagicMock()
+        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
+        mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+
+        with (
+            patch.object(run_pipeline, "run_step", side_effect=fake_run_step),
+            patch.object(run_pipeline, "wait_for_postgres"),
+            patch.object(run_pipeline, "run_sql_file"),
+            patch.object(run_pipeline, "run_sql_statements_parallel"),
+            patch.object(run_pipeline, "set_tables_unlogged"),
+            patch.object(run_pipeline, "set_tables_logged"),
+            patch.object(run_pipeline, "run_vacuum"),
+            patch.object(run_pipeline, "report_sizes"),
+            patch.object(run_pipeline, "write_keep_release_ids", return_value=0),
+            patch.object(run_pipeline, "check_reload_invariant") as mock_check,
+            patch.object(psycopg, "connect", return_value=mock_conn),
+        ):
+            mock_check.return_value = run_pipeline.ReloadInvariantResult(
+                ok=True, release_count=1, artist_coverage=1.0, track_coverage=1.0
+            )
+            run_pipeline._run_database_build(
+                "postgresql:///test",
+                Path("/tmp/csv"),
+                Path("/tmp/library.db"),
+                sys.executable,
+                target_db_url=target_db_url,
+            )
+
+        return [c for c in captured if any("verify_cache.py" in str(x) for x in c)]
+
+    def test_dump_flag_present_when_env_set(self, monkeypatch) -> None:
+        cmd = self._capture_prune_cmd(dump_env="/data/audit", monkeypatch=monkeypatch)
+        assert "--dump-classification" in cmd
+        dump_dir = cmd[cmd.index("--dump-classification") + 1]
+        assert dump_dir.startswith("/data/audit/prune-audit-")
+
+    def test_dump_flag_absent_when_env_unset(self, monkeypatch) -> None:
+        cmd = self._capture_prune_cmd(dump_env=None, monkeypatch=monkeypatch)
+        assert "--dump-classification" not in cmd
+
+    def test_dump_flag_in_stateful_prune_arm(self, monkeypatch) -> None:
+        cmds = self._capture_stateful_verify_cmds(dump_env="/data/audit", monkeypatch=monkeypatch)
+        prune = [c for c in cmds if "--prune" in c]
+        assert len(prune) == 1
+        assert "--dump-classification" in prune[0]
+
+    def test_dump_flag_in_copy_to_arm(self, monkeypatch) -> None:
+        cmds = self._capture_stateful_verify_cmds(
+            dump_env="/data/audit", monkeypatch=monkeypatch, target_db_url="postgresql:///target"
+        )
+        copy = [c for c in cmds if "--copy-to" in c]
+        assert len(copy) == 1
+        assert "--dump-classification" in copy[0]
+
+    def test_dump_flag_absent_in_stateful_arms_when_env_unset(self, monkeypatch) -> None:
+        for target in (None, "postgresql:///target"):
+            cmds = self._capture_stateful_verify_cmds(
+                dump_env=None, monkeypatch=monkeypatch, target_db_url=target
+            )
+            assert cmds, "expected a verify_cache invocation to capture"
+            for c in cmds:
+                assert "--dump-classification" not in c
