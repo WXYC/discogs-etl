@@ -2176,13 +2176,14 @@ class TestDeriveVaReleaseStep:
         cmds = self._derive_cmds(self._invoke_database_build(library_db=None))
         assert cmds == []
 
-    def test_derive_failure_soft_fails_and_drops_stale_table(self) -> None:
+    def test_derive_failure_soft_fails_and_drops_stale_table(self, caplog) -> None:
         """A derive failure must not abort the build (the xml/direct-pg paths
         have no resume state and the tables are still UNLOGGED here); the
         stale pre-rebuild table is dropped best-effort so it can't silently
         mismatch the rebuilt cache, and the next daily sync re-derives."""
         mock_conn = self._mock_conn()
-        cmds = self._invoke_database_build(fail_derive=True, mock_conn=mock_conn)
+        with caplog.at_level(logging.WARNING):
+            cmds = self._invoke_database_build(fail_derive=True, mock_conn=mock_conn)
         # The build completed: prune ran before the derive, and no exception
         # escaped (this call returning at all proves vacuum/set_logged were
         # reached, since they are mocked no-ops after the derive block).
@@ -2193,6 +2194,13 @@ class TestDeriveVaReleaseStep:
             if "DROP TABLE IF EXISTS va_release" in str(call)
         ]
         assert drop_calls, "expected a best-effort DROP of the stale va_release"
+        # The warning must not embed the subprocess argv: str(CalledProcessError)
+        # includes the credentialed --database-url, and this record rides the
+        # wxyc_etl/Sentry logging pipeline.
+        warnings = [
+            r.getMessage() for r in caplog.records if "derive_va_release failed" in r.getMessage()
+        ]
+        assert warnings and all("postgresql:///test" not in msg for msg in warnings)
 
     def test_derive_failure_leaves_resume_state_pending(self) -> None:
         pytest.importorskip("wxyc_etl.state", reason="wxyc-etl not installed")

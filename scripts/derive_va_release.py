@@ -63,7 +63,6 @@ import argparse
 import logging
 import os
 import sys
-import urllib.parse
 from pathlib import Path
 
 import psycopg
@@ -145,20 +144,23 @@ def derive_va_release(conn: psycopg.Connection, *, floor: int = DEFAULT_FLOOR) -
                 f"derived {count} va_release rows, below floor {floor}; "
                 f"rolled back to the pre-existing table ({pre_rows} rows)"
             )
+        release_populated = False
+        if count == 0:
+            # Probed INSIDE the transaction: the CTAS above already holds a
+            # share lock on release, so this cannot newly block, and a probe
+            # error cannot strike after a successful commit and masquerade as
+            # a derivation failure.
+            cur.execute("SELECT EXISTS (SELECT 1 FROM release LIMIT 1)")
+            release_populated = bool(cur.fetchone()[0])
         cur.execute(_TRGM_INDEX_SQL)
         cur.execute("ANALYZE va_release")
     conn.commit()
-    if count == 0:
-        with conn.cursor() as cur:
-            cur.execute("SELECT EXISTS (SELECT 1 FROM release LIMIT 1)")
-            release_populated = bool(cur.fetchone()[0])
-        conn.commit()
-        if release_populated:
-            logger.warning(
-                "Derived an EMPTY va_release from a populated release table — "
-                "the VA predicate matched nothing. Downstream compilation "
-                "matching will find no VA releases until this is investigated."
-            )
+    if count == 0 and release_populated:
+        logger.warning(
+            "Derived an EMPTY va_release from a populated release table — "
+            "the VA predicate matched nothing. Downstream compilation "
+            "matching will find no VA releases until this is investigated."
+        )
     logger.info(
         "Derived va_release: %d rows (pre-existing table: %s)",
         count,
@@ -187,12 +189,22 @@ def resolve_floor(cli_value: int | None) -> int:
 
 
 def _describe_target(database_url: str) -> str:
-    """Loggable host/database of the target URL, never including credentials."""
-    parsed = urllib.parse.urlparse(database_url)
-    host = parsed.hostname or "<local socket>"
-    port = f":{parsed.port}" if parsed.port else ""
-    dbname = parsed.path.lstrip("/") or "<default db>"
-    return f"{host}{port}/{dbname}"
+    """Loggable host/database of the target DSN, never including credentials.
+
+    Uses psycopg's conninfo parser so key/value DSNs (``host=... password=...``)
+    are handled — a naive urlparse would put the whole conninfo, password
+    included, into ``.path``. Any parse failure degrades to a placeholder
+    rather than risking echoing the raw (credentialed) string or crashing
+    before psycopg.connect can produce its clearer error.
+    """
+    try:
+        info = psycopg.conninfo.conninfo_to_dict(database_url)
+        host = info.get("host") or "<local socket>"
+        port = f":{info['port']}" if info.get("port") else ""
+        dbname = info.get("dbname") or "<default db>"
+        return f"{host}{port}/{dbname}"
+    except Exception:
+        return "<unparseable target>"
 
 
 def main(argv: list[str] | None = None) -> int:
