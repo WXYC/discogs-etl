@@ -51,6 +51,7 @@ STEP_NAMES = [
     "import_tracks",
     "create_track_indexes",
     "prune",
+    "derive_va_release",
     "vacuum",
     "set_logged",
 ]
@@ -837,8 +838,8 @@ def _infer_pipeline_state(db_url: str, csv_dir: str) -> PipelineState:
 
     Inspects table existence, row counts, index names, and constraint names
     to determine which pipeline steps have already completed. Steps that
-    cannot be inferred (prune, vacuum) are left as pending since they are
-    safe to re-run.
+    cannot be inferred (prune, derive_va_release, vacuum) are left as pending
+    since they are safe to re-run.
     """
     state = PipelineState(db_url=db_url, csv_dir=csv_dir, steps=STEP_NAMES)
 
@@ -916,7 +917,7 @@ def _infer_pipeline_state(db_url: str, csv_dir: str) -> PipelineState:
     finally:
         conn.close()
 
-    # prune and vacuum cannot be inferred from database state
+    # prune, derive_va_release, and vacuum cannot be inferred from database state
     return state
 
 
@@ -1291,6 +1292,23 @@ def _run_database_build_post_import(
     else:
         logger.info("Skipping prune step (no library.db provided)")
 
+    # -- derive_va_release (#344): re-derive the VA-compilation lookup table
+    # now that dedup/prune have finalized release ids. --floor 0: after a
+    # rebuild the pre-existing table holds pre-rebuild ids (stale garbage),
+    # so an honest empty derivation beats the floor guard's rollback to it —
+    # the floor protects the daily sync path, not this one.
+    run_step(
+        "Derive va_release",
+        [
+            python,
+            str(SCRIPT_DIR / "derive_va_release.py"),
+            "--database-url",
+            db_url,
+            "--floor",
+            "0",
+        ],
+    )
+
     # -- vacuum
     run_vacuum(db_url)
 
@@ -1569,6 +1587,31 @@ def _run_database_build(
         logger.info("Skipping prune step (no library.db provided)")
         if state:
             state.mark_completed("prune")
+            _save_state()
+
+    # -- derive_va_release (#344): re-derive the VA-compilation lookup table
+    # now that dedup/prune have finalized release ids. Runs on the target DB
+    # in copy-to mode (the one consumers read), like vacuum below. --floor 0:
+    # after a rebuild the pre-existing table holds pre-rebuild ids (stale
+    # garbage), so an honest empty derivation beats the floor guard's
+    # rollback to it — the floor protects the daily sync path, not this one.
+    derive_db_url = target_db_url if target_db_url else db_url
+    if state and state.is_completed("derive_va_release"):
+        logger.info("Skipping derive_va_release (already completed)")
+    else:
+        run_step(
+            "Derive va_release",
+            [
+                python,
+                str(SCRIPT_DIR / "derive_va_release.py"),
+                "--database-url",
+                derive_db_url,
+                "--floor",
+                "0",
+            ],
+        )
+        if state:
+            state.mark_completed("derive_va_release")
             _save_state()
 
     # -- vacuum (on target DB if using copy-to, otherwise source)

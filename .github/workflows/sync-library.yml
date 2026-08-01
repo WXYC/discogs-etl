@@ -94,6 +94,14 @@ jobs:
             echo "::warning::Failed to provision LML venv (exit $rc); the compilation-track recall index build will fall back to this job's own interpreter and soft-fail inside sync-library.sh -- the library.db sync/upload is unaffected"
           fi
 
+      # Installed BEFORE the sync (moved from after it in #344): the sync now
+      # runs scripts/derive_va_release.py, which imports psycopg -- absent from
+      # the bare setup-python interpreter this job otherwise runs the sync
+      # with (every other sync-path script here is stdlib-only). One install
+      # serves both the derive step and the cache-health metrics step below.
+      - name: Install discogs-etl
+        run: pip install -e ".[dev]"
+
       - name: Run library sync
         run: scripts/sync-library.sh
         env:
@@ -138,10 +146,6 @@ jobs:
         with:
           role-to-assume: ${{ vars.AWS_ROLE_TO_ASSUME }}
           aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
-
-      - name: Install discogs-etl
-        if: success()
-        run: pip install -e ".[dev]"
 
       - name: Publish cache-health metrics
         if: success()

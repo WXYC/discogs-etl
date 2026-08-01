@@ -229,6 +229,22 @@ if [[ -n "$PRODUCTION_URL" ]]; then
     upload_library_db "$PRODUCTION_URL" "production" "$DB_PATH" || EXIT_CODE=1
 fi
 
+# Re-derive the va_release VA-compilation lookup table in the discogs-cache
+# (#344), ahead of the recall-index build below that reads it via LML's
+# comp-title matcher. Unconditional on purpose: this doubles as the one-off
+# prod backfill and the ongoing freshness mechanism (LML inserts API-fetched
+# VA releases into the cache at runtime, and the monthly rebuild currently
+# only runs on manual dispatch). The script's own floor guard rolls a
+# suspiciously thin derivation back to the previous table, so a bad day here
+# can't clobber a good table. Soft-fail without touching EXIT_CODE -- that
+# variable gates the recall-index build and the library.db release upload,
+# and a derivation failure must block neither (the recall build just reads
+# the previous derivation, or degrades on its own).
+log "Deriving va_release in the discogs-cache..."
+if ! "$PYTHON" scripts/derive_va_release.py 2>&1 | tee -a "$LOG_FILE"; then
+    log "WARNING: va_release derivation failed (continuing; recall-index build reads the previous derivation, if any)"
+fi
+
 # Build the V/A compilation-track recall index (lml_cache.compilation_track_location,
 # LML#1019 / WXYC/discogs-etl#339). Best-effort, mirroring the streaming-links
 # enrichment block above: a failure here must never strip or block the library.db

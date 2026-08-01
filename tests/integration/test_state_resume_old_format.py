@@ -3,7 +3,7 @@ pipeline state file (the pre-migration JSON formats).
 
 run_pipeline.py supports ``--resume --state-file <path>``. When the state file
 is v1 (6 steps) or v2 (8 steps), ``PipelineState.load`` migrates it to the
-current v3 (9 steps) format and the pipeline should:
+current v3 (10-step) format and the pipeline should:
 
 1. Exit 0.
 2. Skip steps marked as completed in the migrated state ("Skipping <step>
@@ -60,7 +60,9 @@ V2_STEP_NAMES = [
     "vacuum",
 ]
 
-# v3 -- the current canonical step list.
+# v3 -- the current canonical step list (10 steps since derive_va_release, #344;
+# still version 3: the loader takes step names from the file's own keys, and
+# default-pending is the correct resume semantics for the new step).
 V3_STEP_NAMES = [
     "create_schema",
     "import_csv",
@@ -69,6 +71,7 @@ V3_STEP_NAMES = [
     "import_tracks",
     "create_track_indexes",
     "prune",
+    "derive_va_release",
     "vacuum",
     "set_logged",
 ]
@@ -339,7 +342,7 @@ class TestStateResumeOldFormat:
                 f"Combined output:\n{combined[:2000]}"
             )
 
-        # Final state file is v3 with all 9 steps completed (including the
+        # Final state file is v3 with all 10 steps completed (including the
         # new set_logged step that did not exist in v2).
         final = _final_state_is_v3_complete(state_file)
         assert final["steps"]["set_logged"]["status"] == "completed"

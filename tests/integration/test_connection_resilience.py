@@ -34,6 +34,7 @@ STEP_NAMES = [
     "import_tracks",
     "create_track_indexes",
     "prune",
+    "derive_va_release",
     "vacuum",
     "set_logged",
 ]
