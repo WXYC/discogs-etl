@@ -514,13 +514,20 @@ def run_derive_va_release_step(db_url: str, python: str) -> bool:
     try:
         run_step("Derive va_release", cmd)
     except subprocess.CalledProcessError as exc:
+        # Log only the exit code — str(exc) embeds the full argv, including
+        # the credentialed --database-url, and this warning rides the
+        # wxyc_etl/Sentry logging pipeline.
         logger.warning(
-            "derive_va_release failed (%s); dropping the stale table and continuing "
-            "(the next daily sync re-derives it)",
-            exc,
+            "derive_va_release failed (exit %d); dropping the stale table and "
+            "continuing (the next daily sync re-derives it)",
+            exc.returncode,
         )
         try:
-            conn = psycopg.connect(db_url, autocommit=True)
+            # Same bounded lock wait as the derive script itself: this drop
+            # contends for the same ACCESS EXCLUSIVE lock, and an unbounded
+            # wait here would stall the rebuild at exactly the step whose
+            # soft-fail exists to keep it moving.
+            conn = psycopg.connect(db_url, autocommit=True, options="-c lock_timeout=30s")
             try:
                 conn.execute("DROP TABLE IF EXISTS va_release")
             finally:

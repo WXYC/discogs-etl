@@ -136,3 +136,24 @@ class TestTargetDescription:
         assert "hunter2" not in described
         assert "user" not in described
         assert described == "db.example.com:5433/discogs"
+
+    def test_describe_target_conninfo_form_never_leaks_password(self, clean_env) -> None:
+        """psycopg accepts key/value DSNs too; a naive urlparse puts the whole
+        conninfo — password included — into .path and would log it."""
+        described = derive_module._describe_target(
+            "host=prod.example.com port=5433 dbname=discogs user=etl password=hunter2"
+        )
+        assert "hunter2" not in described
+        assert "password" not in described
+        assert described == "prod.example.com:5433/discogs"
+
+    def test_describe_target_bad_port_neither_crashes_nor_leaks(self, clean_env) -> None:
+        """urlparse's .port would raise on a non-numeric port before psycopg
+        could produce its clearer connect error; conninfo parsing just passes
+        it through — the log line must simply never crash or leak."""
+        described = derive_module._describe_target("postgresql://etluser:hunter2@host:notaport/db")
+        assert "hunter2" not in described
+        assert "etluser" not in described
+
+    def test_describe_target_degrades_on_unparseable_input(self, clean_env) -> None:
+        assert derive_module._describe_target("%%not-a-dsn%%") == "<unparseable target>"
