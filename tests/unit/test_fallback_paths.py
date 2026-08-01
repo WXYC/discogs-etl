@@ -36,6 +36,7 @@ STEP_NAMES = [
     "import_tracks",
     "create_track_indexes",
     "prune",
+    "derive_va_release",
     "vacuum",
     "set_logged",
 ]
@@ -325,7 +326,13 @@ class TestPipelineStateV1Resume:
         assert not state.is_completed("set_logged")
 
     def test_v1_fully_completed_migrates_all_steps(self, tmp_path: Path) -> None:
-        """V1 with all steps completed -> all v3 steps completed."""
+        """V1 with all steps completed -> all migratable v3 steps completed.
+
+        derive_va_release (#344) deliberately stays pending: the wxyc-etl
+        migration can only infer steps it knows about, and default-pending is
+        the correct semantics anyway — a pre-#344 pipeline never derived
+        va_release, and the step is safe to (re-)run on resume.
+        """
         state_file = self._make_v1_state(
             tmp_path,
             ["create_schema", "import_csv", "create_indexes", "dedup", "prune", "vacuum"],
@@ -333,6 +340,11 @@ class TestPipelineStateV1Resume:
         state = PipelineState.load(str(state_file))
 
         for step in STEP_NAMES:
+            if step == "derive_va_release":
+                assert not state.is_completed(step), (
+                    "derive_va_release must stay pending after v1 migration"
+                )
+                continue
             assert state.is_completed(step), f"Step {step} should be completed after v1 migration"
 
     def test_v1_metadata_preserved(self, tmp_path: Path) -> None:

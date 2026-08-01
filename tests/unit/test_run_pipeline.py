@@ -2012,3 +2012,148 @@ class TestPruneAuditDumpWiring:
             assert cmds, "expected a verify_cache invocation to capture"
             for c in cmds:
                 assert "--dump-classification" not in c
+
+
+class TestDeriveVaReleaseStep:
+    """The derive_va_release step (#344) runs after prune in both build paths,
+    always with --floor 0 (post-rebuild, the pre-existing table's ids are
+    stale garbage, so publishing an honest empty derivation beats rolling
+    back to it), and in copy-to mode derives on the target DB — the one
+    consumers read — exactly like vacuum."""
+
+    def _mock_conn(self):
+        mock_cursor = MagicMock()
+        mock_cursor.fetchone.return_value = [True]
+        mock_cursor.fetchall.return_value = [
+            ("idx_release_artist_name_trgm",),
+            ("idx_release_title_trgm",),
+        ]
+        mock_conn = MagicMock()
+        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
+        mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+        return mock_conn
+
+    def _invoke_database_build(self, *, target_db_url=None, state=None) -> list[list[str]]:
+        import psycopg
+
+        captured_cmds: list[list[str]] = []
+
+        def fake_run_step(step_name, cmd, *args, **kwargs):
+            captured_cmds.append(cmd)
+
+        with (
+            patch.object(run_pipeline, "run_step", side_effect=fake_run_step),
+            patch.object(run_pipeline, "wait_for_postgres"),
+            patch.object(run_pipeline, "run_sql_file"),
+            patch.object(run_pipeline, "run_sql_statements_parallel"),
+            patch.object(run_pipeline, "set_tables_unlogged"),
+            patch.object(run_pipeline, "set_tables_logged"),
+            patch.object(run_pipeline, "run_vacuum"),
+            patch.object(run_pipeline, "report_sizes"),
+            patch.object(run_pipeline, "check_reload_invariant") as mock_check,
+            patch.object(run_pipeline, "write_keep_release_ids", return_value=0),
+            patch.object(psycopg, "connect", return_value=self._mock_conn()),
+        ):
+            mock_check.return_value = run_pipeline.ReloadInvariantResult(
+                ok=True, release_count=1, artist_coverage=1.0, track_coverage=1.0
+            )
+            run_pipeline._run_database_build(
+                "postgresql:///test",
+                Path("/tmp/csv"),
+                Path("/tmp/library.db"),
+                sys.executable,
+                target_db_url=target_db_url,
+                state=state,
+            )
+        return captured_cmds
+
+    def _invoke_post_import(self) -> list[list[str]]:
+        import psycopg
+
+        captured_cmds: list[list[str]] = []
+
+        def fake_run_step(step_name, cmd, *args, **kwargs):
+            captured_cmds.append(cmd)
+
+        with (
+            patch.object(run_pipeline, "run_step", side_effect=fake_run_step),
+            patch.object(run_pipeline, "run_sql_statements_parallel"),
+            patch.object(run_pipeline, "run_vacuum"),
+            patch.object(run_pipeline, "set_tables_logged"),
+            patch.object(run_pipeline, "report_sizes"),
+            patch.object(run_pipeline, "check_reload_invariant") as mock_check,
+            patch.object(run_pipeline, "write_keep_release_ids", return_value=0),
+            patch.object(psycopg, "connect", return_value=self._mock_conn()),
+        ):
+            mock_check.return_value = run_pipeline.ReloadInvariantResult(
+                ok=True, release_count=1, artist_coverage=1.0, track_coverage=1.0
+            )
+            run_pipeline._run_database_build_post_import(
+                "postgresql:///test", Path("/tmp/csv"), Path("/tmp/library.db"), sys.executable
+            )
+        return captured_cmds
+
+    @staticmethod
+    def _derive_cmds(cmds: list[list[str]]) -> list[list[str]]:
+        return [c for c in cmds if any("derive_va_release.py" in str(part) for part in c)]
+
+    def test_step_name_registered_between_prune_and_vacuum(self) -> None:
+        assert "derive_va_release" in run_pipeline.STEP_NAMES
+        names = run_pipeline.STEP_NAMES
+        assert names.index("prune") < names.index("derive_va_release") < names.index("vacuum")
+
+    def test_database_build_derives_with_floor_zero(self) -> None:
+        cmds = self._derive_cmds(self._invoke_database_build())
+        assert len(cmds) == 1
+        cmd = cmds[0]
+        assert cmd[cmd.index("--database-url") + 1] == "postgresql:///test"
+        assert cmd[cmd.index("--floor") + 1] == "0"
+
+    def test_copy_to_mode_derives_on_target(self) -> None:
+        cmds = self._derive_cmds(self._invoke_database_build(target_db_url="postgresql:///target"))
+        assert len(cmds) == 1
+        cmd = cmds[0]
+        assert cmd[cmd.index("--database-url") + 1] == "postgresql:///target"
+
+    def test_post_import_derives_with_floor_zero(self) -> None:
+        cmds = self._derive_cmds(self._invoke_post_import())
+        assert len(cmds) == 1
+        cmd = cmds[0]
+        assert cmd[cmd.index("--database-url") + 1] == "postgresql:///test"
+        assert cmd[cmd.index("--floor") + 1] == "0"
+
+    def test_completed_state_skips_derive(self) -> None:
+        pytest.importorskip("wxyc_etl.state", reason="wxyc-etl not installed")
+        from wxyc_etl.state import PipelineState
+
+        state = PipelineState(
+            db_url="postgresql:///test",
+            csv_dir="/tmp/csv",
+            steps=run_pipeline.STEP_NAMES,
+        )
+        for step in run_pipeline.STEP_NAMES:
+            state.mark_completed(step)
+        cmds = self._derive_cmds(self._invoke_database_build(state=state))
+        assert cmds == []
+
+    def test_state_persisted_without_derive_step_still_runs_it(self, tmp_path) -> None:
+        """A pre-#344 v3 state file lacks derive_va_release; loading it must
+        leave the step pending (so a resume runs it) and round-trip the mark.
+        No state-version bump: unlike set_logged's v2→v3 (which needed a
+        migration inference rule), default-pending is the correct semantics
+        for a never-run derivation."""
+        pytest.importorskip("wxyc_etl.state", reason="wxyc-etl not installed")
+        from wxyc_etl.state import PipelineState
+
+        old_steps = [s for s in run_pipeline.STEP_NAMES if s != "derive_va_release"]
+        old_state = PipelineState(db_url="postgresql:///test", csv_dir="/tmp/csv", steps=old_steps)
+        for step in old_steps:
+            old_state.mark_completed(step)
+        state_file = tmp_path / "state.json"
+        old_state.save(str(state_file))
+
+        loaded = PipelineState.load(str(state_file))
+        assert not loaded.is_completed("derive_va_release")
+        loaded.mark_completed("derive_va_release")
+        loaded.save(str(state_file))
+        assert PipelineState.load(str(state_file)).is_completed("derive_va_release")

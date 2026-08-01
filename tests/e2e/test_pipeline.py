@@ -124,6 +124,27 @@ class TestPipeline:
             assert count > 0, f"Table {table} is empty"
         conn.close()
 
+    def test_va_release_derived(self) -> None:
+        """The derive_va_release step (#344) ran after prune: va_release
+        exists with its GIN trigram index and norm_title = lower(title) for
+        every row. Content is intentionally not pinned here — the fixture's
+        sole VA compilation (8001, artist 'Various') is pruned by the fuzzy
+        artist match against the library's 'Various Artists' rows, so the
+        derived table is empty in this run (published honestly under the
+        pipeline's --floor 0); the predicate itself is covered by
+        tests/integration/test_derive_va_release.py."""
+        conn = self._connect()
+        with conn.cursor() as cur:
+            cur.execute("SELECT title, norm_title FROM va_release")
+            for title, norm_title in cur.fetchall():
+                assert norm_title == title.lower()
+            cur.execute(
+                "SELECT 1 FROM pg_indexes WHERE tablename = 'va_release'"
+                " AND indexname = 'idx_va_release_norm_trgm'"
+            )
+            assert cur.fetchone() is not None
+        conn.close()
+
     def test_format_aware_dedup_and_prune(self) -> None:
         """Format-aware dedup + prune keeps only matching formats.
 

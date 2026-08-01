@@ -47,7 +47,7 @@ By default, `discogs-xml-converter` is expected on PATH. Use `--converter` to sp
 
 ## Pipeline
 
-All 8 steps are automated by `run_pipeline.py`. The script supports two modes: full pipeline from XML, or database build from pre-filtered CSVs.
+All 9 steps are automated by `run_pipeline.py`. The script supports two modes: full pipeline from XML, or database build from pre-filtered CSVs.
 
 | Step | Script | Description |
 |------|--------|-------------|
@@ -58,11 +58,12 @@ All 8 steps are automated by `run_pipeline.py`. The script supports two modes: f
 | 5. Create indexes | `schema/create_indexes.sql` | Accent-insensitive trigram GIN indexes for fuzzy search |
 | 6. Deduplicate | `scripts/dedup_releases.py` | Keep best release per master_id (label match, US, most tracks) |
 | 7. Prune/Copy | `scripts/verify_cache.py` | Remove non-library releases or copy matches to target DB |
-| 8. Vacuum | `VACUUM FULL` | Reclaim disk space |
+| 8. Derive va_release | `scripts/derive_va_release.py` | Re-derive the VA-compilation lookup table consumed by LML's comp matchers (#344) |
+| 9. Vacuum | `VACUUM FULL` | Reclaim disk space |
 
 ### Full Pipeline (--xml)
 
-Runs steps 1-8. `--xml` accepts either a single XML file or a directory containing XML dumps. When `--library-db` is provided, the pipeline generates `library_artists.txt` automatically and uses it to filter during XML conversion:
+Runs steps 1-9. `--xml` accepts either a single XML file or a directory containing XML dumps. When `--library-db` is provided, the pipeline generates `library_artists.txt` automatically and uses it to filter during XML conversion:
 
 ```bash
 # Single file (releases only)
@@ -94,7 +95,7 @@ Use `--library-artists` to provide a pre-existing artist list instead of generat
 
 ### Database Build (--csv-dir)
 
-Runs steps 3-8 from pre-filtered CSVs:
+Runs steps 3-9 from pre-filtered CSVs:
 
 ```bash
 python scripts/run_pipeline.py \

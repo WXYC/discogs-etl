@@ -12,12 +12,13 @@
 8. **Prune or Copy-to** -- one of:
     - `--prune`: delete non-matching releases in place (~89% data reduction, 3 GB -> 340 MB)
     - `--copy-to`/`--target-db-url`: copy matched releases to a separate database, preserving the full import
-9. **Vacuum** to reclaim disk space (`VACUUM FULL`)
-10. **SET LOGGED** to restore WAL durability for consumers
+9. **Derive `va_release`** (`scripts/derive_va_release.py`, #344) -- re-derive the VA-compilation lookup table now that dedup/prune have finalized release ids. `id` / `title` / `norm_title = lower(title)` plus a GIN trigram index on `norm_title`, selected from `release` ⋈ `release_artist` main credits matching the canonical Discogs Various artist (`artist_id = 194`, or the literal name `'Various'` for API-fetched rows whose `artist_id` is NULL). Consumed by library-metadata-lookup's compilation-matching scripts (`match_compilations.py`, `canonicalize_compilations.py`, and through them the `lml_cache.compilation_track_location` recall-index build). This is **derived data with snapshot semantics**: LOGGED (crash recovery must not empty it), no FK to `release` (so it stays out of the LOGGED/UNLOGGED flip lists and the truncate lists — protected by omission, refreshed only by re-derivation), and rebuilt atomically (DROP + CREATE TABLE AS + index in one transaction). The pipeline invocation passes `--floor 0`: post-rebuild, the pre-existing table's ids are stale, so an honest empty derivation beats the floor guard's rollback. The daily `sync-library.sh` re-derivation (see [`automation.md`](automation.md)) keeps the default floor of 1 so a transiently thin derivation can't replace a good table.
+10. **Vacuum** to reclaim disk space (`VACUUM FULL`)
+11. **SET LOGGED** to restore WAL durability for consumers
 
 `scripts/run_pipeline.py` supports two modes:
-- `--xml` mode: runs steps 3-10 (convert+filter, database build through SET LOGGED). `--xml` accepts a single file or a directory. Step 2 (enrich) is no longer part of the orchestrator — operators who want the artist-only filter run `wxyc-enrich-library-artists` separately and pass the result via `--library-artists`.
-- `--csv-dir` mode: runs steps 4-10 (database build from pre-filtered CSVs)
+- `--xml` mode: runs steps 3-11 (convert+filter, database build through SET LOGGED). `--xml` accepts a single file or a directory. Step 2 (enrich) is no longer part of the orchestrator — operators who want the artist-only filter run `wxyc-enrich-library-artists` separately and pass the result via `--library-artists`.
+- `--csv-dir` mode: runs steps 4-11 (database build from pre-filtered CSVs)
 
 Both modes support `--target-db-url` (deprecated, see below) to copy matched releases to a separate database instead of pruning in place, and `--resume` (csv-dir only) to skip already-completed steps. `--keep-csv` (xml mode only) writes converted CSVs to a persistent directory instead of a temp dir, so they survive pipeline failures.
 
@@ -120,7 +121,7 @@ docker compose up db -d     # just the database (for tests)
 
 ## Key Files
 
-- `scripts/run_pipeline.py` -- Pipeline orchestrator (--xml for steps 2-9, --csv-dir for steps 4-9). `write_keep_release_ids` reads `lml_cache.library_release_override` once per run and threads a `--keep-release-ids` allowlist file into every dedup/verify_cache.py invocation (see "Library Release Overrides" above).
+- `scripts/run_pipeline.py` -- Pipeline orchestrator (--xml for steps 3-11, --csv-dir for steps 4-11). `write_keep_release_ids` reads `lml_cache.library_release_override` once per run and threads a `--keep-release-ids` allowlist file into every dedup/verify_cache.py invocation (see "Library Release Overrides" above).
 - `scripts/filter_csv.py` -- Filter Discogs CSVs against the WXYC library. Two modes: (default) artist-only, takes `library_artists.txt`; (`--library-db`) pair-wise on `(artist, title)` against a SQLite library.db. Both filters now also exist on the Rust converter side (`discogs-xml-converter --library-artists` / `--library-db`); the converter applies them inside the streaming scanner so disk never holds the unfiltered output. This script remains as the Python parity reference (the converter's `tests/parity_test.rs` invokes it) and as a standalone tool for filtering pre-staged CSVs. Not on the rebuild-cache.sh path.
 - `scripts/import_csv.py` -- Import CSVs into PostgreSQL (psycopg COPY). Child tables are imported in parallel via ThreadPoolExecutor after parent tables. Artist detail tables (artist_alias, artist_member) are filtered to known artist IDs to prevent FK violations, since the converter's CSVs contain all Discogs artists. Tables with `unique_key` configs are deduped in-memory during COPY.
 - `scripts/dedup_releases.py` -- Deduplicate releases by master_id, preferring label match + sublabel resolution, US releases (copy-swap with `DROP CASCADE`). Index/constraint creation is parallelized via ThreadPoolExecutor. `--keep-release-ids <FILE>` exempts pinned WXYC library overrides from deletion regardless of rank (see "Library Release Overrides" above).
