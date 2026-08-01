@@ -265,8 +265,11 @@ class TestKnownArtistFastPath:
 class TestPipelineStateV1Resume:
     """Test that v1 pipeline state files are correctly migrated and resume works.
 
-    V1 state files have 6 steps. V3 has 9 steps. The migration must correctly
-    infer the completion status of the 3 new steps.
+    V1 state files have 6 steps. V3 now has 10 steps, 4 of them absent from
+    v1: the wxyc-etl migration infers import_tracks / create_track_indexes /
+    set_logged, while derive_va_release (#344) deliberately stays pending —
+    the migration predates it, and default-pending re-runs the derivation on
+    resume, which is its designed semantics.
     """
 
     def _make_v1_state(self, tmp_path: Path, completed: list[str]) -> Path:
@@ -358,7 +361,9 @@ class TestPipelineStateV1Resume:
 class TestPipelineStateV2Resume:
     """Test that v2 pipeline state files are correctly migrated and resume works.
 
-    V2 state files have 8 steps. V3 adds set_logged after vacuum.
+    V2 state files have 8 steps. V3 added set_logged after vacuum (inferred
+    from vacuum by the migration); derive_va_release (#344) was appended
+    later at version 3 and stays pending after migration by design.
     """
 
     def _make_v2_state(self, tmp_path: Path, completed: list[str]) -> Path:

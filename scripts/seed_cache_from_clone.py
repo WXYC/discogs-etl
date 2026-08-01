@@ -10,6 +10,12 @@ local clone already holds those releases in the right shape; this script copies
 exactly the tail artists' releases clone -> prod, additively, so LML resolves
 them as fast cache hits.
 
+Note (#344): seeded rows are invisible to the derived ``va_release`` table
+until its next re-derivation (daily via sync-library.sh, or a manual
+``scripts/derive_va_release.py`` run). If a seeding session is followed
+immediately by an LML compilation-matching or recall-index build, run the
+derive first so just-seeded VA credits are matchable.
+
 Design (see plans/bs1631-tail-cache-seed.md):
 
   * Filter unit is the *artist* -- callers pass the release_id set already
