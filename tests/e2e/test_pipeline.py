@@ -126,18 +126,18 @@ class TestPipeline:
 
     def test_va_release_derived(self) -> None:
         """The derive_va_release step (#344) ran after prune: va_release
-        exists with its GIN trigram index and norm_title = lower(title) for
-        every row. Content is intentionally not pinned here — the fixture's
-        sole VA compilation (8001, artist 'Various') is pruned by the fuzzy
-        artist match against the library's 'Various Artists' rows, so the
-        derived table is empty in this run (published honestly under the
-        pipeline's --floor 0); the predicate itself is covered by
+        exists with its GIN trigram index. The expected content in THIS run
+        is zero rows — the fixture's sole VA compilation (8001, artist
+        'Various') is pruned by the fuzzy artist match against the library's
+        'Various Artists' rows, and the pipeline's --floor 0 publishes that
+        emptiness honestly. Pinning the 0 keeps the assertion real (a prune
+        drift that un-prunes 8001 shows up here explicitly); the predicate
+        and norm_title semantics are covered with actual rows by
         tests/integration/test_derive_va_release.py."""
         conn = self._connect()
         with conn.cursor() as cur:
-            cur.execute("SELECT title, norm_title FROM va_release")
-            for title, norm_title in cur.fetchall():
-                assert norm_title == title.lower()
+            cur.execute("SELECT count(*) FROM va_release")
+            assert cur.fetchone()[0] == 0
             cur.execute(
                 "SELECT 1 FROM pg_indexes WHERE tablename = 'va_release'"
                 " AND indexname = 'idx_va_release_norm_trgm'"

@@ -62,7 +62,7 @@ The `entity.*` schema in the cache database is **owned by this repo** and is cre
 
 ### `va_release` (derived, this repo's)
 
-`public.va_release` is a **derived** VA-compilation lookup table owned by this repo (#344): re-derived by pipeline step 9 on every rebuild and daily by `sync-library.sh`, consumed read-only by library-metadata-lookup's compilation-matching scripts (`match_compilations.py`, `canonicalize_compilations.py`, the recall-index build). LML must not create or migrate it — same ownership rule as the rest of the public schema. DDL lives solely in `scripts/derive_va_release.py`; it is deliberately absent from `schema/create_database.sql`, the truncate lists, and `PIPELINE_TABLES` (no FK, snapshot semantics — see `docs/architecture.md` step 9).
+`public.va_release` is a **derived** VA-compilation lookup table owned by this repo (#344): re-derived on every library-scoped rebuild (pipeline step 9 in `docs/architecture.md`'s numbering — README's coarser table calls it step 8) and daily by `sync-library.sh`, consumed read-only by library-metadata-lookup's compilation-matching scripts (`match_compilations.py`, `canonicalize_compilations.py`, the recall-index build). LML must not create or migrate it — same ownership rule as the rest of the public schema. DDL lives solely in `scripts/derive_va_release.py`; it is deliberately absent from `schema/create_database.sql`, the truncate lists, and `PIPELINE_TABLES` (no FK, snapshot semantics — see `docs/architecture.md` step 9).
 
 ### Advisory lock keys (shared-PG registry)
 

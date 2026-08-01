@@ -3,7 +3,7 @@
 
 Two modes of operation:
 
-  Full pipeline from XML (steps 1-10):
+  Full pipeline from XML (steps 1-11):
     python scripts/run_pipeline.py \\
       --xml <releases.xml.gz> \\
       [--library-artists <library_artists.txt> | --library-db <library.db>] \\
@@ -11,7 +11,7 @@ Two modes of operation:
       [--wxyc-db-url <mysql://user:pass@host:port/db>] \\
       [--database-url <url>]
 
-  Database build from pre-filtered CSVs (steps 4-10):
+  Database build from pre-filtered CSVs (steps 4-11):
     python scripts/run_pipeline.py \\
       --csv-dir <path/to/filtered/> \\
       [--library-db <library.db>] \\
@@ -484,6 +484,51 @@ def run_step(description: str, cmd: list[str], **kwargs) -> None:
         # mask the failure. Default exception handler still exits non-zero.
         raise subprocess.CalledProcessError(proc.returncode, cmd)
     logger.info("  completed in %.1fs", elapsed)
+
+
+def run_derive_va_release_step(db_url: str, python: str) -> bool:
+    """Best-effort derive_va_release step (#344), shared by both build paths.
+
+    Passes ``--floor 0``: post-rebuild the pre-existing table holds
+    pre-rebuild ids (stale garbage), so an honest empty derivation beats the
+    floor guard's rollback to it — the floor protects the daily sync path,
+    not this one.
+
+    Soft-fail by design: the table is an ancillary derived artifact consumed
+    only by LML's offline compilation scripts, and the xml/direct-pg paths
+    have no resume state — a transient failure here must not discard a
+    multi-hour rebuild or strand the pipeline tables UNLOGGED. On failure the
+    stale pre-rebuild table is dropped best-effort (absent is honest and
+    self-heals on the next daily sync; stale ids would silently mismatch the
+    rebuilt cache) and the build continues. Returns True when the derivation
+    succeeded (callers use this to decide whether to mark resume state).
+    """
+    cmd = [
+        python,
+        str(SCRIPT_DIR / "derive_va_release.py"),
+        "--database-url",
+        db_url,
+        "--floor",
+        "0",
+    ]
+    try:
+        run_step("Derive va_release", cmd)
+    except subprocess.CalledProcessError as exc:
+        logger.warning(
+            "derive_va_release failed (%s); dropping the stale table and continuing "
+            "(the next daily sync re-derives it)",
+            exc,
+        )
+        try:
+            conn = psycopg.connect(db_url, autocommit=True)
+            try:
+                conn.execute("DROP TABLE IF EXISTS va_release")
+            finally:
+                conn.close()
+        except Exception as drop_exc:
+            logger.warning("could not drop stale va_release after derive failure: %s", drop_exc)
+        return False
+    return True
 
 
 def run_vacuum(db_url: str) -> None:
@@ -1293,21 +1338,14 @@ def _run_database_build_post_import(
         logger.info("Skipping prune step (no library.db provided)")
 
     # -- derive_va_release (#344): re-derive the VA-compilation lookup table
-    # now that dedup/prune have finalized release ids. --floor 0: after a
-    # rebuild the pre-existing table holds pre-rebuild ids (stale garbage),
-    # so an honest empty derivation beats the floor guard's rollback to it —
-    # the floor protects the daily sync path, not this one.
-    run_step(
-        "Derive va_release",
-        [
-            python,
-            str(SCRIPT_DIR / "derive_va_release.py"),
-            "--database-url",
-            db_url,
-            "--floor",
-            "0",
-        ],
-    )
+    # now that dedup/prune have finalized release ids. Gated like prune: on a
+    # build without library.db nothing consumes the table, and the unpruned
+    # cache makes the derivation orders of magnitude more expensive. See
+    # run_derive_va_release_step for the --floor 0 and soft-fail rationale.
+    if library_db:
+        run_derive_va_release_step(db_url, python)
+    else:
+        logger.info("Skipping derive_va_release step (no library.db provided)")
 
     # -- vacuum
     run_vacuum(db_url)
@@ -1589,33 +1627,29 @@ def _run_database_build(
             state.mark_completed("prune")
             _save_state()
 
+    # The DB consumers read: the copy-to target when set, otherwise the
+    # source. Shared by derive_va_release, vacuum, and set_logged below so
+    # the three can never diverge on which database they finalize.
+    consumer_db_url = target_db_url if target_db_url else db_url
+
     # -- derive_va_release (#344): re-derive the VA-compilation lookup table
-    # now that dedup/prune have finalized release ids. Runs on the target DB
-    # in copy-to mode (the one consumers read), like vacuum below. --floor 0:
-    # after a rebuild the pre-existing table holds pre-rebuild ids (stale
-    # garbage), so an honest empty derivation beats the floor guard's
-    # rollback to it — the floor protects the daily sync path, not this one.
-    derive_db_url = target_db_url if target_db_url else db_url
+    # now that dedup/prune have finalized release ids. Gated like prune; see
+    # run_derive_va_release_step for the --floor 0 and soft-fail rationale.
     if state and state.is_completed("derive_va_release"):
         logger.info("Skipping derive_va_release (already completed)")
-    else:
-        run_step(
-            "Derive va_release",
-            [
-                python,
-                str(SCRIPT_DIR / "derive_va_release.py"),
-                "--database-url",
-                derive_db_url,
-                "--floor",
-                "0",
-            ],
-        )
+    elif not library_db:
+        logger.info("Skipping derive_va_release step (no library.db provided)")
         if state:
+            state.mark_completed("derive_va_release")
+            _save_state()
+    else:
+        derived = run_derive_va_release_step(consumer_db_url, python)
+        if state and derived:
             state.mark_completed("derive_va_release")
             _save_state()
 
     # -- vacuum (on target DB if using copy-to, otherwise source)
-    vacuum_db = target_db_url if target_db_url else db_url
+    vacuum_db = consumer_db_url
     if state and state.is_completed("vacuum"):
         logger.info("Skipping vacuum (already completed)")
     else:

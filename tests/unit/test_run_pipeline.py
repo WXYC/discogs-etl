@@ -2018,8 +2018,10 @@ class TestDeriveVaReleaseStep:
     """The derive_va_release step (#344) runs after prune in both build paths,
     always with --floor 0 (post-rebuild, the pre-existing table's ids are
     stale garbage, so publishing an honest empty derivation beats rolling
-    back to it), and in copy-to mode derives on the target DB — the one
-    consumers read — exactly like vacuum."""
+    back to it), gated on library_db exactly like prune (unpruned builds pay
+    minutes of derivation no consumer reads), soft-fail (a transient failure
+    must not discard a non-resumable multi-hour rebuild), and in copy-to mode
+    derives on the target DB — the one consumers read — exactly like vacuum."""
 
     def _mock_conn(self):
         mock_cursor = MagicMock()
@@ -2033,13 +2035,25 @@ class TestDeriveVaReleaseStep:
         mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
         return mock_conn
 
-    def _invoke_database_build(self, *, target_db_url=None, state=None) -> list[list[str]]:
+    def _invoke_database_build(
+        self,
+        *,
+        target_db_url=None,
+        state=None,
+        library_db=Path("/tmp/library.db"),
+        fail_derive=False,
+        mock_conn=None,
+    ) -> list[list[str]]:
+        import subprocess
+
         import psycopg
 
         captured_cmds: list[list[str]] = []
 
         def fake_run_step(step_name, cmd, *args, **kwargs):
             captured_cmds.append(cmd)
+            if fail_derive and any("derive_va_release.py" in str(part) for part in cmd):
+                raise subprocess.CalledProcessError(1, cmd)
 
         with (
             patch.object(run_pipeline, "run_step", side_effect=fake_run_step),
@@ -2052,7 +2066,7 @@ class TestDeriveVaReleaseStep:
             patch.object(run_pipeline, "report_sizes"),
             patch.object(run_pipeline, "check_reload_invariant") as mock_check,
             patch.object(run_pipeline, "write_keep_release_ids", return_value=0),
-            patch.object(psycopg, "connect", return_value=self._mock_conn()),
+            patch.object(psycopg, "connect", return_value=mock_conn or self._mock_conn()),
         ):
             mock_check.return_value = run_pipeline.ReloadInvariantResult(
                 ok=True, release_count=1, artist_coverage=1.0, track_coverage=1.0
@@ -2060,7 +2074,7 @@ class TestDeriveVaReleaseStep:
             run_pipeline._run_database_build(
                 "postgresql:///test",
                 Path("/tmp/csv"),
-                Path("/tmp/library.db"),
+                library_db,
                 sys.executable,
                 target_db_url=target_db_url,
                 state=state,
@@ -2157,3 +2171,37 @@ class TestDeriveVaReleaseStep:
         loaded.mark_completed("derive_va_release")
         loaded.save(str(state_file))
         assert PipelineState.load(str(state_file)).is_completed("derive_va_release")
+
+    def test_no_library_db_skips_derive(self) -> None:
+        cmds = self._derive_cmds(self._invoke_database_build(library_db=None))
+        assert cmds == []
+
+    def test_derive_failure_soft_fails_and_drops_stale_table(self) -> None:
+        """A derive failure must not abort the build (the xml/direct-pg paths
+        have no resume state and the tables are still UNLOGGED here); the
+        stale pre-rebuild table is dropped best-effort so it can't silently
+        mismatch the rebuilt cache, and the next daily sync re-derives."""
+        mock_conn = self._mock_conn()
+        cmds = self._invoke_database_build(fail_derive=True, mock_conn=mock_conn)
+        # The build completed: prune ran before the derive, and no exception
+        # escaped (this call returning at all proves vacuum/set_logged were
+        # reached, since they are mocked no-ops after the derive block).
+        assert any("--prune" in c for c in cmds)
+        drop_calls = [
+            call
+            for call in mock_conn.execute.call_args_list
+            if "DROP TABLE IF EXISTS va_release" in str(call)
+        ]
+        assert drop_calls, "expected a best-effort DROP of the stale va_release"
+
+    def test_derive_failure_leaves_resume_state_pending(self) -> None:
+        pytest.importorskip("wxyc_etl.state", reason="wxyc-etl not installed")
+        from wxyc_etl.state import PipelineState
+
+        state = PipelineState(
+            db_url="postgresql:///test",
+            csv_dir="/tmp/csv",
+            steps=run_pipeline.STEP_NAMES,
+        )
+        self._invoke_database_build(fail_derive=True, state=state)
+        assert not state.is_completed("derive_va_release")
