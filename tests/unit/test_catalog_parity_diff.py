@@ -433,6 +433,47 @@ class TestRunDiff:
         result = mod.run_diff(str(mysql_db), str(backend_db))
         assert result.matched == 1
 
+    def test_duplicate_id_raises_source_error(self, tmp_path: Path) -> None:
+        """A library.db with duplicate ids is malformed; collapsing it (last-wins)
+        would silently hide row-count drift, so it must raise rather than under-count."""
+        mod = _load_module()
+        mysql_db = tmp_path / "mysql.db"
+        backend_db = tmp_path / "backend.db"
+        _make_library_db(mysql_db, [{"id": 1}])
+        # backend.db has a `library` table without the id PRIMARY KEY, so it can
+        # hold two rows with the same id -- the exact malformed-producer case a
+        # parity harness must surface, not swallow.
+        conn = sqlite3.connect(backend_db)
+        conn.execute(
+            """CREATE TABLE library (
+            id INTEGER, title TEXT, artist TEXT, call_letters TEXT,
+            artist_call_number INTEGER, release_call_number INTEGER,
+            genre TEXT, format TEXT, alternate_artist_name TEXT,
+            album_artist TEXT, label TEXT, cross_reference_names TEXT
+        )"""
+        )
+        conn.executemany("INSERT INTO library (id) VALUES (?)", [(1,), (1,)])
+        conn.commit()
+        conn.close()
+
+        with pytest.raises(mod.SourceError):
+            mod.run_diff(str(mysql_db), str(backend_db))
+
+    def test_path_with_special_uri_chars_opens_read_only(self, tmp_path: Path) -> None:
+        """Paths containing URI-significant characters (?, #, space) must be
+        percent-encoded before building the file: URI, or the `?mode=ro` query
+        gets misparsed -- opening the wrong file (or dropping read-only)."""
+        mod = _load_module()
+        weird_dir = tmp_path / "we ird?dir#x"
+        weird_dir.mkdir()
+        mysql_db = weird_dir / "mysql.db"
+        backend_db = weird_dir / "backend.db"
+        _make_library_db(mysql_db, [{"id": 1, "genre": "Rock"}])
+        _make_library_db(backend_db, [{"id": 1, "genre": "Rock"}])
+
+        result = mod.run_diff(str(mysql_db), str(backend_db))
+        assert result.matched == 1
+
 
 class TestMainCli:
     """CLI wiring: argument validation, JSON contract, exit codes."""
@@ -468,6 +509,28 @@ class TestMainCli:
         _make_library_db(mysql_db, [{"id": 1}])
         conn = sqlite3.connect(backend_db)
         conn.execute("CREATE TABLE unrelated (id INTEGER)")
+        conn.commit()
+        conn.close()
+
+        exit_code = mod.main(["--mysql-db", str(mysql_db), "--backend-db", str(backend_db)])
+        assert exit_code == 3
+
+    def test_duplicate_id_exits_3(self, tmp_path: Path) -> None:
+        """A malformed input (duplicate library.id) is a source error -> exit 3."""
+        mod = _load_module()
+        mysql_db = tmp_path / "mysql.db"
+        backend_db = tmp_path / "backend.db"
+        _make_library_db(backend_db, [{"id": 1}])
+        conn = sqlite3.connect(mysql_db)
+        conn.execute(
+            """CREATE TABLE library (
+            id INTEGER, title TEXT, artist TEXT, call_letters TEXT,
+            artist_call_number INTEGER, release_call_number INTEGER,
+            genre TEXT, format TEXT, alternate_artist_name TEXT,
+            album_artist TEXT, label TEXT, cross_reference_names TEXT
+        )"""
+        )
+        conn.executemany("INSERT INTO library (id) VALUES (?)", [(7,), (7,)])
         conn.commit()
         conn.close()
 
