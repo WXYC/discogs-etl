@@ -128,11 +128,26 @@ MYSQL_PORT="${DB_PORT:-3306}"
 # reads for the XML-converter artist filter -- here it rides along on every
 # library.db row instead of only feeding that allowlist. See
 # WXYC/discogs-etl#334.
+#
+# ALTERNATE_ARTIST_NAME, ALBUM_ARTIST, and the CROSS_REFERENCE_NAMES subquery
+# are wrapped in IFNULL(<expr>, '') because `mysql -B -N` on this server
+# prints a genuine SQL NULL as the literal 4-character text "NULL", not the
+# "\N" sentinel tsv_to_sqlite.py's parser expects -- and since ALBUM_ARTIST
+# feeds the library_fts index, an unwrapped NULL became a literal 'NULL'
+# string that a typed search for "null" then matched against the whole
+# catalog (verified in prod: 64,780 album_artist / 63,904
+# cross_reference_names rows). IFNULL only ever substitutes for a *real* SQL
+# NULL, so an artist or cross-reference genuinely named the text "NULL"
+# still passes through untouched -- this is deliberately a SQL-layer fix, not
+# Python string-sniffing in tsv_to_sqlite.py, which would risk corrupting
+# that row instead. The other columns in this SELECT (ID, TITLE,
+# PRESENTATION_NAME, CALL_LETTERS, both CALL_NUMBERS, and both REFERENCE_NAME
+# columns) are always populated and are left unwrapped.
 ETL_OUTPUT=$(mktemp)
 CSV_FILE=$(mktemp)
 if ! MYSQL_PWD="$LIBRARY_DB_PASSWORD" mysql -h "$MYSQL_HOST" -P "$MYSQL_PORT" -u "$LIBRARY_DB_USER" \
     --default-character-set=utf8 -B -N "$LIBRARY_DB_NAME" \
-    -e "SELECT r.ID, r.TITLE, lc.PRESENTATION_NAME, lc.CALL_LETTERS, lc.CALL_NUMBERS, r.CALL_NUMBERS, g.REFERENCE_NAME, f.REFERENCE_NAME, r.ALTERNATE_ARTIST_NAME, r.ALBUM_ARTIST, (SELECT GROUP_CONCAT(DISTINCT xlc.PRESENTATION_NAME SEPARATOR ' | ') FROM LIBRARY_CODE_CROSS_REFERENCE xcr, LIBRARY_CODE xlc WHERE xlc.ID = CASE WHEN xcr.CROSS_REFERENCING_ARTIST_ID = lc.ID THEN xcr.CROSS_REFERENCED_LIBRARY_CODE_ID WHEN xcr.CROSS_REFERENCED_LIBRARY_CODE_ID = lc.ID THEN xcr.CROSS_REFERENCING_ARTIST_ID ELSE NULL END AND (xcr.CROSS_REFERENCING_ARTIST_ID = lc.ID OR xcr.CROSS_REFERENCED_LIBRARY_CODE_ID = lc.ID) AND xlc.ID != lc.ID) FROM LIBRARY_RELEASE r JOIN LIBRARY_CODE lc ON r.LIBRARY_CODE_ID = lc.ID JOIN FORMAT f ON r.FORMAT_ID = f.ID JOIN GENRE g ON lc.GENRE_ID = g.ID" \
+    -e "SELECT r.ID, r.TITLE, lc.PRESENTATION_NAME, lc.CALL_LETTERS, lc.CALL_NUMBERS, r.CALL_NUMBERS, g.REFERENCE_NAME, f.REFERENCE_NAME, IFNULL(r.ALTERNATE_ARTIST_NAME, ''), IFNULL(r.ALBUM_ARTIST, ''), IFNULL((SELECT GROUP_CONCAT(DISTINCT xlc.PRESENTATION_NAME SEPARATOR ' | ') FROM LIBRARY_CODE_CROSS_REFERENCE xcr, LIBRARY_CODE xlc WHERE xlc.ID = CASE WHEN xcr.CROSS_REFERENCING_ARTIST_ID = lc.ID THEN xcr.CROSS_REFERENCED_LIBRARY_CODE_ID WHEN xcr.CROSS_REFERENCED_LIBRARY_CODE_ID = lc.ID THEN xcr.CROSS_REFERENCING_ARTIST_ID ELSE NULL END AND (xcr.CROSS_REFERENCING_ARTIST_ID = lc.ID OR xcr.CROSS_REFERENCED_LIBRARY_CODE_ID = lc.ID) AND xlc.ID != lc.ID), '') FROM LIBRARY_RELEASE r JOIN LIBRARY_CODE lc ON r.LIBRARY_CODE_ID = lc.ID JOIN FORMAT f ON r.FORMAT_ID = f.ID JOIN GENRE g ON lc.GENRE_ID = g.ID" \
     > "$CSV_FILE" 2> "$ETL_OUTPUT"; then
     ERROR_DETAILS=$(cat "$ETL_OUTPUT" | tail -1 | sed 's/"/\\"/g')
     cat "$ETL_OUTPUT" >> "$LOG_FILE"
@@ -156,12 +171,19 @@ log "Fetched $ROW_COUNT rows from MySQL"
 # no COMPILATION_TRACK_ARTIST table, so a "doesn't exist" failure here is expected
 # and must not fail the overall library sync (or any other CTA-fetch error, since
 # CTA is supplementary -- LIBRARY_RELEASE must never be blocked by it).
+#
+# TRACK_TITLE is wrapped in IFNULL(TRACK_TITLE, '') for the same reason as
+# ALBUM_ARTIST/ALTERNATE_ARTIST_NAME above: this is the same `mysql -B -N`
+# invocation style, so a genuine SQL NULL here renders as the literal text
+# "NULL" too. LIBRARY_RELEASE_ID and ARTIST_NAME are documented NOT NULL
+# (see _import_compilation_track_artists in tsv_to_sqlite.py) and stay
+# unwrapped.
 CTA_CSV_FILE=$(mktemp)
 CTA_ETL_OUTPUT=$(mktemp)
 CTA_TSV_ARGS=()
 if MYSQL_PWD="$LIBRARY_DB_PASSWORD" mysql -h "$MYSQL_HOST" -P "$MYSQL_PORT" -u "$LIBRARY_DB_USER" \
     --default-character-set=utf8 -B -N "$LIBRARY_DB_NAME" \
-    -e "SELECT LIBRARY_RELEASE_ID, ARTIST_NAME, TRACK_TITLE FROM COMPILATION_TRACK_ARTIST ORDER BY LIBRARY_RELEASE_ID" \
+    -e "SELECT LIBRARY_RELEASE_ID, ARTIST_NAME, IFNULL(TRACK_TITLE, '') FROM COMPILATION_TRACK_ARTIST ORDER BY LIBRARY_RELEASE_ID" \
     > "$CTA_CSV_FILE" 2> "$CTA_ETL_OUTPUT"; then
     CTA_ROW_COUNT=$(wc -l < "$CTA_CSV_FILE" | tr -d ' ')
     log "Fetched $CTA_ROW_COUNT compilation track artist rows from MySQL"
