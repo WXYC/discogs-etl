@@ -42,8 +42,9 @@ Exit codes:
   parity.
 - ``2`` -- bad arguments (missing required flags, or the reserved
   build-from-source flags).
-- ``3`` -- source/read error: missing file, unreadable database, or a
-  required table (``library``) absent from one of the inputs.
+- ``3`` -- source/read error: missing file, unreadable database, a required
+  table (``library``) absent from one of the inputs, or a malformed input
+  (duplicate ``library.id``, which a valid library.db's primary key forbids).
 
 Never writes to either input: both files are opened as read-only SQLite
 connections (``mode=ro``).
@@ -68,7 +69,7 @@ logger = logging.getLogger(__name__)
 
 
 class SourceError(RuntimeError):
-    """A library.db input could not be read: missing file, unreadable, or missing a table."""
+    """A library.db input is unusable: missing file, unreadable, missing a required table, or malformed (duplicate id)."""
 
 
 # The exact `library` table column list, derived from scripts/tsv_to_sqlite.py's
