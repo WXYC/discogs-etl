@@ -59,6 +59,7 @@ import sys
 from collections import Counter
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from urllib.request import pathname2url
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from lib.observability import init_logger  # noqa: E402
@@ -159,7 +160,12 @@ def _open_readonly(path: str, label: str) -> sqlite3.Connection:
     p = Path(path)
     if not p.is_file():
         raise SourceError(f"{label} database not found: {path}")
-    uri = f"file:{p.resolve().as_posix()}?mode=ro"
+    # Percent-encode the path before splicing it into the file: URI. A raw path
+    # containing a URI-significant character (?, #, or a space) would otherwise
+    # be misparsed -- e.g. a `?` in the path prematurely starts the query string,
+    # silently dropping the `?mode=ro` read-only guard and/or opening the wrong
+    # file. pathname2url encodes those characters while leaving `/` intact.
+    uri = f"file:{pathname2url(str(p.resolve()))}?mode=ro"
     try:
         conn = sqlite3.connect(uri, uri=True)
         conn.execute("SELECT 1")  # surface "file is not a database" errors immediately
@@ -168,14 +174,27 @@ def _open_readonly(path: str, label: str) -> sqlite3.Connection:
     return conn
 
 
-def _load_library_rows(conn: sqlite3.Connection) -> dict[int, dict[str, object]]:
-    """Read every ``library`` row, keyed by ``id``."""
+def _load_library_rows(conn: sqlite3.Connection, label: str) -> dict[int, dict[str, object]]:
+    """Read every ``library`` row, keyed by ``id``.
+
+    A valid daily-sync ``library.db`` has ``id INTEGER PRIMARY KEY`` (see
+    ``scripts/tsv_to_sqlite.py``), so ids are unique. If two rows share an id
+    the input is malformed; keying into a dict would silently keep only the
+    last (hiding a row-count divergence this parity harness exists to catch),
+    so we raise ``SourceError`` instead of under-counting.
+    """
     cols = ", ".join(LIBRARY_COLUMNS)
     rows = conn.execute(f"SELECT {cols} FROM library").fetchall()
     result: dict[int, dict[str, object]] = {}
     for row in rows:
         record = dict(zip(LIBRARY_COLUMNS, row, strict=True))
-        result[int(record["id"])] = record
+        row_id = int(record["id"])
+        if row_id in result:
+            raise SourceError(
+                f"{label} database has a duplicate library.id ({row_id}); "
+                "a valid library.db has a unique id primary key"
+            )
+        result[row_id] = record
     return result
 
 
@@ -201,8 +220,8 @@ def diff_library_dbs(
     Assumes both connections have a ``library`` table (callers -- ``run_diff``
     -- are responsible for validating that up front via ``_require_table``).
     """
-    mysql_rows = _load_library_rows(mysql_conn)
-    backend_rows = _load_library_rows(backend_conn)
+    mysql_rows = _load_library_rows(mysql_conn, "mysql")
+    backend_rows = _load_library_rows(backend_conn, "backend")
 
     mysql_ids = set(mysql_rows)
     backend_ids = set(backend_rows)
