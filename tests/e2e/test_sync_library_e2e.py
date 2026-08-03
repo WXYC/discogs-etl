@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import re
 import sqlite3
 import subprocess
 import sys
@@ -243,3 +244,155 @@ class TestCompilationTrackLocationInvocation:
         # Only the "Various Artists" row is compilation-shelf (Stereolab isn't);
         # is_compilation_artist is the same wxyc_etl classifier discogs-etl uses.
         assert comp_ids == {20001}
+
+
+# --- literal-NULL-string bugfix (verified in prod 2026-08-02) --------------
+#
+# ``mysql -B -N`` (the CLI mode sync-library.sh uses) prints a genuine SQL
+# NULL on this server as the literal 4-character text "NULL", not the "\N"
+# sentinel tsv_to_sqlite.py's parser expects. Left unwrapped, that literal
+# text lands in SQLite as the *string* 'NULL' -- and since album_artist feeds
+# library_fts, a typed search for "null" matched the whole catalog.
+#
+# The fix is in the SQL text (IFNULL(<col>, '')), not in tsv_to_sqlite.py's
+# Python: an artist genuinely named "NULL" must survive, so string-sniffing
+# for the text 'NULL' would silently corrupt that row instead. There is no
+# MySQL server available in this environment, so these tests execute the
+# *actual* wrapped column expressions -- extracted live from
+# scripts/sync-library.sh -- against SQLite, which implements IFNULL
+# identically to MySQL for a plain column reference. This is a stronger,
+# self-updating proof than a hand-duplicated SQL string: if the wrap is
+# missing or malformed, the test fails for the right reason (the bare column
+# selects real NULL/None instead of '').
+_SYNC_SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "sync-library.sh"
+
+# Anchor on the actual `-e "SELECT ..."` mysql invocations, not the whole file
+# -- the file's own explanatory comments (necessarily) mention these same
+# column names in prose, and a naive whole-file search could match a comment
+# instead of the live SQL.
+_LIBRARY_SELECT_RE = re.compile(
+    r"-e \"(SELECT r\.ID.*?"
+    r"FROM LIBRARY_RELEASE r JOIN LIBRARY_CODE lc ON r\.LIBRARY_CODE_ID = lc\.ID "
+    r"JOIN FORMAT f ON r\.FORMAT_ID = f\.ID JOIN GENRE g ON lc\.GENRE_ID = g\.ID)\"",
+    re.DOTALL,
+)
+_CTA_SELECT_RE = re.compile(
+    r"-e \"(SELECT LIBRARY_RELEASE_ID.*?FROM COMPILATION_TRACK_ARTIST ORDER BY LIBRARY_RELEASE_ID)\"",
+    re.DOTALL,
+)
+
+
+def _library_select_text() -> str:
+    match = _LIBRARY_SELECT_RE.search(_SYNC_SCRIPT.read_text())
+    assert match, f"could not locate the LIBRARY_RELEASE SELECT in {_SYNC_SCRIPT.name}"
+    return match.group(1)
+
+
+def _cta_select_text() -> str:
+    match = _CTA_SELECT_RE.search(_SYNC_SCRIPT.read_text())
+    assert match, f"could not locate the COMPILATION_TRACK_ARTIST SELECT in {_SYNC_SCRIPT.name}"
+    return match.group(1)
+
+
+def _extract_column_expr(select_text: str, table_alias: str, column: str) -> str:
+    """Return whatever expression currently selects `column` in `select_text`
+    (the isolated SQL SELECT clause, not the whole script): either the bare
+    `alias.COLUMN` reference or an `IFNULL(alias.COLUMN, '')` wrap, whichever
+    the script actually contains right now."""
+    pattern = re.compile(
+        rf"(IFNULL\({re.escape(table_alias)}\.{re.escape(column)}, ''\)"
+        rf"|{re.escape(table_alias)}\.{re.escape(column)})"
+    )
+    match = pattern.search(select_text)
+    assert match, f"could not find {table_alias}.{column} in the SELECT clause"
+    return match.group(1)
+
+
+def _extract_bare_column_expr(select_text: str, column: str) -> str:
+    """Same as _extract_column_expr but for the un-aliased CTA SELECT."""
+    pattern = re.compile(rf"(IFNULL\({re.escape(column)}, ''\)|{re.escape(column)})")
+    match = pattern.search(select_text)
+    assert match, f"could not find {column} in the SELECT clause"
+    return match.group(1)
+
+
+class TestLibrarySelectRealNullVsLiteralNullText:
+    """A real SQL NULL must become '' (via IFNULL); an artist/track genuinely
+    named the text "NULL" must pass through untouched."""
+
+    def test_album_artist_real_null_becomes_empty_string_literal_null_text_survives(
+        self,
+    ) -> None:
+        expr = _extract_column_expr(_library_select_text(), "r", "ALBUM_ARTIST")
+
+        conn = sqlite3.connect(":memory:")
+        conn.execute("CREATE TABLE r (ALBUM_ARTIST TEXT)")
+        conn.execute("INSERT INTO r (ALBUM_ARTIST) VALUES (NULL)")
+        conn.execute("INSERT INTO r (ALBUM_ARTIST) VALUES ('NULL')")
+        rows = [row[0] for row in conn.execute(f"SELECT {expr} FROM r").fetchall()]
+        conn.close()
+
+        assert rows == ["", "NULL"], (
+            "a real SQL NULL album_artist must become '' and a literal text "
+            "'NULL' album_artist must survive unchanged"
+        )
+
+    def test_alternate_artist_name_real_null_becomes_empty_string_literal_null_text_survives(
+        self,
+    ) -> None:
+        expr = _extract_column_expr(_library_select_text(), "r", "ALTERNATE_ARTIST_NAME")
+
+        conn = sqlite3.connect(":memory:")
+        conn.execute("CREATE TABLE r (ALTERNATE_ARTIST_NAME TEXT)")
+        conn.execute("INSERT INTO r (ALTERNATE_ARTIST_NAME) VALUES (NULL)")
+        conn.execute("INSERT INTO r (ALTERNATE_ARTIST_NAME) VALUES ('NULL')")
+        rows = [row[0] for row in conn.execute(f"SELECT {expr} FROM r").fetchall()]
+        conn.close()
+
+        assert rows == ["", "NULL"]
+
+    def test_cross_reference_names_ifnull_pattern_converts_null_subquery_to_empty_string(
+        self,
+    ) -> None:
+        """The real cross_reference_names expression is a correlated
+        GROUP_CONCAT subquery using MySQL-only syntax (``SEPARATOR``, an
+        old-style comma-join) that doesn't parse under SQLite, so this
+        doesn't execute the literal production text the way the two tests
+        above do. It instead proves the same *pattern* the fix applies to
+        that subquery -- IFNULL wrapped around an expression that yields SQL
+        NULL when no cross-reference exists (the common case: 63,904 NULL
+        rows in prod) -- converts that NULL to ''. The wiring test in
+        tests/unit/test_sync_library_null_handling.py separately pins that
+        the actual subquery in sync-library.sh is wrapped this way.
+        """
+        conn = sqlite3.connect(":memory:")
+        conn.execute("CREATE TABLE lc (id INTEGER PRIMARY KEY)")
+        conn.execute("CREATE TABLE xref (lc_id INTEGER, other_name TEXT)")
+        conn.execute("INSERT INTO lc (id) VALUES (1)")
+        # No matching xref row for lc.id = 1 -> the correlated subquery below
+        # returns SQL NULL, mirroring the no-cross-reference case in prod.
+        rows = conn.execute(
+            "SELECT IFNULL("
+            "  (SELECT group_concat(other_name) FROM xref WHERE xref.lc_id = lc.id),"
+            "  ''"
+            ") FROM lc"
+        ).fetchall()
+        conn.close()
+
+        assert rows == [("",)]
+
+
+class TestCompilationTrackArtistRealNullVsLiteralNullText:
+    def test_track_title_real_null_becomes_empty_string_literal_null_text_survives(
+        self,
+    ) -> None:
+        expr = _extract_bare_column_expr(_cta_select_text(), "TRACK_TITLE")
+
+        conn = sqlite3.connect(":memory:")
+        conn.execute("CREATE TABLE t (TRACK_TITLE TEXT)")
+        conn.execute("INSERT INTO t (TRACK_TITLE) VALUES (NULL)")
+        conn.execute("INSERT INTO t (TRACK_TITLE) VALUES ('NULL')")
+        rows = [row[0] for row in conn.execute(f"SELECT {expr} FROM t").fetchall()]
+        conn.close()
+
+        assert rows == ["", "NULL"]
