@@ -127,6 +127,58 @@ class TestTsvToSqlite:
         assert row[0] is None
         assert row[1] is None
 
+    def test_empty_fields_are_stored_as_empty_string_not_null_or_literal_null(
+        self, tmp_path: Path
+    ) -> None:
+        """Empty TSV fields -- the shape sync-library.sh now emits for a real
+        SQL NULL after the IFNULL(<col>, '') wrap -- land as '' in SQLite, not
+        None and not the literal string 'NULL'.
+
+        This pins the actual post-fix production contract end to end: the
+        wrap turns a genuine NULL into an empty field on the wire (proven at
+        the SQL layer in tests/e2e/test_sync_library_e2e.py), and this parser
+        must carry that empty field through as ''. It complements
+        test_null_handling above (which still exercises the \\N sentinel that
+        tsv_to_sqlite.py keeps mapping to SQL NULL for other callers, but
+        which the live -B -N sync no longer emits).
+
+        album_artist and cross_reference_names are the two columns that held
+        the literal string 'NULL' on ~64k prod rows; the assertion that
+        MATCH 'null' returns nothing is the exact regression the fix closes.
+        """
+        tsv = _make_tsv(
+            [
+                # album_artist (col 10) and cross_reference_names (col 11) are
+                # empty -- the post-IFNULL shape for a real NULL. The empty
+                # trailing field must not break the 11-column count.
+                ["1", "Aluminum Tunes", "Stereolab", "ST", "100", "1", "Rock", "CD", "", "", ""],
+            ]
+        )
+        tsv_file = tmp_path / "input.tsv"
+        tsv_file.write_text(tsv, encoding="utf-8")
+        db_path = tmp_path / "library.db"
+
+        count = tsv_to_sqlite(str(tsv_file), str(db_path))
+
+        # An empty trailing field is preserved by rstrip("\n").split("\t"),
+        # so the row is a valid 11-field row and is imported (not skipped).
+        assert count == 1
+
+        conn = sqlite3.connect(str(db_path))
+        row = conn.execute(
+            "SELECT alternate_artist_name, album_artist, cross_reference_names"
+            " FROM library WHERE id = 1"
+        ).fetchone()
+        # The empty fields are the empty string, never None or 'NULL'.
+        assert row == ("", "", "")
+        # The literal-'NULL'-string bug: an empty album_artist must not put a
+        # 'null' token into the FTS index.
+        null_hits = conn.execute(
+            "SELECT rowid FROM library_fts WHERE library_fts MATCH 'null'"
+        ).fetchall()
+        conn.close()
+        assert null_hits == []
+
     def test_eleven_column_validation(self, tmp_path: Path) -> None:
         """Rows with != 11 fields are skipped; valid rows are still imported."""
         tsv = (
