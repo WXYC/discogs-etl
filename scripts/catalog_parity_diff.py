@@ -169,7 +169,13 @@ def _open_readonly(path: str, label: str) -> sqlite3.Connection:
     uri = f"file:{pathname2url(str(p.resolve()))}?mode=ro"
     try:
         conn = sqlite3.connect(uri, uri=True)
-        conn.execute("SELECT 1")  # surface "file is not a database" errors immediately
+        # Force a read of the database header/schema so a "file is not a
+        # database" error surfaces here (and is wrapped as SourceError) rather
+        # than leaking as a raw sqlite3.DatabaseError from a later query. A bare
+        # `SELECT 1` is a constant expression that never touches the file, so it
+        # does NOT validate the header on every SQLite build (it passes on macOS
+        # but not on the Linux CI build); querying sqlite_master does.
+        conn.execute("SELECT count(*) FROM sqlite_master")
     except sqlite3.Error as exc:
         raise SourceError(f"{label} database unreadable: {path} ({exc})") from exc
     return conn
