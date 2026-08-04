@@ -1,6 +1,8 @@
 # Ephemeral rebuild stack — operator runbook
 
-CloudFormation/SAM stack that runs the WXYC monthly Discogs cache rebuild on a one-shot EC2 instance instead of permanent infrastructure. Deployed to AWS account `503977661500` in `us-east-1`, alongside [`wxyc-canary`](https://github.com/WXYC/wxyc-canary).
+CloudFormation/SAM stack that runs the WXYC monthly Discogs cache rebuild on a one-shot EC2 instance instead of permanent infrastructure. Deployed to the WXYC organization AWS account `203767826763` in `us-east-1`, alongside [`wxyc-canary`](https://github.com/WXYC/wxyc-canary), by the OIDC role in [`infra/bootstrap/`](../bootstrap/README.md).
+
+> **This stack runs in the org account, and only there.** It ran in a personal account between 2026-05-30 and the [#353](https://github.com/WXYC/discogs-etl/issues/353) cutover — not instead of the org copy but *alongside* it, so two EventBridge rules fired the same `cron(0 6 4 * ? *)` at the same shared database and the two rebuilds clobbered each other's scratch tables, destroying 27,163 releases on 2026-08-04 ([#352](https://github.com/WXYC/discogs-etl/issues/352)). If you find this stack absent from an account, that absence is deliberate: it means the migration happened. Do not read it as "never deployed" and re-create it — that is precisely the inference [#248](https://github.com/WXYC/discogs-etl/issues/248) made in good faith, and it undid a correct migration.
 
 The stack itself does no work — it provisions the infra (Launch Template, two Lambdas, IAM, S3 log bucket, alarms, SNS) and steps out of the way. EventBridge fires the launcher once a month; the launcher boots an EC2; the EC2 self-terminates when it's done. Everything billable lasts ~90 minutes per month.
 
@@ -29,7 +31,7 @@ cd infra/ephemeral-rebuild
 ./provision-secrets.sh
 ```
 
-The script hard-fails before any write if the caller's AWS account isn't `503977661500` (the rebuild account), then displays account/region/prefix/caller-arn and asks for an explicit `y` confirmation as the second line of defence. `--overwrite` makes it safe to re-run for rotations. The final summary table lists parameter names + types only — never the decrypted values. Three env-var overrides are honored: `SSM_PREFIX=/some/other/path` if you deployed the stack with a non-default `SsmPrefix`, `AWS_REGION=…` if you deployed it outside the default `us-east-1`, and `EXPECTED_ACCOUNT=<id>` to deliberately target a sandbox/test account.
+The script hard-fails before any write if the caller's AWS account isn't `203767826763` (the WXYC org account), then displays account/region/prefix/caller-arn and asks for an explicit `y` confirmation as the second line of defence. `--overwrite` makes it safe to re-run for rotations. The final summary table lists parameter names + types only — never the decrypted values. Three env-var overrides are honored: `SSM_PREFIX=/some/other/path` if you deployed the stack with a non-default `SsmPrefix`, `AWS_REGION=…` if you deployed it outside the default `us-east-1`, and `EXPECTED_ACCOUNT=<id>` to deliberately target a sandbox/test account.
 
 ### 1a. Optional: enable the prune-coverage audit dump for one run
 
@@ -65,6 +67,8 @@ sam deploy --guided \
 
 The first guided deploy writes its choices to `samconfig.toml`; subsequent deploys can use `sam deploy` with no flags.
 
+`samconfig.toml` names the SAM artifact bucket explicitly (`s3_bucket = …`) rather than setting `resolve_s3`. `resolve_s3` reconciles the `aws-sam-cli-managed-default` CloudFormation stack, which the least-privilege CI deploy role is not authorized to touch. Note that the two are mutually exclusive — SAM rejects `--s3-bucket` and `--resolve-s3` together, and a `samconfig.toml` default counts as "provided", so re-adding `resolve_s3` there breaks the CI deploy even though nothing on the command line changed.
+
 ### 3. Confirm the schedule
 
 ```bash
@@ -76,6 +80,16 @@ aws events list-rule-names-by-target \
 ```
 
 The schedule rule should be named like `wxyc-discogs-rebuild-LauncherFunctionMonthly-*`.
+
+#### Arming and disarming it
+
+`ScheduleState` (`ENABLED` / `DISABLED`, default `ENABLED`) controls whether the monthly rule fires. **Change it through the stack, never with `aws events disable-rule`** — the rule is CloudFormation-managed, so a console/CLI disable is drift that the next `sam deploy` reverts, and that deploy fires automatically on any push touching this directory. See [`docs/ec2-rebuild-runbook.md`](../../docs/ec2-rebuild-runbook.md) for the full procedure and the caveat about manually launched rebuilds.
+
+CI does not pass `ScheduleState`, and SAM sends `UsePreviousValue=true` for parameters it does not override, so a deliberate `DISABLED` survives redeploys until someone sets it back.
+
+The sweeper's hourly rule is not gated by this parameter. It force-terminates rebuild instances past their wall-clock budget, including manually launched ones — disarming the monthly rebuild must not disarm the cleanup.
+
+Do not reach for the SAM `Enabled:` property as an alternative spelling. SAM resolves `Enabled` at transform time in Python, so an intrinsic like `!Ref` is always truthy and the rule comes out **armed** regardless of the parameter's value — silently, and `sam validate --lint` does not catch it. `tests/unit/test_ephemeral_rebuild_template.py` asserts against the transformed `AWS::Events::Rule` to keep that from creeping back in.
 
 ### 4. Run a manual rebuild before the first cron tick
 
@@ -184,7 +198,7 @@ curl -fL --continue-at - --retry 5 --retry-delay 30 --retry-all-errors -o "$WORK
 
 The download is sequential with the converter — curl finishes, *then* `run_pipeline.py` starts. The earlier FIFO design overlapped the two; sequential adds roughly +14 min worst-case to a 60–90 min run, which is the cost of resumability.
 
-When triaging an alarm: check the per-instance log in `s3://wxyc-discogs-rebuild-logs-503977661500/<instance-id>/` for the curl line. Without `--verbose`, curl's retry messages look like `Warning: Transient problem: ... Will retry in 30 seconds. N retries left.` Multiple of those before a final non-zero exit means the CDN was unhealthy through the whole window. A clean curl exit-0 followed by a converter failure means the issue is downstream of curl. (#181)
+When triaging an alarm: check the per-instance log in `s3://wxyc-discogs-rebuild-logs-203767826763/<instance-id>/` for the curl line. (Runs from 2026-05-30 to the #353 cutover archived to the non-org account's bucket instead; that bucket is retained read-only for the #352 / #188 / #298 / #217 forensics.) Without `--verbose`, curl's retry messages look like `Warning: Transient problem: ... Will retry in 30 seconds. N retries left.` Multiple of those before a final non-zero exit means the CDN was unhealthy through the whole window. A clean curl exit-0 followed by a converter failure means the issue is downstream of curl. (#181)
 
 ## Related
 

@@ -13,10 +13,13 @@
 #                                         # us-east-1, matches the stack)
 #     EXPECTED_ACCOUNT=123456789012 \
 #         ./provision-secrets.sh          # override the account guard (default
-#                                         # 503977661500, the rebuild account)
+#                                         # 203767826763, the WXYC org account)
 #
 # Prereqs:
-#     - AWS credentials configured for the rebuild account (503977661500).
+#     - AWS credentials for the WXYC organization account (203767826763), e.g.
+#       `aws sso login --profile wxyc-api`. WXYC infrastructure does not run in
+#       personal accounts — writing these secrets into one is how the rebuild
+#       came to run twice a month against the same database (#352, #353).
 #     - aws CLI on PATH (v1 or v2; both support --overwrite + SecureString).
 #
 # What it writes:
@@ -34,7 +37,7 @@ set -euo pipefail
 
 SSM_PREFIX="${SSM_PREFIX:-/wxyc/discogs-rebuild}"
 AWS_REGION="${AWS_REGION:-us-east-1}"
-EXPECTED_ACCOUNT="${EXPECTED_ACCOUNT:-503977661500}"
+EXPECTED_ACCOUNT="${EXPECTED_ACCOUNT:-203767826763}"
 export AWS_REGION
 
 # Account sanity check — writing the wrong DATABASE_URL into the wrong account

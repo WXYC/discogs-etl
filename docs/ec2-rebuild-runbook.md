@@ -317,14 +317,39 @@ new path archives its logs to `s3://wxyc-discogs-rebuild-logs-<account>/` so
 the legacy directory doesn't grow further once the cron is removed.
 
 If the new path needs to be temporarily disabled (e.g. while debugging an
-infra issue), re-add the cron before disabling the EventBridge schedule:
+infra issue), re-add the cron, then redeploy the stack with the schedule
+parameter flipped:
 
 ```bash
-aws events disable-rule \
-  --name $(aws events list-rule-names-by-target \
-      --target-arn $(aws cloudformation describe-stacks \
-          --stack-name wxyc-discogs-rebuild \
-          --query 'Stacks[0].Outputs[?OutputKey==`LauncherFunctionArn`].OutputValue' \
-          --output text) \
-      --query 'RuleNames[0]' --output text)
+cd infra/ephemeral-rebuild
+sam deploy --parameter-overrides ScheduleState=DISABLED
 ```
+
+**Do not use `aws events disable-rule`.** It works, and it is silently undone:
+the rule is a CloudFormation-managed resource, so disabling it by hand is drift
+that the next `sam deploy` reverts — and that deploy fires automatically on any
+push touching `infra/ephemeral-rebuild/**` or
+`scripts/rebuild-cache-bootstrap.sh`. A schedule believed to be disabled, that
+silently re-arms on an unrelated merge, is how two rebuilds ended up running
+against the same database in August 2026 ([#352](https://github.com/WXYC/discogs-etl/issues/352),
+[#353](https://github.com/WXYC/discogs-etl/issues/353)). `ScheduleState` is a
+real stack parameter and CI does not override it, so the disable survives
+redeploys until someone deliberately sets it back.
+
+Re-arm the same way, with `ScheduleState=ENABLED`.
+
+> **While the schedule is disabled, the collision guards are your only
+> protection.** The bootstrap's peer check ([#311](https://github.com/WXYC/discogs-etl/issues/311))
+> and the launcher precheck ([#304](https://github.com/WXYC/discogs-etl/issues/304))
+> both key off `Project=discogs-rebuild`-tagged instances, so a rebuild started
+> by hand — `ec2 run-instances`, or invoking the launcher directly — is visible
+> to them and to the sweeper. A rebuild started any *other* way is not. The
+> #298 recovery in July 2026 ran four instances, two starting in the same
+> second; do not assume "I'm the only one" without checking:
+>
+> ```bash
+> aws ec2 describe-instances \
+>   --filters Name=tag:Project,Values=discogs-rebuild \
+>             Name=instance-state-name,Values=pending,running \
+>   --query 'Reservations[].Instances[].[InstanceId,LaunchTime]' --output table
+> ```
