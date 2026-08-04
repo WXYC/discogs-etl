@@ -53,30 +53,28 @@ The GitHub OIDC provider itself is **not** declared here. It is account-global, 
 
 ## Verifying the policy
 
-The policy is deliberately least-privilege and was written by enumerating the target stack's resources, so the failure mode is a missing grant, not an excessive one. Verify with the simulator rather than by deploying:
+A bootstrap IAM template has no behaviour a unit test can assert before it is deployed, so its test is executed operationally:
 
 ```bash
-ROLE=arn:aws:iam::203767826763:role/discogs-etl-deploy
-
-aws iam simulate-principal-policy --profile wxyc-api \
-  --policy-source-arn "$ROLE" \
-  --action-names cloudformation:CreateChangeSet ssm:GetParameters \
-                 ec2:CreateLaunchTemplate iam:CreateInstanceProfile \
-                 s3:PutObject lambda:UpdateFunctionCode \
-  --query 'EvaluationResults[].[EvalActionName,EvalDecision]' --output table
+./infra/bootstrap/simulate-deploy-role.sh
 ```
 
-`cloudwatch:PutMetricData` must be simulated separately, **with its condition key supplied** — the statement is scoped by namespace condition, and the simulator returns `implicitDeny` without it:
+22 expectations, exit non-zero if any fails. Run it after every deploy of this stack and after any policy edit. It covers the deploy actions, the `sync-library.yml` metrics grant, four negative controls (so a policy that got too permissive fails too, not just one that got too narrow), and two expected simulator artifacts.
 
-```bash
-aws iam simulate-principal-policy --profile wxyc-api \
-  --policy-source-arn "$ROLE" \
-  --action-names cloudwatch:PutMetricData \
-  --context-entries ContextKeyName=cloudwatch:namespace,ContextKeyType=string,ContextKeyValues=WXYC/DiscogsCache \
-  --query 'EvaluationResults[].[EvalActionName,EvalDecision]' --output table
-```
+**Do not simulate without `--resource-arns`.** Every statement here is resource-scoped, so a bare `simulate-principal-policy --action-names ...` evaluates against `*`, matches nothing, and returns `implicitDeny` for all of them — which reads as a completely broken role. It is the wrong question, not a finding.
 
-An `implicitDeny` there is a simulator artifact if the context is missing and a real bug if it is present. Do not "fix" a denial by widening to `AdministratorAccess` — read the action name out of the `AccessDenied` and add that one grant.
+Two results are `implicitDeny` even with the correct resource, and the script asserts they stay that way:
+
+| action | resource |
+|---|---|
+| `cloudformation:ExecuteChangeSet` | `…:changeSet/<name>/<uuid>` |
+| `cloudformation:CreateChangeSet` | `…:aws:transform/Serverless-2016-10-31` |
+
+The simulator resolves `--resource-arns` against the resource types IAM's service-authorization reference registers per action, and both of those register `stack` only. A changeSet or transform ARN therefore matches no statement regardless of what the policy grants — the tell is that `ExecuteChangeSet` against the *stack* ARN comes back `allowed`. Both grants are nonetheless load-bearing at deploy time: `wxyc-canary` added them in commits `8cc483a` and `be022a7` after real `AccessDenied` failures. Their only real proof is a successful `sam deploy`.
+
+`cloudwatch:PutMetricData` is scoped by condition rather than by resource, so it needs `--context-entries ContextKeyName=cloudwatch:namespace,…`. Without it you get `implicitDeny` and an invitation to widen a statement that was never wrong.
+
+Do not respond to a denial by widening to `AdministratorAccess` — read the action name out of the `AccessDenied` and add that one grant.
 
 ## Note on resource naming
 
