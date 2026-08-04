@@ -1,7 +1,14 @@
 name: Deploy Ephemeral Rebuild Stack
 
-# Builds + deploys the wxyc-discogs-rebuild SAM stack to account 503977661500
-# us-east-1. Mirrors the pattern in WXYC/wxyc-canary's deploy.yml.
+# Builds + deploys the wxyc-discogs-rebuild SAM stack to the WXYC organization
+# AWS account (203767826763) in us-east-1, via the OIDC role defined in
+# infra/bootstrap/deploy-role.yaml. Mirrors WXYC/wxyc-canary's deploy.yml, which
+# runs in the same account.
+#
+# WXYC infrastructure does not run in personal AWS accounts. This workflow
+# deployed to one between 2026-05-30 and the #353 cutover, which is how a second
+# armed copy of the monthly rebuild schedule came to exist and destroy 27,163
+# cache rows on 2026-08-04 (#352).
 #
 # The stack itself is the trigger (EventBridge schedule fires monthly); this
 # workflow only re-deploys the stack when the template, the Lambda handlers,
@@ -33,11 +40,20 @@ jobs:
           use-installer: true
       - name: SAM validate
         run: sam validate --lint -t infra/ephemeral-rebuild/template.yaml
-      - name: pytest (Lambda unit tests)
+      - name: pytest (stack unit tests)
+        # The dev extra, not a bare `pip install pytest`: the template test needs
+        # aws-sam-translator + pyyaml to run the SAM transform in process. This
+        # job gates `deploy` via `needs:`, so an ImportError here blocks the
+        # deploy rather than merely skipping a test.
+        #
+        # The file list is explicit rather than `tests/unit/` — this job is a
+        # pre-deploy gate on the stack's own tests, not a second full CI run
+        # (ci.yml already does that). Add new stack tests here.
         run: |
-          pip install pytest
+          pip install -e ".[dev]"
           pytest tests/unit/test_ephemeral_rebuild_launcher.py \
-                 tests/unit/test_ephemeral_rebuild_sweeper.py -v
+                 tests/unit/test_ephemeral_rebuild_sweeper.py \
+                 tests/unit/test_ephemeral_rebuild_template.py -v
 
   deploy:
     runs-on: ubuntu-latest
@@ -60,13 +76,40 @@ jobs:
         run: sam build
       - name: SAM deploy
         working-directory: infra/ephemeral-rebuild
+        env:
+          SAM_S3_BUCKET: ${{ vars.SAM_S3_BUCKET }}
+          REBUILD_ALERT_EMAIL: ${{ vars.REBUILD_ALERT_EMAIL }}
+        # Point at the SAM managed bucket explicitly rather than --resolve-s3.
+        # --resolve-s3 reconciles the `aws-sam-cli-managed-default` CloudFormation
+        # stack to guarantee the bucket exists, and the least-privilege deploy
+        # role — scoped to stack/wxyc-discogs-rebuild/* — is not authorized to
+        # touch that stack. The bucket already exists (created when the account
+        # was first SAM-bootstrapped); the role's SamBucket statement grants the
+        # s3:* it needs on it. samconfig.toml carries the same value as the
+        # default, so this flag only matters when SAM_S3_BUCKET overrides it.
+        #
+        # AlertEmail is appended conditionally: `--parameter-overrides` in the
+        # shorthand Key=Value form rejects an empty value with a parse error, so
+        # an unset variable has to omit the parameter entirely rather than pass
+        # `AlertEmail=`. Omitted, the template's own default ('') applies and the
+        # HasAlertEmail condition drops the subscription.
+        #
+        # ScheduleState is deliberately NOT overridden. SAM sends
+        # UsePreviousValue=true for every template parameter absent from
+        # --parameter-overrides, so a deliberate `ScheduleState=DISABLED` set
+        # out-of-band survives redeploys instead of being silently re-armed —
+        # which is the entire point of #353 having parameterized it.
         run: |
+          OPTIONAL_ARGS=()
+          if [ -n "$REBUILD_ALERT_EMAIL" ]; then
+            OPTIONAL_ARGS+=("AlertEmail=$REBUILD_ALERT_EMAIL")
+          fi
           sam deploy \
             --no-confirm-changeset \
             --no-fail-on-empty-changeset \
             --stack-name wxyc-discogs-rebuild \
             --capabilities CAPABILITY_IAM \
-            --resolve-s3 \
+            --s3-bucket "${SAM_S3_BUCKET:-aws-sam-cli-managed-default-samclisourcebucket-v0kc5deo10yi}" \
             --parameter-overrides \
               RepoBranch=main \
-              AlertEmail=${{ vars.REBUILD_ALERT_EMAIL }}
+              "${OPTIONAL_ARGS[@]}"
