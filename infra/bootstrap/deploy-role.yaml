@@ -1,0 +1,266 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Least-privilege GitHub Actions OIDC deploy role for the wxyc-discogs-rebuild
+  SAM stack. Deployed once, by hand, with admin credentials. See
+  infra/bootstrap/README.md. Context: WXYC/discogs-etl#353, #352.
+
+# This stack does NOT declare the GitHub OIDC provider. That resource is
+# account-global and unique per URL, and it is already owned by the
+# wxyc-canary-deploy stack in this account (WXYC/wxyc-canary
+# bootstrap/deploy-role.yaml). A second declaration fails with
+# EntityAlreadyExists. Extract it to a shared stack if a third repo adopts
+# OIDC; until then this template only references it.
+#
+# The role is assumed by two workflows, not one:
+#   - .github/workflows/deploy-ephemeral-rebuild.yml  (sam deploy)
+#   - .github/workflows/sync-library.yml              (daily cache-health
+#     metrics -> CloudWatch namespace WXYC/DiscogsCache)
+# Hence the name `discogs-etl-deploy` rather than `wxyc-discogs-rebuild-deploy`,
+# and hence the CacheHealthMetrics statement at the bottom, which has nothing to
+# do with deploying.
+
+Parameters:
+  GitHubOrg:
+    Type: String
+    Default: WXYC
+
+  RepoName:
+    Type: String
+    Default: discogs-etl
+
+  OidcProviderArn:
+    Type: String
+    Default: ''
+    Description: >
+      ARN of the account's GitHub Actions OIDC provider. Leave empty to derive
+      the well-known ARN for this account — there is exactly one provider per
+      URL per account and its ARN is a pure function of the account id, so the
+      derived value is correct unless you are deliberately pointing at another
+      account's provider.
+
+  SamManagedBucket:
+    Type: String
+    Default: aws-sam-cli-managed-default-samclisourcebucket-v0kc5deo10yi
+    Description: >
+      Existing SAM artifact bucket. The deploy uses --s3-bucket rather than
+      --resolve-s3 precisely because resolve_s3 reconciles the
+      aws-sam-cli-managed-default CloudFormation stack, which this role is not
+      authorized to touch (see infra/ephemeral-rebuild/samconfig.toml).
+
+  StackName:
+    Type: String
+    Default: wxyc-discogs-rebuild
+    Description: >
+      Name of the SAM stack this role may deploy. Also the prefix CloudFormation
+      uses when it auto-names that stack's IAM roles and EventBridge rules.
+
+Conditions:
+  DeriveOidcProviderArn: !Equals [!Ref OidcProviderArn, '']
+
+Resources:
+  DiscogsEtlDeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: discogs-etl-deploy
+      Description: !Sub GitHub Actions OIDC role for ${GitHubOrg}/${RepoName} (main only).
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !If
+                - DeriveOidcProviderArn
+                - !Sub arn:aws:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com
+                - !Ref OidcProviderArn
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+                # Exact-match on the ref, not StringLike on repo:*. A workflow
+                # running from any other branch, a tag, or a fork PR cannot
+                # assume this role.
+                token.actions.githubusercontent.com:sub: !Sub repo:${GitHubOrg}/${RepoName}:ref:refs/heads/main
+      Policies:
+        - PolicyName: wxyc-discogs-rebuild-sam-deploy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # ---------------------------------------------------------------
+              # CloudFormation / SAM plumbing
+              # ---------------------------------------------------------------
+              - Sid: CfnStack
+                Effect: Allow
+                Action: cloudformation:*
+                Resource:
+                  - !Sub arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${StackName}/*
+                  # SAM deploys through a change set: CreateChangeSet authorizes
+                  # against the stack, but DescribeChangeSet/ExecuteChangeSet
+                  # authorize against the changeSet resource ARN — which cannot
+                  # be scoped to a stack by ARN. Without this the deploy creates
+                  # the changeset and then fails AccessDenied polling its status.
+                  # Changesets are ephemeral, deploy-only artifacts.
+                  - !Sub arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:changeSet/*
+              - Sid: CfnListDescribe # unscopable read actions SAM issues pre-changeset
+                Effect: Allow
+                Action: [cloudformation:ListStacks, cloudformation:ValidateTemplate]
+                Resource: '*'
+              - Sid: SamTransform
+                # The template's `Transform: AWS::Serverless-2016-10-31` is
+                # expanded by this AWS-owned macro during CreateChangeSet;
+                # CloudFormation authorizes the expansion against the transform's
+                # own ARN (the account segment is literally `aws`).
+                Effect: Allow
+                Action: cloudformation:CreateChangeSet
+                Resource: !Sub arn:aws:cloudformation:${AWS::Region}:aws:transform/Serverless-2016-10-31
+              - Sid: SamBucket
+                # `sam deploy` uploads the built Lambda artifacts here. The
+                # LogBucket statement further down does NOT cover this — that one
+                # is scoped to the stack's own log bucket.
+                Effect: Allow
+                Action: [s3:PutObject, s3:GetObject, s3:ListBucket, s3:GetBucketLocation]
+                Resource:
+                  - !Sub arn:aws:s3:::${SamManagedBucket}
+                  - !Sub arn:aws:s3:::${SamManagedBucket}/*
+              - Sid: AmiSsmParameter
+                # infra/ephemeral-rebuild/template.yaml declares AmiId as
+                # AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>. CloudFormation
+                # resolves that at changeset time using the *deploying
+                # principal's* credentials, so the role — not the stack's roles —
+                # needs to read the AWS-public parameter. Public parameters have
+                # an empty account segment in their ARN; both forms are listed
+                # because the authorizing form is not consistently documented.
+                Effect: Allow
+                Action: [ssm:GetParameter, ssm:GetParameters]
+                Resource:
+                  - !Sub arn:aws:ssm:${AWS::Region}::parameter/aws/service/ami-amazon-linux-latest/*
+                  - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/aws/service/ami-amazon-linux-latest/*
+
+              # ---------------------------------------------------------------
+              # Stack resources.
+              #
+              # Physical names span TWO prefixes, deliberately: resources the
+              # template names explicitly use `discogs-rebuild-*` (Lambdas, SNS
+              # topic, alarms) or the bare name `discogs-rebuild` (launch
+              # template), while resources CloudFormation auto-names inherit the
+              # stack name and land under `wxyc-discogs-rebuild-*` (IAM roles,
+              # instance profile, EventBridge rules, log bucket). A single
+              # prefix matches only half of them.
+              # ---------------------------------------------------------------
+              - Sid: LogBucket
+                Effect: Allow
+                Action: s3:*
+                Resource:
+                  - !Sub arn:aws:s3:::${StackName}-logs-${AWS::AccountId}
+                  - !Sub arn:aws:s3:::${StackName}-logs-${AWS::AccountId}/*
+              - Sid: LaunchTemplate
+                Effect: Allow
+                Action:
+                  [
+                    ec2:CreateLaunchTemplate,
+                    ec2:DeleteLaunchTemplate,
+                    ec2:CreateLaunchTemplateVersion,
+                    ec2:DeleteLaunchTemplateVersions,
+                    ec2:ModifyLaunchTemplate,
+                    ec2:CreateTags,
+                    ec2:DeleteTags,
+                  ]
+                Resource: !Sub arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:launch-template/*
+              - Sid: Ec2Describe # ec2:Describe* has no resource-level scoping
+                Effect: Allow
+                Action: [ec2:DescribeLaunchTemplates, ec2:DescribeLaunchTemplateVersions]
+                Resource: '*'
+              - Sid: Lambda
+                Effect: Allow
+                Action: lambda:*
+                Resource:
+                  - !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:discogs-rebuild-launcher
+                  - !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:discogs-rebuild-launcher:*
+                  - !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:discogs-rebuild-sweeper
+                  - !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:discogs-rebuild-sweeper:*
+              - Sid: Scheduler # SAM names the Schedule rules <stack>-<LogicalId>-<suffix>
+                Effect: Allow
+                Action: events:*
+                Resource: !Sub arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule/${StackName}-*
+              - Sid: Sns
+                Effect: Allow
+                Action: sns:*
+                Resource: !Sub arn:aws:sns:${AWS::Region}:${AWS::AccountId}:discogs-rebuild-alerts
+              - Sid: Alarms
+                Effect: Allow
+                Action: [cloudwatch:PutMetricAlarm, cloudwatch:DeleteAlarms, cloudwatch:DescribeAlarms]
+                Resource: !Sub arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:discogs-rebuild-*
+              - Sid: Logs
+                Effect: Allow
+                Action:
+                  [
+                    logs:CreateLogGroup,
+                    logs:DeleteLogGroup,
+                    logs:PutRetentionPolicy,
+                    logs:DescribeLogGroups,
+                    logs:TagResource,
+                    logs:ListTagsForResource,
+                  ]
+                Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/discogs-rebuild-*:*
+              - Sid: StackRoleLifecycle
+                # Covers InstanceRole plus the two SAM-generated Lambda execution
+                # roles (wxyc-discogs-rebuild-LauncherFunctionRole-*, -SweeperFunctionRole-*).
+                Effect: Allow
+                Action:
+                  [
+                    iam:CreateRole,
+                    iam:DeleteRole,
+                    iam:GetRole,
+                    iam:PassRole,
+                    iam:UpdateAssumeRolePolicy,
+                    iam:AttachRolePolicy,
+                    iam:DetachRolePolicy,
+                    iam:PutRolePolicy,
+                    iam:DeleteRolePolicy,
+                    iam:GetRolePolicy,
+                    iam:TagRole,
+                    iam:UntagRole,
+                    iam:ListRolePolicies,
+                    iam:ListAttachedRolePolicies,
+                    iam:ListRoleTags,
+                  ]
+                Resource: !Sub arn:aws:iam::${AWS::AccountId}:role/${StackName}-*
+              - Sid: InstanceProfileLifecycle
+                Effect: Allow
+                Action:
+                  [
+                    iam:CreateInstanceProfile,
+                    iam:DeleteInstanceProfile,
+                    iam:GetInstanceProfile,
+                    iam:AddRoleToInstanceProfile,
+                    iam:RemoveRoleFromInstanceProfile,
+                    iam:TagInstanceProfile,
+                    iam:UntagInstanceProfile,
+                  ]
+                Resource: !Sub arn:aws:iam::${AWS::AccountId}:instance-profile/${StackName}-*
+
+              # ---------------------------------------------------------------
+              # Not a deploy grant. sync-library.yml assumes this same role daily
+              # to run scripts/cache_health_metrics.py, which publishes
+              # release_count / artwork_imageless_count / artwork_never_asked_count
+              # into WXYC/DiscogsCache. Dropping this statement silently kills the
+              # daily metrics — and the release-count floor alarm built on them
+              # (#358) decays to INSUFFICIENT_DATA rather than firing.
+              #
+              # PutMetricData cannot be resource-scoped; the namespace condition
+              # is the scoping mechanism. Note that simulate-principal-policy
+              # returns implicitDeny for this unless the condition key is supplied:
+              #   --context-entries ContextKeyName=cloudwatch:namespace,\
+              #     ContextKeyType=string,ContextKeyValues=WXYC/DiscogsCache
+              # ---------------------------------------------------------------
+              - Sid: CacheHealthMetrics
+                Effect: Allow
+                Action: cloudwatch:PutMetricData
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    cloudwatch:namespace: WXYC/DiscogsCache
+
+Outputs:
+  DeployRoleArn:
+    Description: Set this as the AWS_ROLE_TO_ASSUME repository variable.
+    Value: !GetAtt DiscogsEtlDeployRole.Arn
