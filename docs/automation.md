@@ -4,6 +4,16 @@
 
 This pipeline runs monthly (or when Discogs publishes new data dumps). It has a completely different lifecycle from the request-handling services that consume its output.
 
+## AWS accounts
+
+**All WXYC AWS infrastructure runs in the WXYC organization account, `203767826763` (SSO profile `wxyc-api`), in `us-east-1`.** Never in a personal account. This covers the `wxyc-discogs-rebuild` stack, the `discogs-etl-deploy` OIDC role ([`infra/bootstrap/`](../infra/bootstrap/README.md)), the SSM SecureStrings the rebuild reads, the `WXYC/DiscogsCache` and `WXYC/DiscogsRebuild` CloudWatch namespaces, and the S3 log bucket.
+
+Two workflows assume the same role, `AWS_ROLE_TO_ASSUME`: `deploy-ephemeral-rebuild.yml` deploys the stack with it, and `sync-library.yml` uses it to publish daily cache-health metrics. Re-pointing that variable moves both.
+
+**An absent stack means the migration happened.** From 2026-05-30 until the [#353](https://github.com/WXYC/discogs-etl/issues/353) cutover the rebuild stack existed in *two* accounts at once, both armed with `cron(0 6 4 * ? *)` against the same Railway database, and the resulting double-run destroyed 27,163 cache rows on 2026-08-04 ([#352](https://github.com/WXYC/discogs-etl/issues/352)). The duplicate was not carelessness: a correct migration in May 2026 deleted the old stack, and [#248](https://github.com/WXYC/discogs-etl/issues/248) — fixing a genuinely broken CI deploy a week later — observed that account was empty of the stack and concluded it had never deployed. Both readings fit the evidence. Writing the directive down is what makes the intended one recoverable, which is why this paragraph exists rather than just the rule above it.
+
+Before concluding infrastructure is missing, check the other account.
+
 ## Monthly Cache Rebuild (`rebuild-cache.yml`)
 
 **Status (2026-05-07)**: the GH Actions cron is disabled. The rebuild now runs on a one-shot ephemeral EC2 spawned monthly by the `wxyc-discogs-rebuild` SAM stack (`infra/ephemeral-rebuild/`). Setup + recurring-ops instructions in [`infra/ephemeral-rebuild/README.md`](../infra/ephemeral-rebuild/README.md). The Backend-Service EC2 cron is the legacy fallback; once two ephemeral runs land successfully, it is removed per the procedure in [`docs/ec2-rebuild-runbook.md`](ec2-rebuild-runbook.md). The GH workflow file stays in the repo as a `workflow_dispatch`-only manual escape hatch (no scheduled trigger).
