@@ -5,4 +5,11 @@ stack_name = "wxyc-discogs-rebuild"
 region = "us-east-1"
 capabilities = "CAPABILITY_IAM"
 confirm_changeset = false
-resolve_s3 = true
+# Use the existing SAM managed bucket directly instead of resolve_s3. resolve_s3
+# reconciles the aws-sam-cli-managed-default CloudFormation stack, which the
+# least-privilege CI deploy role (scoped to stack/wxyc-discogs-rebuild/*) is not
+# authorized to touch. It also cannot merely be dropped from the CLI invocation:
+# SAM rejects --s3-bucket and --resolve-s3 together, and a config-file default
+# counts, so leaving this line in would hard-fail the deploy. The CI workflow can
+# override the bucket via the SAM_S3_BUCKET variable.
+s3_bucket = "aws-sam-cli-managed-default-samclisourcebucket-v0kc5deo10yi"
