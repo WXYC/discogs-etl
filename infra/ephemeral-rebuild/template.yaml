@@ -18,6 +18,25 @@ Parameters:
       the 4th of each month (Discogs publishes the new dump on the 1st;
       a few days of slack lets the dump settle).
 
+  ScheduleState:
+    Type: String
+    Default: ENABLED
+    AllowedValues: [ENABLED, DISABLED]
+    Description: >
+      Whether the monthly rebuild schedule is armed. Set to DISABLED to stand
+      the stack up without arming it — for a second copy in another account,
+      a recovery deploy, or any window where a rebuild must not start on its
+      own. The sweeper's hourly rule is deliberately NOT gated by this; it is
+      the failsafe that cleans up a stuck instance, including a manually
+      launched one.
+
+      Do not reach for the `Enabled:` property on the Schedule event instead.
+      SAM resolves `Enabled` at transform time in Python, so an intrinsic like
+      `!Ref` is always truthy and the rule comes out armed regardless of the
+      parameter value — silently, and `sam validate --lint` does not catch it.
+      `State` is a PassThrough property and is the only spelling that works.
+      The two are mutually exclusive. See #353.
+
   RepoBranch:
     Type: String
     Default: main
@@ -257,6 +276,8 @@ Resources:
           Type: Schedule
           Properties:
             Schedule: !Ref ScheduleExpression
+            # `State`, never `Enabled` — see the ScheduleState parameter.
+            State: !Ref ScheduleState
             Description: Monthly Discogs cache rebuild.
 
   LauncherLogGroup:
