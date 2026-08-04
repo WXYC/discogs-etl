@@ -34,7 +34,7 @@ The child-table CSVs are converter-derived into an ephemeral `TemporaryDirectory
 
 ### 1. Rotate `GH_TOKEN` (unblocks [#296](https://github.com/WXYC/discogs-etl/issues/296))
 
-Replace the SSM SecureString at `/wxyc/discogs-rebuild/GH_TOKEN` (account `503977661500`) with a fresh fine-grained PAT granting `contents: read` on `WXYC/library-metadata-lookup` and `WXYC/discogs-xml-converter` (both needed by the two `gh release download` calls). No code change. See [`ec2-rebuild-runbook.md` → "`gh release download` fails with `HTTP 401`"](ec2-rebuild-runbook.md).
+Replace the SSM SecureString at `/wxyc/discogs-rebuild/GH_TOKEN` (WXYC org account `203767826763`) with a fresh fine-grained PAT granting `contents: read` on `WXYC/library-metadata-lookup` and `WXYC/discogs-xml-converter` (both needed by the two `gh release download` calls). No code change. See [`ec2-rebuild-runbook.md` → "`gh release download` fails with `HTTP 401`"](ec2-rebuild-runbook.md).
 
 ```bash
 aws ssm put-parameter \

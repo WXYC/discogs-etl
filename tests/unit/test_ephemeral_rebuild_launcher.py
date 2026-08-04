@@ -139,19 +139,19 @@ def test_user_data_injects_log_bucket_env_var(handler_module):
     ``${REBUILD_LOG_BUCKET:-}`` and skip when it's empty.
     """
     rendered = handler_module.build_user_data(
-        "main", log_bucket="wxyc-discogs-rebuild-logs-503977661500"
+        "main", log_bucket="wxyc-discogs-rebuild-logs-203767826763"
     )
-    assert "export REBUILD_LOG_BUCKET=wxyc-discogs-rebuild-logs-503977661500" in rendered
+    assert "export REBUILD_LOG_BUCKET=wxyc-discogs-rebuild-logs-203767826763" in rendered
 
 
 def test_lambda_handler_pipes_log_bucket_from_env(handler_module, fake_ec2, monkeypatch):
     monkeypatch.setenv("LAUNCH_TEMPLATE_ID", "lt-0fab0123456789ab0")
-    monkeypatch.setenv("LOG_BUCKET_NAME", "wxyc-discogs-rebuild-logs-503977661500")
+    monkeypatch.setenv("LOG_BUCKET_NAME", "wxyc-discogs-rebuild-logs-203767826763")
 
     handler_module.lambda_handler({}, None, ec2_client=fake_ec2)
 
     user_data = fake_ec2.run_instances.call_args.kwargs["UserData"]
-    assert "export REBUILD_LOG_BUCKET=wxyc-discogs-rebuild-logs-503977661500" in user_data
+    assert "export REBUILD_LOG_BUCKET=wxyc-discogs-rebuild-logs-203767826763" in user_data
 
 
 def test_lambda_handler_tolerates_missing_log_bucket(handler_module, fake_ec2, monkeypatch):
