@@ -1,25 +1,33 @@
 """Unit tests for ``scripts/catalog_parity_diff.py``.
 
-The diff-two-files core of the discogs-etl#346 catalog-parity harness:
-given two already-built ``library.db`` SQLite files (one from the daily
-MySQL-sourced build, one from a future Backend-sourced build), report where
-they diverge -- per-column field mismatches, row-set membership (ids present
-in only one side), and ``compilation_track_artist`` (CTA) drift.
+Two halves of the catalog-parity harness live in that script:
 
-The "producer" half of #346 (building a fresh library.db from a live source)
-is out of scope here -- see the ``TestBuildFromSourceStubs`` class, which
-pins the NotImplementedError contract for the reserved ``--mysql-source`` /
-``--backend-source`` flags.
+- The **diff core** (discogs-etl#346): given two already-built ``library.db``
+  SQLite files (one from the daily MySQL-sourced build, one Backend-sourced),
+  report where they diverge -- per-column field mismatches, row-set
+  membership (ids present in only one side), and ``compilation_track_artist``
+  (CTA) drift.
+- The **producers** (discogs-etl#351): build either side from a live source
+  -- ``TestMysqlProducer`` (the daily build's own ``mysql`` CLI read path) and
+  ``TestBackendProducer`` (the BS#1965 NDJSON exports over HTTP, exercised
+  against a real local HTTP server rather than a mocked ``urlopen``, so the
+  gzip/header/framing handling is actually covered).
 """
 
 from __future__ import annotations
 
+import gzip
 import importlib.util
 import json
+import re
 import sqlite3
 import subprocess
 import sys
+import threading
+from dataclasses import dataclass, field
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import Any, Callable
 
 import pytest
 
@@ -36,8 +44,9 @@ def _load_module():
     return mod
 
 
-# The exact daily-sync `library` table shape, derived from
-# scripts/tsv_to_sqlite.py's CREATE TABLE statement.
+# The exact daily-sync `library` table shape. Spelled out literally rather
+# than imported from lib/library_db.py: these tests assert what the schema IS,
+# so importing the constant under test would make them tautological.
 _LIBRARY_COLUMNS = (
     "id",
     "title",
@@ -113,6 +122,153 @@ def _make_library_db(
         )
     conn.commit()
     conn.close()
+
+
+# --- Producer fixtures (#351) --------------------------------------------
+
+_LM_A = "Sat, 09 Aug 2026 12:00:00 GMT"
+_LM_B = "Sat, 09 Aug 2026 12:30:00 GMT"
+
+
+def _squash(text: str) -> str:
+    """Collapse all whitespace runs to single spaces, for SQL source comparison."""
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _catalog_row(**overrides: Any) -> dict[str, Any]:
+    """One ``CatalogExportRow`` as GET /library/catalog serves it (BS#1965).
+
+    Defaults mirror ``_DEFAULT_ROW`` above so a Backend-sourced build and the
+    MySQL-sourced fixtures diff to zero. ``id`` is the BS serial (deliberately
+    different from ``legacy_release_id``, to prove the producer emits the
+    latter).
+    """
+    row: dict[str, Any] = {
+        "id": 5_001,
+        "legacy_release_id": 72_101,
+        "album_title": "Aluminum Tunes",
+        "artist_name": "Stereolab",
+        "code_letters": "ST",
+        "code_artist_number": 100,
+        "code_number": 1,
+        "genre_name": "Rock",
+        "format_name": "CD",
+        "alternate_artist_name": None,
+        "album_artist": None,
+        "cross_reference_names": [],
+        "label": "Duophonic",
+        "on_streaming": True,
+        "rotation_bin": None,
+        "rotation_kill_date": None,
+    }
+    row.update(overrides)
+    return row
+
+
+@dataclass
+class _RecordedRequest:
+    path: str
+    authorization: str | None
+
+
+class _BackendStub:
+    """A stand-in for Backend-Service's two catalog NDJSON exports.
+
+    Serves gzipped NDJSON with a ``Last-Modified`` watermark, records every
+    request, and exposes ``on_catalog_fetch`` so a test can advance the
+    watermark mid-pair to exercise the torn-snapshot re-fetch rule.
+    """
+
+    def __init__(
+        self,
+        catalog_rows: list[dict[str, Any]],
+        cta_rows: list[dict[str, Any]],
+        gzip_body: bool = True,
+        last_modified: str = _LM_A,
+    ) -> None:
+        self.catalog_rows = catalog_rows
+        self.cta_rows = cta_rows
+        self.gzip_body = gzip_body
+        self.last_modified = last_modified
+        self.requests: list[_RecordedRequest] = []
+        self.on_catalog_fetch: Callable[[], None] | None = None
+        self._server = ThreadingHTTPServer(("127.0.0.1", 0), self._handler_class())
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+
+    @property
+    def base_url(self) -> str:
+        host, port = self._server.server_address[:2]
+        return f"http://{host}:{port}"
+
+    def __enter__(self) -> _BackendStub:
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self._server.shutdown()
+        self._server.server_close()
+        self._thread.join(timeout=5)
+
+    def _handler_class(self) -> type[BaseHTTPRequestHandler]:
+        stub = self
+
+        class _Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.0"
+
+            def log_message(self, *args: object) -> None:  # keep pytest output clean
+                pass
+
+            def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
+                stub.requests.append(_RecordedRequest(self.path, self.headers.get("Authorization")))
+                if self.path == "/library/catalog":
+                    rows = stub.catalog_rows
+                elif self.path == "/library/catalog/compilation-tracks":
+                    rows = stub.cta_rows
+                else:
+                    self.send_error(404)
+                    return
+                body = "".join(json.dumps(r) + "\n" for r in rows).encode("utf-8")
+                if stub.gzip_body:
+                    body = gzip.compress(body)
+                self.send_response(200)
+                self.send_header("Content-Type", "application/x-ndjson")
+                self.send_header("Last-Modified", stub.last_modified)
+                if stub.gzip_body:
+                    self.send_header("Content-Encoding", "gzip")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                if self.path == "/library/catalog" and stub.on_catalog_fetch is not None:
+                    stub.on_catalog_fetch()
+
+        return _Handler
+
+
+@dataclass
+class _MysqlCall:
+    argv: list[str]
+    env: dict[str, str]
+
+
+@dataclass
+class _FakeMysqlRunner:
+    """Stands in for the ``mysql`` CLI, writing canned TSV to the capture file.
+
+    ``cta_tsv=None`` simulates a source whose ``COMPILATION_TRACK_ARTIST``
+    table does not exist -- the query fails and the build must continue.
+    """
+
+    library_tsv: str
+    cta_tsv: str | None
+    calls: list[_MysqlCall] = field(default_factory=list)
+
+    def __call__(self, argv: list[str], env: dict[str, str], stdout_path: str) -> bool:
+        self.calls.append(_MysqlCall(list(argv), dict(env)))
+        payload = self.library_tsv if len(self.calls) == 1 else self.cta_tsv
+        if payload is None:
+            return False
+        Path(stdout_path).write_text(payload, encoding="utf-8")
+        return True
 
 
 class TestNormalize:
@@ -615,22 +771,472 @@ class TestMainCli:
         assert payload["matched"] == 1
 
 
-class TestBuildFromSourceStubs:
-    """The producer half of #346 is out of scope: reserved flags raise/exit cleanly."""
+class TestBackendProducer:
+    """``--backend-source``: build a daily-sync-shaped library.db over HTTP (#351).
 
-    def test_mysql_source_flag_is_not_implemented(self, tmp_path: Path) -> None:
-        mod = _load_module()
-        exit_code = mod.main(["--mysql-source", "mysql://example", "--backend-db", "x"])
-        assert exit_code == 2
+    Decision D3 / Option B (2026-08-03): the Backend-sourced build reads the
+    extended ``GET /library/catalog`` + ``GET /library/catalog/compilation-tracks``
+    NDJSON exports (WXYC/Backend-Service#1965) with a service-account bearer
+    token -- no prod-DB credentials.
+    """
 
-    def test_backend_source_flag_is_not_implemented(self, tmp_path: Path) -> None:
+    def test_builds_the_daily_sync_library_shape(self, tmp_path: Path, monkeypatch) -> None:
         mod = _load_module()
-        exit_code = mod.main(["--mysql-db", "x", "--backend-source", "https://example"])
-        assert exit_code == 2
+        monkeypatch.setenv(mod.BACKEND_TOKEN_ENV, "svc-token")
+        out = tmp_path / "backend.db"
+        with _BackendStub(
+            catalog_rows=[_catalog_row(legacy_release_id=72_101)],
+            cta_rows=[
+                {
+                    "legacy_release_id": 72_101,
+                    "artist_name": "Juana Molina",
+                    "track_title": "la paradoja",
+                }
+            ],
+        ) as stub:
+            mod._build_library_db_from_backend(stub.base_url, str(out))
 
-    def test_build_stub_functions_raise_not_implemented_error(self) -> None:
+        conn = sqlite3.connect(out)
+        try:
+            cols = [r[1] for r in conn.execute("PRAGMA table_info(library)")]
+            assert tuple(cols) == _LIBRARY_COLUMNS
+            row = conn.execute(f"SELECT {', '.join(_LIBRARY_COLUMNS)} FROM library").fetchone()
+            # id is legacy_release_id, NOT the BS serial id (which collides
+            # with the tubafrenzy id space -- BS#1963 / decision D4).
+            assert row == (
+                72_101,
+                "Aluminum Tunes",
+                "Stereolab",
+                "ST",
+                100,
+                1,
+                "Rock",
+                "CD",
+                "",
+                "",
+                None,
+                "",
+            )
+            assert conn.execute(
+                "SELECT library_release_id, artist_name, track_title FROM compilation_track_artist"
+            ).fetchall() == [(72_101, "Juana Molina", "la paradoja")]
+            # Same FTS + index furniture the MySQL-sourced daily build creates.
+            objects = {
+                r[0]
+                for r in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type IN ('table', 'index')"
+                )
+            }
+            assert {"library_fts", "idx_artist", "idx_album_artist", "idx_cta_release"} <= objects
+            assert conn.execute(
+                "SELECT rowid FROM library_fts WHERE library_fts MATCH 'stereolab'"
+            ).fetchall() == [(72_101,)]
+        finally:
+            conn.close()
+
+    def test_pipe_joins_cross_reference_names(self, tmp_path: Path, monkeypatch) -> None:
+        """The wire carries an ARRAY; library.db stores the ' | '-joined string."""
         mod = _load_module()
-        with pytest.raises(NotImplementedError):
-            mod._build_library_db_from_mysql("mysql://example", "/tmp/out.db")
-        with pytest.raises(NotImplementedError):
-            mod._build_library_db_from_backend("https://example", "/tmp/out.db")
+        monkeypatch.setenv(mod.BACKEND_TOKEN_ENV, "svc-token")
+        out = tmp_path / "backend.db"
+        with _BackendStub(
+            catalog_rows=[
+                _catalog_row(
+                    legacy_release_id=72_102,
+                    artist_name="Nilüfer Yanya",
+                    cross_reference_names=["Csillagrablók", "Hermanos Gutiérrez"],
+                )
+            ],
+            cta_rows=[],
+        ) as stub:
+            mod._build_library_db_from_backend(stub.base_url, str(out))
+
+        conn = sqlite3.connect(out)
+        try:
+            assert conn.execute("SELECT artist, cross_reference_names FROM library").fetchone() == (
+                "Nilüfer Yanya",
+                "Csillagrablók | Hermanos Gutiérrez",
+            )
+        finally:
+            conn.close()
+
+    def test_absent_optional_text_becomes_empty_string_not_null(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """Match prod byte-for-byte: sync-library.sh IFNULLs these three to ''.
+
+        Not merely a parity nicety -- after the cutover this producer's output
+        IS library.db, and a NULL where prod has '' changes what LML's
+        pipe-split and the FTS content see.
+        """
+        mod = _load_module()
+        monkeypatch.setenv(mod.BACKEND_TOKEN_ENV, "svc-token")
+        out = tmp_path / "backend.db"
+        with _BackendStub(
+            catalog_rows=[
+                _catalog_row(
+                    legacy_release_id=72_103,
+                    alternate_artist_name=None,
+                    album_artist=None,
+                    cross_reference_names=[],
+                )
+            ],
+            cta_rows=[],
+        ) as stub:
+            mod._build_library_db_from_backend(stub.base_url, str(out))
+
+        conn = sqlite3.connect(out)
+        try:
+            assert conn.execute(
+                "SELECT alternate_artist_name, album_artist, cross_reference_names FROM library"
+            ).fetchone() == ("", "", "")
+            assert (
+                conn.execute(
+                    "SELECT rowid FROM library_fts WHERE library_fts MATCH 'null'"
+                ).fetchall()
+                == []
+            )
+        finally:
+            conn.close()
+
+    def test_sends_the_service_account_bearer_token(self, tmp_path: Path, monkeypatch) -> None:
+        mod = _load_module()
+        monkeypatch.setenv(mod.BACKEND_TOKEN_ENV, "svc-token")
+        out = tmp_path / "backend.db"
+        with _BackendStub(catalog_rows=[_catalog_row()], cta_rows=[]) as stub:
+            mod._build_library_db_from_backend(stub.base_url, str(out))
+
+        assert [r.path for r in stub.requests] == [
+            "/library/catalog",
+            "/library/catalog/compilation-tracks",
+        ]
+        assert {r.authorization for r in stub.requests} == {"Bearer svc-token"}
+
+    def test_reads_an_identity_encoded_body(self, tmp_path: Path, monkeypatch) -> None:
+        """Content-Encoding is honoured, not assumed: a non-gzip body still parses."""
+        mod = _load_module()
+        monkeypatch.setenv(mod.BACKEND_TOKEN_ENV, "svc-token")
+        out = tmp_path / "backend.db"
+        with _BackendStub(
+            catalog_rows=[_catalog_row(legacy_release_id=72_104)], cta_rows=[], gzip_body=False
+        ) as stub:
+            mod._build_library_db_from_backend(stub.base_url, str(out))
+
+        conn = sqlite3.connect(out)
+        try:
+            assert conn.execute("SELECT id FROM library").fetchone() == (72_104,)
+        finally:
+            conn.close()
+
+    def test_rejects_a_row_with_no_legacy_release_id(self, tmp_path: Path, monkeypatch) -> None:
+        """Fail loudly rather than write a library.db row with a null id."""
+        mod = _load_module()
+        monkeypatch.setenv(mod.BACKEND_TOKEN_ENV, "svc-token")
+        out = tmp_path / "backend.db"
+        with _BackendStub(catalog_rows=[_catalog_row(legacy_release_id=None)], cta_rows=[]) as stub:
+            with pytest.raises(mod.SourceError, match="legacy_release_id"):
+                mod._build_library_db_from_backend(stub.base_url, str(out))
+        assert not out.exists()
+
+    def test_refetches_when_the_watermark_advances_between_the_two_gets(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """A Last-Modified change across the pair means 're-fetch both' (api.yaml)."""
+        mod = _load_module()
+        monkeypatch.setenv(mod.BACKEND_TOKEN_ENV, "svc-token")
+        out = tmp_path / "backend.db"
+        with _BackendStub(
+            catalog_rows=[_catalog_row(legacy_release_id=72_105)], cta_rows=[]
+        ) as stub:
+            # First catalog fetch is served at watermark A, then the watermark
+            # advances before the CTA fetch -- exactly the torn-snapshot the
+            # spec tells the producer to discard. It settles for attempt 2.
+            def advance_once() -> None:
+                stub.last_modified = _LM_B
+                stub.on_catalog_fetch = None
+
+            stub.on_catalog_fetch = advance_once
+            mod._build_library_db_from_backend(stub.base_url, str(out))
+
+        assert [r.path for r in stub.requests] == [
+            "/library/catalog",
+            "/library/catalog/compilation-tracks",
+            "/library/catalog",
+            "/library/catalog/compilation-tracks",
+        ]
+        conn = sqlite3.connect(out)
+        try:
+            assert conn.execute("SELECT id FROM library").fetchone() == (72_105,)
+        finally:
+            conn.close()
+
+    def test_gives_up_when_the_watermark_never_settles(self, tmp_path: Path, monkeypatch) -> None:
+        mod = _load_module()
+        monkeypatch.setenv(mod.BACKEND_TOKEN_ENV, "svc-token")
+        out = tmp_path / "backend.db"
+        with _BackendStub(catalog_rows=[_catalog_row()], cta_rows=[]) as stub:
+            counter = {"n": 0}
+
+            def always_advance() -> None:
+                counter["n"] += 1
+                stub.last_modified = f"Sat, 09 Aug 2026 12:{counter['n']:02d}:00 GMT"
+
+            stub.on_catalog_fetch = always_advance
+            with pytest.raises(mod.SourceError, match="watermark"):
+                mod._build_library_db_from_backend(stub.base_url, str(out))
+        assert not out.exists()
+
+    def test_refetches_on_a_compilation_track_with_no_catalog_row(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """A dangling legacy_release_id is evidence to re-fetch, then an error."""
+        mod = _load_module()
+        monkeypatch.setenv(mod.BACKEND_TOKEN_ENV, "svc-token")
+        out = tmp_path / "backend.db"
+        with _BackendStub(
+            catalog_rows=[_catalog_row(legacy_release_id=72_106)],
+            cta_rows=[
+                {
+                    "legacy_release_id": 999_999,
+                    "artist_name": "Jessica Pratt",
+                    "track_title": "Back, Baby",
+                }
+            ],
+        ) as stub:
+            with pytest.raises(mod.SourceError, match="compilation"):
+                mod._build_library_db_from_backend(stub.base_url, str(out))
+        assert len(stub.requests) > 2  # retried the pair before giving up
+        assert not out.exists()
+
+    def test_refuses_plaintext_http_to_a_remote_host(self, tmp_path: Path, monkeypatch) -> None:
+        """Never put a bearer token on the wire in the clear."""
+        mod = _load_module()
+        monkeypatch.setenv(mod.BACKEND_TOKEN_ENV, "svc-token")
+        with pytest.raises(mod.SourceError, match="https"):
+            mod._build_library_db_from_backend("http://api.wxyc.org", str(tmp_path / "backend.db"))
+
+    def test_requires_the_service_account_token(self, tmp_path: Path, monkeypatch) -> None:
+        mod = _load_module()
+        monkeypatch.delenv(mod.BACKEND_TOKEN_ENV, raising=False)
+        with pytest.raises(mod.SourceError, match=mod.BACKEND_TOKEN_ENV):
+            mod._build_library_db_from_backend("https://api.wxyc.org", str(tmp_path / "backend.db"))
+
+    def test_refuses_to_overwrite_an_existing_file(self, tmp_path: Path, monkeypatch) -> None:
+        """Scratch copies only -- never clobber a prod artifact or a built input."""
+        mod = _load_module()
+        monkeypatch.setenv(mod.BACKEND_TOKEN_ENV, "svc-token")
+        existing = tmp_path / "library.db"
+        existing.write_bytes(b"precious")
+        with pytest.raises(mod.SourceError, match="exists"):
+            mod._build_library_db_from_backend("https://api.wxyc.org", str(existing))
+        assert existing.read_bytes() == b"precious"
+
+
+class TestMysqlProducer:
+    """``--mysql-source``: build the baseline library.db via the daily-sync read path."""
+
+    def test_builds_via_the_mysql_cli_read_path(self, tmp_path: Path, monkeypatch) -> None:
+        mod = _load_module()
+        out = tmp_path / "mysql.db"
+        runner = _FakeMysqlRunner(
+            library_tsv=("72101\tAluminum Tunes\tStereolab\tST\t100\t1\tRock\tCD\t\t\t\n"),
+            cta_tsv="72101\tJuana Molina\tla paradoja\n",
+        )
+        monkeypatch.setattr(mod, "_mysql_runner", runner)
+
+        mod._build_library_db_from_mysql("mysql://wxyc:sekrit@127.0.0.1:13306/wxycmusic", str(out))
+
+        conn = sqlite3.connect(out)
+        try:
+            assert conn.execute("SELECT id, artist FROM library").fetchall() == [
+                (72_101, "Stereolab")
+            ]
+            assert conn.execute(
+                "SELECT library_release_id, artist_name FROM compilation_track_artist"
+            ).fetchall() == [(72_101, "Juana Molina")]
+        finally:
+            conn.close()
+
+        # Same invocation shape as sync-library.sh: mysql CLI (not a Python
+        # driver -- MySQL 4.1 auth), batch/raw mode, password via MYSQL_PWD.
+        assert runner.calls[0].argv[0] == "mysql"
+        assert "-B" in runner.calls[0].argv and "-N" in runner.calls[0].argv
+        assert runner.calls[0].env["MYSQL_PWD"] == "sekrit"
+        assert "sekrit" not in " ".join(runner.calls[0].argv)
+
+    def test_continues_when_the_compilation_track_table_is_absent(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """CTA is supplementary; a missing table must not fail the build."""
+        mod = _load_module()
+        out = tmp_path / "mysql.db"
+        runner = _FakeMysqlRunner(
+            library_tsv="72101\tAluminum Tunes\tStereolab\tST\t100\t1\tRock\tCD\t\t\t\n",
+            cta_tsv=None,  # query fails, as it does on a source with no CTA table
+        )
+        monkeypatch.setattr(mod, "_mysql_runner", runner)
+
+        mod._build_library_db_from_mysql("mysql://wxyc:sekrit@127.0.0.1/wxycmusic", str(out))
+
+        conn = sqlite3.connect(out)
+        try:
+            assert conn.execute("SELECT count(*) FROM library").fetchone() == (1,)
+            assert conn.execute(
+                "SELECT count(*) FROM sqlite_master WHERE name = 'compilation_track_artist'"
+            ).fetchone() == (0,)
+        finally:
+            conn.close()
+
+    def test_refuses_to_overwrite_an_existing_file(self, tmp_path: Path) -> None:
+        mod = _load_module()
+        existing = tmp_path / "library.db"
+        existing.write_bytes(b"precious")
+        with pytest.raises(mod.SourceError, match="exists"):
+            mod._build_library_db_from_mysql("mysql://u:p@h/db", str(existing))
+        assert existing.read_bytes() == b"precious"
+
+    def test_select_statements_match_sync_library_sh(self) -> None:
+        """Drift guard: the baseline must be the *same* query prod runs daily.
+
+        A producer that quietly diverges from ``scripts/sync-library.sh``
+        would diff the Backend build against something production never
+        builds -- parity would then measure the harness, not the migration.
+        """
+        mod = _load_module()
+        script = (REPO_ROOT / "scripts" / "sync-library.sh").read_text(encoding="utf-8")
+        for sql in (mod.LIBRARY_SELECT_SQL, mod.COMPILATION_TRACK_SELECT_SQL):
+            assert _squash(sql) in _squash(script)
+
+
+class TestProducerCli:
+    """Wiring: --mysql-source / --backend-source build, then the core diffs."""
+
+    def test_round_trip_builds_both_sides_and_diffs_to_zero(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        mod = _load_module()
+        monkeypatch.setenv(mod.BACKEND_TOKEN_ENV, "svc-token")
+        monkeypatch.setattr(
+            mod,
+            "_mysql_runner",
+            _FakeMysqlRunner(
+                library_tsv=(
+                    "72101\tAluminum Tunes\tStereolab\tST\t100\t1\tRock\tCD\t\t\t\n"
+                    "72102\tOn Your Own Love Again\tJessica Pratt\tPR\t42\t7\tRock\tLP\t\t\t\n"
+                ),
+                cta_tsv="72101\tJuana Molina\tla paradoja\n",
+            ),
+        )
+        mysql_db = tmp_path / "mysql.db"
+        backend_db = tmp_path / "backend.db"
+        with _BackendStub(
+            catalog_rows=[
+                _catalog_row(legacy_release_id=72_101),
+                _catalog_row(
+                    legacy_release_id=72_102,
+                    album_title="On Your Own Love Again",
+                    artist_name="Jessica Pratt",
+                    code_letters="PR",
+                    code_artist_number=42,
+                    code_number=7,
+                    format_name="LP",
+                ),
+            ],
+            cta_rows=[
+                {
+                    "legacy_release_id": 72_101,
+                    "artist_name": "Juana Molina",
+                    "track_title": "la paradoja",
+                }
+            ],
+        ) as stub:
+            exit_code = mod.main(
+                [
+                    "--mysql-source",
+                    "mysql://wxyc:sekrit@127.0.0.1/wxycmusic",
+                    "--mysql-db",
+                    str(mysql_db),
+                    "--backend-source",
+                    stub.base_url,
+                    "--backend-db",
+                    str(backend_db),
+                    "--json",
+                ]
+            )
+
+        assert exit_code == 0
+        assert mysql_db.exists() and backend_db.exists()
+        result = mod.run_diff(str(mysql_db), str(backend_db))
+        assert result.matched == 2
+        assert result.missing_in_backend == 0
+        assert result.extra_in_backend == 0
+        assert set(result.field_mismatches.values()) == {0}
+        assert (result.cta_missing, result.cta_extra) == (0, 0)
+
+    def test_json_stdout_stays_a_single_object_while_producing(
+        self, tmp_path: Path, monkeypatch, capsys: pytest.CaptureFixture
+    ) -> None:
+        """Producer progress must not leak into the machine-readable channel.
+
+        Both producers print an "Exported N rows" line and the CTA import
+        prints its own; on stdout they would sit in front of the JSON object
+        and break every consumer that parses it.
+        """
+        mod = _load_module()
+        monkeypatch.setenv(mod.BACKEND_TOKEN_ENV, "svc-token")
+        monkeypatch.setattr(
+            mod,
+            "_mysql_runner",
+            _FakeMysqlRunner(
+                library_tsv="72101\tAluminum Tunes\tStereolab\tST\t100\t1\tRock\tCD\t\t\t\n",
+                cta_tsv="72101\tJuana Molina\tla paradoja\n",
+            ),
+        )
+        with _BackendStub(
+            catalog_rows=[_catalog_row(legacy_release_id=72_101)],
+            cta_rows=[
+                {
+                    "legacy_release_id": 72_101,
+                    "artist_name": "Juana Molina",
+                    "track_title": "la paradoja",
+                }
+            ],
+        ) as stub:
+            exit_code = mod.main(
+                [
+                    "--mysql-source",
+                    "mysql://wxyc:sekrit@127.0.0.1/wxycmusic",
+                    "--mysql-db",
+                    str(tmp_path / "mysql.db"),
+                    "--backend-source",
+                    stub.base_url,
+                    "--backend-db",
+                    str(tmp_path / "backend.db"),
+                    "--json",
+                ]
+            )
+
+        assert exit_code == 0
+        captured = capsys.readouterr()
+        assert json.loads(captured.out)["matched"] == 1  # the WHOLE of stdout
+        assert "Exported" in captured.err
+
+    def test_source_flag_without_an_output_path_is_a_usage_error(self) -> None:
+        mod = _load_module()
+        assert mod.main(["--backend-source", "https://api.wxyc.org", "--mysql-db", "x"]) == 2
+        assert mod.main(["--mysql-source", "mysql://u:p@h/db", "--backend-db", "x"]) == 2
+
+    def test_a_build_failure_exits_three(self, tmp_path: Path, monkeypatch) -> None:
+        mod = _load_module()
+        monkeypatch.delenv(mod.BACKEND_TOKEN_ENV, raising=False)
+        exit_code = mod.main(
+            [
+                "--backend-source",
+                "https://api.wxyc.org",
+                "--backend-db",
+                str(tmp_path / "backend.db"),
+                "--mysql-db",
+                str(tmp_path / "mysql.db"),
+            ]
+        )
+        assert exit_code == 3
