@@ -135,6 +135,15 @@ def _squash(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+def _sync_library_selects(script: str) -> set[str]:
+    """Every SELECT ``sync-library.sh`` hands to the ``mysql`` CLI, squashed.
+
+    The script passes each query as a double-quoted ``-e`` argument and none
+    of them contain a double quote, so this lifts them out exactly.
+    """
+    return {_squash(sql) for sql in re.findall(r'-e "(SELECT [^"]*)"', script)}
+
+
 def _catalog_row(**overrides: Any) -> dict[str, Any]:
     """One ``CatalogExportRow`` as GET /library/catalog serves it (BS#1965).
 
@@ -240,6 +249,54 @@ class _BackendStub:
                 self.wfile.write(body)
                 if self.path == "/library/catalog" and stub.on_catalog_fetch is not None:
                     stub.on_catalog_fetch()
+
+        return _Handler
+
+
+class _RedirectingStub:
+    """A server that answers every GET with a 302 to another origin.
+
+    Stands in for a proxy, a misconfigured CDN, or hijacked DNS: the hop the
+    producer must not follow while still carrying the service-account bearer
+    token.
+    """
+
+    def __init__(self, target_base: str, status: int = 302) -> None:
+        self.target_base = target_base
+        self.status = status
+        self.requests: list[_RecordedRequest] = []
+        self._server = ThreadingHTTPServer(("127.0.0.1", 0), self._handler_class())
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+
+    @property
+    def base_url(self) -> str:
+        host, port = self._server.server_address[:2]
+        return f"http://{host}:{port}"
+
+    def __enter__(self) -> _RedirectingStub:
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self._server.shutdown()
+        self._server.server_close()
+        self._thread.join(timeout=5)
+
+    def _handler_class(self) -> type[BaseHTTPRequestHandler]:
+        stub = self
+
+        class _Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.0"
+
+            def log_message(self, *args: object) -> None:
+                pass
+
+            def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
+                stub.requests.append(_RecordedRequest(self.path, self.headers.get("Authorization")))
+                self.send_response(stub.status)
+                self.send_header("Location", stub.target_base + self.path)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
 
         return _Handler
 
@@ -1031,12 +1088,174 @@ class TestBackendProducer:
             mod._build_library_db_from_backend("https://api.wxyc.org", str(existing))
         assert existing.read_bytes() == b"precious"
 
+    def test_refuses_to_follow_a_cross_origin_redirect(self, tmp_path: Path, monkeypatch) -> None:
+        """The bearer token must not be replayed to a host the operator didn't name.
+
+        urllib's default redirect handler copies every header (including
+        Authorization) into the redirected request, so a 302 from a proxy,
+        a misconfigured CDN, or hijacked DNS would hand the service-account
+        JWT to a foreign origin -- and to a plaintext one, defeating the
+        https-only check entirely (that check only ever sees the first URL).
+        """
+        mod = _load_module()
+        monkeypatch.setenv(mod.BACKEND_TOKEN_ENV, "svc-token")
+        out = tmp_path / "backend.db"
+        with _BackendStub(catalog_rows=[_catalog_row()], cta_rows=[]) as elsewhere:
+            with _RedirectingStub(elsewhere.base_url) as redirector:
+                with pytest.raises(mod.SourceError, match="redirect"):
+                    mod._build_library_db_from_backend(redirector.base_url, str(out))
+            assert elsewhere.requests == []
+        assert not out.exists()
+
+    def test_rejects_a_string_cross_reference_names(self, tmp_path: Path, monkeypatch) -> None:
+        """A scalar where the contract promises an array must fail, not char-split.
+
+        ``' | '.join("Stereolab")`` yields 'S | t | e | r | e | o | l | a | b'
+        -- one phantom alias per letter, which LML then pipe-splits into the
+        live search index. Silent, and indistinguishable from real drift.
+        """
+        mod = _load_module()
+        monkeypatch.setenv(mod.BACKEND_TOKEN_ENV, "svc-token")
+        out = tmp_path / "backend.db"
+        with _BackendStub(
+            catalog_rows=[_catalog_row(cross_reference_names="Stereolab")], cta_rows=[]
+        ) as stub:
+            with pytest.raises(mod.SourceError, match="cross_reference_names"):
+                mod._build_library_db_from_backend(stub.base_url, str(out))
+        assert not out.exists()
+
+    @pytest.mark.parametrize(
+        "field_name",
+        [
+            "album_title",
+            "artist_name",
+            "code_letters",
+            "code_artist_number",
+            "code_number",
+            "genre_name",
+            "format_name",
+        ],
+    )
+    def test_rejects_a_missing_required_field(
+        self, tmp_path: Path, monkeypatch, field_name: str
+    ) -> None:
+        """Every api.yaml-`required` CatalogExportRow field is validated, not just the id.
+
+        A bare ``.get()`` would write SQL NULL for a renamed or regressed
+        field: post-cutover that empties the row's FTS content and breaks LML
+        search, and pre-cutover it looks like an ordinary field mismatch.
+        """
+        mod = _load_module()
+        monkeypatch.setenv(mod.BACKEND_TOKEN_ENV, "svc-token")
+        out = tmp_path / "backend.db"
+        with _BackendStub(catalog_rows=[_catalog_row(**{field_name: None})], cta_rows=[]) as stub:
+            with pytest.raises(mod.SourceError, match=field_name):
+                mod._build_library_db_from_backend(stub.base_url, str(out))
+        assert not out.exists()
+
+    def test_rejects_a_zero_row_catalog_export(self, tmp_path: Path, monkeypatch) -> None:
+        """An empty catalog is a producer failure, never a 64,815-row drift report.
+
+        A broken export query, an over-narrow token scope, or a truncated
+        cached buffer all surface as a 200 with no rows; building from it
+        would report the whole catalog as missing_in_backend.
+        """
+        mod = _load_module()
+        monkeypatch.setenv(mod.BACKEND_TOKEN_ENV, "svc-token")
+        out = tmp_path / "backend.db"
+        with _BackendStub(catalog_rows=[], cta_rows=[]) as stub:
+            with pytest.raises(mod.SourceError, match="no rows"):
+                mod._build_library_db_from_backend(stub.base_url, str(out))
+        assert not out.exists()
+
+    def test_leaves_no_partial_file_when_the_build_fails(self, tmp_path: Path, monkeypatch) -> None:
+        """A failure mid-insert must not leave a stub file that wedges the next run.
+
+        ``_require_absent`` refuses any path that exists, so a partial write
+        here would block every subsequent parity day until an operator
+        deleted it by hand.
+        """
+        mod = _load_module()
+        monkeypatch.setenv(mod.BACKEND_TOKEN_ENV, "svc-token")
+        out = tmp_path / "backend.db"
+        # Two rows sharing a legacy_release_id: the mapping succeeds, and the
+        # library.id PRIMARY KEY rejects the second INSERT mid-build.
+        with _BackendStub(
+            catalog_rows=[_catalog_row(id=1), _catalog_row(id=2)], cta_rows=[]
+        ) as stub:
+            with pytest.raises(mod.SourceError):
+                mod._build_library_db_from_backend(stub.base_url, str(out))
+        assert not out.exists()
+        assert list(tmp_path.iterdir()) == []
+
+    def test_rejects_a_non_integer_legacy_release_id(self, tmp_path: Path, monkeypatch) -> None:
+        """A non-numeric id is a contract violation -- a SourceError, not a ValueError."""
+        mod = _load_module()
+        monkeypatch.setenv(mod.BACKEND_TOKEN_ENV, "svc-token")
+        out = tmp_path / "backend.db"
+        bad_row = _catalog_row(legacy_release_id="ST-100")
+        with _BackendStub(catalog_rows=[bad_row], cta_rows=[]) as stub:
+            with pytest.raises(mod.SourceError, match="legacy_release_id"):
+                mod._build_library_db_from_backend(stub.base_url, str(out))
+        assert not out.exists()
+
+    def test_tolerates_mixed_id_types_across_the_two_exports(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """A stringified bigint on one side must not crash the dangling-id check.
+
+        Sorting ``{"72101", 72101}`` with a raw ``<`` raises TypeError inside
+        the torn-snapshot error path -- the one place that has to stay
+        diagnosable.
+        """
+        mod = _load_module()
+        monkeypatch.setenv(mod.BACKEND_TOKEN_ENV, "svc-token")
+        out = tmp_path / "backend.db"
+        with _BackendStub(
+            catalog_rows=[_catalog_row(legacy_release_id=72_101)],
+            cta_rows=[
+                {
+                    "legacy_release_id": "72101",
+                    "artist_name": "Juana Molina",
+                    "track_title": "la paradoja",
+                }
+            ],
+        ) as stub:
+            mod._build_library_db_from_backend(stub.base_url, str(out))
+
+        conn = sqlite3.connect(out)
+        try:
+            assert conn.execute(
+                "SELECT library_release_id FROM compilation_track_artist"
+            ).fetchall() == [(72_101,)]
+        finally:
+            conn.close()
+
+
+class TestSharedSchemaConstants:
+    """The producer must not re-declare what ``lib/library_db.py`` owns."""
+
+    def test_library_columns_is_the_shared_constant(self) -> None:
+        """A local copy would silently keep diffing the old column set.
+
+        ``lib/library_db.py`` exists so the shape lives in exactly one place;
+        a re-declaration here means a column added there becomes a
+        permanently-undiffed blind spot in the tool that certifies the cutover.
+        """
+        mod = _load_module()
+        sys.path.insert(0, str(REPO_ROOT))
+        from lib.library_db import LIBRARY_COLUMNS as shared_columns
+
+        assert mod.LIBRARY_COLUMNS is shared_columns
+        assert tuple(shared_columns) == _LIBRARY_COLUMNS
+
 
 class TestMysqlProducer:
     """``--mysql-source``: build the baseline library.db via the daily-sync read path."""
 
     def test_builds_via_the_mysql_cli_read_path(self, tmp_path: Path, monkeypatch) -> None:
         mod = _load_module()
+        monkeypatch.delenv(mod.MYSQL_PASSWORD_ENV, raising=False)
         out = tmp_path / "mysql.db"
         runner = _FakeMysqlRunner(
             library_tsv=("72101\tAluminum Tunes\tStereolab\tST\t100\t1\tRock\tCD\t\t\t\n"),
@@ -1101,11 +1320,44 @@ class TestMysqlProducer:
         A producer that quietly diverges from ``scripts/sync-library.sh``
         would diff the Backend build against something production never
         builds -- parity would then measure the harness, not the migration.
+
+        Asserted as set equality over every ``-e "SELECT ..."`` the script
+        runs, not as substring containment: containment is one-directional,
+        so appending ``ORDER BY``/``LIMIT`` to the shell's copy -- or adding a
+        third, divergent SELECT -- would leave the guard green while the two
+        producers ran different queries.
         """
         mod = _load_module()
         script = (REPO_ROOT / "scripts" / "sync-library.sh").read_text(encoding="utf-8")
-        for sql in (mod.LIBRARY_SELECT_SQL, mod.COMPILATION_TRACK_SELECT_SQL):
-            assert _squash(sql) in _squash(script)
+        assert _sync_library_selects(script) == {
+            _squash(mod.LIBRARY_SELECT_SQL),
+            _squash(mod.COMPILATION_TRACK_SELECT_SQL),
+        }
+
+    def test_password_comes_from_the_environment_not_the_dsn(self, monkeypatch) -> None:
+        """A DSN password sits in *this* process's argv, visible to `ps`."""
+        mod = _load_module()
+        monkeypatch.setenv(mod.MYSQL_PASSWORD_ENV, "sekrit")
+        argv, env = mod._mysql_invocation("mysql://wxyc@127.0.0.1:13306/wxycmusic")
+
+        assert env["MYSQL_PWD"] == "sekrit"
+        assert "sekrit" not in " ".join(argv)
+        assert argv[:5] == ["mysql", "-h", "127.0.0.1", "-P", "13306"]
+
+    def test_environment_password_wins_over_a_dsn_password(self, monkeypatch) -> None:
+        mod = _load_module()
+        monkeypatch.setenv(mod.MYSQL_PASSWORD_ENV, "from-env")
+        _, env = mod._mysql_invocation("mysql://wxyc:from-dsn@127.0.0.1/wxycmusic")
+        assert env["MYSQL_PWD"] == "from-env"
+
+    def test_a_malformed_port_raises_source_error(self, monkeypatch) -> None:
+        """A `/` in an un-encoded DSN password shifts the netloc, so the port
+        parse blows up with a bare ValueError deep in urllib -- exit 1 with a
+        traceback, not the documented exit 3."""
+        mod = _load_module()
+        monkeypatch.delenv(mod.MYSQL_PASSWORD_ENV, raising=False)
+        with pytest.raises(mod.SourceError, match="port"):
+            mod._mysql_invocation("mysql://wxyc:se/kr@127.0.0.1:13306/wxycmusic")
 
 
 class TestProducerCli:
@@ -1240,3 +1492,69 @@ class TestProducerCli:
             ]
         )
         assert exit_code == 3
+
+    def test_an_unexpected_producer_failure_still_exits_three(
+        self, tmp_path: Path, monkeypatch, capsys: pytest.CaptureFixture
+    ) -> None:
+        """Exit 3 is the documented contract for *any* producer failure.
+
+        Catching only SourceError let a `mysql` binary that isn't on PATH, a
+        missing output directory, or a malformed DSN port escape as a raw
+        traceback and exit 1.
+        """
+        mod = _load_module()
+        monkeypatch.delenv(mod.MYSQL_PASSWORD_ENV, raising=False)
+
+        def explode(*args: object, **kwargs: object) -> bool:
+            raise FileNotFoundError(2, "No such file or directory: 'mysql'")
+
+        monkeypatch.setattr(mod, "_mysql_runner", explode)
+        exit_code = mod.main(
+            [
+                "--mysql-source",
+                "mysql://wxyc@127.0.0.1/wxycmusic",
+                "--mysql-db",
+                str(tmp_path / "mysql.db"),
+                "--backend-db",
+                str(tmp_path / "backend.db"),
+            ]
+        )
+        assert exit_code == 3
+        assert "error:" in capsys.readouterr().err
+
+    def test_output_paths_are_checked_before_any_build_runs(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """Refusing the backend path only *after* the MySQL export burns the whole export.
+
+        Both --*-db paths are validated up front, so a same-path mistake
+        costs nothing.
+        """
+        mod = _load_module()
+        monkeypatch.setenv(mod.BACKEND_TOKEN_ENV, "svc-token")
+        monkeypatch.delenv(mod.MYSQL_PASSWORD_ENV, raising=False)
+        runner = _FakeMysqlRunner(
+            library_tsv="72101\tAluminum Tunes\tStereolab\tST\t100\t1\tRock\tCD\t\t\t\n",
+            cta_tsv=None,
+        )
+        monkeypatch.setattr(mod, "_mysql_runner", runner)
+        existing = tmp_path / "backend.db"
+        existing.write_bytes(b"precious")
+
+        exit_code = mod.main(
+            [
+                "--mysql-source",
+                "mysql://wxyc@127.0.0.1/wxycmusic",
+                "--mysql-db",
+                str(tmp_path / "mysql.db"),
+                "--backend-source",
+                "https://api.wxyc.org",
+                "--backend-db",
+                str(existing),
+            ]
+        )
+
+        assert exit_code == 3
+        assert runner.calls == []
+        assert existing.read_bytes() == b"precious"
+        assert not (tmp_path / "mysql.db").exists()

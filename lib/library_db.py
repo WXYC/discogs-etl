@@ -1,4 +1,4 @@
-"""The canonical ``library.db`` shape, shared by every producer that builds one.
+"""The canonical ``library.db`` shape, shared by both producers of the served one.
 
 ``library.db`` is the SQLite catalog snapshot that library-metadata-lookup
 serves searches from. Production builds it nightly from tubafrenzy's MySQL
@@ -7,12 +7,25 @@ tubafrenzy turndown (WXYC/wiki#89, Phase 3.5) moves that build to
 Backend-Service over HTTP (``scripts/catalog_parity_diff.py
 --backend-source``, WXYC/discogs-etl#351).
 
-Both paths must emit a **byte-identical schema**, so the DDL lives here once
-rather than being copied into each producer. That is not a tidiness
-preference: the Backend-sourced build is not merely a diff input, it becomes
-the real ``library.db`` at the cutover, and a divergent FTS tokenizer or a
-missing index would degrade live search in a way the row-by-row parity diff
-(which compares column *values*, not table definitions) cannot see.
+Both of those paths must emit a **byte-identical schema**, so the DDL lives
+here once rather than being copied into each producer. That is not a
+tidiness preference: the Backend-sourced build is not merely a diff input,
+it becomes the real ``library.db`` at the cutover, and a divergent FTS
+tokenizer or a missing index would degrade live search in a way the
+row-by-row parity diff (which compares column *values*, not table
+definitions) cannot see.
+
+**One further producer exists and does not use this module.**
+``scripts/run_pipeline.py --generate-library-db`` shells out to
+wxyc-catalog's ``wxyc-export-to-sqlite``, which builds a **10-column**
+``library`` table (no ``album_artist``, no ``cross_reference_names``), an
+FTS5 table over three columns with the **default** unicode61 tokenizer, and
+no ``idx_album_artist``. It is already drifted, and this module cannot stop
+it. What bounds the damage is where its output goes: a tempdir, consumed by
+the pipeline's own KEEP/PRUNE artist filter, never uploaded to LML -- so the
+missing tokenizer categories and index cost nothing today. Do not treat that
+as safe by construction; if that database ever becomes a served artifact, it
+has to move onto this module first.
 
 The ``library`` table's 12 columns are ``id, title, artist, call_letters,
 artist_call_number, release_call_number, genre, format,
@@ -105,7 +118,8 @@ def insert_library_rows(cur: sqlite3.Cursor, rows: Iterable[Sequence[object]]) -
 
 def finalize_library(cur: sqlite3.Cursor) -> None:
     """Populate the FTS index from ``library`` and create the search indexes."""
-    cur.execute("""INSERT INTO library_fts(rowid, title, artist, alternate_artist_name, album_artist)
+    cur.execute("""
+        INSERT INTO library_fts(rowid, title, artist, alternate_artist_name, album_artist)
         SELECT id, title, artist, alternate_artist_name, album_artist FROM library""")
     cur.execute("CREATE INDEX idx_artist ON library(artist)")
     cur.execute("CREATE INDEX idx_title ON library(title)")
