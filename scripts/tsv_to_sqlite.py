@@ -1,16 +1,16 @@
 """Convert a MySQL TSV dump to a SQLite database with FTS5 index.
 
 Reads a tab-separated file (as produced by ``mysql -B -N``) with 11 columns
-corresponding to the WXYC library catalog schema and creates a SQLite
-database containing:
+corresponding to the WXYC library catalog schema and creates a
+``library.db``: a ``library`` table, its FTS5 companion, the search indexes,
+and optionally a ``compilation_track_artist`` table.
 
-- A ``library`` table with id, title, artist, call_letters,
-  artist_call_number, release_call_number, genre, format,
-  alternate_artist_name, album_artist, label, and cross_reference_names
-  columns (label is always NULL since the MySQL query doesn't include it).
-- An FTS5 virtual table (``library_fts``) for full-text search on title,
-  artist, alternate_artist_name, and album_artist.
-- Indexes on artist, title, alternate_artist_name, and album_artist.
+This is the **MySQL-sourced** producer -- the one that builds production's
+``library.db`` nightly out of ``scripts/sync-library.sh``. The schema itself
+lives in :mod:`lib.library_db`, shared with the Backend-sourced producer
+(``scripts/catalog_parity_diff.py --backend-source``, WXYC/discogs-etl#351)
+so the two builds cannot drift apart in shape. See that module's docstring
+for the column list and why ``label`` is always NULL.
 
 ``cross_reference_names`` holds the pipe-joined (``" | "``) PRESENTATION_NAMEs
 of any WXYC ``LIBRARY_CODE``s cataloger-cross-referenced to this row's own
@@ -26,99 +26,21 @@ Optionally also imports a ``compilation_track_artist`` table from a second,
 sourced from tubafrenzy's ``COMPILATION_TRACK_ARTIST`` table. This restores
 the export dropped in the #65 slim-down (see WXYC/discogs-etl#332); LML's
 ``library/db.py`` detects the table at connect time and UNIONs in
-compilations featuring a searched track artist. ``artist_name`` and
-``track_title`` are free text and can themselves contain embedded
-tab/newline/backslash bytes -- ``mysql -B -N`` escapes those into two-char
-``\\t``/``\\n``/``\\\\`` sequences before they ever reach the TSV, which is
-why splitting on real tab/newline bytes (the same approach the ``library``
-table above already relies on) is safe here too.
+compilations featuring a searched track artist.
 """
 
 from __future__ import annotations
 
-import sqlite3
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from lib.library_db import (  # noqa: E402
+    build_library_db,
+    parse_compilation_track_tsv,
+    parse_library_tsv,
+)
 from lib.observability import init_logger  # noqa: E402
-
-
-def _import_compilation_track_artists(cta_tsv_path: str, cur: sqlite3.Cursor) -> int:
-    """Import compilation_track_artist rows from a MySQL TSV dump into SQLite.
-
-    Reads a 3-column TSV (library_release_id, artist_name, track_title) as
-    produced by ``mysql -B -N`` against tubafrenzy's COMPILATION_TRACK_ARTIST
-    table. track_title is nullable (MySQL ``\\N``); library_release_id and
-    artist_name are not.
-
-    The table (plus its indexes) is created only if at least one row parses
-    successfully. This is the graceful-degradation path: when the source
-    table doesn't exist (pre-V008 fixtures, the Backend-Service catalog
-    source) or the query fails, callers pass no ``cta_tsv_path`` at all, and
-    when it's genuinely empty this function is a no-op -- either way, no
-    ``compilation_track_artist`` table is created, so LML's
-    ``_has_compilation_track_artist`` presence check stays False rather than
-    seeing a stray empty table.
-
-    Rows with the wrong field count are skipped with a WARNING on stderr
-    (never silently dropped), matching the ``library`` table's malformed-row
-    handling above.
-
-    Returns:
-        The number of compilation_track_artist rows imported.
-    """
-    rows: list[tuple[int, str, str | None]] = []
-    with open(cta_tsv_path, encoding="utf-8") as f:
-        for line in f:
-            fields = line.rstrip("\n").split("\t")
-            if len(fields) != 3:
-                print(
-                    f"WARNING: skipping malformed compilation_track_artist row with "
-                    f"{len(fields)} fields",
-                    file=sys.stderr,
-                )
-                continue
-            library_release_id_raw, artist_name, track_title = (
-                None if v == "\\N" else v for v in fields
-            )
-            if library_release_id_raw is None or artist_name is None:
-                print(
-                    "WARNING: skipping compilation_track_artist row with NULL "
-                    "library_release_id or artist_name",
-                    file=sys.stderr,
-                )
-                continue
-            try:
-                library_release_id = int(library_release_id_raw)
-            except ValueError:
-                print(
-                    "WARNING: skipping compilation_track_artist row with "
-                    f"non-integer library_release_id {library_release_id_raw!r}",
-                    file=sys.stderr,
-                )
-                continue
-            rows.append((library_release_id, artist_name, track_title))
-
-    if not rows:
-        return 0
-
-    cur.execute("""CREATE TABLE compilation_track_artist (
-        library_release_id INTEGER NOT NULL,
-        artist_name TEXT NOT NULL,
-        track_title TEXT
-    )""")
-    cur.executemany(
-        "INSERT INTO compilation_track_artist"
-        " (library_release_id, artist_name, track_title) VALUES (?,?,?)",
-        rows,
-    )
-    cur.execute("CREATE INDEX idx_cta_release ON compilation_track_artist(library_release_id)")
-    cur.execute("CREATE INDEX idx_cta_artist ON compilation_track_artist(artist_name)")
-
-    releases = len({row[0] for row in rows})
-    print(f"Exported {len(rows)} compilation track artists across {releases} releases")
-    return len(rows)
 
 
 def tsv_to_sqlite(tsv_path: str, db_path: str, cta_tsv_path: str | None = None) -> int:
@@ -135,70 +57,8 @@ def tsv_to_sqlite(tsv_path: str, db_path: str, cta_tsv_path: str | None = None) 
         The number of library rows successfully imported (unaffected by
         compilation_track_artist import counts).
     """
-    conn = sqlite3.connect(db_path)
-    cur = conn.cursor()
-    cur.execute("""CREATE TABLE library (
-        id INTEGER PRIMARY KEY, title TEXT, artist TEXT, call_letters TEXT,
-        artist_call_number INTEGER, release_call_number INTEGER,
-        genre TEXT, format TEXT, alternate_artist_name TEXT,
-        album_artist TEXT, label TEXT, cross_reference_names TEXT
-    )""")
-    # FTS5 tokenizer extends unicode61 with the Symbol category and U+200D ZWJ so
-    # bare-emoji rows (waving-hand, musical-note) and ZWJ graphemes (family,
-    # flag, person-with-profession) get tokenized. The default unicode61
-    # categories ('L* N* Co') drop everything else, leaving the FTS index with
-    # no token to anchor a supplementary-plane row on.
-    # Cf is NOT included wholesale -- that would merge tokens around
-    # zero-width-space, BOM, soft-hyphen, etc. ZWJ is opted in explicitly via
-    # tokenchars; the U+200D codepoint is written as the explicit \\u200d escape
-    # below so the source stays unambiguous in editors and diffs that render
-    # zero-width characters invisibly.
-    # Must stay in sync with `library.db.LIBRARY_FTS_CREATE_SQL` in
-    # WXYC/library-metadata-lookup. See WXYC/discogs-etl#161 and
-    # WXYC/library-metadata-lookup#251.
-    fts_tokenizer = "unicode61 categories 'L* N* Co S*' tokenchars '\u200d'"
-    cur.execute(
-        "CREATE VIRTUAL TABLE library_fts USING fts5("
-        "title, artist, alternate_artist_name, album_artist, "
-        f'tokenize="{fts_tokenizer}", '
-        "content='library', content_rowid='id'"
-        ")"
-    )
-
-    count = 0
-    with open(tsv_path, encoding="utf-8") as f:
-        for line in f:
-            fields = line.rstrip("\n").split("\t")
-            if len(fields) != 11:
-                print(
-                    f"WARNING: skipping malformed row with {len(fields)} fields",
-                    file=sys.stderr,
-                )
-                continue
-            # MySQL -B outputs \N for NULL
-            row = [None if v == "\\N" else v for v in fields]
-            cur.execute(
-                "INSERT INTO library (id, title, artist, call_letters,"
-                " artist_call_number, release_call_number, genre, format,"
-                " alternate_artist_name, album_artist, cross_reference_names)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                row,
-            )
-            count += 1
-
-    cur.execute("""INSERT INTO library_fts(rowid, title, artist, alternate_artist_name, album_artist)
-        SELECT id, title, artist, alternate_artist_name, album_artist FROM library""")
-    cur.execute("CREATE INDEX idx_artist ON library(artist)")
-    cur.execute("CREATE INDEX idx_title ON library(title)")
-    cur.execute("CREATE INDEX idx_alternate_artist ON library(alternate_artist_name)")
-    cur.execute("CREATE INDEX idx_album_artist ON library(album_artist)")
-
-    if cta_tsv_path:
-        _import_compilation_track_artists(cta_tsv_path, cur)
-
-    conn.commit()
-    conn.close()
-    return count
+    cta_rows = parse_compilation_track_tsv(cta_tsv_path) if cta_tsv_path else None
+    return build_library_db(db_path, parse_library_tsv(tsv_path), cta_rows)
 
 
 def _parse_args(argv: list[str]) -> tuple[str, str, str | None]:

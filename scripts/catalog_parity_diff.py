@@ -11,22 +11,39 @@ This script is the comparison core of that proof: given two already-built
 they diverge, so an operator can drive the migration to zero drift (or an
 explicitly accepted residue).
 
-**Out of scope**: building a fresh ``library.db`` from a live source (direct
-Postgres vs. an HTTP call to Backend-Service) is a separate, not-yet-decided
-piece of work -- see ``_build_library_db_from_mysql`` /
-``_build_library_db_from_backend`` below and WXYC/discogs-etl#346. The
-``--mysql-source`` / ``--backend-source`` flags are reserved for that future
-producer step; passing them today is a CLI usage error (exit 2), not a
-partial implementation.
+It also carries the **producer** half (WXYC/discogs-etl#351): given a live
+source instead of a prebuilt file, ``--mysql-source`` / ``--backend-source``
+build the corresponding ``library.db`` first, so a single invocation can
+build both sides and diff them.
+
+- ``--mysql-source mysql://user:pass@host:port/dbname`` reproduces the daily
+  build's own read path -- the ``mysql`` CLI in batch/raw mode, running the
+  exact SELECTs from ``scripts/sync-library.sh`` (a source-grep test pins
+  them together), parsed by the same TSV parser production uses. The CLI, not
+  a Python driver, because tubafrenzy's MySQL 4.1 auth breaks those drivers.
+- ``--backend-source https://api.wxyc.org`` is the migration target
+  (decision D3 / Option B, 2026-08-03): the gzipped-NDJSON exports ``GET
+  /library/catalog`` + ``GET /library/catalog/compilation-tracks``
+  (WXYC/Backend-Service#1965) read over HTTPS with a service-account bearer
+  token from ``$BACKEND_CATALOG_TOKEN`` -- no prod-DB credentials, which is
+  the whole point of Option B over a direct-Postgres producer.
+
+Both producers write **only** to the path named by the matching ``--*-db``
+flag, and refuse to write to a path that already exists: this harness must
+never be able to clobber a real ``library.db``.
+
+**Still out of scope**: the operational cutover -- running the 7 clean parity
+days, flipping ``sync-library.sh``'s source, and taking ``/wxycdb`` dark --
+is WXYC/discogs-etl#346, deliberately human-gated.
 
 Schema note: the ``library`` table's 12 columns (``id, title, artist,
 call_letters, artist_call_number, release_call_number, genre, format,
-alternate_artist_name, album_artist, label, cross_reference_names``) are
-derived from ``scripts/tsv_to_sqlite.py``'s ``CREATE TABLE library`` -- the
-authoritative daily-sync shape. ``label`` is always NULL in production (the
-TSV INSERT never includes it -- see that script's module docstring), so it
-is excluded from the diffed column set below rather than compared as a
-trivially-always-equal no-op.
+alternate_artist_name, album_artist, label, cross_reference_names``) come
+from ``lib/library_db.py`` -- the authoritative daily-sync shape, shared with
+``scripts/tsv_to_sqlite.py`` so both producers build the same database.
+``label`` is always NULL in production (nothing ever inserts it -- see that
+module's docstring), so it is excluded from the diffed column set below
+rather than compared as a trivially-always-equal no-op.
 
 Usage::
 
@@ -40,11 +57,12 @@ Exit codes:
 - ``0`` -- ran successfully. A nonzero diff count is still exit 0; the
   operator reads the counts (and, in ``--json`` mode, the id lists) to judge
   parity.
-- ``2`` -- bad arguments (missing required flags, or the reserved
-  build-from-source flags).
+- ``2`` -- bad arguments (missing required flags).
 - ``3`` -- source/read error: missing file, unreadable database, a required
-  table (``library``) absent from one of the inputs, or a malformed input
-  (duplicate ``library.id``, which a valid library.db's primary key forbids).
+  table (``library``) absent from one of the inputs, a malformed input
+  (duplicate ``library.id``, which a valid library.db's primary key forbids),
+  or a producer failure (unreachable source, missing credentials, a refused
+  overwrite, an inconsistent snapshot).
 
 Never writes to either input: both files are opened as read-only SQLite
 connections (``mode=ro``).
@@ -53,23 +71,44 @@ connections (``mode=ro``).
 from __future__ import annotations
 
 import argparse
+import gzip
 import json
 import logging
+import os
+import shutil
 import sqlite3
+import subprocess
 import sys
+import tempfile
 from collections import Counter
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from urllib.request import pathname2url
+from typing import Any
+from urllib.error import URLError
+from urllib.parse import unquote, urlsplit
+from urllib.request import Request, pathname2url, urlopen
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from lib.library_db import (  # noqa: E402
+    CROSS_REFERENCE_SEPARATOR,
+    build_library_db,
+    parse_compilation_track_tsv,
+    parse_library_tsv,
+)
 from lib.observability import init_logger  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
 
 class SourceError(RuntimeError):
-    """A library.db input is unusable: missing file, unreadable, missing a required table, or malformed (duplicate id)."""
+    """A library.db side is unusable.
+
+    Either an input file (missing, unreadable, missing a required table, or
+    malformed -- e.g. a duplicate id) or a producer that could not build one
+    (bad DSN/URL, missing credentials, a refused overwrite, an unreachable
+    source, or an inconsistent snapshot).
+    """
 
 
 # The exact `library` table column list, derived from scripts/tsv_to_sqlite.py's
@@ -281,39 +320,402 @@ def run_diff(mysql_db: str, backend_db: str) -> ParityDiff:
         mysql_conn.close()
 
 
-# --- Producer stubs (out of scope; see the module docstring and #346) -----
-#
-# Building a fresh library.db from a live source is a separate, not-yet-
-# decided piece of work (direct-PG vs. HTTP producer). These functions exist
-# only to reserve the CLI surface (--mysql-source / --backend-source) so the
-# real producer can be wired in later without a breaking CLI change. They
-# must not be implemented here.
+# --- Producers: build a library.db from a live source (#351) --------------
+
+# Env var holding the Backend-Service service-account bearer JWT. Decision D3
+# (Option B) deliberately picked an HTTP/contract-governed producer over a
+# direct-Postgres one precisely so that no prod-DB credential has to exist in
+# GitHub Actions -- this token is the only secret the Backend producer needs.
+BACKEND_TOKEN_ENV = "BACKEND_CATALOG_TOKEN"
+
+_CATALOG_PATH = "/library/catalog"
+_COMPILATION_TRACKS_PATH = "/library/catalog/compilation-tracks"
+
+# The full catalog is ~2.6 MB gzipped and the CTA export ~3.2 MB (measured
+# against the 2026-07-19 prod snapshot, api.yaml BS#1965 notes), both served
+# from a per-watermark in-memory cache -- but a cold cache has to build the
+# whole body first, so the budget is generous.
+_HTTP_TIMEOUT_SECONDS = 300
+
+# GET /library/catalog and GET /library/catalog/compilation-tracks are two
+# requests, not one transaction. They form a consistent snapshot only while
+# the shared library_watermark holds still across both; api.yaml's
+# CROSS-ENDPOINT CONSISTENCY note says to treat a change as "re-fetch both".
+# A catalog write mid-fetch is rare and self-healing, so a couple of retries
+# is plenty -- and failing after them is right, because the alternative is
+# diffing a torn snapshot and calling the tear a parity defect.
+_SNAPSHOT_ATTEMPTS = 3
+
+# Loopback only: anywhere else, plain HTTP would put the service-account
+# bearer token on the wire in the clear.
+_PLAINTEXT_OK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+
+# The library SELECT production runs every day, copied verbatim from
+# scripts/sync-library.sh. tests/unit/test_catalog_parity_diff.py asserts
+# (whitespace-insensitively) that this text still appears in that script:
+# a baseline built from a *different* query would make the parity diff
+# measure the harness rather than the migration. Change one, change both.
+LIBRARY_SELECT_SQL = (
+    "SELECT r.ID, r.TITLE, lc.PRESENTATION_NAME, lc.CALL_LETTERS, lc.CALL_NUMBERS,"
+    " r.CALL_NUMBERS, g.REFERENCE_NAME, f.REFERENCE_NAME,"
+    " IFNULL(r.ALTERNATE_ARTIST_NAME, ''), IFNULL(r.ALBUM_ARTIST, ''),"
+    " IFNULL((SELECT GROUP_CONCAT(DISTINCT xlc.PRESENTATION_NAME SEPARATOR ' | ')"
+    " FROM LIBRARY_CODE_CROSS_REFERENCE xcr, LIBRARY_CODE xlc"
+    " WHERE xlc.ID = CASE WHEN xcr.CROSS_REFERENCING_ARTIST_ID = lc.ID"
+    " THEN xcr.CROSS_REFERENCED_LIBRARY_CODE_ID"
+    " WHEN xcr.CROSS_REFERENCED_LIBRARY_CODE_ID = lc.ID"
+    " THEN xcr.CROSS_REFERENCING_ARTIST_ID ELSE NULL END"
+    " AND (xcr.CROSS_REFERENCING_ARTIST_ID = lc.ID"
+    " OR xcr.CROSS_REFERENCED_LIBRARY_CODE_ID = lc.ID)"
+    " AND xlc.ID != lc.ID), '')"
+    " FROM LIBRARY_RELEASE r JOIN LIBRARY_CODE lc ON r.LIBRARY_CODE_ID = lc.ID"
+    " JOIN FORMAT f ON r.FORMAT_ID = f.ID JOIN GENRE g ON lc.GENRE_ID = g.ID"
+)
+
+# Likewise the compilation-track SELECT. Supplementary to LIBRARY_RELEASE: on
+# a source with no COMPILATION_TRACK_ARTIST table this query fails and the
+# build continues without the table, exactly as sync-library.sh does.
+COMPILATION_TRACK_SELECT_SQL = (
+    "SELECT LIBRARY_RELEASE_ID, ARTIST_NAME, IFNULL(TRACK_TITLE, '')"
+    " FROM COMPILATION_TRACK_ARTIST ORDER BY LIBRARY_RELEASE_ID"
+)
 
 
-def _build_library_db_from_mysql(source: str, output_path: str) -> None:
-    """STUB -- build a library.db from a live MySQL (tubafrenzy) source.
+def _require_absent(output_path: str, label: str) -> None:
+    """Refuse to build over an existing file.
 
-    Not implemented: the producer half of #346 is blocked on an unmade
-    direct-PG-vs-HTTP design decision. Do not implement without that
-    decision; pass an already-built ``--mysql-db`` file instead.
+    The harness builds scratch copies; the one thing it must never do is
+    overwrite a real ``library.db`` (or the prebuilt file the operator passed
+    as the other side of the diff).
     """
-    raise NotImplementedError(
-        "the producer (build-from-source) half of #346 is out of scope for "
-        "this harness -- pass --mysql-db pointing at an already-built "
-        "library.db instead"
+    if Path(output_path).exists():
+        raise SourceError(
+            f"refusing to build the {label} library.db at {output_path}: the path "
+            f"already exists. This harness only ever writes fresh scratch copies -- "
+            f"point --{label}-db at a new path (or delete that one deliberately)."
+        )
+
+
+def _report(message: str) -> None:
+    """Emit a producer progress line on stderr.
+
+    Deliberately not stdout: under ``--json`` stdout carries exactly one JSON
+    object, and a progress line there would break every machine consumer of
+    this harness. (``tsv_to_sqlite.py``, whose stdout is a human log, keeps
+    the default.)
+    """
+    print(message, file=sys.stderr)
+
+
+def _empty_if_none(value: object) -> object:
+    """Map a null wire value to ''.
+
+    sync-library.sh wraps alternate_artist_name / album_artist /
+    cross_reference_names in ``IFNULL(<col>, '')``, so production's
+    library.db holds '' -- never NULL -- for those three. The Backend build
+    must match: after the cutover this output *is* library.db, and the
+    difference is observable in the FTS content and in LML's pipe-split of
+    cross_reference_names, not just in the diff (which normalizes them equal).
+    """
+    return "" if value is None else value
+
+
+def _catalog_row_to_library_row(row: dict[str, Any]) -> list[object]:
+    """Map one CatalogExportRow onto a daily-sync ``library`` row tuple."""
+    legacy_release_id = row.get("legacy_release_id")
+    if legacy_release_id is None:
+        raise SourceError(
+            "catalog export row has no legacy_release_id "
+            f"(Backend serial id {row.get('id')!r}): either this Backend predates "
+            "WXYC/Backend-Service#1965 or the BS#1963 mint/backfill is incomplete. "
+            "Refusing to write a library.db row with a null id."
+        )
+    cross_reference_names = row.get("cross_reference_names") or []
+    return [
+        int(legacy_release_id),
+        row.get("album_title"),
+        row.get("artist_name"),
+        row.get("code_letters"),
+        row.get("code_artist_number"),
+        row.get("code_number"),
+        row.get("genre_name"),
+        row.get("format_name"),
+        _empty_if_none(row.get("alternate_artist_name")),
+        _empty_if_none(row.get("album_artist")),
+        # The wire carries an array precisely so no artist name can be split
+        # into phantom aliases by the delimiter; the join happens here, at the
+        # one place that writes the SQLite column.
+        CROSS_REFERENCE_SEPARATOR.join(cross_reference_names),
+    ]
+
+
+def _catalog_cta_row_to_library_row(row: dict[str, Any]) -> tuple[object, ...]:
+    """Map one CatalogCompilationTrackRow onto a ``compilation_track_artist`` row."""
+    legacy_release_id = row.get("legacy_release_id")
+    artist_name = row.get("artist_name")
+    if legacy_release_id is None or artist_name is None:
+        # Both are `required` in the api.yaml schema and NOT NULL in the
+        # column beneath it, so this is a contract violation, not a data gap.
+        raise SourceError(
+            "compilation-track export row is missing a required field "
+            f"(legacy_release_id={legacy_release_id!r}, artist_name={artist_name!r})"
+        )
+    return (
+        int(legacy_release_id),
+        artist_name,
+        _empty_if_none(row.get("track_title")),
+    )
+
+
+def _resolve_backend_base_url(source: str) -> str:
+    """Validate and normalize the Backend base URL."""
+    parts = urlsplit(source)
+    if parts.scheme not in ("http", "https") or not parts.netloc:
+        raise SourceError(
+            f"--backend-source must be an http(s) base URL (e.g. https://api.wxyc.org), got {source!r}"
+        )
+    if parts.scheme == "http" and (parts.hostname or "") not in _PLAINTEXT_OK_HOSTS:
+        raise SourceError(
+            f"refusing to send the {BACKEND_TOKEN_ENV} bearer token over plaintext http "
+            f"to {parts.hostname!r} -- use https (plain http is allowed only for a "
+            "loopback address, for local testing)"
+        )
+    return f"{parts.scheme}://{parts.netloc}{parts.path.rstrip('/')}"
+
+
+def _fetch_ndjson(url: str, token: str) -> tuple[list[dict[str, Any]], str]:
+    """GET a gzipped-NDJSON export; return its rows and the Last-Modified watermark."""
+    # Scheme is validated to http/https in _resolve_backend_base_url, so this
+    # cannot be tricked into a file:// or other local-handler fetch.
+    request = Request(
+        url,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/x-ndjson",
+            "Accept-Encoding": "gzip",
+        },
+    )
+    try:
+        with urlopen(request, timeout=_HTTP_TIMEOUT_SECONDS) as response:
+            watermark = response.headers.get("Last-Modified")
+            encoding = (response.headers.get("Content-Encoding") or "").lower()
+            body = response.read()
+    except (URLError, OSError) as exc:
+        raise SourceError(f"failed to fetch {url}: {exc}") from exc
+
+    if encoding == "gzip":
+        try:
+            body = gzip.decompress(body)
+        except (OSError, EOFError) as exc:
+            raise SourceError(
+                f"{url} declared Content-Encoding: gzip but did not decompress: {exc}"
+            ) from exc
+    if not watermark:
+        # Without it the cross-endpoint consistency rule below is unenforceable,
+        # and silently pairing two unrelated snapshots is worse than stopping.
+        raise SourceError(
+            f"{url} returned no Last-Modified header; the catalog exports must carry "
+            "the library_watermark for the two-request snapshot to be checkable"
+        )
+
+    rows: list[dict[str, Any]] = []
+    for lineno, line in enumerate(body.decode("utf-8").splitlines(), start=1):
+        if not line.strip():
+            continue
+        try:
+            rows.append(json.loads(line))
+        except json.JSONDecodeError as exc:
+            raise SourceError(f"{url} line {lineno} is not valid JSON: {exc}") from exc
+    return rows, watermark
+
+
+def _fetch_consistent_snapshot(
+    base_url: str, token: str
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Fetch both exports, retrying until they describe the same catalog snapshot."""
+    reason = "no attempt was made"
+    for attempt in range(1, _SNAPSHOT_ATTEMPTS + 1):
+        catalog_rows, catalog_watermark = _fetch_ndjson(base_url + _CATALOG_PATH, token)
+        cta_rows, cta_watermark = _fetch_ndjson(base_url + _COMPILATION_TRACKS_PATH, token)
+
+        if catalog_watermark != cta_watermark:
+            reason = (
+                "the catalog watermark advanced between the two exports "
+                f"({catalog_watermark!r} -> {cta_watermark!r})"
+            )
+        else:
+            catalog_ids = {r.get("legacy_release_id") for r in catalog_rows}
+            dangling = sorted(
+                {r.get("legacy_release_id") for r in cta_rows} - catalog_ids,
+                key=lambda v: (v is None, v),
+            )
+            if dangling:
+                # Server-side row eligibility should make this impossible within
+                # one snapshot, so seeing it means the pair is torn in a way the
+                # watermark didn't reveal. Same remedy: re-fetch.
+                reason = (
+                    "the compilation-track export references legacy_release_id(s) "
+                    f"{dangling[:5]} with no row in the catalog export "
+                    f"({len(dangling)} total)"
+                )
+            else:
+                if attempt > 1:
+                    logger.info(
+                        "catalog snapshot settled",
+                        extra={"step": "backend_producer", "attempt": attempt},
+                    )
+                return catalog_rows, cta_rows
+
+        logger.warning(
+            "re-fetching the catalog snapshot",
+            extra={"step": "backend_producer", "attempt": attempt, "reason": reason},
+        )
+
+    raise SourceError(
+        f"could not read a consistent catalog snapshot from {base_url} in "
+        f"{_SNAPSHOT_ATTEMPTS} attempts: {reason}"
     )
 
 
 def _build_library_db_from_backend(source: str, output_path: str) -> None:
-    """STUB -- build a library.db from Backend-Service.
+    """Build a daily-sync-shaped library.db from Backend-Service over HTTP.
 
-    Not implemented: see ``_build_library_db_from_mysql`` above and #346.
+    Args:
+        source: Backend base URL, e.g. ``https://api.wxyc.org``.
+        output_path: Where to write the SQLite database. Must not exist.
+
+    Raises:
+        SourceError: on a refused overwrite, a bad/plaintext URL, a missing
+            ``$BACKEND_CATALOG_TOKEN``, a fetch or decode failure, a torn
+            snapshot, or a catalog row with no ``legacy_release_id``.
     """
-    raise NotImplementedError(
-        "the producer (build-from-source) half of #346 is out of scope for "
-        "this harness -- pass --backend-db pointing at an already-built "
-        "library.db instead"
+    _require_absent(output_path, "backend")
+    base_url = _resolve_backend_base_url(source)
+    token = os.environ.get(BACKEND_TOKEN_ENV)
+    if not token:
+        raise SourceError(
+            f"{BACKEND_TOKEN_ENV} is not set: the Backend catalog exports require a "
+            "service-account bearer token with catalog:read"
+        )
+
+    catalog_rows, cta_rows = _fetch_consistent_snapshot(base_url, token)
+    # Map before opening the database so a bad row fails without leaving a
+    # half-built file behind.
+    library_rows = [_catalog_row_to_library_row(row) for row in catalog_rows]
+    compilation_rows = [_catalog_cta_row_to_library_row(row) for row in cta_rows]
+
+    count = build_library_db(output_path, library_rows, compilation_rows or None, report=_report)
+    logger.info(
+        "built Backend-sourced library.db",
+        extra={
+            "step": "backend_producer",
+            "rows": count,
+            "compilation_track_rows": len(compilation_rows),
+            "output": output_path,
+        },
     )
+    _report(f"Exported {count} rows to {output_path} (source: {base_url})")
+
+
+def _default_mysql_runner(argv: Sequence[str], env: dict[str, str], stdout_path: str) -> bool:
+    """Run the ``mysql`` CLI, capturing stdout to ``stdout_path``.
+
+    Returns True on exit 0. stderr is echoed so a failure is diagnosable
+    (sync-library.sh does the same, appending it to the ETL log).
+    """
+    with open(stdout_path, "wb") as stdout:
+        # argv is built by _mysql_invocation; no shell, no interpolation.
+        completed = subprocess.run(
+            list(argv),
+            env={**os.environ, **env},
+            stdout=stdout,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+    if completed.stderr:
+        sys.stderr.write(completed.stderr.decode("utf-8", errors="replace"))
+    return completed.returncode == 0
+
+
+# Module-level seam so tests can substitute the CLI. Rebound, not wrapped, so
+# `_build_library_db_from_mysql` picks it up at call time.
+_mysql_runner = _default_mysql_runner
+
+
+def _mysql_invocation(source: str) -> tuple[list[str], dict[str, str]]:
+    """Build the ``mysql`` argv + env from a ``mysql://`` DSN.
+
+    Mirrors sync-library.sh: batch (``-B``) + raw (``-N``) mode over the CLI
+    rather than a Python driver, because tubafrenzy runs a MySQL old enough
+    that the drivers can't authenticate against it. The password goes through
+    ``MYSQL_PWD``, never argv, so it can't leak into a process listing.
+    """
+    parts = urlsplit(source)
+    if parts.scheme not in ("mysql", "mysql+pymysql"):
+        raise SourceError(
+            f"--mysql-source must be a mysql:// DSN "
+            f"(mysql://user:password@host:port/dbname), got {source!r}"
+        )
+    database = parts.path.lstrip("/")
+    if not parts.hostname or not database:
+        raise SourceError(f"--mysql-source is missing a host and/or database name: {source!r}")
+
+    argv = ["mysql", "-h", parts.hostname, "-P", str(parts.port or 3306)]
+    if parts.username:
+        argv += ["-u", unquote(parts.username)]
+    argv += ["--default-character-set=utf8", "-B", "-N", database]
+    env = {"MYSQL_PWD": unquote(parts.password or "")}
+    return argv, env
+
+
+def _build_library_db_from_mysql(source: str, output_path: str) -> None:
+    """Build the baseline library.db from tubafrenzy MySQL, the way prod does.
+
+    Args:
+        source: ``mysql://user:password@host:port/dbname``. Point it at a
+            local port when tunnelling, as sync-library.sh does.
+        output_path: Where to write the SQLite database. Must not exist.
+
+    Raises:
+        SourceError: on a refused overwrite, a malformed DSN, or a failed
+            library export query. A failed *compilation-track* query is
+            tolerated (that table is supplementary and absent on some
+            sources), matching sync-library.sh.
+    """
+    _require_absent(output_path, "mysql")
+    argv, env = _mysql_invocation(source)
+
+    scratch = tempfile.mkdtemp(prefix="catalog-parity-mysql-")
+    try:
+        library_tsv = os.path.join(scratch, "library.tsv")
+        if not _mysql_runner([*argv, "-e", LIBRARY_SELECT_SQL], env, library_tsv):
+            raise SourceError(
+                "the MySQL library export query failed (see stderr above); "
+                "no library.db was written"
+            )
+
+        cta_tsv = os.path.join(scratch, "compilation_track_artist.tsv")
+        cta_rows = None
+        if _mysql_runner([*argv, "-e", COMPILATION_TRACK_SELECT_SQL], env, cta_tsv):
+            if os.path.getsize(cta_tsv) > 0:
+                cta_rows = parse_compilation_track_tsv(cta_tsv)
+        else:
+            logger.warning(
+                "compilation-track export unavailable; building without it",
+                extra={"step": "mysql_producer"},
+            )
+
+        count = build_library_db(
+            output_path, parse_library_tsv(library_tsv), cta_rows, report=_report
+        )
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
+    logger.info(
+        "built MySQL-sourced library.db",
+        extra={"step": "mysql_producer", "rows": count, "output": output_path},
+    )
+    _report(f"Exported {count} rows to {output_path} (source: MySQL)")
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
@@ -341,20 +743,25 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Emit a single JSON object on stdout (machine-readable).",
     )
-    # Reserved for the not-yet-built producer half of #346 (build library.db
-    # from a live source). Deliberately NOT implemented -- see the module
-    # docstring. Passing either flag is a CLI usage error (exit 2).
     p.add_argument(
         "--mysql-source",
         default=None,
         metavar="DSN",
-        help="Reserved for a future producer step (NOT IMPLEMENTED).",
+        help=(
+            "Build the MySQL-sourced library.db first, from this "
+            "mysql://user:password@host:port/dbname DSN, writing it to --mysql-db "
+            "(which must not already exist)."
+        ),
     )
     p.add_argument(
         "--backend-source",
         default=None,
         metavar="URL",
-        help="Reserved for a future producer step (NOT IMPLEMENTED).",
+        help=(
+            "Build the Backend-sourced library.db first, from this base URL "
+            f"(e.g. https://api.wxyc.org), writing it to --backend-db (which must "
+            f"not already exist). Requires a service-account token in ${BACKEND_TOKEN_ENV}."
+        ),
     )
     return p
 
@@ -379,20 +786,34 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     init_logger(repo="discogs-etl", tool="discogs-etl catalog_parity_diff")
 
-    if args.mysql_source is not None or args.backend_source is not None:
-        try:
-            if args.mysql_source is not None:
-                _build_library_db_from_mysql(args.mysql_source, args.mysql_db or "")
-            if args.backend_source is not None:
-                _build_library_db_from_backend(args.backend_source, args.backend_db or "")
-        except NotImplementedError as exc:
-            print(f"error: {exc}", file=sys.stderr)
+    # Each --*-source needs its matching --*-db as the output path, so the
+    # required-flags check runs before any build.
+    for source, output, flag in (
+        (args.mysql_source, args.mysql_db, "mysql"),
+        (args.backend_source, args.backend_db, "backend"),
+    ):
+        if source is not None and not output:
+            print(
+                f"error: --{flag}-source requires --{flag}-db, the path to write the "
+                "built library.db to.",
+                file=sys.stderr,
+            )
+            parser.print_usage(sys.stderr)
             return 2
 
     if not args.mysql_db or not args.backend_db:
         print("error: --mysql-db and --backend-db are both required.", file=sys.stderr)
         parser.print_usage(sys.stderr)
         return 2
+
+    try:
+        if args.mysql_source is not None:
+            _build_library_db_from_mysql(args.mysql_source, args.mysql_db)
+        if args.backend_source is not None:
+            _build_library_db_from_backend(args.backend_source, args.backend_db)
+    except SourceError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 3
 
     try:
         result = run_diff(args.mysql_db, args.backend_db)
