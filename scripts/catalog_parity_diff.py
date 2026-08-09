@@ -16,21 +16,27 @@ source instead of a prebuilt file, ``--mysql-source`` / ``--backend-source``
 build the corresponding ``library.db`` first, so a single invocation can
 build both sides and diff them.
 
-- ``--mysql-source mysql://user:pass@host:port/dbname`` reproduces the daily
+- ``--mysql-source mysql://user@host:port/dbname`` reproduces the daily
   build's own read path -- the ``mysql`` CLI in batch/raw mode, running the
   exact SELECTs from ``scripts/sync-library.sh`` (a source-grep test pins
   them together), parsed by the same TSV parser production uses. The CLI, not
   a Python driver, because tubafrenzy's MySQL 4.1 auth breaks those drivers.
+  The password comes from ``$LIBRARY_DB_PASSWORD``: put in the DSN it would
+  sit in this process's own argv, visible to ``ps`` for the whole run.
 - ``--backend-source https://api.wxyc.org`` is the migration target
   (decision D3 / Option B, 2026-08-03): the gzipped-NDJSON exports ``GET
   /library/catalog`` + ``GET /library/catalog/compilation-tracks``
   (WXYC/Backend-Service#1965) read over HTTPS with a service-account bearer
   token from ``$BACKEND_CATALOG_TOKEN`` -- no prod-DB credentials, which is
-  the whole point of Option B over a direct-Postgres producer.
+  the whole point of Option B over a direct-Postgres producer. Plain http to
+  anything but a loopback address is refused, and so is any cross-origin
+  redirect, which urllib would otherwise follow *carrying that token*.
 
 Both producers write **only** to the path named by the matching ``--*-db``
 flag, and refuse to write to a path that already exists: this harness must
-never be able to clobber a real ``library.db``.
+never be able to clobber a real ``library.db``. Each builds into a scratch
+file beside its target and renames it into place at the end, so a build that
+dies partway leaves nothing behind to refuse on the next parity day.
 
 **Still out of scope**: the operational cutover -- running the 7 clean parity
 days, flipping ``sync-library.sh``'s source, and taking ``/wxycdb`` dark --
@@ -38,9 +44,11 @@ is WXYC/discogs-etl#346, deliberately human-gated.
 
 Schema note: the ``library`` table's 12 columns (``id, title, artist,
 call_letters, artist_call_number, release_call_number, genre, format,
-alternate_artist_name, album_artist, label, cross_reference_names``) come
-from ``lib/library_db.py`` -- the authoritative daily-sync shape, shared with
-``scripts/tsv_to_sqlite.py`` so both producers build the same database.
+alternate_artist_name, album_artist, label, cross_reference_names``) are
+**imported** from ``lib/library_db.py`` -- the authoritative daily-sync
+shape, shared with ``scripts/tsv_to_sqlite.py`` so both producers build the
+same database. Imported rather than restated, so a column added there widens
+this diff automatically instead of becoming an undiffed blind spot.
 ``label`` is always NULL in production (nothing ever inserts it -- see that
 module's docstring), so it is excluded from the diffed column set below
 rather than compared as a trivially-always-equal no-op.
@@ -61,8 +69,9 @@ Exit codes:
 - ``3`` -- source/read error: missing file, unreadable database, a required
   table (``library``) absent from one of the inputs, a malformed input
   (duplicate ``library.id``, which a valid library.db's primary key forbids),
-  or a producer failure (unreachable source, missing credentials, a refused
-  overwrite, an inconsistent snapshot).
+  or **any** producer failure (unreachable source, missing credentials, a
+  refused overwrite, an inconsistent snapshot, an empty catalog export, a
+  contract-violating row, a missing ``mysql`` binary, a malformed DSN).
 
 Never writes to either input: both files are opened as read-only SQLite
 connections (``mode=ro``).
@@ -80,18 +89,26 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import zlib
 from collections import Counter
-from collections.abc import Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 from urllib.error import URLError
 from urllib.parse import unquote, urlsplit
-from urllib.request import Request, pathname2url, urlopen
+from urllib.request import (
+    HTTPRedirectHandler,
+    Request,
+    build_opener,
+    pathname2url,
+)
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from lib.library_db import (  # noqa: E402
     CROSS_REFERENCE_SEPARATOR,
+    LIBRARY_COLUMNS,
     build_library_db,
     parse_compilation_track_tsv,
     parse_library_tsv,
@@ -111,29 +128,16 @@ class SourceError(RuntimeError):
     """
 
 
-# The exact `library` table column list, derived from scripts/tsv_to_sqlite.py's
-# `CREATE TABLE library (...)` statement -- the authoritative daily-sync shape
-# (also reflected in sync-library.sh's MySQL SELECT).
-LIBRARY_COLUMNS = (
-    "id",
-    "title",
-    "artist",
-    "call_letters",
-    "artist_call_number",
-    "release_call_number",
-    "genre",
-    "format",
-    "alternate_artist_name",
-    "album_artist",
-    "label",
-    "cross_reference_names",
-)
-
 # Columns actually diffed field-by-field: every library column except `id`
 # (the join key, not a diffable field) and `label` (always NULL in prod --
-# the TSV insert in tsv_to_sqlite.py omits it entirely -- so it is trivially
+# `lib/library_db.py`'s insert omits it entirely -- so it is trivially
 # NULL==NULL on both sides and carries no signal; excluded rather than
 # reported as a permanently-zero mismatch bucket).
+#
+# Derived from the imported `LIBRARY_COLUMNS` rather than a local copy: a
+# column added to `lib/library_db.py` must widen the diff automatically, or
+# it becomes a permanently-undiffed blind spot in the tool that certifies
+# the cutover.
 DIFF_COLUMNS = tuple(c for c in LIBRARY_COLUMNS if c not in ("id", "label"))
 
 # compilation_track_artist has no primary key of its own; it is compared as
@@ -224,7 +228,7 @@ def _load_library_rows(conn: sqlite3.Connection, label: str) -> dict[int, dict[s
     """Read every ``library`` row, keyed by ``id``.
 
     A valid daily-sync ``library.db`` has ``id INTEGER PRIMARY KEY`` (see
-    ``scripts/tsv_to_sqlite.py``), so ids are unique. If two rows share an id
+    ``lib/library_db.py``), so ids are unique. If two rows share an id
     the input is malformed; keying into a dict would silently keep only the
     last (hiding a row-count divergence this parity harness exists to catch),
     so we raise ``SourceError`` instead of under-counting.
@@ -322,11 +326,24 @@ def run_diff(mysql_db: str, backend_db: str) -> ParityDiff:
 
 # --- Producers: build a library.db from a live source (#351) --------------
 
+# One row of either output table, already mapped out of its wire dict: a
+# `library` row in LIBRARY_INSERT_COLUMNS order, or a (library_release_id,
+# artist_name, track_title) triple. Element 0 is the library release id in
+# both, which is what the snapshot-consistency check keys on.
+_Row = Sequence[object]
+
 # Env var holding the Backend-Service service-account bearer JWT. Decision D3
 # (Option B) deliberately picked an HTTP/contract-governed producer over a
 # direct-Postgres one precisely so that no prod-DB credential has to exist in
 # GitHub Actions -- this token is the only secret the Backend producer needs.
 BACKEND_TOKEN_ENV = "BACKEND_CATALOG_TOKEN"
+
+# Env var holding the tubafrenzy MySQL password. It is read from the
+# environment rather than from the ``--mysql-source`` DSN because a DSN
+# password sits in *this* process's argv for the whole run -- readable by any
+# `ps`, and echoed by a `set -x` or a GitHub Actions command trace. (It is
+# still accepted inside the DSN for local one-offs; the env var wins.)
+MYSQL_PASSWORD_ENV = "LIBRARY_DB_PASSWORD"
 
 _CATALOG_PATH = "/library/catalog"
 _COMPILATION_TRACKS_PATH = "/library/catalog/compilation-tracks"
@@ -350,11 +367,63 @@ _SNAPSHOT_ATTEMPTS = 3
 # bearer token on the wire in the clear.
 _PLAINTEXT_OK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 
+_DEFAULT_PORTS = {"http": 80, "https": 443}
+
+
+def _origin(url: str) -> tuple[str, str, int]:
+    """(scheme, host, port) with the scheme's default port made explicit."""
+    parts = urlsplit(url)
+    scheme = parts.scheme.lower()
+    return (scheme, (parts.hostname or "").lower(), parts.port or _DEFAULT_PORTS.get(scheme, 0))
+
+
+class _SameOriginRedirectHandler(HTTPRedirectHandler):
+    """Refuse any redirect that would carry the bearer token to a new origin.
+
+    ``urllib``'s default handler copies every header except Content-Length /
+    Content-Type into the redirected request -- ``Authorization`` included.
+    So a 302 from a proxy, a misconfigured CDN, or hijacked DNS would replay
+    the service-account JWT to a foreign host, and to a plaintext one, which
+    is exactly what ``_resolve_backend_base_url``'s https check exists to
+    prevent. That check only ever sees the *first* URL, so the guard has to
+    live here as well.
+
+    Stopping (rather than stripping the header and following the hop) keeps
+    the failure diagnosable: a silently-unauthenticated request would come
+    back as a bare 401 from an origin the operator never named.
+    """
+
+    def redirect_request(
+        self,
+        req: Request,
+        fp: Any,
+        code: int,
+        msg: str,
+        headers: Any,
+        newurl: str,
+    ) -> Request | None:
+        if _origin(req.full_url) != _origin(newurl):
+            raise SourceError(
+                f"refusing to follow the {code} redirect from {req.full_url} to {newurl}: "
+                f"it crosses origins, and urllib would replay the {BACKEND_TOKEN_ENV} "
+                "bearer token to the new host. Point --backend-source at the origin that "
+                "actually serves the catalog exports."
+            )
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+# Module-level opener so every catalog fetch goes through the redirect guard
+# above; the bare `urllib.request.urlopen` would use the permissive default.
+_opener = build_opener(_SameOriginRedirectHandler())
+
 # The library SELECT production runs every day, copied verbatim from
-# scripts/sync-library.sh. tests/unit/test_catalog_parity_diff.py asserts
-# (whitespace-insensitively) that this text still appears in that script:
-# a baseline built from a *different* query would make the parity diff
-# measure the harness rather than the migration. Change one, change both.
+# scripts/sync-library.sh. tests/unit/test_catalog_parity_diff.py lifts every
+# `-e "SELECT ..."` out of that script and asserts (whitespace-insensitively)
+# that the set is exactly these two -- equality, not containment, so neither
+# an appended `ORDER BY`/`LIMIT` on the shell side nor a third divergent
+# query can slip past. A baseline built from a *different* query would make
+# the parity diff measure the harness rather than the migration. Change one,
+# change both.
 LIBRARY_SELECT_SQL = (
     "SELECT r.ID, r.TITLE, lc.PRESENTATION_NAME, lc.CALL_LETTERS, lc.CALL_NUMBERS,"
     " r.CALL_NUMBERS, g.REFERENCE_NAME, f.REFERENCE_NAME,"
@@ -394,6 +463,56 @@ def _require_absent(output_path: str, label: str) -> None:
             f"already exists. This harness only ever writes fresh scratch copies -- "
             f"point --{label}-db at a new path (or delete that one deliberately)."
         )
+    parent = Path(output_path).parent
+    if not parent.is_dir():
+        raise SourceError(
+            f"cannot build the {label} library.db at {output_path}: its parent "
+            f"directory {str(parent)!r} does not exist"
+        )
+
+
+@contextmanager
+def _atomic_output(output_path: str, label: str) -> Iterator[str]:
+    """Yield a scratch path to build into, published only on success.
+
+    ``_require_absent`` refuses any path that already exists, so a build that
+    dies partway -- a duplicate id, a full disk, a killed process -- must not
+    leave a stub behind: it would refuse every subsequent run of a
+    seven-clean-day parity soak until an operator deleted it by hand. Build
+    beside the target (same filesystem, so the publish is a rename) and
+    ``os.replace`` it into place at the end.
+    """
+    _require_absent(output_path, label)
+    target = Path(output_path)
+    fd, scratch = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".partial", dir=target.parent)
+    os.close(fd)
+    try:
+        yield scratch
+    except BaseException:
+        Path(scratch).unlink(missing_ok=True)
+        raise
+    os.replace(scratch, output_path)
+
+
+def _build_into(
+    output_path: str,
+    label: str,
+    library_rows: Iterable[_Row],
+    cta_rows: Iterable[_Row] | None,
+) -> int:
+    """Build a library.db at ``output_path`` atomically, as a ``SourceError`` seam.
+
+    SQLite write failures (a duplicate id from a malformed export, a full
+    disk) are producer failures like any other, so they surface as
+    ``SourceError`` -- exit 3 -- rather than a raw traceback.
+    """
+    try:
+        with _atomic_output(output_path, label) as scratch:
+            return build_library_db(scratch, library_rows, cta_rows, report=_report)
+    except sqlite3.Error as exc:
+        raise SourceError(
+            f"failed to write the {label} library.db at {output_path}: {exc}"
+        ) from exc
 
 
 def _report(message: str) -> None:
@@ -420,26 +539,75 @@ def _empty_if_none(value: object) -> object:
     return "" if value is None else value
 
 
-def _catalog_row_to_library_row(row: dict[str, Any]) -> list[object]:
-    """Map one CatalogExportRow onto a daily-sync ``library`` row tuple."""
+# The CatalogExportRow fields api.yaml marks `required` and this producer
+# writes straight into a library column. A bare `.get()` on any of them would
+# turn a field rename or a partial server-side regression into a SQL NULL for
+# every row: after the cutover that empties the row's FTS content and breaks
+# LML search, and before it, it reads as an ordinary field mismatch --
+# indistinguishable from real catalog drift. (`id`, also required, is
+# deliberately absent: it is never written, only quoted in diagnostics.)
+_REQUIRED_CATALOG_FIELDS = (
+    "album_title",
+    "artist_name",
+    "code_letters",
+    "code_artist_number",
+    "code_number",
+    "genre_name",
+    "format_name",
+)
+
+
+def _require_legacy_release_id(row: dict[str, Any], what: str) -> int:
+    """Read ``legacy_release_id`` as an int, or raise ``SourceError``."""
     legacy_release_id = row.get("legacy_release_id")
     if legacy_release_id is None:
         raise SourceError(
-            "catalog export row has no legacy_release_id "
+            f"{what} export row has no legacy_release_id "
             f"(Backend serial id {row.get('id')!r}): either this Backend predates "
             "WXYC/Backend-Service#1965 or the BS#1963 mint/backfill is incomplete. "
             "Refusing to write a library.db row with a null id."
         )
+    try:
+        return int(legacy_release_id)
+    except (TypeError, ValueError) as exc:
+        raise SourceError(
+            f"{what} export row has a non-integer legacy_release_id "
+            f"({legacy_release_id!r}); library.db's id is an INTEGER PRIMARY KEY"
+        ) from exc
+
+
+def _catalog_row_to_library_row(row: dict[str, Any]) -> list[object]:
+    """Map one CatalogExportRow onto a daily-sync ``library`` row tuple."""
+    legacy_release_id = _require_legacy_release_id(row, "catalog")
+    for name in _REQUIRED_CATALOG_FIELDS:
+        if row.get(name) is None:
+            raise SourceError(
+                f"catalog export row for legacy_release_id {legacy_release_id} is missing "
+                f"the required field {name!r}; api.yaml's CatalogExportRow marks it required, "
+                "and writing it as NULL would corrupt library.db rather than show up as drift"
+            )
+
     cross_reference_names = row.get("cross_reference_names") or []
+    if not isinstance(cross_reference_names, list):
+        # A string is truthy and joinable, so without this check a scalar
+        # would be split character-by-character into phantom aliases
+        # ('S | t | e | r | e | o | l | a | b') that LML then pipe-splits
+        # straight into the live search index.
+        raise SourceError(
+            f"catalog export row for legacy_release_id {legacy_release_id} has "
+            f"cross_reference_names of type {type(cross_reference_names).__name__}, "
+            "not the array api.yaml specifies"
+        )
+
     return [
-        int(legacy_release_id),
-        row.get("album_title"),
-        row.get("artist_name"),
-        row.get("code_letters"),
-        row.get("code_artist_number"),
-        row.get("code_number"),
-        row.get("genre_name"),
-        row.get("format_name"),
+        legacy_release_id,
+        row["album_title"],
+        row["artist_name"],
+        row["code_letters"],
+        row["code_artist_number"],
+        row["code_number"],
+        row["genre_name"],
+        row["format_name"],
         _empty_if_none(row.get("alternate_artist_name")),
         _empty_if_none(row.get("album_artist")),
         # The wire carries an array precisely so no artist name can be split
@@ -451,17 +619,17 @@ def _catalog_row_to_library_row(row: dict[str, Any]) -> list[object]:
 
 def _catalog_cta_row_to_library_row(row: dict[str, Any]) -> tuple[object, ...]:
     """Map one CatalogCompilationTrackRow onto a ``compilation_track_artist`` row."""
-    legacy_release_id = row.get("legacy_release_id")
+    legacy_release_id = _require_legacy_release_id(row, "compilation-track")
     artist_name = row.get("artist_name")
-    if legacy_release_id is None or artist_name is None:
-        # Both are `required` in the api.yaml schema and NOT NULL in the
-        # column beneath it, so this is a contract violation, not a data gap.
+    if artist_name is None:
+        # `required` in the api.yaml schema and NOT NULL in the column
+        # beneath it, so this is a contract violation, not a data gap.
         raise SourceError(
-            "compilation-track export row is missing a required field "
-            f"(legacy_release_id={legacy_release_id!r}, artist_name={artist_name!r})"
+            "compilation-track export row is missing the required field 'artist_name' "
+            f"(legacy_release_id={legacy_release_id})"
         )
     return (
-        int(legacy_release_id),
+        legacy_release_id,
         artist_name,
         _empty_if_none(row.get("track_title")),
     )
@@ -472,7 +640,8 @@ def _resolve_backend_base_url(source: str) -> str:
     parts = urlsplit(source)
     if parts.scheme not in ("http", "https") or not parts.netloc:
         raise SourceError(
-            f"--backend-source must be an http(s) base URL (e.g. https://api.wxyc.org), got {source!r}"
+            "--backend-source must be an http(s) base URL "
+            f"(e.g. https://api.wxyc.org), got {source!r}"
         )
     if parts.scheme == "http" and (parts.hostname or "") not in _PLAINTEXT_OK_HOSTS:
         raise SourceError(
@@ -483,10 +652,38 @@ def _resolve_backend_base_url(source: str) -> str:
     return f"{parts.scheme}://{parts.netloc}{parts.path.rstrip('/')}"
 
 
-def _fetch_ndjson(url: str, token: str) -> tuple[list[dict[str, Any]], str]:
-    """GET a gzipped-NDJSON export; return its rows and the Last-Modified watermark."""
+def _map_ndjson_lines(
+    url: str, stream: Any, mapper: Callable[[dict[str, Any]], _Row]
+) -> list[_Row]:
+    """Parse an NDJSON byte stream line by line, mapping each row as it arrives.
+
+    Deliberately incremental: the two prod exports are 28.5 MB + 13.1 MB
+    across 64,815 + 144,778 rows, and reading the whole body, decoding it,
+    splitting it into a line list, and keeping every raw dict alive would
+    hold four copies at once for a job whose logical working set is one row.
+    Mapping here also drops each parsed dict as soon as its library row is
+    built.
+    """
+    rows: list[_Row] = []
+    for lineno, raw in enumerate(stream, start=1):
+        line = raw.decode("utf-8").strip()
+        if not line:
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise SourceError(f"{url} line {lineno} is not valid JSON: {exc}") from exc
+        rows.append(mapper(payload))
+    return rows
+
+
+def _fetch_ndjson(
+    url: str, token: str, mapper: Callable[[dict[str, Any]], _Row]
+) -> tuple[list[_Row], str]:
+    """GET a gzipped-NDJSON export; return its mapped rows and the watermark."""
     # Scheme is validated to http/https in _resolve_backend_base_url, so this
-    # cannot be tricked into a file:// or other local-handler fetch.
+    # cannot be tricked into a file:// or other local-handler fetch, and
+    # _opener refuses any cross-origin redirect that would carry the token on.
     request = Request(
         url,
         headers={
@@ -496,47 +693,54 @@ def _fetch_ndjson(url: str, token: str) -> tuple[list[dict[str, Any]], str]:
         },
     )
     try:
-        with urlopen(request, timeout=_HTTP_TIMEOUT_SECONDS) as response:
+        with _opener.open(request, timeout=_HTTP_TIMEOUT_SECONDS) as response:
             watermark = response.headers.get("Last-Modified")
+            if not watermark:
+                # Without it the cross-endpoint consistency rule below is
+                # unenforceable, and silently pairing two unrelated snapshots
+                # is worse than stopping.
+                raise SourceError(
+                    f"{url} returned no Last-Modified header; the catalog exports must carry "
+                    "the library_watermark for the two-request snapshot to be checkable"
+                )
             encoding = (response.headers.get("Content-Encoding") or "").lower()
-            body = response.read()
+            stream = gzip.GzipFile(fileobj=response) if encoding == "gzip" else response
+            rows = _map_ndjson_lines(url, stream, mapper)
+    except SourceError:
+        raise
+    except (gzip.BadGzipFile, EOFError, zlib.error) as exc:
+        raise SourceError(
+            f"{url} declared Content-Encoding: gzip but did not decompress: {exc}"
+        ) from exc
+    except UnicodeDecodeError as exc:
+        raise SourceError(f"{url} returned a body that is not valid UTF-8: {exc}") from exc
     except (URLError, OSError) as exc:
         raise SourceError(f"failed to fetch {url}: {exc}") from exc
-
-    if encoding == "gzip":
-        try:
-            body = gzip.decompress(body)
-        except (OSError, EOFError) as exc:
-            raise SourceError(
-                f"{url} declared Content-Encoding: gzip but did not decompress: {exc}"
-            ) from exc
-    if not watermark:
-        # Without it the cross-endpoint consistency rule below is unenforceable,
-        # and silently pairing two unrelated snapshots is worse than stopping.
-        raise SourceError(
-            f"{url} returned no Last-Modified header; the catalog exports must carry "
-            "the library_watermark for the two-request snapshot to be checkable"
-        )
-
-    rows: list[dict[str, Any]] = []
-    for lineno, line in enumerate(body.decode("utf-8").splitlines(), start=1):
-        if not line.strip():
-            continue
-        try:
-            rows.append(json.loads(line))
-        except json.JSONDecodeError as exc:
-            raise SourceError(f"{url} line {lineno} is not valid JSON: {exc}") from exc
     return rows, watermark
 
 
-def _fetch_consistent_snapshot(
-    base_url: str, token: str
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Fetch both exports, retrying until they describe the same catalog snapshot."""
+def _fetch_consistent_snapshot(base_url: str, token: str) -> tuple[list[_Row], list[_Row]]:
+    """Fetch both exports, retrying until they describe the same catalog snapshot.
+
+    Returns rows already mapped into ``library`` / ``compilation_track_artist``
+    shape, so both id sets are plain ints and nothing raw survives the fetch.
+
+    Note that ``Last-Modified`` is an HTTP-date, i.e. whole seconds: two
+    distinct watermarks inside the same second compare equal, so a write
+    landing between the two GETs in that window slips through. The
+    dangling-id check below catches the CTA->catalog direction of that tear;
+    the other direction (a catalog row added mid-pair) would show up as a
+    single spurious ``extra_in_backend`` and self-heals on the next run,
+    because the exports are served from a per-watermark cache.
+    """
     reason = "no attempt was made"
     for attempt in range(1, _SNAPSHOT_ATTEMPTS + 1):
-        catalog_rows, catalog_watermark = _fetch_ndjson(base_url + _CATALOG_PATH, token)
-        cta_rows, cta_watermark = _fetch_ndjson(base_url + _COMPILATION_TRACKS_PATH, token)
+        catalog_rows, catalog_watermark = _fetch_ndjson(
+            base_url + _CATALOG_PATH, token, _catalog_row_to_library_row
+        )
+        cta_rows, cta_watermark = _fetch_ndjson(
+            base_url + _COMPILATION_TRACKS_PATH, token, _catalog_cta_row_to_library_row
+        )
 
         if catalog_watermark != cta_watermark:
             reason = (
@@ -544,11 +748,8 @@ def _fetch_consistent_snapshot(
                 f"({catalog_watermark!r} -> {cta_watermark!r})"
             )
         else:
-            catalog_ids = {r.get("legacy_release_id") for r in catalog_rows}
-            dangling = sorted(
-                {r.get("legacy_release_id") for r in cta_rows} - catalog_ids,
-                key=lambda v: (v is None, v),
-            )
+            catalog_ids = {row[0] for row in catalog_rows}
+            dangling = sorted({row[0] for row in cta_rows} - catalog_ids)
             if dangling:
                 # Server-side row eligibility should make this impossible within
                 # one snapshot, so seeing it means the pair is torn in a way the
@@ -585,9 +786,10 @@ def _build_library_db_from_backend(source: str, output_path: str) -> None:
         output_path: Where to write the SQLite database. Must not exist.
 
     Raises:
-        SourceError: on a refused overwrite, a bad/plaintext URL, a missing
-            ``$BACKEND_CATALOG_TOKEN``, a fetch or decode failure, a torn
-            snapshot, or a catalog row with no ``legacy_release_id``.
+        SourceError: on a refused overwrite, a bad/plaintext URL, a
+            cross-origin redirect, a missing ``$BACKEND_CATALOG_TOKEN``, a
+            fetch or decode failure, a torn snapshot, an empty catalog, or a
+            catalog row that violates the api.yaml contract.
     """
     _require_absent(output_path, "backend")
     base_url = _resolve_backend_base_url(source)
@@ -598,13 +800,33 @@ def _build_library_db_from_backend(source: str, output_path: str) -> None:
             "service-account bearer token with catalog:read"
         )
 
-    catalog_rows, cta_rows = _fetch_consistent_snapshot(base_url, token)
-    # Map before opening the database so a bad row fails without leaving a
-    # half-built file behind.
-    library_rows = [_catalog_row_to_library_row(row) for row in catalog_rows]
-    compilation_rows = [_catalog_cta_row_to_library_row(row) for row in cta_rows]
+    library_rows, compilation_rows = _fetch_consistent_snapshot(base_url, token)
+    if not library_rows:
+        # A broken export query, an over-narrow token scope, or a truncated
+        # cached buffer all surface as a 200 with no rows. Building from it
+        # would report the entire catalog as missing_in_backend -- an
+        # operator reading that sees catastrophic drift, not a producer that
+        # read nothing. And post-cutover this producer IS the daily build.
+        raise SourceError(
+            f"{base_url}{_CATALOG_PATH} returned no rows; a catalog export is never "
+            "legitimately empty, so this is a producer failure (check the token's scope "
+            "and the export query) rather than total drift"
+        )
+    if not compilation_rows:
+        # Supplementary, and genuinely absent on some sources -- so a warning
+        # rather than a failure, matching the MySQL side's graceful
+        # degradation. Loud, because in prod it is ~144k rows and its absence
+        # would otherwise land in the report as cta_missing.
+        logger.warning(
+            "the compilation-track export returned no rows; building without the table",
+            extra={"step": "backend_producer", "source": base_url},
+        )
+        _report(
+            f"WARNING: {base_url}{_COMPILATION_TRACKS_PATH} returned no rows; "
+            "building without a compilation_track_artist table"
+        )
 
-    count = build_library_db(output_path, library_rows, compilation_rows or None, report=_report)
+    count = _build_into(output_path, "backend", library_rows, compilation_rows or None)
     logger.info(
         "built Backend-sourced library.db",
         extra={
@@ -647,33 +869,52 @@ def _mysql_invocation(source: str) -> tuple[list[str], dict[str, str]]:
 
     Mirrors sync-library.sh: batch (``-B``) + raw (``-N``) mode over the CLI
     rather than a Python driver, because tubafrenzy runs a MySQL old enough
-    that the drivers can't authenticate against it. The password goes through
-    ``MYSQL_PWD``, never argv, so it can't leak into a process listing.
+    that the drivers can't authenticate against it. The password reaches the
+    CLI through ``MYSQL_PWD``, never its argv.
+
+    Prefer ``$LIBRARY_DB_PASSWORD`` over a password embedded in the DSN. The
+    DSN reaches *this* process on the command line, so an embedded password
+    is visible to `ps` for the whole run and echoed by any ``set -x`` or
+    GitHub Actions command trace -- and a password containing ``/``, ``#``,
+    ``?`` or ``%`` has to be percent-encoded or ``urlsplit`` silently
+    mis-slices the DSN around it.
     """
     parts = urlsplit(source)
     if parts.scheme not in ("mysql", "mysql+pymysql"):
         raise SourceError(
-            f"--mysql-source must be a mysql:// DSN "
-            f"(mysql://user:password@host:port/dbname), got {source!r}"
+            f"--mysql-source must be a mysql:// DSN (mysql://user@host:port/dbname), got {source!r}"
         )
     database = parts.path.lstrip("/")
     if not parts.hostname or not database:
         raise SourceError(f"--mysql-source is missing a host and/or database name: {source!r}")
+    try:
+        port = parts.port or 3306
+    except ValueError as exc:
+        # Reached whenever the netloc's `:`-suffix isn't numeric -- most often
+        # an un-encoded `/` in the password, which moves the real host:port
+        # into the path and leaves the password fragment where the port
+        # belongs. Percent-encode it, or (better) use $LIBRARY_DB_PASSWORD.
+        raise SourceError(
+            f"--mysql-source has a malformed port in {source!r} ({exc}). If the password "
+            f"contains '/', '#', '?' or '%' it must be percent-encoded -- or supply it via "
+            f"${MYSQL_PASSWORD_ENV} and leave it out of the DSN entirely."
+        ) from exc
 
-    argv = ["mysql", "-h", parts.hostname, "-P", str(parts.port or 3306)]
+    argv = ["mysql", "-h", parts.hostname, "-P", str(port)]
     if parts.username:
         argv += ["-u", unquote(parts.username)]
     argv += ["--default-character-set=utf8", "-B", "-N", database]
-    env = {"MYSQL_PWD": unquote(parts.password or "")}
-    return argv, env
+    password = os.environ.get(MYSQL_PASSWORD_ENV) or unquote(parts.password or "")
+    return argv, {"MYSQL_PWD": password}
 
 
 def _build_library_db_from_mysql(source: str, output_path: str) -> None:
     """Build the baseline library.db from tubafrenzy MySQL, the way prod does.
 
     Args:
-        source: ``mysql://user:password@host:port/dbname``. Point it at a
-            local port when tunnelling, as sync-library.sh does.
+        source: ``mysql://user@host:port/dbname``, with the password in
+            ``$LIBRARY_DB_PASSWORD``. Point it at a local port when
+            tunnelling, as sync-library.sh does.
         output_path: Where to write the SQLite database. Must not exist.
 
     Raises:
@@ -705,9 +946,7 @@ def _build_library_db_from_mysql(source: str, output_path: str) -> None:
                 extra={"step": "mysql_producer"},
             )
 
-        count = build_library_db(
-            output_path, parse_library_tsv(library_tsv), cta_rows, report=_report
-        )
+        count = _build_into(output_path, "mysql", parse_library_tsv(library_tsv), cta_rows)
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
 
@@ -749,8 +988,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         metavar="DSN",
         help=(
             "Build the MySQL-sourced library.db first, from this "
-            "mysql://user:password@host:port/dbname DSN, writing it to --mysql-db "
-            "(which must not already exist)."
+            "mysql://user@host:port/dbname DSN, writing it to --mysql-db "
+            f"(which must not already exist). Password via ${MYSQL_PASSWORD_ENV} -- "
+            "putting it in the DSN leaves it in this process's argv."
         ),
     )
     p.add_argument(
@@ -807,11 +1047,26 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     try:
+        # Validate BOTH output paths before either build runs: checking the
+        # backend path only when its turn comes would burn the entire MySQL
+        # export before refusing a path the operator already had on disk.
+        if args.mysql_source is not None:
+            _require_absent(args.mysql_db, "mysql")
+        if args.backend_source is not None:
+            _require_absent(args.backend_db, "backend")
+
         if args.mysql_source is not None:
             _build_library_db_from_mysql(args.mysql_source, args.mysql_db)
         if args.backend_source is not None:
             _build_library_db_from_backend(args.backend_source, args.backend_db)
     except SourceError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 3
+    except Exception as exc:
+        # Exit 3 is the documented contract for *any* producer failure. Without
+        # this, a `mysql` binary that isn't on PATH, an unreadable output
+        # directory, or a malformed DSN escapes as a raw traceback and exit 1.
+        logger.exception("catalog parity producer failed")
         print(f"error: {exc}", file=sys.stderr)
         return 3
 

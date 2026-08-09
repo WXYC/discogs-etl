@@ -127,8 +127,9 @@ class TestCompilationTrackArtistSelectNullableTextColumnsWrapped:
 
     def test_not_null_columns_left_unwrapped(self) -> None:
         """LIBRARY_RELEASE_ID and ARTIST_NAME are documented NOT NULL
-        (scripts/tsv_to_sqlite.py's _import_compilation_track_artists
-        docstring) -- they must stay unwrapped."""
+        (lib/library_db.py's create_compilation_track_artists declares the
+        columns; parse_compilation_track_tsv beside it skips rows that
+        violate them) -- they must stay unwrapped."""
         select_text = _cta_select()
         for col in ("LIBRARY_RELEASE_ID", "ARTIST_NAME"):
             assert f"IFNULL({col}" not in select_text, f"{col} should not be IFNULL-wrapped"

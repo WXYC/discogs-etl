@@ -165,8 +165,8 @@ log "Fetched $ROW_COUNT rows from MySQL"
 # export dropped in the #65 slim-down -- WXYC/discogs-etl#332). Reuses the same
 # MySQL auth as the query above. artist_name/track_title are free text but mysql
 # -B -N already escapes embedded tab/newline/backslash bytes in field values, so
-# tsv_to_sqlite.py's tab/newline-based TSV parser (shared with the LIBRARY_RELEASE
-# export above) is safe to reuse unchanged.
+# the tab/newline-based TSV parser in lib/library_db.py (shared with the
+# LIBRARY_RELEASE export above) is safe to reuse unchanged.
 # Degrades gracefully: pre-V008 fixtures / the Backend-Service catalog source have
 # no COMPILATION_TRACK_ARTIST table, so a "doesn't exist" failure here is expected
 # and must not fail the overall library sync (or any other CTA-fetch error, since
@@ -176,8 +176,9 @@ log "Fetched $ROW_COUNT rows from MySQL"
 # ALBUM_ARTIST/ALTERNATE_ARTIST_NAME above: this is the same `mysql -B -N`
 # invocation style, so a genuine SQL NULL here renders as the literal text
 # "NULL" too. LIBRARY_RELEASE_ID and ARTIST_NAME are documented NOT NULL
-# (see _import_compilation_track_artists in tsv_to_sqlite.py) and stay
-# unwrapped.
+# (see create_compilation_track_artists in lib/library_db.py for the column
+# definitions, and parse_compilation_track_tsv beside it for the skip-with-a-
+# warning that enforces them) and stay unwrapped.
 CTA_CSV_FILE=$(mktemp)
 CTA_ETL_OUTPUT=$(mktemp)
 CTA_TSV_ARGS=()
