@@ -251,6 +251,7 @@ class _BackendStub:
         # by pre-loading these.
         self.sign_in_statuses: list[int] = []
         self.exchange_statuses: list[int] = []
+        self.sign_out_statuses: list[int] = []
         # Everything this stub has minted and not superseded.
         self.sessions: set[str] = set()
         self.jwts: set[str] = set()
@@ -260,6 +261,10 @@ class _BackendStub:
     @property
     def sign_ins(self) -> int:
         return sum(1 for r in self.requests if r.path == "/auth/sign-in/email")
+
+    @property
+    def sign_outs(self) -> int:
+        return sum(1 for r in self.requests if r.path == "/auth/sign-out")
 
     @property
     def exchanges(self) -> int:
@@ -313,6 +318,15 @@ class _BackendStub:
 
             def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
                 self._record()
+                if self.path == "/auth/sign-out":
+                    forced = stub.sign_out_statuses.pop(0) if stub.sign_out_statuses else None
+                    if forced is not None:
+                        self._send_json(forced, {"message": "forced"})
+                        return
+                    bearer = (self.headers.get("Authorization") or "").removeprefix("Bearer ")
+                    stub.sessions.discard(bearer)
+                    self._send_json(200, {"success": True})
+                    return
                 if self.path != "/auth/sign-in/email":
                     self.send_error(404)
                     return
@@ -1657,6 +1671,102 @@ class TestServiceAccountMint:
             self._use_credentials(mod, monkeypatch, stub)
             mod._build_library_db_from_backend(stub.base_url, str(out))
 
+            assert stub.exchanges == 1
+        assert out.exists()
+
+    def test_signs_out_the_session_it_minted(self, tmp_path: Path, monkeypatch) -> None:
+        """A run must not leave a year-long credential behind it.
+
+        Backend-Service pins ``session.expiresIn`` to 365 days, so every
+        un-revoked sign-in is a standalone catalog:read credential that
+        survives a password rotation (``admin/set-user-password`` revokes
+        nothing). A daily soak would accumulate one per run.
+        """
+        mod = _load_module()
+        out = tmp_path / "backend.db"
+        with _BackendStub(
+            catalog_rows=[_catalog_row(legacy_release_id=72_101)],
+            cta_rows=[],
+            credentials=("catalog-parity@wxyc.org", "hunter2-but-48-bytes"),
+        ) as stub:
+            self._use_credentials(mod, monkeypatch, stub)
+            mod._build_library_db_from_backend(stub.base_url, str(out))
+
+            assert stub.sign_outs == 1
+            assert stub.sessions == set(), "the minted session must not outlive the run"
+        assert out.exists()
+
+    def test_signs_out_even_when_the_export_fails(self, tmp_path: Path, monkeypatch) -> None:
+        """The failure path is the one that would otherwise leak most."""
+        mod = _load_module()
+        out = tmp_path / "backend.db"
+        with _BackendStub(
+            catalog_rows=[],  # an empty catalog is a producer failure
+            cta_rows=[],
+            credentials=("catalog-parity@wxyc.org", "hunter2-but-48-bytes"),
+        ) as stub:
+            self._use_credentials(mod, monkeypatch, stub)
+            with pytest.raises(mod.SourceError):
+                mod._build_library_db_from_backend(stub.base_url, str(out))
+
+            assert stub.sign_outs == 1
+            assert stub.sessions == set()
+        assert not out.exists()
+
+    def test_a_failed_sign_out_does_not_fail_the_run(self, tmp_path: Path, monkeypatch) -> None:
+        """Best-effort: the export already succeeded, and the JWT expires anyway."""
+        mod = _load_module()
+        out = tmp_path / "backend.db"
+        with _BackendStub(
+            catalog_rows=[_catalog_row(legacy_release_id=72_101)],
+            cta_rows=[],
+            credentials=("catalog-parity@wxyc.org", "hunter2-but-48-bytes"),
+        ) as stub:
+            self._use_credentials(mod, monkeypatch, stub)
+            stub.sign_out_statuses = [500]
+            mod._build_library_db_from_backend(stub.base_url, str(out))
+
+            assert stub.sign_outs == 1
+        assert out.exists()
+
+    def test_nothing_to_sign_out_of_in_static_mode(self, tmp_path: Path, monkeypatch) -> None:
+        """A token the operator supplied is not this run's to revoke."""
+        mod = _load_module()
+        out = tmp_path / "backend.db"
+        with _BackendStub(catalog_rows=[_catalog_row()], cta_rows=[]) as stub:
+            monkeypatch.setenv(mod.BACKEND_TOKEN_ENV, "svc-token")
+            monkeypatch.delenv(mod.BACKEND_EMAIL_ENV, raising=False)
+            monkeypatch.delenv(mod.BACKEND_PASSWORD_ENV, raising=False)
+            mod._build_library_db_from_backend(stub.base_url, str(out))
+
+            assert stub.sign_outs == 0
+        assert out.exists()
+
+    def test_a_stale_static_token_falls_back_to_the_credentials(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """A leftover $BACKEND_CATALOG_TOKEN must not strand a run that can mint.
+
+        #365's original acceptance criterion asked for that secret, so an
+        unattended run may well inherit one alongside the credential pair.
+        Failing on a 15-minute-old JWT while holding everything needed to mint
+        a fresh one -- and advising the operator to set variables that are
+        already set -- is the wrong end state.
+        """
+        mod = _load_module()
+        out = tmp_path / "backend.db"
+        with _BackendStub(
+            catalog_rows=[_catalog_row(legacy_release_id=72_101)],
+            cta_rows=[],
+            credentials=("catalog-parity@wxyc.org", "hunter2-but-48-bytes"),
+        ) as stub:
+            monkeypatch.setenv(mod.BACKEND_TOKEN_ENV, "stale-token")
+            monkeypatch.setenv(mod.BACKEND_EMAIL_ENV, "catalog-parity@wxyc.org")
+            monkeypatch.setenv(mod.BACKEND_PASSWORD_ENV, "hunter2-but-48-bytes")
+            monkeypatch.setenv(mod.BACKEND_AUTH_URL_ENV, f"{stub.base_url}/auth")
+            mod._build_library_db_from_backend(stub.base_url, str(out))
+
+            assert stub.sign_ins == 1, "the fallback mints rather than giving up"
             assert stub.exchanges == 1
         assert out.exists()
 

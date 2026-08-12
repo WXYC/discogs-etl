@@ -375,6 +375,12 @@ _DEFAULT_AUTH_ORIGIN = "https://dj.wxyc.org"
 
 _SIGN_IN_PATH = "/sign-in/email"
 _EXCHANGE_PATH = "/token"
+_SIGN_OUT_PATH = "/sign-out"
+
+# Cleanup budget. Deliberately not _HTTP_TIMEOUT_SECONDS: the export is
+# already done by the time this runs, and a hung revocation must not hold a
+# finished run open for five minutes.
+_SIGN_OUT_TIMEOUT_SECONDS = 30
 
 # better-auth's default JWT life, which Backend-Service does not override.
 # Only a fallback: it schedules the next refresh when a token's own `exp` is
@@ -836,6 +842,7 @@ class _TokenSource:
     """
 
     def __init__(self, base_url: str) -> None:
+        self._base_url = base_url
         self._static = os.environ.get(BACKEND_TOKEN_ENV) or None
         self._email = os.environ.get(BACKEND_EMAIL_ENV) or None
         self._password = os.environ.get(BACKEND_PASSWORD_ENV) or None
@@ -843,9 +850,18 @@ class _TokenSource:
         self._jwt: str | None = None
         self._jwt_expires_at = 0.0
         self._sign_ins = 0
+        self._auth_url = ""
+        self._origin = ""
 
         if self._static:
+            # Credentials, when they are also set, are this token's fallback
+            # rather than dead weight -- but resolving the auth URL now would
+            # refuse a plaintext one the run may never touch.
             return
+        self._enter_credential_mode()
+
+    def _enter_credential_mode(self) -> None:
+        """Validate the credential pair and pin the URL the password goes to."""
         if not (self._email and self._password):
             raise SourceError(
                 "no Backend service-account credentials: set "
@@ -855,11 +871,12 @@ class _TokenSource:
                 "JWTs expire after 15 minutes). Either way the principal needs catalog:read."
             )
         self._auth_url = _resolve_https_base_url(
-            os.environ.get(BACKEND_AUTH_URL_ENV) or _default_auth_url(base_url),
+            os.environ.get(BACKEND_AUTH_URL_ENV) or _default_auth_url(self._base_url),
             source_label=f"${BACKEND_AUTH_URL_ENV}",
             secret_description=f"the ${BACKEND_PASSWORD_ENV} sign-in password",
         )
         self._origin = os.environ.get(BACKEND_AUTH_ORIGIN_ENV) or _DEFAULT_AUTH_ORIGIN
+        self._static = None
 
     def token(self) -> str:
         """A bearer valid now -- minting or refreshing if it isn't."""
@@ -880,14 +897,72 @@ class _TokenSource:
         with the sign-in limiter.
         """
         if self._static:
-            raise SourceError(
-                f"the ${BACKEND_TOKEN_ENV} token was rejected (401) and cannot be refreshed: "
-                "better-auth JWTs expire after 15 minutes. Mint a fresh one, or set "
-                f"${BACKEND_EMAIL_ENV} + ${BACKEND_PASSWORD_ENV} so the harness can mint per "
-                "run -- which is what an unattended soak needs."
+            if not (self._email and self._password):
+                raise SourceError(
+                    f"the ${BACKEND_TOKEN_ENV} token was rejected (401) and cannot be "
+                    "refreshed: better-auth JWTs expire after 15 minutes. Mint a fresh one, "
+                    f"or set ${BACKEND_EMAIL_ENV} + ${BACKEND_PASSWORD_ENV} so the harness "
+                    "can mint per run -- which is what an unattended soak needs."
+                )
+            # Both are set, which is what an unattended run inherits if the
+            # secret #365 originally specified is left in place. Stranding it
+            # on a 15-minute-old JWT -- while holding everything needed to
+            # mint a fresh one -- would be a self-inflicted outage.
+            logger.warning(
+                "the pre-minted token was rejected; falling back to the credential pair",
+                extra={"step": "backend_producer"},
             )
+            _report(
+                f"WARNING: ${BACKEND_TOKEN_ENV} was rejected (401); minting from "
+                f"${BACKEND_EMAIL_ENV} instead"
+            )
+            self._enter_credential_mode()
+            return
         self._jwt = None
         self._jwt_expires_at = 0.0
+
+    def close(self) -> None:
+        """Revoke the session this run minted, if it minted one.
+
+        Backend-Service pins ``session.expiresIn`` to a year, so a session
+        left behind is a standalone catalog:read credential with a year to
+        run -- and ``admin/set-user-password`` revokes nothing, so a password
+        rotation would not clear it. Unattended runs would accumulate one per
+        run.
+
+        Best-effort by design: the export has already happened, and the worst
+        case of a failed revocation is the state every run had before this
+        existed. A token supplied through ``$BACKEND_CATALOG_TOKEN`` is not
+        this run's to revoke and is left alone.
+        """
+        session, self._session = self._session, None
+        self._jwt = None
+        self._jwt_expires_at = 0.0
+        if not session:
+            return
+        url = self._auth_url + _SIGN_OUT_PATH
+        request = Request(
+            url,
+            data=b"{}",
+            headers={
+                "Authorization": f"Bearer {session}",
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "Origin": self._origin,
+            },
+        )
+        try:
+            with _opener.open(request, timeout=_SIGN_OUT_TIMEOUT_SECONDS):
+                pass
+        except OSError as exc:  # URLError/HTTPError are both OSError subclasses
+            # Named loudly: the leftover session outlives this process by a
+            # year, so an operator who sees this may want to revoke it by hand
+            # (POST /auth/admin/revoke-user-sessions).
+            logger.warning(
+                "could not sign out the parity session; it stays valid server-side",
+                extra={"step": "backend_producer", "error": str(exc)},
+            )
+            _report(f"WARNING: sign-out at {url} failed ({exc}); the session was not revoked")
 
     def _exchange(self) -> str:
         """Trade the cached session for a JWT, re-signing-in at most once.
@@ -1207,7 +1282,18 @@ def _build_library_db_from_backend(source: str, output_path: str) -> None:
     _require_absent(output_path, "backend")
     base_url = _resolve_backend_base_url(source)
     token_source = _TokenSource(base_url)
+    try:
+        _build_from_backend_snapshot(base_url, output_path, token_source)
+    finally:
+        # The failure path is the one that would leak most: a run that dies
+        # mid-export has still minted a year-long session.
+        token_source.close()
 
+
+def _build_from_backend_snapshot(
+    base_url: str, output_path: str, token_source: _TokenSource
+) -> None:
+    """Fetch a consistent snapshot and write it, with the token source live."""
     library_rows, compilation_rows = _fetch_consistent_snapshot(base_url, token_source)
     if not library_rows:
         # A broken export query, an over-narrow token scope, or a truncated

@@ -187,31 +187,40 @@ python scripts/catalog_parity_diff.py \
 
 #### Minting and rotating the parity service account (#365)
 
-The bearer above **cannot be a stored secret**. `requirePermissions` accepts only a JWKS-verified JWT, and better-auth issues those with a 15-minute expiry (its default, which Backend-Service does not override) — so what CI stores is the service account's *password*, and `catalog_parity_diff.py` mints a token per run from `BACKEND_CATALOG_EMAIL` + `BACKEND_CATALOG_PASSWORD`. `BACKEND_CATALOG_TOKEN` still works for a one-off run with a JWT already in hand. Two optional overrides exist for non-prod: `BACKEND_AUTH_URL` (defaults to `<--backend-source>/auth`) and `BACKEND_AUTH_ORIGIN` (defaults to `https://dj.wxyc.org`, which must be one of the auth server's `BETTER_AUTH_TRUSTED_ORIGINS` — better-auth's CSRF guard rejects an origin-less sign-in).
+The bearer above **cannot be a stored secret**. `requirePermissions` accepts only a JWKS-verified JWT, and better-auth issues those with a 15-minute expiry (its default, which Backend-Service does not override) — so what CI stores is the service account's *password*, and `catalog_parity_diff.py` mints a token per run from `BACKEND_CATALOG_EMAIL` + `BACKEND_CATALOG_PASSWORD`. `BACKEND_CATALOG_TOKEN` still works for a one-off run with a JWT already in hand: it takes precedence, and if it turns out to be stale the run falls back to minting from the credential pair rather than failing on a 15-minute-old token it could replace. Two optional overrides exist for non-prod: `BACKEND_AUTH_URL` (defaults to `<--backend-source>/auth`) and `BACKEND_AUTH_ORIGIN` (defaults to `https://dj.wxyc.org`, which must be one of the auth server's `BETTER_AUTH_TRUSTED_ORIGINS` — better-auth's CSRF guard rejects an origin-less sign-in).
 
 A run outlives its 15-minute token, so the harness refreshes — and how it refreshes is shaped by the two rate limiters in front of `/auth/sign-in` (the express one, 10 per 15 min; better-auth's own, 3 per 10s). It caches the *session* and refreshes by re-exchanging at `/auth/token`, which is exempt from the express limiter; only an exchange that itself 401s (a dead session) costs a second sign-in, and there are at most two sign-ins per run. The two budgets are separate — spending the sign-in allowance must never disable refreshing against a session that still works. A 429 whose retry hint exceeds 10s is **not** waited out: the run fails quoting the hint, because retrying into a 15-minute window is a guaranteed second refusal and the operator wants the real number. If that happens, check whether something else is signing in as the service account.
 
 **Mint** (one-time, needs an admin session on `api.wxyc.org/auth`):
 
+Every password below reaches `curl` on **stdin**, never in argv — same reason `LIBRARY_DB_PASSWORD` goes through `MYSQL_PWD` above. `-d "{...$PASSWORD...}"` would put it in a command line that `ps` shows to every user on the box and that `set -x` echoes into the scrollback.
+
 ```bash
 # 1. Admin sign-in -> session token.
-SESSION=$(curl -sS -X POST https://api.wxyc.org/auth/sign-in/email \
-    -H 'Content-Type: application/json' -H 'Origin: https://dj.wxyc.org' \
-    -d "{\"email\":\"$ADMIN_EMAIL\",\"password\":\"$ADMIN_PASSWORD\"}" | jq -r .token)
+SESSION=$(jq -n --arg e "$ADMIN_EMAIL" --arg p "$ADMIN_PASSWORD" '{email:$e,password:$p}' \
+    | curl -sS -X POST https://api.wxyc.org/auth/sign-in/email \
+        -H 'Content-Type: application/json' -H 'Origin: https://dj.wxyc.org' \
+        --data-binary @- | jq -r .token)
 
 # 2. Create the principal with a password, no email, no setup token.
+#    Keep USER_ID: rotation and revocation both need it.
 PASSWORD=$(python3 -c 'import secrets; print(secrets.token_urlsafe(48))')
-curl -sS -X POST https://api.wxyc.org/auth/admin/create-user \
-    -H "Authorization: Bearer $SESSION" -H 'Content-Type: application/json' \
-    -H 'Origin: https://dj.wxyc.org' \
-    -d "{\"email\":\"catalog-parity@wxyc.org\",\"name\":\"Catalog Parity\",\"password\":\"$PASSWORD\",\"data\":{\"emailVerified\":true}}"
+USER_ID=$(jq -n --arg p "$PASSWORD" \
+    '{email:"catalog-parity@wxyc.org",name:"Catalog Parity",password:$p,data:{emailVerified:true}}' \
+    | curl -sS -X POST https://api.wxyc.org/auth/admin/create-user \
+        -H "Authorization: Bearer $SESSION" -H 'Content-Type: application/json' \
+        -H 'Origin: https://dj.wxyc.org' --data-binary @- | jq -r .user.id)
 
 # 3. Store it where CI reads it.
 gh secret set BACKEND_CATALOG_EMAIL --repo WXYC/discogs-etl --body catalog-parity@wxyc.org
-gh secret set BACKEND_CATALOG_PASSWORD --repo WXYC/discogs-etl --body "$PASSWORD"
+printf %s "$PASSWORD" | gh secret set BACKEND_CATALOG_PASSWORD --repo WXYC/discogs-etl --body-file -
 ```
 
-**Rotate**: repeat step 2 as `POST /auth/admin/set-user-password` with `{"userId": "...", "newPassword": "..."}`, then step 3. Nothing else consumes these secrets, so rotation is atomic from the soak's point of view as long as it doesn't land mid-run.
+If `USER_ID` was not captured at mint time, recover it with `POST /auth/admin/list-users` (`{"searchField":"email","searchValue":"catalog-parity@wxyc.org"}`) rather than guessing.
+
+**Rotate**: repeat step 2 as `POST /auth/admin/set-user-password` with `{"userId":"$USER_ID","newPassword":"..."}`, then **revoke the old sessions** — `POST /auth/admin/revoke-user-sessions` with `{"userId":"$USER_ID"}` — then step 3. The revocation is not optional bookkeeping: `set-user-password` revokes nothing, and Backend-Service pins `session.expiresIn` to **365 days** (`shared/authentication/src/auth.definition.ts`), so a rotation without it orphans the stored secret while leaving every previously-minted session able to keep exchanging for `catalog:read` JWTs for a year. The harness signs out the session it mints (`_TokenSource.close`, in a `finally`), so in the normal case there is nothing left to revoke — this covers the runs that died before they could.
+
+Nothing else consumes these secrets, so rotation is atomic from the soak's point of view as long as it doesn't land mid-run.
 
 Three things about that procedure are load-bearing:
 
@@ -219,7 +228,7 @@ Three things about that procedure are load-bearing:
 - **`member` is the least-privileged role that carries `catalog:read`.** Every WXYC role has it; `member` is the floor. The residual grants are `bin:read/write` (its own DJ bin) and `flowsheet:read` — no catalog write, no flowsheet write. A truly catalog-read-only role would need a new entry in the shared `WXYCRole` union across three repos.
 - **No `role` field in the create-user body.** That field is better-auth's *global* admin role (`user.role`), not the org role — leaving it at the default keeps the account outside the admin plugin entirely.
 
-If the account ever needs revoking: rotate the password (which orphans the stored secret), and ban the user if the compromise is active — the JWT payload carries `banned` and `requirePermissions` 403s on it, so a ban takes effect within one 15-minute token turnover rather than waiting out the year-long session.
+If the account ever needs revoking: rotate the password **and** revoke the sessions (both above — the password alone leaves year-long sessions live), and ban the user if the compromise is active. The JWT payload carries `banned` and `requirePermissions` 403s on it, so a ban takes effect within one 15-minute token turnover; it is the only one of the three that also invalidates a JWT already in flight.
 
 Four properties worth knowing before reading a parity report:
 
