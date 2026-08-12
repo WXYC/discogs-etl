@@ -111,6 +111,34 @@ class TestMintScript:
         assert "/sign-in/username" in script
         assert "--admin-username" in script
 
+    def test_an_email_passed_as_a_username_is_caught_locally(self, script: str) -> None:
+        """better-auth 422s an `@` as INVALID_USERNAME -- catch it before the wire.
+
+        The two flags are easy to confuse precisely because the account has
+        both kinds of identifier, and a round trip to production to learn you
+        typed the wrong flag is a worse teacher than a local message.
+        """
+        code = "\n".join(line for line in script.splitlines() if not line.strip().startswith("#"))
+        assert re.search(r'ADMIN_USERNAME"?\s*==\s*\*@\*', code)
+
+    def test_it_accepts_a_session_the_operator_already_has(self, script: str) -> None:
+        """Not every admin can reach a password.
+
+        This deployment enables emailOTP, so an account may sign in by
+        one-time code and have no usable password at all. Handing the script a
+        session obtained however dj-site obtains one keeps that operator
+        unblocked without inventing a credential for them.
+        """
+        assert "--admin-session" in script
+
+    def test_a_supplied_session_is_not_revoked(self, script: str) -> None:
+        """Revoking it would sign the operator out of dj-site.
+
+        Same rule the harness applies to $BACKEND_CATALOG_TOKEN: this script
+        revokes what it minted, and nothing else.
+        """
+        assert "SESSION_IS_OURS" in script
+
     def test_the_sign_in_failure_is_actionable(self, script: str) -> None:
         """better-auth cannot say which half was wrong, so the script must.
 
