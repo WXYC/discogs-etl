@@ -193,7 +193,13 @@ A run outlives its 15-minute token, so the harness refreshes — and how it refr
 
 **Mint** (one-time, needs an admin session on `api.wxyc.org/auth`):
 
-Every password below reaches `curl` on **stdin**, never in argv — same reason `LIBRARY_DB_PASSWORD` goes through `MYSQL_PWD` above. `-d "{...$PASSWORD...}"` would put it in a command line that `ps` shows to every user on the box and that `set -x` echoes into the scrollback.
+**`scripts/mint-parity-service-account.sh` does all of this**, and is the path to prefer — it reads the admin password without echo, revokes the admin session from a `trap` on the way out, and exercises the new credential (sign-in + JWT exchange) before reporting success, which is what proves the org `member` row landed:
+
+```bash
+./scripts/mint-parity-service-account.sh --admin-email you@example.org
+```
+
+The steps below are what it does, kept here because a runbook that only says "run the script" is useless the day the script is the thing that's broken. Every password reaches `curl` on **stdin**, never in argv — same reason `LIBRARY_DB_PASSWORD` goes through `MYSQL_PWD` above. `-d "{...$PASSWORD...}"` would put it in a command line that `ps` shows to every user on the box and that `set -x` echoes into the scrollback.
 
 ```bash
 # 1. Admin sign-in -> session token.
