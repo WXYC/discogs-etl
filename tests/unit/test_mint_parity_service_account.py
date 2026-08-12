@@ -131,6 +131,18 @@ class TestMintScript:
         """
         assert "--admin-session" in script
 
+    def test_it_rejects_a_jwt_pasted_where_the_session_belongs(self, script: str) -> None:
+        """`set-auth-jwt` and `set-auth-token` are one letter apart in practice.
+
+        The admin endpoints resolve their caller through `getSessionFromCtx`,
+        so a JWT pasted here authenticates as nobody and returns another
+        opaque 401. The shapes are distinguishable locally: a JWT is three
+        base64url segments whose first decodes to a JOSE header.
+        """
+        assert "set-auth-token" in script
+        code = "\n".join(line for line in script.splitlines() if not line.strip().startswith("#"))
+        assert "alg" in code, "the JWT-shape check must inspect the JOSE header"
+
     def test_a_supplied_session_is_not_revoked(self, script: str) -> None:
         """Revoking it would sign the operator out of dj-site.
 
