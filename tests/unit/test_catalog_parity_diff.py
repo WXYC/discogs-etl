@@ -243,7 +243,7 @@ class _BackendStub:
         # window is 15 minutes, so a hint far longer than any retry the
         # producer is willing to wait out is the realistic case, not an
         # exotic one.
-        self.sign_in_retry_after = "1"
+        self.sign_in_retry_after: str | None = "1"
         self.requests: list[_RecordedRequest] = []
         self.on_catalog_fetch: Callable[[], None] | None = None
         # Queues of forced statuses, popped left-to-right; empty means "behave
@@ -320,6 +320,14 @@ class _BackendStub:
                 self._record()
                 if self.path == "/auth/sign-out":
                     forced = stub.sign_out_statuses.pop(0) if stub.sign_out_statuses else None
+                    if forced == 302:
+                        # A proxy that redirects only this path -- the shape
+                        # that reaches the redirect handler, not the socket
+                        # layer, and so raises SourceError rather than OSError.
+                        self._send_json(
+                            302, {"message": "moved"}, Location="https://elsewhere.example.org/x"
+                        )
+                        return
                     if forced is not None:
                         self._send_json(forced, {"message": "forced"})
                         return
@@ -337,11 +345,14 @@ class _BackendStub:
                     # better-auth's own limiter emits X-Retry-After, NOT the
                     # standard header the express limiter sends -- a producer
                     # that reads only one of the two waits the wrong amount.
-                    self._send_json(
-                        429,
-                        {"message": "Too many requests"},
-                        X_Retry_After=stub.sign_in_retry_after,
+                    # None stands in for a limiter that sends neither (a proxy
+                    # or WAF in front of both).
+                    hint = (
+                        {"X_Retry_After": stub.sign_in_retry_after}
+                        if stub.sign_in_retry_after is not None
+                        else {}
                     )
+                    self._send_json(429, {"message": "Too many requests"}, **hint)
                     return
                 if forced is not None:
                     self._send_json(forced, {"message": "forced"})
@@ -1727,6 +1738,94 @@ class TestServiceAccountMint:
             mod._build_library_db_from_backend(stub.base_url, str(out))
 
             assert stub.sign_outs == 1
+        assert out.exists()
+
+    def test_a_redirected_sign_out_does_not_fail_a_finished_run(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """Best-effort has to mean every failure, not just the socket ones.
+
+        The redirect guard raises ``SourceError`` -- a ``RuntimeError``, not an
+        ``OSError`` -- so a proxy that redirects only ``/sign-out`` would throw
+        out of the cleanup and fail a build that had already succeeded.
+        """
+        mod = _load_module()
+        out = tmp_path / "backend.db"
+        with _BackendStub(
+            catalog_rows=[_catalog_row(legacy_release_id=72_101)],
+            cta_rows=[],
+            credentials=("catalog-parity@wxyc.org", "hunter2-but-48-bytes"),
+        ) as stub:
+            self._use_credentials(mod, monkeypatch, stub)
+            stub.sign_out_statuses = [302]
+            mod._build_library_db_from_backend(stub.base_url, str(out))
+        assert out.exists()
+
+    def test_a_failed_sign_out_never_masks_the_real_failure(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """An exception from `finally` replaces the one being raised.
+
+        The operator needs the diagnosis they can act on -- the empty export --
+        not a redirect on a cleanup call they never asked for.
+        """
+        mod = _load_module()
+        out = tmp_path / "backend.db"
+        with _BackendStub(
+            catalog_rows=[],  # the real failure: a producer that read nothing
+            cta_rows=[],
+            credentials=("catalog-parity@wxyc.org", "hunter2-but-48-bytes"),
+        ) as stub:
+            self._use_credentials(mod, monkeypatch, stub)
+            stub.sign_out_statuses = [302]
+            with pytest.raises(mod.SourceError, match="returned no rows"):
+                mod._build_library_db_from_backend(stub.base_url, str(out))
+        assert not out.exists()
+
+    def test_a_429_without_a_usable_hint_fails_fast(self, tmp_path: Path, monkeypatch) -> None:
+        """No hint means no way to tell a 10s window from a 15-minute one.
+
+        Both limiters we know about send one, so a 429 without it came from
+        something else in front of them -- and retrying into the express
+        limiter's 15-minute window would burn a second slot from a budget
+        shared with every DJ signing in, to learn nothing.
+        """
+        mod = _load_module()
+        out = tmp_path / "backend.db"
+        slept: list[float] = []
+        with _BackendStub(
+            catalog_rows=[_catalog_row()],
+            cta_rows=[],
+            credentials=("catalog-parity@wxyc.org", "hunter2-but-48-bytes"),
+        ) as stub:
+            self._use_credentials(mod, monkeypatch, stub)
+            stub.sign_in_statuses = [429]
+            stub.sign_in_retry_after = None
+            monkeypatch.setattr(mod.time, "sleep", slept.append)
+            with pytest.raises(mod.SourceError, match="429"):
+                mod._build_library_db_from_backend(stub.base_url, str(out))
+
+            assert slept == []
+            assert stub.sign_ins == 1
+        assert not out.exists()
+
+    def test_a_zero_retry_hint_still_waits(self, tmp_path: Path, monkeypatch) -> None:
+        """`Retry-After: 0` is not an invitation to retry inside the same tick."""
+        mod = _load_module()
+        out = tmp_path / "backend.db"
+        slept: list[float] = []
+        with _BackendStub(
+            catalog_rows=[_catalog_row(legacy_release_id=72_101)],
+            cta_rows=[],
+            credentials=("catalog-parity@wxyc.org", "hunter2-but-48-bytes"),
+        ) as stub:
+            self._use_credentials(mod, monkeypatch, stub)
+            stub.sign_in_statuses = [429]
+            stub.sign_in_retry_after = "0"
+            monkeypatch.setattr(mod.time, "sleep", slept.append)
+            mod._build_library_db_from_backend(stub.base_url, str(out))
+
+            assert slept and all(delay >= 1 for delay in slept)
         assert out.exists()
 
     def test_nothing_to_sign_out_of_in_static_mode(self, tmp_path: Path, monkeypatch) -> None:
