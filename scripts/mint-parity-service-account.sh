@@ -209,6 +209,25 @@ if [[ "$USE_SUPPLIED_SESSION" == true ]]; then
     IFS= read -r -s -p 'Admin session token: ' SESSION
     echo >&2
     [[ -n "$SESSION" ]] || die "no session token given"
+    # A JWT pasted here would authenticate as nobody: the admin endpoints
+    # resolve their caller through getSessionFromCtx, which the bearer plugin
+    # feeds from a *session* token. Browsers see both -- as `set-auth-jwt` and
+    # `set-auth-token` -- and confusing them produces another opaque 401, so
+    # tell them apart locally instead.
+    if python3 -c '
+import base64, json, sys
+parts = sys.argv[1].split(".")
+if len(parts) != 3:
+    sys.exit(1)
+seg = parts[0]
+try:
+    header = json.loads(base64.urlsafe_b64decode(seg + "=" * (-len(seg) % 4)))
+except Exception:
+    sys.exit(1)
+sys.exit(0 if isinstance(header, dict) and "alg" in header else 1)
+' "$SESSION"; then
+        die "that is a JWT (set-auth-jwt), not a session token. The admin API needs the session: copy set-auth-token, or the token field from the /auth/sign-in response body."
+    fi
     SESSION_IS_OURS=false
     log "using the session token you supplied (it will not be revoked)"
 else
