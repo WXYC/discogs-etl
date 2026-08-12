@@ -407,9 +407,10 @@ _MAX_EXCHANGE_ATTEMPTS = 2
 # sit in front of that path: the express one (10 per 15 min, draft-7
 # `Retry-After`) and better-auth's own (3 per 10s, `X-Retry-After`). The cap
 # has to be able to clear the shorter window, so it is 10s and not
-# wxyc-canary's 5s. A hint longer than this is not waited out -- see
-# `_sign_in`.
+# wxyc-canary's 5s. A hint longer than this -- or missing entirely -- is not
+# waited out; see `_sign_in`.
 _SIGN_IN_RETRY_CAP_SECONDS = 10
+_SIGN_IN_RETRY_FLOOR_SECONDS = 1
 
 # Env var holding the tubafrenzy MySQL password. It is read from the
 # environment rather than from the ``--mysql-source`` DSN because a DSN
@@ -954,7 +955,14 @@ class _TokenSource:
         try:
             with _opener.open(request, timeout=_SIGN_OUT_TIMEOUT_SECONDS):
                 pass
-        except OSError as exc:  # URLError/HTTPError are both OSError subclasses
+        except Exception as exc:  # noqa: BLE001 - see below: nothing may escape here
+            # Deliberately every exception, not just OSError. This runs from a
+            # `finally`, where anything raised *replaces* the exception in
+            # flight -- so a redirect on the cleanup call (SourceError, a
+            # RuntimeError) would overwrite the torn-snapshot or empty-export
+            # diagnosis the operator actually needs, and on the success path
+            # would fail a build that had already finished.
+            #
             # Named loudly: the leftover session outlives this process by a
             # year, so an operator who sees this may want to revoke it by hand
             # (POST /auth/admin/revoke-user-sessions).
@@ -1036,18 +1044,35 @@ class _TokenSource:
             except _AuthStatusError as exc:
                 if exc.code == 429 and attempt == 1:
                     hint = exc.retry_hint_seconds()
-                    if hint is not None and hint > _SIGN_IN_RETRY_CAP_SECONDS:
+                    if hint is None:
+                        # Both limiters in front of this path send a hint, so
+                        # a 429 without one came from something else (a proxy,
+                        # a WAF) whose window we cannot guess. Retrying blind
+                        # into what may be the express limiter's 15 minutes
+                        # spends a second slot from a budget shared with every
+                        # DJ signing in, and learns nothing.
+                        raise SourceError(
+                            f"sign-in as ${BACKEND_EMAIL_ENV} at {url} was rate limited "
+                            "(HTTP 429) with no usable Retry-After/X-Retry-After hint, so there "
+                            "is no way to tell a "
+                            "10-second window from a 15-minute one. Re-run later, and check "
+                            "whether something else is signing in as this service account."
+                        ) from exc
+                    if hint > _SIGN_IN_RETRY_CAP_SECONDS:
                         # The express limiter's window is 15 minutes. Sleeping
                         # the cap and retrying into a window this long is a
                         # guaranteed second refusal; the operator wants the
                         # real number, not a truncated one.
                         raise SourceError(
-                            f"sign-in as ${BACKEND_EMAIL_ENV} at {url} was rate limited and "
-                            f"asks for {hint:g}s, longer than the {_SIGN_IN_RETRY_CAP_SECONDS}s "
+                            f"sign-in as ${BACKEND_EMAIL_ENV} at {url} was rate limited "
+                            f"(HTTP 429) and asks for {hint:g}s, longer than the "
+                            f"{_SIGN_IN_RETRY_CAP_SECONDS}s "
                             "this run will wait. Re-run after that window, and check whether "
                             "something else is signing in as this service account."
                         ) from exc
-                    delay = hint if hint is not None else _SIGN_IN_RETRY_CAP_SECONDS
+                    # A floor, because `Retry-After: 0` is not an invitation to
+                    # retry inside the same tick of whatever window refused us.
+                    delay = max(hint, _SIGN_IN_RETRY_FLOOR_SECONDS)
                     logger.warning(
                         "sign-in was rate limited; retrying once",
                         extra={"step": "backend_producer", "delay_seconds": delay},
