@@ -48,6 +48,7 @@ SERVICE_NAME="Catalog Parity"
 ORIGIN="${BACKEND_AUTH_ORIGIN:-https://dj.wxyc.org}"
 ADMIN_EMAIL=""
 ADMIN_USERNAME=""
+USE_SUPPLIED_SESSION=false
 OUT_DIR=""
 
 usage() {
@@ -60,6 +61,9 @@ Usage: mint-parity-service-account.sh [options]
                         looks like an email). One of the two is required.
   --auth-url URL        Auth service base (default: https://api.wxyc.org/auth)
   --service-email EMAIL Service account to create (default: catalog-parity@wxyc.invalid)
+  --admin-session       Use a session token you already hold instead of a
+                        password (prompted for, never in argv). For accounts
+                        that sign in by one-time code and have no password.
   --origin ORIGIN       Origin header (default: https://dj.wxyc.org)
   --out-dir DIR         Where to write svc.password / svc.user_id (default: mktemp -d)
   -h, --help            This message
@@ -73,6 +77,7 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --admin-email) ADMIN_EMAIL="$2"; shift 2 ;;
         --admin-username) ADMIN_USERNAME="$2"; shift 2 ;;
+        --admin-session) USE_SUPPLIED_SESSION=true; shift ;;
         --auth-url) AUTH_URL="$2"; shift 2 ;;
         --service-email) SERVICE_EMAIL="$2"; shift 2 ;;
         --origin) ORIGIN="$2"; shift 2 ;;
@@ -101,7 +106,19 @@ AUTH_URL="${AUTH_URL%/}"
 if [[ -n "$ADMIN_EMAIL" && -n "$ADMIN_USERNAME" ]]; then
     die "pass --admin-email or --admin-username, not both"
 fi
-if [[ -z "$ADMIN_EMAIL" && -z "$ADMIN_USERNAME" ]]; then
+# Catch the confusable pair locally. better-auth 422s an "@" as
+# INVALID_USERNAME, and learning that from production is a slow way to find
+# out which flag you wanted.
+if [[ -n "$ADMIN_USERNAME" && "$ADMIN_USERNAME" == *@* ]]; then
+    die "--admin-username takes a username; '${ADMIN_USERNAME}' is an address, so use --admin-email"
+fi
+if [[ -n "$ADMIN_EMAIL" && "$ADMIN_EMAIL" != *@* ]]; then
+    die "--admin-email takes an address; '${ADMIN_EMAIL}' has no '@', so use --admin-username"
+fi
+if [[ "$USE_SUPPLIED_SESSION" == true && ( -n "$ADMIN_EMAIL" || -n "$ADMIN_USERNAME" ) ]]; then
+    die "--admin-session signs in for you; drop --admin-email/--admin-username"
+fi
+if [[ "$USE_SUPPLIED_SESSION" == false && -z "$ADMIN_EMAIL" && -z "$ADMIN_USERNAME" ]]; then
     IFS= read -r -p 'Admin email or username: ' ADMIN_IDENTIFIER
     if [[ "$ADMIN_IDENTIFIER" == *@* ]]; then
         ADMIN_EMAIL="$ADMIN_IDENTIFIER"
@@ -115,7 +132,12 @@ fi
 # routes to /sign-in/username whenever the identifier has no "@". An
 # account that signs in by username has no working email path, and the
 # refusal is the same INVALID_EMAIL_OR_PASSWORD either way.
-if [[ -n "$ADMIN_USERNAME" ]]; then
+ADMIN_IDENTIFIER=""
+SIGN_IN_PATH=""
+SIGN_IN_FIELD=""
+if [[ "$USE_SUPPLIED_SESSION" == true ]]; then
+    :
+elif [[ -n "$ADMIN_USERNAME" ]]; then
     ADMIN_IDENTIFIER="$ADMIN_USERNAME"
     SIGN_IN_PATH="/sign-in/username"
     SIGN_IN_FIELD="username"
@@ -134,8 +156,16 @@ fi
 mkdir -p "$OUT_DIR"
 
 SESSION=""
+# Only ever revoke what this script minted. A session the operator handed us
+# is their dj-site login; signing it out would log them off mid-task. Same
+# rule the harness applies to $BACKEND_CATALOG_TOKEN.
+SESSION_IS_OURS=false
 cleanup() {
     local status=$?
+    if [[ -n "$SESSION" && "$SESSION_IS_OURS" == false ]]; then
+        log "leaving the session you supplied alone; this script revokes only what it mints"
+        SESSION=""
+    fi
     # Revoke on every exit path, including a failure between sign-in and
     # create-user: the session is good for a year either way.
     if [[ -n "$SESSION" ]]; then
@@ -172,38 +202,47 @@ call_auth() {
     RESPONSE="${raw%$'\n'*}"
 }
 
-# 1. Admin sign-in. The password is read without echo and piped straight into
+# 1. Get an admin session, either by signing in or by taking one the operator
+#    already holds. The password is read without echo and goes straight into
 #    the JSON body -- it exists only in this process's memory.
-# IFS= so a password with a leading or trailing space survives intact: a
-# bare `read` splits on IFS and would silently hand the server a different
-# string than the one that was typed.
-IFS= read -r -s -p "Password for ${ADMIN_IDENTIFIER}: " ADMIN_PASSWORD
-echo >&2
-[[ -n "$ADMIN_PASSWORD" ]] || die "an admin password is required"
+if [[ "$USE_SUPPLIED_SESSION" == true ]]; then
+    IFS= read -r -s -p 'Admin session token: ' SESSION
+    echo >&2
+    [[ -n "$SESSION" ]] || die "no session token given"
+    SESSION_IS_OURS=false
+    log "using the session token you supplied (it will not be revoked)"
+else
+    IFS= read -r -s -p "Password for ${ADMIN_IDENTIFIER}: " ADMIN_PASSWORD
+    echo >&2
+    [[ -n "$ADMIN_PASSWORD" ]] || die "an admin password is required"
 
-call_auth "$SIGN_IN_PATH" "" \
-    < <(jq -n --arg f "$SIGN_IN_FIELD" --arg i "$ADMIN_IDENTIFIER" --arg p "$ADMIN_PASSWORD" \
-        '{($f): $i, password: $p}')
-unset ADMIN_PASSWORD
-if [[ "$HTTP_STATUS" == "401" ]]; then
-    # better-auth answers "no such user" and "wrong password" identically, by
-    # design. Say which two things to check, because the operator staring at a
-    # password they know is correct cannot tell those apart.
-    log "ERROR: ${SIGN_IN_PATH} rejected ${ADMIN_IDENTIFIER} (HTTP 401): ${RESPONSE}"
-    log "       better-auth returns this for an unknown ${SIGN_IN_FIELD} AND for a wrong password."
-    if [[ "$SIGN_IN_FIELD" == "email" ]]; then
-        log "       If you sign in to dj.wxyc.org with a username rather than that address,"
-        log "       re-run with --admin-username <name>: they are separate endpoints."
-    else
-        log "       If you sign in to dj.wxyc.org with an email address, re-run with"
-        log "       --admin-email <address>: they are separate endpoints."
+    call_auth "$SIGN_IN_PATH" "" \
+        < <(jq -n --arg f "$SIGN_IN_FIELD" --arg i "$ADMIN_IDENTIFIER" --arg p "$ADMIN_PASSWORD" \
+            '{($f): $i, password: $p}')
+    unset ADMIN_PASSWORD
+    if [[ "$HTTP_STATUS" == "401" ]]; then
+        # better-auth answers "no such user" and "wrong password" identically,
+        # by design. Say which things to check, because the operator staring at
+        # a password they know is correct cannot tell those apart.
+        log "ERROR: ${SIGN_IN_PATH} rejected ${ADMIN_IDENTIFIER} (HTTP 401): ${RESPONSE}"
+        log "       better-auth returns this for an unknown ${SIGN_IN_FIELD} AND for a wrong password."
+        if [[ "$SIGN_IN_FIELD" == "email" ]]; then
+            log "       If you sign in to dj.wxyc.org with a username rather than that address,"
+            log "       re-run with --admin-username <name>: they are separate endpoints."
+        else
+            log "       If you sign in to dj.wxyc.org with an email address, re-run with"
+            log "       --admin-email <address>: they are separate endpoints."
+        fi
+        log "       If you sign in with a one-time code and have no password, re-run with"
+        log "       --admin-session and paste a session token from a signed-in browser."
+        exit 1
     fi
-    exit 1
+    [[ "$HTTP_STATUS" == "200" ]] || die "admin sign-in failed with HTTP ${HTTP_STATUS}: ${RESPONSE}"
+    SESSION="$(jq -r '.token // empty' <<<"$RESPONSE")"
+    [[ -n "$SESSION" ]] || die "admin sign-in returned no session token"
+    SESSION_IS_OURS=true
+    log "signed in as ${ADMIN_IDENTIFIER}"
 fi
-[[ "$HTTP_STATUS" == "200" ]] || die "admin sign-in failed with HTTP ${HTTP_STATUS}: ${RESPONSE}"
-SESSION="$(jq -r '.token // empty' <<<"$RESPONSE")"
-[[ -n "$SESSION" ]] || die "admin sign-in returned no session token"
-log "signed in as ${ADMIN_IDENTIFIER}"
 
 # 2. Create the principal. No `role` field: that one is better-auth's global
 #    admin role, not the org role. The org `member` row -- which is where
