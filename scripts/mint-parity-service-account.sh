@@ -64,6 +64,15 @@ Usage: mint-parity-service-account.sh [options]
   --admin-session       Use a session token you already hold instead of a
                         password (prompted for, never in argv). For accounts
                         that sign in by one-time code and have no password.
+                        Get one from a signed-in browser: DevTools > Storage >
+                        Cookies > dj.wxyc.org, the cookie whose name ends in
+                        `better-auth.session_token`. Copy the whole value,
+                        including the `.` and everything after it -- that is
+                        the signature, and the bearer plugin verifies it. The
+                        cookie is httpOnly, so `document.cookie` will not show
+                        it. Do NOT copy `set-auth-jwt` or the body of an
+                        /auth/token response: those are JWTs, and the admin
+                        API authenticates by session.
   --origin ORIGIN       Origin header (default: https://dj.wxyc.org)
   --out-dir DIR         Where to write svc.password / svc.user_id (default: mktemp -d)
   -h, --help            This message
@@ -206,7 +215,7 @@ call_auth() {
 #    already holds. The password is read without echo and goes straight into
 #    the JSON body -- it exists only in this process's memory.
 if [[ "$USE_SUPPLIED_SESSION" == true ]]; then
-    IFS= read -r -s -p 'Admin session token: ' SESSION
+    IFS= read -r -s -p 'Admin session token (the better-auth.session_token cookie value): ' SESSION
     echo >&2
     [[ -n "$SESSION" ]] || die "no session token given"
     # A JWT pasted here would authenticate as nobody: the admin endpoints
