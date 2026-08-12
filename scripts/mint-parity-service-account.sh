@@ -47,13 +47,17 @@ SERVICE_NAME="Catalog Parity"
 # MISSING_OR_NULL_ORIGIN. This must be one of BETTER_AUTH_TRUSTED_ORIGINS.
 ORIGIN="${BACKEND_AUTH_ORIGIN:-https://dj.wxyc.org}"
 ADMIN_EMAIL=""
+ADMIN_USERNAME=""
 OUT_DIR=""
 
 usage() {
     cat <<'USAGE'
 Usage: mint-parity-service-account.sh [options]
 
-  --admin-email EMAIL   Admin to sign in as (prompted if omitted)
+  --admin-email EMAIL   Admin to sign in as, by email
+  --admin-username NAME Admin to sign in as, by username (WXYC accounts may
+                        have either; dj-site picks by whether the identifier
+                        looks like an email). One of the two is required.
   --auth-url URL        Auth service base (default: https://api.wxyc.org/auth)
   --service-email EMAIL Service account to create (default: catalog-parity@wxyc.invalid)
   --origin ORIGIN       Origin header (default: https://dj.wxyc.org)
@@ -68,6 +72,7 @@ USAGE
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --admin-email) ADMIN_EMAIL="$2"; shift 2 ;;
+        --admin-username) ADMIN_USERNAME="$2"; shift 2 ;;
         --auth-url) AUTH_URL="$2"; shift 2 ;;
         --service-email) SERVICE_EMAIL="$2"; shift 2 ;;
         --origin) ORIGIN="$2"; shift 2 ;;
@@ -93,10 +98,32 @@ case "$AUTH_URL" in
 esac
 AUTH_URL="${AUTH_URL%/}"
 
-if [[ -z "$ADMIN_EMAIL" ]]; then
-    read -r -p 'Admin email: ' ADMIN_EMAIL
+if [[ -n "$ADMIN_EMAIL" && -n "$ADMIN_USERNAME" ]]; then
+    die "pass --admin-email or --admin-username, not both"
 fi
-[[ -n "$ADMIN_EMAIL" ]] || die "an admin email is required"
+if [[ -z "$ADMIN_EMAIL" && -z "$ADMIN_USERNAME" ]]; then
+    IFS= read -r -p 'Admin email or username: ' ADMIN_IDENTIFIER
+    if [[ "$ADMIN_IDENTIFIER" == *@* ]]; then
+        ADMIN_EMAIL="$ADMIN_IDENTIFIER"
+    else
+        ADMIN_USERNAME="$ADMIN_IDENTIFIER"
+    fi
+fi
+
+# better-auth exposes the two as separate endpoints with separate body
+# fields; the username plugin is enabled on this deployment, and dj-site
+# routes to /sign-in/username whenever the identifier has no "@". An
+# account that signs in by username has no working email path, and the
+# refusal is the same INVALID_EMAIL_OR_PASSWORD either way.
+if [[ -n "$ADMIN_USERNAME" ]]; then
+    ADMIN_IDENTIFIER="$ADMIN_USERNAME"
+    SIGN_IN_PATH="/sign-in/username"
+    SIGN_IN_FIELD="username"
+else
+    ADMIN_IDENTIFIER="$ADMIN_EMAIL"
+    SIGN_IN_PATH="/sign-in/email"
+    SIGN_IN_FIELD="email"
+fi
 
 # Secrets land here; keep them off other users' terminals from the start
 # rather than chmod-ing after the write.
@@ -147,17 +174,36 @@ call_auth() {
 
 # 1. Admin sign-in. The password is read without echo and piped straight into
 #    the JSON body -- it exists only in this process's memory.
-read -r -s -p "Password for ${ADMIN_EMAIL}: " ADMIN_PASSWORD
+# IFS= so a password with a leading or trailing space survives intact: a
+# bare `read` splits on IFS and would silently hand the server a different
+# string than the one that was typed.
+IFS= read -r -s -p "Password for ${ADMIN_IDENTIFIER}: " ADMIN_PASSWORD
 echo >&2
 [[ -n "$ADMIN_PASSWORD" ]] || die "an admin password is required"
 
-call_auth "/sign-in/email" "" \
-    < <(jq -n --arg e "$ADMIN_EMAIL" --arg p "$ADMIN_PASSWORD" '{email:$e,password:$p}')
+call_auth "$SIGN_IN_PATH" "" \
+    < <(jq -n --arg f "$SIGN_IN_FIELD" --arg i "$ADMIN_IDENTIFIER" --arg p "$ADMIN_PASSWORD" \
+        '{($f): $i, password: $p}')
 unset ADMIN_PASSWORD
+if [[ "$HTTP_STATUS" == "401" ]]; then
+    # better-auth answers "no such user" and "wrong password" identically, by
+    # design. Say which two things to check, because the operator staring at a
+    # password they know is correct cannot tell those apart.
+    log "ERROR: ${SIGN_IN_PATH} rejected ${ADMIN_IDENTIFIER} (HTTP 401): ${RESPONSE}"
+    log "       better-auth returns this for an unknown ${SIGN_IN_FIELD} AND for a wrong password."
+    if [[ "$SIGN_IN_FIELD" == "email" ]]; then
+        log "       If you sign in to dj.wxyc.org with a username rather than that address,"
+        log "       re-run with --admin-username <name>: they are separate endpoints."
+    else
+        log "       If you sign in to dj.wxyc.org with an email address, re-run with"
+        log "       --admin-email <address>: they are separate endpoints."
+    fi
+    exit 1
+fi
 [[ "$HTTP_STATUS" == "200" ]] || die "admin sign-in failed with HTTP ${HTTP_STATUS}: ${RESPONSE}"
 SESSION="$(jq -r '.token // empty' <<<"$RESPONSE")"
 [[ -n "$SESSION" ]] || die "admin sign-in returned no session token"
-log "signed in as ${ADMIN_EMAIL}"
+log "signed in as ${ADMIN_IDENTIFIER}"
 
 # 2. Create the principal. No `role` field: that one is better-auth's global
 #    admin role, not the org role. The org `member` row -- which is where
