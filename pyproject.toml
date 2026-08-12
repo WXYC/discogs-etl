@@ -1,6 +1,7 @@
 [project]
 name = "discogs-cache"
 version = "0.1.0"
+license = "PolyForm-Noncommercial-1.0.0"
 description = "ETL pipeline for building a WXYC Discogs cache database"
 requires-python = ">=3.9"
 dependencies = [
@@ -32,7 +33,7 @@ dev = [
 ]
 
 [build-system]
-requires = ["setuptools>=65.0", "wheel"]
+requires = ["setuptools>=77.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
