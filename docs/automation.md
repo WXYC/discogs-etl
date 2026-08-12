@@ -110,3 +110,14 @@ The `--notify` flag is always passed, so Slack notifications are sent on failure
 | `DISCOGS_TOKEN` | Discogs API token — used by the recall index build's artwork precompute (optional; rows still write with `artwork_url = NULL` without it) |
 
 After a successful run, verify the library-metadata-lookup health endpoint returns healthy with the expected row count.
+
+## Unwired secrets (catalog parity)
+
+Two repo secrets exist that **no workflow reads yet**. They authenticate the Backend-sourced producer in `scripts/catalog_parity_diff.py` against `GET /library/catalog` — the catalog-parity soak on [wiki#89](https://github.com/WXYC/wiki/issues/89), which runs by hand today. The workflow that will consume them is [#346](https://github.com/WXYC/discogs-etl/issues/346); until it lands, these are set so the soak can run unattended from a runner or a laptop without a credential detour.
+
+| Secret | Description |
+|--------|-------------|
+| `BACKEND_CATALOG_EMAIL` | Service-account email (`catalog-parity@wxyc.org`), `member` org role — the least-privileged role carrying `catalog:read` |
+| `BACKEND_CATALOG_PASSWORD` | That account's password. **Not a token**: the JWT Backend-Service accepts expires in 15 minutes, so the harness signs in and mints one per run |
+
+Mint and rotation procedure: [`architecture.md` → Minting and rotating the parity service account](architecture.md#minting-and-rotating-the-parity-service-account-365). Treat the pair as sensitive — the export it unlocks is the entire library catalog.

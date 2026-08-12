@@ -316,10 +316,14 @@ class _BackendStub:
                 if forced is not None:
                     self._send_json(forced, {"message": "forced"})
                     return
-                if stub.credentials is not None and (
-                    body.get("email"),
-                    body.get("password"),
-                ) != stub.credentials:
+                if (
+                    stub.credentials is not None
+                    and (
+                        body.get("email"),
+                        body.get("password"),
+                    )
+                    != stub.credentials
+                ):
                     self._send_json(401, {"message": "Invalid email or password"})
                     return
                 session = f"session-{len(stub.sessions) + 1}"
@@ -410,12 +414,28 @@ class _RedirectingStub:
             def log_message(self, *args: object) -> None:
                 pass
 
-            def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
-                stub.requests.append(_RecordedRequest(self.path, self.headers.get("Authorization")))
+            def _redirect(self) -> None:
+                stub.requests.append(
+                    _RecordedRequest(
+                        self.path,
+                        self.headers.get("Authorization"),
+                        self.headers.get("Origin"),
+                    )
+                )
                 self.send_response(stub.status)
                 self.send_header("Location", stub.target_base + self.path)
                 self.send_header("Content-Length", "0")
                 self.end_headers()
+
+            def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
+                self._redirect()
+
+            # A proxy that redirects GETs redirects POSTs too, and the POST is
+            # the dangerous one: it carries the sign-in password.
+            def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
+                length = int(self.headers.get("Content-Length") or 0)
+                self.rfile.read(length)
+                self._redirect()
 
         return _Handler
 
@@ -1349,6 +1369,279 @@ class TestBackendProducer:
             ).fetchall() == [(72_101,)]
         finally:
             conn.close()
+
+
+class TestServiceAccountMint:
+    """Minting and refreshing the Backend service-account JWT (#365).
+
+    The JWT that ``requirePermissions`` accepts lives 15 minutes (better-auth's
+    default, which Backend-Service does not override), so it cannot be a static
+    CI secret for a soak that runs 7+ consecutive days: what CI stores is the
+    service account's *password*, and the producer mints per run.
+
+    The load-bearing constraint on how it refreshes is the auth service's rate
+    limiter. ``/auth/sign-in`` is capped at 10 per 15 minutes by the express
+    limiter and 3 per 10 seconds by better-auth's own; ``/auth/token`` is
+    exempt from the former and generous under the latter. So the *ordinary*
+    refresh re-exchanges against a cached session, and only an exchange that
+    itself 401s costs a second sign-in -- capped at one per process, or a
+    broken credential becomes a sign-in storm against a limiter shared with
+    every real DJ logging in.
+    """
+
+    @staticmethod
+    def _use_credentials(mod, monkeypatch, stub) -> None:
+        monkeypatch.delenv(mod.BACKEND_TOKEN_ENV, raising=False)
+        monkeypatch.setenv(mod.BACKEND_EMAIL_ENV, "catalog-parity@wxyc.org")
+        monkeypatch.setenv(mod.BACKEND_PASSWORD_ENV, "hunter2-but-48-bytes")
+        monkeypatch.setenv(mod.BACKEND_AUTH_URL_ENV, f"{stub.base_url}/auth")
+
+    def test_mints_a_token_from_the_credential_pair(self, tmp_path: Path, monkeypatch) -> None:
+        mod = _load_module()
+        out = tmp_path / "backend.db"
+        with _BackendStub(
+            catalog_rows=[_catalog_row(legacy_release_id=72_101)],
+            cta_rows=[],
+            credentials=("catalog-parity@wxyc.org", "hunter2-but-48-bytes"),
+        ) as stub:
+            self._use_credentials(mod, monkeypatch, stub)
+            mod._build_library_db_from_backend(stub.base_url, str(out))
+
+            assert stub.sign_ins == 1
+            assert stub.exchanges == 1
+            # Every export carried a bearer this stub actually issued.
+            for request in stub.export_requests:
+                assert (request.authorization or "").removeprefix("Bearer ") in stub.jwts
+            # better-auth's CSRF guard rejects an origin-less sign-in.
+            sign_in = next(r for r in stub.requests if r.path == "/auth/sign-in/email")
+            assert sign_in.origin == mod._DEFAULT_AUTH_ORIGIN
+        assert out.exists()
+
+    def test_refreshes_by_re_exchanging_not_re_signing_in(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """A 401 mid-run costs an exchange, never a sign-in.
+
+        This is the assertion the rate limiter makes load-bearing: a run that
+        outlives its 15-minute token (three snapshot attempts x two exports,
+        each with a 300s budget) must not spend a sign-in per refresh.
+        """
+        mod = _load_module()
+        out = tmp_path / "backend.db"
+        with _BackendStub(
+            catalog_rows=[_catalog_row(legacy_release_id=72_101)],
+            cta_rows=[],
+            credentials=("catalog-parity@wxyc.org", "hunter2-but-48-bytes"),
+        ) as stub:
+            self._use_credentials(mod, monkeypatch, stub)
+
+            # Expire the minted JWT the instant the first export is served, so
+            # the CTA export gets a 401 the way a real 15-minute expiry would
+            # deliver one: mid-run, on a token that was valid when it left.
+            def expire_everything() -> None:
+                stub.jwts.clear()
+
+            stub.on_catalog_fetch = expire_everything
+            mod._build_library_db_from_backend(stub.base_url, str(out))
+
+            assert stub.sign_ins == 1, "a refresh must not re-sign-in"
+            assert stub.exchanges == 2
+        assert out.exists()
+
+    def test_re_signs_in_once_when_the_exchange_itself_401s(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """A dead session is the one thing that legitimately costs a sign-in."""
+        mod = _load_module()
+        out = tmp_path / "backend.db"
+        with _BackendStub(
+            catalog_rows=[_catalog_row(legacy_release_id=72_101)],
+            cta_rows=[],
+            credentials=("catalog-parity@wxyc.org", "hunter2-but-48-bytes"),
+        ) as stub:
+            self._use_credentials(mod, monkeypatch, stub)
+            stub.exchange_statuses = [401]
+            mod._build_library_db_from_backend(stub.base_url, str(out))
+
+            assert stub.sign_ins == 2
+            assert stub.exchanges == 2
+        assert out.exists()
+
+    def test_gives_up_rather_than_looping_on_a_dead_credential(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        mod = _load_module()
+        out = tmp_path / "backend.db"
+        with _BackendStub(
+            catalog_rows=[_catalog_row()],
+            cta_rows=[],
+            credentials=("catalog-parity@wxyc.org", "hunter2-but-48-bytes"),
+        ) as stub:
+            self._use_credentials(mod, monkeypatch, stub)
+            stub.exchange_statuses = [401, 401, 401, 401]
+            with pytest.raises(mod.SourceError, match="401"):
+                mod._build_library_db_from_backend(stub.base_url, str(out))
+
+            assert stub.sign_ins <= 2, "a broken credential must not storm the limiter"
+        assert not out.exists()
+
+    def test_retries_a_rate_limited_sign_in_once(self, tmp_path: Path, monkeypatch) -> None:
+        """429 carries X-Retry-After from better-auth, Retry-After from express."""
+        mod = _load_module()
+        out = tmp_path / "backend.db"
+        with _BackendStub(
+            catalog_rows=[_catalog_row(legacy_release_id=72_101)],
+            cta_rows=[],
+            credentials=("catalog-parity@wxyc.org", "hunter2-but-48-bytes"),
+        ) as stub:
+            self._use_credentials(mod, monkeypatch, stub)
+            stub.sign_in_statuses = [429]
+            monkeypatch.setattr(mod.time, "sleep", lambda _seconds: None)
+            mod._build_library_db_from_backend(stub.base_url, str(out))
+
+            assert stub.sign_ins == 2
+        assert out.exists()
+
+    def test_a_second_429_fails_with_the_status(self, tmp_path: Path, monkeypatch) -> None:
+        mod = _load_module()
+        out = tmp_path / "backend.db"
+        with _BackendStub(
+            catalog_rows=[_catalog_row()],
+            cta_rows=[],
+            credentials=("catalog-parity@wxyc.org", "hunter2-but-48-bytes"),
+        ) as stub:
+            self._use_credentials(mod, monkeypatch, stub)
+            stub.sign_in_statuses = [429, 429]
+            monkeypatch.setattr(mod.time, "sleep", lambda _seconds: None)
+            with pytest.raises(mod.SourceError, match="429"):
+                mod._build_library_db_from_backend(stub.base_url, str(out))
+        assert not out.exists()
+
+    def test_a_pre_minted_token_still_wins(self, tmp_path: Path, monkeypatch) -> None:
+        """Static mode is how an operator runs a one-off without the password."""
+        mod = _load_module()
+        out = tmp_path / "backend.db"
+        with _BackendStub(catalog_rows=[_catalog_row()], cta_rows=[]) as stub:
+            monkeypatch.setenv(mod.BACKEND_TOKEN_ENV, "svc-token")
+            monkeypatch.setenv(mod.BACKEND_EMAIL_ENV, "catalog-parity@wxyc.org")
+            monkeypatch.setenv(mod.BACKEND_PASSWORD_ENV, "hunter2-but-48-bytes")
+            mod._build_library_db_from_backend(stub.base_url, str(out))
+
+            assert stub.sign_ins == 0
+            assert stub.exchanges == 0
+            assert all(r.authorization == "Bearer svc-token" for r in stub.export_requests)
+
+    def test_an_expired_static_token_says_what_to_do_about_it(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """A 401 on a static token is terminal -- there is nothing to refresh from."""
+        mod = _load_module()
+        out = tmp_path / "backend.db"
+        with _BackendStub(
+            catalog_rows=[_catalog_row()],
+            cta_rows=[],
+            credentials=("catalog-parity@wxyc.org", "hunter2-but-48-bytes"),
+        ) as stub:
+            monkeypatch.setenv(mod.BACKEND_TOKEN_ENV, "stale-token")
+            monkeypatch.delenv(mod.BACKEND_EMAIL_ENV, raising=False)
+            monkeypatch.delenv(mod.BACKEND_PASSWORD_ENV, raising=False)
+            with pytest.raises(mod.SourceError, match=mod.BACKEND_PASSWORD_ENV):
+                mod._build_library_db_from_backend(stub.base_url, str(out))
+            assert stub.sign_ins == 0
+        assert not out.exists()
+
+    def test_re_exchanges_a_token_that_is_about_to_expire(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """Don't start a 300-second fetch with 30 seconds of token left."""
+        mod = _load_module()
+        out = tmp_path / "backend.db"
+        with _BackendStub(
+            catalog_rows=[_catalog_row(legacy_release_id=72_101)],
+            cta_rows=[],
+            credentials=("catalog-parity@wxyc.org", "hunter2-but-48-bytes"),
+            jwt_ttl_seconds=30,
+        ) as stub:
+            self._use_credentials(mod, monkeypatch, stub)
+            mod._build_library_db_from_backend(stub.base_url, str(out))
+
+            # One exchange per export: each one saw a token inside the margin.
+            assert stub.exchanges == 2
+            assert stub.sign_ins == 1
+        assert out.exists()
+
+    def test_requires_a_token_or_the_credential_pair(self, tmp_path: Path, monkeypatch) -> None:
+        mod = _load_module()
+        for var in (mod.BACKEND_TOKEN_ENV, mod.BACKEND_EMAIL_ENV, mod.BACKEND_PASSWORD_ENV):
+            monkeypatch.delenv(var, raising=False)
+        with pytest.raises(mod.SourceError) as excinfo:
+            mod._build_library_db_from_backend("https://api.wxyc.org", str(tmp_path / "b.db"))
+        # Both routes named: an operator reading this shouldn't have to guess
+        # which of the two credential shapes the harness wanted.
+        assert mod.BACKEND_TOKEN_ENV in str(excinfo.value)
+        assert mod.BACKEND_EMAIL_ENV in str(excinfo.value)
+        assert mod.BACKEND_PASSWORD_ENV in str(excinfo.value)
+
+    def test_refuses_a_plaintext_auth_url(self, tmp_path: Path, monkeypatch) -> None:
+        """The password is on that wire -- the message must say so."""
+        mod = _load_module()
+        monkeypatch.delenv(mod.BACKEND_TOKEN_ENV, raising=False)
+        monkeypatch.setenv(mod.BACKEND_EMAIL_ENV, "catalog-parity@wxyc.org")
+        monkeypatch.setenv(mod.BACKEND_PASSWORD_ENV, "hunter2-but-48-bytes")
+        monkeypatch.setenv(mod.BACKEND_AUTH_URL_ENV, "http://auth.example.org/auth")
+        with pytest.raises(mod.SourceError) as excinfo:
+            mod._build_library_db_from_backend("https://api.wxyc.org", str(tmp_path / "b.db"))
+        message = str(excinfo.value)
+        assert "https" in message
+        assert mod.BACKEND_AUTH_URL_ENV in message
+        assert mod.BACKEND_PASSWORD_ENV in message
+        # Must not misname the secret at risk: no bearer token is involved here.
+        assert mod.BACKEND_TOKEN_ENV not in message
+
+    def test_refuses_a_cross_origin_redirect_on_sign_in(self, tmp_path: Path, monkeypatch) -> None:
+        """A 302 out of sign-in would replay the password to a host nobody named."""
+        mod = _load_module()
+        out = tmp_path / "backend.db"
+        with _BackendStub(
+            catalog_rows=[_catalog_row()],
+            cta_rows=[],
+            credentials=("catalog-parity@wxyc.org", "hunter2-but-48-bytes"),
+        ) as elsewhere:
+            with _RedirectingStub(elsewhere.base_url) as redirector:
+                self._use_credentials(mod, monkeypatch, elsewhere)
+                monkeypatch.setenv(mod.BACKEND_AUTH_URL_ENV, f"{redirector.base_url}/auth")
+                with pytest.raises(mod.SourceError, match="redirect"):
+                    mod._build_library_db_from_backend(elsewhere.base_url, str(out))
+            assert elsewhere.sign_ins == 0
+        assert not out.exists()
+
+    def test_derives_the_auth_url_from_the_backend_source(self, monkeypatch) -> None:
+        """One flag, not two: --backend-source https://api.wxyc.org implies /auth."""
+        mod = _load_module()
+        monkeypatch.delenv(mod.BACKEND_AUTH_URL_ENV, raising=False)
+        assert mod._default_auth_url("https://api.wxyc.org") == "https://api.wxyc.org/auth"
+        assert mod._default_auth_url("https://api.wxyc.org/") == "https://api.wxyc.org/auth"
+
+    def test_never_prints_the_session_token_or_password(
+        self, tmp_path: Path, monkeypatch, capsys
+    ) -> None:
+        """A sign-in success body carries a session token; it must not surface."""
+        mod = _load_module()
+        out = tmp_path / "backend.db"
+        with _BackendStub(
+            catalog_rows=[_catalog_row(legacy_release_id=72_101)],
+            cta_rows=[],
+            credentials=("catalog-parity@wxyc.org", "hunter2-but-48-bytes"),
+        ) as stub:
+            self._use_credentials(mod, monkeypatch, stub)
+            mod._build_library_db_from_backend(stub.base_url, str(out))
+            printed = capsys.readouterr()
+            haystack = printed.out + printed.err
+            assert "hunter2-but-48-bytes" not in haystack
+            for session in stub.sessions:
+                assert session not in haystack
+            for jwt in stub.jwts:
+                assert jwt not in haystack
 
 
 class TestSharedSchemaConstants:

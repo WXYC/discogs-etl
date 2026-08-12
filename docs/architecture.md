@@ -169,9 +169,10 @@ Functionality that was previously local to this repo has been extracted to share
 Retiring the `wxycmusic` MySQL means moving that daily build's catalog source to Backend-Service — but only once a Backend-sourced `library.db` is proven field-equivalent to the MySQL-sourced one, or every downstream consumer (LML search, streaming checks, compilation matching, dj-site catalog, iOS metadata) silently regresses. `scripts/catalog_parity_diff.py` builds both sides and diffs them:
 
 ```bash
-PARITY_DIR=$(mktemp -d)          # fresh each run: both --*-db paths must not already exist
-export LIBRARY_DB_PASSWORD=...   # never in the DSN -- see below
-export BACKEND_CATALOG_TOKEN=... # service-account JWT with catalog:read
+PARITY_DIR=$(mktemp -d)              # fresh each run: both --*-db paths must not already exist
+export LIBRARY_DB_PASSWORD=...       # never in the DSN -- see below
+export BACKEND_CATALOG_EMAIL=catalog-parity@wxyc.org
+export BACKEND_CATALOG_PASSWORD=...  # the service account's password; the harness mints per run
 
 python scripts/catalog_parity_diff.py \
     --mysql-source "mysql://$LIBRARY_DB_USER@127.0.0.1:13306/$LIBRARY_DB_NAME" \
@@ -182,7 +183,41 @@ python scripts/catalog_parity_diff.py \
 ```
 
 - **MySQL side** reproduces the daily build exactly: the same `mysql -B -N` CLI invocation (a Python driver cannot authenticate against tubafrenzy's MySQL), the same two SELECTs — a unit test lifts every `-e "SELECT ..."` out of `sync-library.sh` and asserts set equality with the harness's copies, because a baseline built from a *different* query would make parity measure the harness rather than the migration — and the same TSV parser. The password comes from **`LIBRARY_DB_PASSWORD`** and reaches the CLI via `MYSQL_PWD`: embedding it in the DSN would put it in *this* process's argv (visible to `ps`, echoed by `set -x` and by GitHub Actions command traces) and would need percent-encoding for `/`, `#`, `?`, `%`. A missing `COMPILATION_TRACK_ARTIST` table is tolerated, as in the daily sync.
-- **Backend side** is decision D3 / Option B ([wiki#89](https://github.com/WXYC/wiki/issues/89), 2026-08-03): the gzipped-NDJSON `GET /library/catalog` + `GET /library/catalog/compilation-tracks` exports ([Backend-Service#1965](https://github.com/WXYC/Backend-Service/issues/1965)) over HTTPS with a service-account bearer token in **`BACKEND_CATALOG_TOKEN`** (needs `catalog:read`). Option B was chosen over a direct-Postgres producer precisely so no prod-DB credential has to live in GitHub Actions; plain `http://` to anything but a loopback address is refused, and so is any cross-origin redirect — urllib copies `Authorization` into a redirected request, so a 302 from a proxy or hijacked DNS would otherwise replay the token to a host nobody named.
+- **Backend side** is decision D3 / Option B ([wiki#89](https://github.com/WXYC/wiki/issues/89), 2026-08-03): the gzipped-NDJSON `GET /library/catalog` + `GET /library/catalog/compilation-tracks` exports ([Backend-Service#1965](https://github.com/WXYC/Backend-Service/issues/1965)) over HTTPS with a service-account bearer token (needs `catalog:read`). Option B was chosen over a direct-Postgres producer precisely so no prod-DB credential has to live in GitHub Actions; plain `http://` to anything but a loopback address is refused, and so is any cross-origin redirect — urllib copies `Authorization` into a redirected request, so a 302 from a proxy or hijacked DNS would otherwise replay the token to a host nobody named.
+
+#### Minting and rotating the parity service account (#365)
+
+The bearer above **cannot be a stored secret**. `requirePermissions` accepts only a JWKS-verified JWT, and better-auth issues those with a 15-minute expiry (its default, which Backend-Service does not override) — so what CI stores is the service account's *password*, and `catalog_parity_diff.py` mints a token per run from `BACKEND_CATALOG_EMAIL` + `BACKEND_CATALOG_PASSWORD`. `BACKEND_CATALOG_TOKEN` still works for a one-off run with a JWT already in hand. Two optional overrides exist for non-prod: `BACKEND_AUTH_URL` (defaults to `<--backend-source>/auth`) and `BACKEND_AUTH_ORIGIN` (defaults to `https://dj.wxyc.org`, which must be one of the auth server's `BETTER_AUTH_TRUSTED_ORIGINS` — better-auth's CSRF guard rejects an origin-less sign-in).
+
+**Mint** (one-time, needs an admin session on `api.wxyc.org/auth`):
+
+```bash
+# 1. Admin sign-in -> session token.
+SESSION=$(curl -sS -X POST https://api.wxyc.org/auth/sign-in/email \
+    -H 'Content-Type: application/json' -H 'Origin: https://dj.wxyc.org' \
+    -d "{\"email\":\"$ADMIN_EMAIL\",\"password\":\"$ADMIN_PASSWORD\"}" | jq -r .token)
+
+# 2. Create the principal with a password, no email, no setup token.
+PASSWORD=$(python3 -c 'import secrets; print(secrets.token_urlsafe(48))')
+curl -sS -X POST https://api.wxyc.org/auth/admin/create-user \
+    -H "Authorization: Bearer $SESSION" -H 'Content-Type: application/json' \
+    -H 'Origin: https://dj.wxyc.org' \
+    -d "{\"email\":\"catalog-parity@wxyc.org\",\"name\":\"Catalog Parity\",\"password\":\"$PASSWORD\",\"data\":{\"emailVerified\":true}}"
+
+# 3. Store it where CI reads it.
+gh secret set BACKEND_CATALOG_EMAIL --repo WXYC/discogs-etl --body catalog-parity@wxyc.org
+gh secret set BACKEND_CATALOG_PASSWORD --repo WXYC/discogs-etl --body "$PASSWORD"
+```
+
+**Rotate**: repeat step 2 as `POST /auth/admin/set-user-password` with `{"userId": "...", "newPassword": "..."}`, then step 3. Nothing else consumes these secrets, so rotation is atomic from the soak's point of view as long as it doesn't land mid-run.
+
+Three things about that procedure are load-bearing:
+
+- **`admin/create-user`, not `admin/provision-user`.** The org's own wrapper refuses a caller-supplied password and emails an account-setup link whose token is valid for **7 days** (`shared/authentication/src/account-setup-token.ts`) — the length of the soak. Setting the password afterwards does not revoke it, so anyone who could read that mailbox could reset the account mid-soak. better-auth's admin endpoint takes the password directly and mints no token. Backend-Service handles this path explicitly: a `hooks.after` branch auto-verifies the email (BS#1118) and the `user.create.after` hook inserts the org `member` row, which is where the `catalog:read` permission actually comes from.
+- **`member` is the least-privileged role that carries `catalog:read`.** Every WXYC role has it; `member` is the floor. The residual grants are `bin:read/write` (its own DJ bin) and `flowsheet:read` — no catalog write, no flowsheet write. A truly catalog-read-only role would need a new entry in the shared `WXYCRole` union across three repos.
+- **No `role` field in the create-user body.** That field is better-auth's *global* admin role (`user.role`), not the org role — leaving it at the default keeps the account outside the admin plugin entirely.
+
+If the account ever needs revoking: rotate the password (which orphans the stored secret), and ban the user if the compromise is active — the JWT payload carries `banned` and `requirePermissions` 403s on it, so a ban takes effect within one 15-minute token turnover rather than waiting out the year-long session.
 
 Four properties worth knowing before reading a parity report:
 
