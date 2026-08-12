@@ -171,7 +171,7 @@ Retiring the `wxycmusic` MySQL means moving that daily build's catalog source to
 ```bash
 PARITY_DIR=$(mktemp -d)              # fresh each run: both --*-db paths must not already exist
 export LIBRARY_DB_PASSWORD=...       # never in the DSN -- see below
-export BACKEND_CATALOG_EMAIL=catalog-parity@wxyc.org
+export BACKEND_CATALOG_EMAIL=catalog-parity@wxyc.invalid
 export BACKEND_CATALOG_PASSWORD=...  # the service account's password; the harness mints per run
 
 python scripts/catalog_parity_diff.py \
@@ -206,17 +206,17 @@ SESSION=$(jq -n --arg e "$ADMIN_EMAIL" --arg p "$ADMIN_PASSWORD" '{email:$e,pass
 #    Keep USER_ID: rotation and revocation both need it.
 PASSWORD=$(python3 -c 'import secrets; print(secrets.token_urlsafe(48))')
 USER_ID=$(jq -n --arg p "$PASSWORD" \
-    '{email:"catalog-parity@wxyc.org",name:"Catalog Parity",password:$p,data:{emailVerified:true}}' \
+    '{email:"catalog-parity@wxyc.invalid",name:"Catalog Parity",password:$p,data:{emailVerified:true}}' \
     | curl -sS -X POST https://api.wxyc.org/auth/admin/create-user \
         -H "Authorization: Bearer $SESSION" -H 'Content-Type: application/json' \
         -H 'Origin: https://dj.wxyc.org' --data-binary @- | jq -r .user.id)
 
 # 3. Store it where CI reads it.
-gh secret set BACKEND_CATALOG_EMAIL --repo WXYC/discogs-etl --body catalog-parity@wxyc.org
+gh secret set BACKEND_CATALOG_EMAIL --repo WXYC/discogs-etl --body catalog-parity@wxyc.invalid
 printf %s "$PASSWORD" | gh secret set BACKEND_CATALOG_PASSWORD --repo WXYC/discogs-etl --body-file -
 ```
 
-If `USER_ID` was not captured at mint time, recover it with `POST /auth/admin/list-users` (`{"searchField":"email","searchValue":"catalog-parity@wxyc.org"}`) rather than guessing.
+If `USER_ID` was not captured at mint time, recover it with `POST /auth/admin/list-users` (`{"searchField":"email","searchValue":"catalog-parity@wxyc.invalid"}`) rather than guessing.
 
 **Rotate**: repeat step 2 as `POST /auth/admin/set-user-password` with `{"userId":"$USER_ID","newPassword":"..."}`, then **revoke the old sessions** — `POST /auth/admin/revoke-user-sessions` with `{"userId":"$USER_ID"}` — then step 3. The revocation is not optional bookkeeping: `set-user-password` revokes nothing, and Backend-Service pins `session.expiresIn` to **365 days** (`shared/authentication/src/auth.definition.ts`), so a rotation without it orphans the stored secret while leaving every previously-minted session able to keep exchanging for `catalog:read` JWTs for a year. The harness signs out the session it mints (`_TokenSource.close`, in a `finally`), so in the normal case there is nothing left to revoke — this covers the runs that died before they could.
 
@@ -227,6 +227,7 @@ Three things about that procedure are load-bearing:
 - **`admin/create-user`, not `admin/provision-user`.** The org's own wrapper refuses a caller-supplied password and emails an account-setup link whose token is valid for **7 days** (`shared/authentication/src/account-setup-token.ts`) — the length of the soak. Setting the password afterwards does not revoke it, so anyone who could read that mailbox could reset the account mid-soak. better-auth's admin endpoint takes the password directly and mints no token. Backend-Service handles this path explicitly: a `hooks.after` branch auto-verifies the email (BS#1118) and the `user.create.after` hook inserts the org `member` row, which is where the `catalog:read` permission actually comes from.
 - **`member` is the least-privileged role that carries `catalog:read`.** Every WXYC role has it; `member` is the floor. The residual grants are `bin:read/write` (its own DJ bin) and `flowsheet:read` — no catalog write, no flowsheet write. A truly catalog-read-only role would need a new entry in the shared `WXYCRole` union across three repos.
 - **No `role` field in the create-user body.** That field is better-auth's *global* admin role (`user.role`), not the org role — leaving it at the default keeps the account outside the admin plugin entirely.
+- **`@wxyc.invalid`, deliberately not `@wxyc.org`.** The address is an identifier, not a mailbox: `.invalid` is reserved by [RFC 2606](https://www.rfc-editor.org/rfc/rfc2606#section-2) and can never be delegated in the global DNS, so no mail can reach it *and no future change can make it reachable*. That last clause is the point — an `@wxyc.org` address needs no mailbox today, but anyone who later adds a catch-all silently hands whoever reads it the ability to run `forget-password` against an account holding the whole catalog. Nothing in the mint path sends mail (`admin/create-user` mints no token and the body sets `emailVerified`), and rotation is admin-driven, so the account never needs to receive anything. One consequence to know: a `forget-password` submitted for this address makes SES attempt delivery to a domain that cannot resolve, which is a hard bounce against the org's sender reputation. Rotate through `admin/set-user-password`; never through the reset flow.
 
 If the account ever needs revoking: rotate the password **and** revoke the sessions (both above — the password alone leaves year-long sessions live), and ban the user if the compromise is active. The JWT payload carries `banned` and `requirePermissions` 403s on it, so a ban takes effect within one 15-minute token turnover; it is the only one of the three that also invalidates a JWT already in flight.
 

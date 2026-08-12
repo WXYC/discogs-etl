@@ -355,7 +355,7 @@ _Row = Sequence[object]
 BACKEND_TOKEN_ENV = "BACKEND_CATALOG_TOKEN"
 
 # The service account's own credentials (#365) -- what CI actually stores.
-# `catalog-parity@wxyc.org` holds the `member` org role, the least-privileged
+# `catalog-parity@wxyc.invalid` holds the `member` org role, the least-privileged
 # role carrying `catalog:read`.
 BACKEND_EMAIL_ENV = "BACKEND_CATALOG_EMAIL"
 BACKEND_PASSWORD_ENV = "BACKEND_CATALOG_PASSWORD"

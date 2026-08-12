@@ -117,7 +117,7 @@ Two repo secrets exist that **no workflow reads yet**. They authenticate the Bac
 
 | Secret | Description |
 |--------|-------------|
-| `BACKEND_CATALOG_EMAIL` | Service-account email (`catalog-parity@wxyc.org`), `member` org role — the least-privileged role carrying `catalog:read` |
+| `BACKEND_CATALOG_EMAIL` | Service-account email (`catalog-parity@wxyc.invalid`), `member` org role — the least-privileged role carrying `catalog:read` |
 | `BACKEND_CATALOG_PASSWORD` | That account's password. **Not a token**: the JWT Backend-Service accepts expires in 15 minutes, so the harness signs in and mints one per run |
 
 Mint and rotation procedure: [`architecture.md` → Minting and rotating the parity service account](architecture.md#minting-and-rotating-the-parity-service-account-365). Treat the pair as sensitive — the export it unlocks is the entire library catalog.
