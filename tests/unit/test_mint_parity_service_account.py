@@ -90,6 +90,38 @@ class TestMintScript:
         """Read silently, so it stays out of the terminal and out of history."""
         assert re.search(r"read\b[^\n]*-[a-z]*s[a-z]*\b[^\n]*ADMIN_PASSWORD", script)
 
+    def test_the_password_read_does_not_strip_whitespace(self, script: str) -> None:
+        """A bare `read` splits on IFS and eats leading/trailing spaces.
+
+        A password that legitimately starts or ends with a space would be
+        silently mangled into one that fails -- and the operator, who can see
+        that their password is correct, has no way to tell that apart from a
+        genuinely rejected credential.
+        """
+        assert re.search(r"IFS=\s+read\b[^\n]*ADMIN_PASSWORD", script)
+
+    def test_it_can_sign_in_by_username(self, script: str) -> None:
+        """WXYC accounts authenticate by username or by email.
+
+        dj-site branches on whether the identifier looks like an email and
+        calls `signIn.username` when it does not, so an operator whose account
+        is username-based cannot mint at all through an email-only path. What
+        they see is an indistinguishable INVALID_EMAIL_OR_PASSWORD.
+        """
+        assert "/sign-in/username" in script
+        assert "--admin-username" in script
+
+    def test_the_sign_in_failure_is_actionable(self, script: str) -> None:
+        """better-auth cannot say which half was wrong, so the script must.
+
+        A 401 here means the identifier did not match a user OR the password
+        did not match that user -- and for an admin staring at a password they
+        know is right, "which one?" is the whole question.
+        """
+        code = "\n".join(line for line in script.splitlines() if not line.strip().startswith("#"))
+        assert "INVALID_EMAIL_OR_PASSWORD" in code or "--admin-username" in code
+        assert re.search(r"401", code), "the 401 branch must explain itself"
+
     def test_it_mints_the_documented_principal(self, script: str) -> None:
         """Drift guard: the script and the runbook must name one account.
 
