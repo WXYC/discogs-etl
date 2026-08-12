@@ -189,6 +189,8 @@ python scripts/catalog_parity_diff.py \
 
 The bearer above **cannot be a stored secret**. `requirePermissions` accepts only a JWKS-verified JWT, and better-auth issues those with a 15-minute expiry (its default, which Backend-Service does not override) — so what CI stores is the service account's *password*, and `catalog_parity_diff.py` mints a token per run from `BACKEND_CATALOG_EMAIL` + `BACKEND_CATALOG_PASSWORD`. `BACKEND_CATALOG_TOKEN` still works for a one-off run with a JWT already in hand. Two optional overrides exist for non-prod: `BACKEND_AUTH_URL` (defaults to `<--backend-source>/auth`) and `BACKEND_AUTH_ORIGIN` (defaults to `https://dj.wxyc.org`, which must be one of the auth server's `BETTER_AUTH_TRUSTED_ORIGINS` — better-auth's CSRF guard rejects an origin-less sign-in).
 
+A run outlives its 15-minute token, so the harness refreshes — and how it refreshes is shaped by the two rate limiters in front of `/auth/sign-in` (the express one, 10 per 15 min; better-auth's own, 3 per 10s). It caches the *session* and refreshes by re-exchanging at `/auth/token`, which is exempt from the express limiter; only an exchange that itself 401s (a dead session) costs a second sign-in, and there are at most two sign-ins per run. The two budgets are separate — spending the sign-in allowance must never disable refreshing against a session that still works. A 429 whose retry hint exceeds 10s is **not** waited out: the run fails quoting the hint, because retrying into a 15-minute window is a guaranteed second refusal and the operator wants the real number. If that happens, check whether something else is signing in as the service account.
+
 **Mint** (one-time, needs an admin session on `api.wxyc.org/auth`):
 
 ```bash

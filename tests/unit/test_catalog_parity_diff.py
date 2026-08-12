@@ -176,14 +176,19 @@ def _catalog_row(**overrides: Any) -> dict[str, Any]:
     return row
 
 
-def _fake_jwt(expires_in_seconds: int = 900) -> str:
+def _fake_jwt(expires_in_seconds: int = 900, *, unreadable_exp: bool = False) -> str:
     """A JWT-shaped string whose payload carries an ``exp``.
 
     The producer never verifies a signature -- it decodes ``exp`` locally to
     decide when to refresh -- so a real key would only make the fixture
     slower. The signature segment is deliberately garbage.
+
+    ``unreadable_exp`` produces the shape a claim-format change upstream would
+    hand us: still a JWT, still accepted by Backend-Service, but with nothing
+    the local decode can turn into an epoch.
     """
-    payload = {"exp": int(time.time()) + expires_in_seconds, "role": "member"}
+    exp: Any = "not-an-epoch" if unreadable_exp else int(time.time()) + expires_in_seconds
+    payload = {"exp": exp, "role": "member"}
 
     def seg(obj: dict[str, Any]) -> str:
         return base64.urlsafe_b64encode(json.dumps(obj).encode()).rstrip(b"=").decode()
@@ -225,6 +230,7 @@ class _BackendStub:
         last_modified: str = _LM_A,
         credentials: tuple[str, str] | None = None,
         jwt_ttl_seconds: int = 900,
+        unreadable_jwt_exp: bool = False,
     ) -> None:
         self.catalog_rows = catalog_rows
         self.cta_rows = cta_rows
@@ -232,6 +238,12 @@ class _BackendStub:
         self.last_modified = last_modified
         self.credentials = credentials
         self.jwt_ttl_seconds = jwt_ttl_seconds
+        self.unreadable_jwt_exp = unreadable_jwt_exp
+        # What a forced 429 puts in its retry hint. The express limiter's
+        # window is 15 minutes, so a hint far longer than any retry the
+        # producer is willing to wait out is the realistic case, not an
+        # exotic one.
+        self.sign_in_retry_after = "1"
         self.requests: list[_RecordedRequest] = []
         self.on_catalog_fetch: Callable[[], None] | None = None
         # Queues of forced statuses, popped left-to-right; empty means "behave
@@ -311,7 +323,11 @@ class _BackendStub:
                     # better-auth's own limiter emits X-Retry-After, NOT the
                     # standard header the express limiter sends -- a producer
                     # that reads only one of the two waits the wrong amount.
-                    self._send_json(429, {"message": "Too many requests"}, X_Retry_After="1")
+                    self._send_json(
+                        429,
+                        {"message": "Too many requests"},
+                        X_Retry_After=stub.sign_in_retry_after,
+                    )
                     return
                 if forced is not None:
                     self._send_json(forced, {"message": "forced"})
@@ -341,7 +357,7 @@ class _BackendStub:
                     if bearer not in stub.sessions:
                         self._send_json(401, {"message": "Unauthorized"})
                         return
-                    jwt = _fake_jwt(stub.jwt_ttl_seconds)
+                    jwt = _fake_jwt(stub.jwt_ttl_seconds, unreadable_exp=stub.unreadable_jwt_exp)
                     stub.jwts.add(jwt)
                     self._send_json(200, {"token": jwt})
                     return
@@ -1467,6 +1483,59 @@ class TestServiceAccountMint:
             assert stub.exchanges == 2
         assert out.exists()
 
+    def test_a_retried_sign_in_does_not_cost_the_refresh_path(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """The 429 retry is part of one sign-in, not a second one.
+
+        Counting HTTP attempts rather than sign-ins conflates the two budgets:
+        a single rate-limited-then-successful sign-in would exhaust the
+        allowance, and every later refresh -- against a session that is
+        perfectly good -- would abort without issuing an exchange at all.
+        """
+        mod = _load_module()
+        out = tmp_path / "backend.db"
+        with _BackendStub(
+            catalog_rows=[_catalog_row(legacy_release_id=72_101)],
+            cta_rows=[],
+            credentials=("catalog-parity@wxyc.org", "hunter2-but-48-bytes"),
+        ) as stub:
+            self._use_credentials(mod, monkeypatch, stub)
+            stub.sign_in_statuses = [429]
+            monkeypatch.setattr(mod.time, "sleep", lambda _seconds: None)
+            stub.on_catalog_fetch = stub.jwts.clear
+            mod._build_library_db_from_backend(stub.base_url, str(out))
+
+            assert stub.exchanges == 2, "the refresh must survive a retried sign-in"
+            assert stub.sign_ins == 2, "one 429 plus its retry -- and no more"
+        assert out.exists()
+
+    def test_recovering_a_dead_session_does_not_end_the_refresh_path(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """Spending the sign-in allowance must not disable re-exchanging.
+
+        The allowance exists to bound sign-ins against a limiter shared with
+        every DJ logging in. Gating the *exchange* loop on it as well means a
+        run that legitimately recovers one dead session can never refresh
+        again -- which is the whole reason the token source exists.
+        """
+        mod = _load_module()
+        out = tmp_path / "backend.db"
+        with _BackendStub(
+            catalog_rows=[_catalog_row(legacy_release_id=72_101)],
+            cta_rows=[],
+            credentials=("catalog-parity@wxyc.org", "hunter2-but-48-bytes"),
+        ) as stub:
+            self._use_credentials(mod, monkeypatch, stub)
+            stub.exchange_statuses = [401]  # spends the second sign-in
+            stub.on_catalog_fetch = stub.jwts.clear  # then forces a refresh
+            mod._build_library_db_from_backend(stub.base_url, str(out))
+
+            assert stub.sign_ins == 2
+            assert stub.exchanges == 3, "the post-recovery refresh must re-exchange"
+        assert out.exists()
+
     def test_gives_up_rather_than_looping_on_a_dead_credential(
         self, tmp_path: Path, monkeypatch
     ) -> None:
@@ -1516,6 +1585,80 @@ class TestServiceAccountMint:
             with pytest.raises(mod.SourceError, match="429"):
                 mod._build_library_db_from_backend(stub.base_url, str(out))
         assert not out.exists()
+
+    def test_a_retry_hint_longer_than_the_cap_fails_fast(self, tmp_path: Path, monkeypatch) -> None:
+        """Truncating the hint buys a certain second 429 instead of an answer.
+
+        The express limiter's window is 15 minutes, so its draft-7 hint can
+        legitimately be ~900s. Waiting the 10s cap and retrying anyway is a
+        guaranteed refusal; the operator wants the real number.
+        """
+        mod = _load_module()
+        out = tmp_path / "backend.db"
+        slept: list[float] = []
+        with _BackendStub(
+            catalog_rows=[_catalog_row()],
+            cta_rows=[],
+            credentials=("catalog-parity@wxyc.org", "hunter2-but-48-bytes"),
+        ) as stub:
+            self._use_credentials(mod, monkeypatch, stub)
+            stub.sign_in_statuses = [429]
+            stub.sign_in_retry_after = "900"
+            monkeypatch.setattr(mod.time, "sleep", slept.append)
+            with pytest.raises(mod.SourceError, match="900"):
+                mod._build_library_db_from_backend(stub.base_url, str(out))
+
+            assert slept == [], "no point sleeping out a window this run cannot clear"
+            assert stub.sign_ins == 1
+        assert not out.exists()
+
+    def test_the_refresh_margin_covers_a_whole_fetch(self, tmp_path: Path, monkeypatch) -> None:
+        """A token must not start a fetch that can outlive it.
+
+        A fetch runs for up to ``_HTTP_TIMEOUT_SECONDS``, so a token with less
+        life than that is not usable even though it has not expired yet. The
+        401 retry would paper over it -- at the cost of re-fetching a whole
+        export.
+        """
+        mod = _load_module()
+        assert mod._JWT_REFRESH_MARGIN_SECONDS >= mod._HTTP_TIMEOUT_SECONDS
+
+        out = tmp_path / "backend.db"
+        with _BackendStub(
+            catalog_rows=[_catalog_row(legacy_release_id=72_101)],
+            cta_rows=[],
+            credentials=("catalog-parity@wxyc.org", "hunter2-but-48-bytes"),
+            jwt_ttl_seconds=mod._HTTP_TIMEOUT_SECONDS - 100,
+        ) as stub:
+            self._use_credentials(mod, monkeypatch, stub)
+            mod._build_library_db_from_backend(stub.base_url, str(out))
+
+            assert stub.exchanges == 2, "a token too short for a fetch is not reused"
+        assert out.exists()
+
+    def test_an_unreadable_exp_costs_one_exchange_not_one_per_call(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """An unparseable ``exp`` must not turn every call into an exchange.
+
+        Treating it as "expired" re-exchanges on every ``token()`` -- 6+ per
+        run across three snapshot attempts x two exports -- against
+        better-auth's 3-per-10s window. Assuming the documented 15-minute life
+        bounds it, and the 401 retry remains the authority.
+        """
+        mod = _load_module()
+        out = tmp_path / "backend.db"
+        with _BackendStub(
+            catalog_rows=[_catalog_row(legacy_release_id=72_101)],
+            cta_rows=[],
+            credentials=("catalog-parity@wxyc.org", "hunter2-but-48-bytes"),
+            unreadable_jwt_exp=True,
+        ) as stub:
+            self._use_credentials(mod, monkeypatch, stub)
+            mod._build_library_db_from_backend(stub.base_url, str(out))
+
+            assert stub.exchanges == 1
+        assert out.exists()
 
     def test_a_pre_minted_token_still_wins(self, tmp_path: Path, monkeypatch) -> None:
         """Static mode is how an operator runs a one-off without the password."""
