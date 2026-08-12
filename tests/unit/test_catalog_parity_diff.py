@@ -16,6 +16,7 @@ Two halves of the catalog-parity harness live in that script:
 
 from __future__ import annotations
 
+import base64
 import gzip
 import importlib.util
 import json
@@ -24,6 +25,7 @@ import sqlite3
 import subprocess
 import sys
 import threading
+import time
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -174,10 +176,29 @@ def _catalog_row(**overrides: Any) -> dict[str, Any]:
     return row
 
 
+def _fake_jwt(expires_in_seconds: int = 900) -> str:
+    """A JWT-shaped string whose payload carries an ``exp``.
+
+    The producer never verifies a signature -- it decodes ``exp`` locally to
+    decide when to refresh -- so a real key would only make the fixture
+    slower. The signature segment is deliberately garbage.
+    """
+    payload = {"exp": int(time.time()) + expires_in_seconds, "role": "member"}
+
+    def seg(obj: dict[str, Any]) -> str:
+        return base64.urlsafe_b64encode(json.dumps(obj).encode()).rstrip(b"=").decode()
+
+    return f"{seg({'alg': 'EdDSA'})}.{seg(payload)}.not-a-signature"
+
+
 @dataclass
 class _RecordedRequest:
     path: str
     authorization: str | None
+    # better-auth's CSRF guard rejects an origin-less sign-in, so the mint
+    # path has to send one -- which no test could assert on while this stub
+    # recorded only (path, authorization).
+    origin: str | None = None
 
 
 class _BackendStub:
@@ -186,6 +207,14 @@ class _BackendStub:
     Serves gzipped NDJSON with a ``Last-Modified`` watermark, records every
     request, and exposes ``on_catalog_fetch`` so a test can advance the
     watermark mid-pair to exercise the torn-snapshot re-fetch rule.
+
+    It also stands in for the two auth-service endpoints the producer mints
+    through (``POST /auth/sign-in/email`` -> session, ``GET /auth/token`` ->
+    JWT). Passing ``credentials`` turns on bearer enforcement: the exports
+    then 401 anything but a JWT this stub actually issued, which is what
+    makes the refresh path testable. Left at ``None`` (the default), any
+    bearer is accepted and the auth endpoints simply go unused -- the regime
+    every pre-#365 test in this file runs under.
     """
 
     def __init__(
@@ -194,15 +223,39 @@ class _BackendStub:
         cta_rows: list[dict[str, Any]],
         gzip_body: bool = True,
         last_modified: str = _LM_A,
+        credentials: tuple[str, str] | None = None,
+        jwt_ttl_seconds: int = 900,
     ) -> None:
         self.catalog_rows = catalog_rows
         self.cta_rows = cta_rows
         self.gzip_body = gzip_body
         self.last_modified = last_modified
+        self.credentials = credentials
+        self.jwt_ttl_seconds = jwt_ttl_seconds
         self.requests: list[_RecordedRequest] = []
         self.on_catalog_fetch: Callable[[], None] | None = None
+        # Queues of forced statuses, popped left-to-right; empty means "behave
+        # normally". A test drives 429-then-200, or a 401 from the exchange,
+        # by pre-loading these.
+        self.sign_in_statuses: list[int] = []
+        self.exchange_statuses: list[int] = []
+        # Everything this stub has minted and not superseded.
+        self.sessions: set[str] = set()
+        self.jwts: set[str] = set()
         self._server = ThreadingHTTPServer(("127.0.0.1", 0), self._handler_class())
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+
+    @property
+    def sign_ins(self) -> int:
+        return sum(1 for r in self.requests if r.path == "/auth/sign-in/email")
+
+    @property
+    def exchanges(self) -> int:
+        return sum(1 for r in self.requests if r.path == "/auth/token")
+
+    @property
+    def export_requests(self) -> list[_RecordedRequest]:
+        return [r for r in self.requests if not r.path.startswith("/auth/")]
 
     @property
     def base_url(self) -> str:
@@ -227,8 +280,74 @@ class _BackendStub:
             def log_message(self, *args: object) -> None:  # keep pytest output clean
                 pass
 
+            def _record(self) -> None:
+                stub.requests.append(
+                    _RecordedRequest(
+                        self.path,
+                        self.headers.get("Authorization"),
+                        self.headers.get("Origin"),
+                    )
+                )
+
+            def _send_json(self, status: int, payload: dict[str, Any], **headers: str) -> None:
+                body = json.dumps(payload).encode("utf-8")
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                for name, value in headers.items():
+                    self.send_header(name.replace("_", "-"), value)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
+                self._record()
+                if self.path != "/auth/sign-in/email":
+                    self.send_error(404)
+                    return
+                length = int(self.headers.get("Content-Length") or 0)
+                body = json.loads(self.rfile.read(length) or b"{}")
+                forced = stub.sign_in_statuses.pop(0) if stub.sign_in_statuses else None
+                if forced == 429:
+                    # better-auth's own limiter emits X-Retry-After, NOT the
+                    # standard header the express limiter sends -- a producer
+                    # that reads only one of the two waits the wrong amount.
+                    self._send_json(429, {"message": "Too many requests"}, X_Retry_After="1")
+                    return
+                if forced is not None:
+                    self._send_json(forced, {"message": "forced"})
+                    return
+                if stub.credentials is not None and (
+                    body.get("email"),
+                    body.get("password"),
+                ) != stub.credentials:
+                    self._send_json(401, {"message": "Invalid email or password"})
+                    return
+                session = f"session-{len(stub.sessions) + 1}"
+                stub.sessions.add(session)
+                self._send_json(200, {"token": session, "user": {"id": "svc-user"}})
+
             def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
-                stub.requests.append(_RecordedRequest(self.path, self.headers.get("Authorization")))
+                if self.path == "/auth/token":
+                    self._record()
+                    forced = stub.exchange_statuses.pop(0) if stub.exchange_statuses else None
+                    if forced is not None:
+                        self._send_json(forced, {"message": "forced"})
+                        return
+                    bearer = (self.headers.get("Authorization") or "").removeprefix("Bearer ")
+                    if bearer not in stub.sessions:
+                        self._send_json(401, {"message": "Unauthorized"})
+                        return
+                    jwt = _fake_jwt(stub.jwt_ttl_seconds)
+                    stub.jwts.add(jwt)
+                    self._send_json(200, {"token": jwt})
+                    return
+
+                self._record()
+                if stub.credentials is not None:
+                    bearer = (self.headers.get("Authorization") or "").removeprefix("Bearer ")
+                    if bearer not in stub.jwts:
+                        self._send_json(401, {"error": "Unauthorized: Invalid or expired token."})
+                        return
                 if self.path == "/library/catalog":
                     rows = stub.catalog_rows
                 elif self.path == "/library/catalog/compilation-tracks":
