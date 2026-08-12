@@ -376,23 +376,33 @@ _DEFAULT_AUTH_ORIGIN = "https://dj.wxyc.org"
 _SIGN_IN_PATH = "/sign-in/email"
 _EXCHANGE_PATH = "/token"
 
-# Refresh a JWT this far before its `exp` rather than after: a fetch can run
-# for _HTTP_TIMEOUT_SECONDS, and starting one with seconds of validity left
-# buys a guaranteed 401 and a wasted export.
-_JWT_REFRESH_MARGIN_SECONDS = 120
+# better-auth's default JWT life, which Backend-Service does not override.
+# Only a fallback: it schedules the next refresh when a token's own `exp` is
+# unreadable, so a claim-format change upstream costs one assumption rather
+# than an exchange per call.
+_ASSUMED_JWT_TTL_SECONDS = 900
 
 # Sign-ins per process. Two: the first, plus one recovery for a session that
 # turns out to be dead. The refresh path re-exchanges instead (see
 # `_TokenSource`), so a long run does not spend these -- and a credential that
 # is simply wrong fails after two rather than hammering a rate limiter shared
-# with every DJ logging in.
+# with every DJ logging in. Counted per sign-in, not per HTTP attempt: the
+# 429 retry below belongs to the sign-in that provoked it.
 _MAX_SIGN_INS = 2
+
+# Attempts per exchange: one against the cached session, and -- if that session
+# turns out to be dead -- one against a fresh one. Deliberately its own budget
+# rather than a share of _MAX_SIGN_INS, because an exhausted sign-in allowance
+# must not disable refreshing against a session that still works. That
+# conflation is what made a long soak run unable to refresh at all.
+_MAX_EXCHANGE_ATTEMPTS = 2
 
 # One retry on a rate-limited sign-in, waiting at most this long. Two limiters
 # sit in front of that path: the express one (10 per 15 min, draft-7
 # `Retry-After`) and better-auth's own (3 per 10s, `X-Retry-After`). The cap
 # has to be able to clear the shorter window, so it is 10s and not
-# wxyc-canary's 5s.
+# wxyc-canary's 5s. A hint longer than this is not waited out -- see
+# `_sign_in`.
 _SIGN_IN_RETRY_CAP_SECONDS = 10
 
 # Env var holding the tubafrenzy MySQL password. It is read from the
@@ -410,6 +420,13 @@ _COMPILATION_TRACKS_PATH = "/library/catalog/compilation-tracks"
 # from a per-watermark in-memory cache -- but a cold cache has to build the
 # whole body first, so the budget is generous.
 _HTTP_TIMEOUT_SECONDS = 300
+
+# Refresh a JWT this far before its `exp` rather than after. A fetch can run
+# for the whole timeout above, so a token with less life than that left cannot
+# safely start one: it is "expired" for our purposes while the clock still
+# says otherwise. The 401 retry would recover, but at the price of re-fetching
+# an entire export.
+_JWT_REFRESH_MARGIN_SECONDS = _HTTP_TIMEOUT_SECONDS
 
 # GET /library/catalog and GET /library/catalog/compilation-tracks are two
 # requests, not one transaction. They form a consistent snapshot only while
@@ -753,40 +770,46 @@ class _AuthStatusError(Exception):
         self.detail = detail
         self.headers = headers
 
-    def retry_after_seconds(self, cap: float) -> float:
-        """Seconds to wait before one retry, from whichever hint header exists.
+    def retry_hint_seconds(self) -> float | None:
+        """The server's own wait hint, or None when it did not give a usable one.
 
         The express limiter sends draft-7 ``Retry-After``; better-auth's own
         limiter sends ``X-Retry-After`` and nothing else. Reading only one of
-        the two means waiting the default against half the limiters that can
+        the two means ignoring the hint from half the limiters that can
         produce this response.
+
+        Returned unclamped, because the caller has to be able to tell a hint
+        it can wait out from one it cannot: silently truncating a 15-minute
+        window to a 10-second sleep buys a certain second refusal.
         """
         for header in ("Retry-After", "X-Retry-After"):
             raw = self.headers.get(header) if self.headers is not None else None
             if raw is None:
                 continue
             try:
-                return min(max(float(str(raw).strip()), 0.0), cap)
+                return max(float(str(raw).strip()), 0.0)
             except ValueError:
-                continue  # HTTP-date form: fall through to the cap
-        return cap
+                continue  # HTTP-date form: treat as "no usable hint"
+        return None
 
 
 def _jwt_expiry_epoch(token: str) -> float:
-    """The ``exp`` claim, or 0.0 when it cannot be read.
+    """The ``exp`` claim, or the assumed life when it cannot be read.
 
     A local, signature-unverified decode: this only schedules the *next*
     refresh, and the authority on whether a token is good remains the 401 from
-    Backend-Service. 0.0 means "refresh now", so an unparseable token costs an
-    extra exchange rather than a surprise expiry mid-fetch.
+    Backend-Service. An unreadable claim therefore falls back to better-auth's
+    documented 15 minutes rather than to "expired" -- the latter would make
+    every single ``token()`` call an exchange, six-plus per run, against a
+    limiter that allows three every ten seconds.
     """
     try:
         segment = token.split(".")[1]
         padded = segment + "=" * (-len(segment) % 4)
         claims = json.loads(base64.urlsafe_b64decode(padded))
         return float(claims["exp"])
-    except Exception:  # noqa: BLE001 - any malformed shape means "refresh now"
-        return 0.0
+    except Exception:  # noqa: BLE001 - any malformed shape falls back
+        return time.time() + _ASSUMED_JWT_TTL_SECONDS
 
 
 class _TokenSource:
@@ -867,10 +890,17 @@ class _TokenSource:
         self._jwt_expires_at = 0.0
 
     def _exchange(self) -> str:
-        """Trade the cached session for a JWT, re-signing-in at most once."""
+        """Trade the cached session for a JWT, re-signing-in at most once.
+
+        Bounded by its own attempt budget. Gating this loop on the sign-in
+        allowance instead would mean that once a run had spent that allowance
+        -- on a rate-limited first sign-in, or on one legitimate dead-session
+        recovery -- every later refresh would raise without issuing a single
+        exchange, against a session that was still perfectly good.
+        """
         url = self._auth_url + _EXCHANGE_PATH
         last: _AuthStatusError | None = None
-        while self._sign_ins < _MAX_SIGN_INS:
+        for _attempt in range(_MAX_EXCHANGE_ATTEMPTS):
             session = self._session or self._sign_in()
             request = Request(
                 url,
@@ -892,18 +922,29 @@ class _TokenSource:
                 last = exc
                 self._session = None
         raise SourceError(
-            f"the token exchange at {url} kept returning HTTP 401 after "
-            f"{self._sign_ins} sign-ins as ${BACKEND_EMAIL_ENV}: "
+            f"the token exchange at {url} returned HTTP 401 on every one of "
+            f"{_MAX_EXCHANGE_ATTEMPTS} attempts as ${BACKEND_EMAIL_ENV}: "
             f"{last.detail if last else 'no detail'}. Check that the service account "
             "exists, is not banned, and holds catalog:read."
         )
 
     def _sign_in(self) -> str:
-        """Exchange the password for a session token. One retry on a 429."""
+        """Exchange the password for a session token. One retry on a 429.
+
+        Costs one unit of the sign-in allowance however many HTTP attempts it
+        takes -- the 429 retry is part of this sign-in, not a second one.
+        """
         url = self._auth_url + _SIGN_IN_PATH
+        if self._sign_ins >= _MAX_SIGN_INS:
+            raise SourceError(
+                f"signing in as ${BACKEND_EMAIL_ENV} at {url} already ran "
+                f"{self._sign_ins} times this run and the session it returns keeps coming "
+                "back dead. Check that the service account exists, is not banned, and that "
+                f"${BACKEND_PASSWORD_ENV} is current."
+            )
+        self._sign_ins += 1
         body = json.dumps({"email": self._email, "password": self._password}).encode("utf-8")
         for attempt in (1, 2):
-            self._sign_ins += 1
             request = Request(
                 url,
                 data=body,
@@ -919,7 +960,19 @@ class _TokenSource:
                 session = _auth_token_from(request, "sign-in")
             except _AuthStatusError as exc:
                 if exc.code == 429 and attempt == 1:
-                    delay = exc.retry_after_seconds(_SIGN_IN_RETRY_CAP_SECONDS)
+                    hint = exc.retry_hint_seconds()
+                    if hint is not None and hint > _SIGN_IN_RETRY_CAP_SECONDS:
+                        # The express limiter's window is 15 minutes. Sleeping
+                        # the cap and retrying into a window this long is a
+                        # guaranteed second refusal; the operator wants the
+                        # real number, not a truncated one.
+                        raise SourceError(
+                            f"sign-in as ${BACKEND_EMAIL_ENV} at {url} was rate limited and "
+                            f"asks for {hint:g}s, longer than the {_SIGN_IN_RETRY_CAP_SECONDS}s "
+                            "this run will wait. Re-run after that window, and check whether "
+                            "something else is signing in as this service account."
+                        ) from exc
+                    delay = hint if hint is not None else _SIGN_IN_RETRY_CAP_SECONDS
                     logger.warning(
                         "sign-in was rate limited; retrying once",
                         extra={"step": "backend_producer", "delay_seconds": delay},
