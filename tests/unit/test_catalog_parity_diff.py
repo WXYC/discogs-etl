@@ -1433,7 +1433,7 @@ class TestServiceAccountMint:
     @staticmethod
     def _use_credentials(mod, monkeypatch, stub) -> None:
         monkeypatch.delenv(mod.BACKEND_TOKEN_ENV, raising=False)
-        monkeypatch.setenv(mod.BACKEND_EMAIL_ENV, "catalog-parity@wxyc.org")
+        monkeypatch.setenv(mod.BACKEND_EMAIL_ENV, "catalog-parity@wxyc.invalid")
         monkeypatch.setenv(mod.BACKEND_PASSWORD_ENV, "hunter2-but-48-bytes")
         monkeypatch.setenv(mod.BACKEND_AUTH_URL_ENV, f"{stub.base_url}/auth")
 
@@ -1443,7 +1443,7 @@ class TestServiceAccountMint:
         with _BackendStub(
             catalog_rows=[_catalog_row(legacy_release_id=72_101)],
             cta_rows=[],
-            credentials=("catalog-parity@wxyc.org", "hunter2-but-48-bytes"),
+            credentials=("catalog-parity@wxyc.invalid", "hunter2-but-48-bytes"),
         ) as stub:
             self._use_credentials(mod, monkeypatch, stub)
             mod._build_library_db_from_backend(stub.base_url, str(out))
@@ -1472,7 +1472,7 @@ class TestServiceAccountMint:
         with _BackendStub(
             catalog_rows=[_catalog_row(legacy_release_id=72_101)],
             cta_rows=[],
-            credentials=("catalog-parity@wxyc.org", "hunter2-but-48-bytes"),
+            credentials=("catalog-parity@wxyc.invalid", "hunter2-but-48-bytes"),
         ) as stub:
             self._use_credentials(mod, monkeypatch, stub)
 
@@ -1498,7 +1498,7 @@ class TestServiceAccountMint:
         with _BackendStub(
             catalog_rows=[_catalog_row(legacy_release_id=72_101)],
             cta_rows=[],
-            credentials=("catalog-parity@wxyc.org", "hunter2-but-48-bytes"),
+            credentials=("catalog-parity@wxyc.invalid", "hunter2-but-48-bytes"),
         ) as stub:
             self._use_credentials(mod, monkeypatch, stub)
             stub.exchange_statuses = [401]
@@ -1523,7 +1523,7 @@ class TestServiceAccountMint:
         with _BackendStub(
             catalog_rows=[_catalog_row(legacy_release_id=72_101)],
             cta_rows=[],
-            credentials=("catalog-parity@wxyc.org", "hunter2-but-48-bytes"),
+            credentials=("catalog-parity@wxyc.invalid", "hunter2-but-48-bytes"),
         ) as stub:
             self._use_credentials(mod, monkeypatch, stub)
             stub.sign_in_statuses = [429]
@@ -1550,7 +1550,7 @@ class TestServiceAccountMint:
         with _BackendStub(
             catalog_rows=[_catalog_row(legacy_release_id=72_101)],
             cta_rows=[],
-            credentials=("catalog-parity@wxyc.org", "hunter2-but-48-bytes"),
+            credentials=("catalog-parity@wxyc.invalid", "hunter2-but-48-bytes"),
         ) as stub:
             self._use_credentials(mod, monkeypatch, stub)
             stub.exchange_statuses = [401]  # spends the second sign-in
@@ -1569,7 +1569,7 @@ class TestServiceAccountMint:
         with _BackendStub(
             catalog_rows=[_catalog_row()],
             cta_rows=[],
-            credentials=("catalog-parity@wxyc.org", "hunter2-but-48-bytes"),
+            credentials=("catalog-parity@wxyc.invalid", "hunter2-but-48-bytes"),
         ) as stub:
             self._use_credentials(mod, monkeypatch, stub)
             stub.exchange_statuses = [401, 401, 401, 401]
@@ -1586,7 +1586,7 @@ class TestServiceAccountMint:
         with _BackendStub(
             catalog_rows=[_catalog_row(legacy_release_id=72_101)],
             cta_rows=[],
-            credentials=("catalog-parity@wxyc.org", "hunter2-but-48-bytes"),
+            credentials=("catalog-parity@wxyc.invalid", "hunter2-but-48-bytes"),
         ) as stub:
             self._use_credentials(mod, monkeypatch, stub)
             stub.sign_in_statuses = [429]
@@ -1602,7 +1602,7 @@ class TestServiceAccountMint:
         with _BackendStub(
             catalog_rows=[_catalog_row()],
             cta_rows=[],
-            credentials=("catalog-parity@wxyc.org", "hunter2-but-48-bytes"),
+            credentials=("catalog-parity@wxyc.invalid", "hunter2-but-48-bytes"),
         ) as stub:
             self._use_credentials(mod, monkeypatch, stub)
             stub.sign_in_statuses = [429, 429]
@@ -1624,7 +1624,7 @@ class TestServiceAccountMint:
         with _BackendStub(
             catalog_rows=[_catalog_row()],
             cta_rows=[],
-            credentials=("catalog-parity@wxyc.org", "hunter2-but-48-bytes"),
+            credentials=("catalog-parity@wxyc.invalid", "hunter2-but-48-bytes"),
         ) as stub:
             self._use_credentials(mod, monkeypatch, stub)
             stub.sign_in_statuses = [429]
@@ -1652,7 +1652,7 @@ class TestServiceAccountMint:
         with _BackendStub(
             catalog_rows=[_catalog_row(legacy_release_id=72_101)],
             cta_rows=[],
-            credentials=("catalog-parity@wxyc.org", "hunter2-but-48-bytes"),
+            credentials=("catalog-parity@wxyc.invalid", "hunter2-but-48-bytes"),
             jwt_ttl_seconds=mod._HTTP_TIMEOUT_SECONDS - 100,
         ) as stub:
             self._use_credentials(mod, monkeypatch, stub)
@@ -1676,7 +1676,7 @@ class TestServiceAccountMint:
         with _BackendStub(
             catalog_rows=[_catalog_row(legacy_release_id=72_101)],
             cta_rows=[],
-            credentials=("catalog-parity@wxyc.org", "hunter2-but-48-bytes"),
+            credentials=("catalog-parity@wxyc.invalid", "hunter2-but-48-bytes"),
             unreadable_jwt_exp=True,
         ) as stub:
             self._use_credentials(mod, monkeypatch, stub)
@@ -1698,7 +1698,7 @@ class TestServiceAccountMint:
         with _BackendStub(
             catalog_rows=[_catalog_row(legacy_release_id=72_101)],
             cta_rows=[],
-            credentials=("catalog-parity@wxyc.org", "hunter2-but-48-bytes"),
+            credentials=("catalog-parity@wxyc.invalid", "hunter2-but-48-bytes"),
         ) as stub:
             self._use_credentials(mod, monkeypatch, stub)
             mod._build_library_db_from_backend(stub.base_url, str(out))
@@ -1714,7 +1714,7 @@ class TestServiceAccountMint:
         with _BackendStub(
             catalog_rows=[],  # an empty catalog is a producer failure
             cta_rows=[],
-            credentials=("catalog-parity@wxyc.org", "hunter2-but-48-bytes"),
+            credentials=("catalog-parity@wxyc.invalid", "hunter2-but-48-bytes"),
         ) as stub:
             self._use_credentials(mod, monkeypatch, stub)
             with pytest.raises(mod.SourceError):
@@ -1731,7 +1731,7 @@ class TestServiceAccountMint:
         with _BackendStub(
             catalog_rows=[_catalog_row(legacy_release_id=72_101)],
             cta_rows=[],
-            credentials=("catalog-parity@wxyc.org", "hunter2-but-48-bytes"),
+            credentials=("catalog-parity@wxyc.invalid", "hunter2-but-48-bytes"),
         ) as stub:
             self._use_credentials(mod, monkeypatch, stub)
             stub.sign_out_statuses = [500]
@@ -1754,7 +1754,7 @@ class TestServiceAccountMint:
         with _BackendStub(
             catalog_rows=[_catalog_row(legacy_release_id=72_101)],
             cta_rows=[],
-            credentials=("catalog-parity@wxyc.org", "hunter2-but-48-bytes"),
+            credentials=("catalog-parity@wxyc.invalid", "hunter2-but-48-bytes"),
         ) as stub:
             self._use_credentials(mod, monkeypatch, stub)
             stub.sign_out_statuses = [302]
@@ -1774,7 +1774,7 @@ class TestServiceAccountMint:
         with _BackendStub(
             catalog_rows=[],  # the real failure: a producer that read nothing
             cta_rows=[],
-            credentials=("catalog-parity@wxyc.org", "hunter2-but-48-bytes"),
+            credentials=("catalog-parity@wxyc.invalid", "hunter2-but-48-bytes"),
         ) as stub:
             self._use_credentials(mod, monkeypatch, stub)
             stub.sign_out_statuses = [302]
@@ -1796,7 +1796,7 @@ class TestServiceAccountMint:
         with _BackendStub(
             catalog_rows=[_catalog_row()],
             cta_rows=[],
-            credentials=("catalog-parity@wxyc.org", "hunter2-but-48-bytes"),
+            credentials=("catalog-parity@wxyc.invalid", "hunter2-but-48-bytes"),
         ) as stub:
             self._use_credentials(mod, monkeypatch, stub)
             stub.sign_in_statuses = [429]
@@ -1817,7 +1817,7 @@ class TestServiceAccountMint:
         with _BackendStub(
             catalog_rows=[_catalog_row(legacy_release_id=72_101)],
             cta_rows=[],
-            credentials=("catalog-parity@wxyc.org", "hunter2-but-48-bytes"),
+            credentials=("catalog-parity@wxyc.invalid", "hunter2-but-48-bytes"),
         ) as stub:
             self._use_credentials(mod, monkeypatch, stub)
             stub.sign_in_statuses = [429]
@@ -1857,10 +1857,10 @@ class TestServiceAccountMint:
         with _BackendStub(
             catalog_rows=[_catalog_row(legacy_release_id=72_101)],
             cta_rows=[],
-            credentials=("catalog-parity@wxyc.org", "hunter2-but-48-bytes"),
+            credentials=("catalog-parity@wxyc.invalid", "hunter2-but-48-bytes"),
         ) as stub:
             monkeypatch.setenv(mod.BACKEND_TOKEN_ENV, "stale-token")
-            monkeypatch.setenv(mod.BACKEND_EMAIL_ENV, "catalog-parity@wxyc.org")
+            monkeypatch.setenv(mod.BACKEND_EMAIL_ENV, "catalog-parity@wxyc.invalid")
             monkeypatch.setenv(mod.BACKEND_PASSWORD_ENV, "hunter2-but-48-bytes")
             monkeypatch.setenv(mod.BACKEND_AUTH_URL_ENV, f"{stub.base_url}/auth")
             mod._build_library_db_from_backend(stub.base_url, str(out))
@@ -1875,7 +1875,7 @@ class TestServiceAccountMint:
         out = tmp_path / "backend.db"
         with _BackendStub(catalog_rows=[_catalog_row()], cta_rows=[]) as stub:
             monkeypatch.setenv(mod.BACKEND_TOKEN_ENV, "svc-token")
-            monkeypatch.setenv(mod.BACKEND_EMAIL_ENV, "catalog-parity@wxyc.org")
+            monkeypatch.setenv(mod.BACKEND_EMAIL_ENV, "catalog-parity@wxyc.invalid")
             monkeypatch.setenv(mod.BACKEND_PASSWORD_ENV, "hunter2-but-48-bytes")
             mod._build_library_db_from_backend(stub.base_url, str(out))
 
@@ -1892,7 +1892,7 @@ class TestServiceAccountMint:
         with _BackendStub(
             catalog_rows=[_catalog_row()],
             cta_rows=[],
-            credentials=("catalog-parity@wxyc.org", "hunter2-but-48-bytes"),
+            credentials=("catalog-parity@wxyc.invalid", "hunter2-but-48-bytes"),
         ) as stub:
             monkeypatch.setenv(mod.BACKEND_TOKEN_ENV, "stale-token")
             monkeypatch.delenv(mod.BACKEND_EMAIL_ENV, raising=False)
@@ -1911,7 +1911,7 @@ class TestServiceAccountMint:
         with _BackendStub(
             catalog_rows=[_catalog_row(legacy_release_id=72_101)],
             cta_rows=[],
-            credentials=("catalog-parity@wxyc.org", "hunter2-but-48-bytes"),
+            credentials=("catalog-parity@wxyc.invalid", "hunter2-but-48-bytes"),
             jwt_ttl_seconds=30,
         ) as stub:
             self._use_credentials(mod, monkeypatch, stub)
@@ -1938,7 +1938,7 @@ class TestServiceAccountMint:
         """The password is on that wire -- the message must say so."""
         mod = _load_module()
         monkeypatch.delenv(mod.BACKEND_TOKEN_ENV, raising=False)
-        monkeypatch.setenv(mod.BACKEND_EMAIL_ENV, "catalog-parity@wxyc.org")
+        monkeypatch.setenv(mod.BACKEND_EMAIL_ENV, "catalog-parity@wxyc.invalid")
         monkeypatch.setenv(mod.BACKEND_PASSWORD_ENV, "hunter2-but-48-bytes")
         monkeypatch.setenv(mod.BACKEND_AUTH_URL_ENV, "http://auth.example.org/auth")
         with pytest.raises(mod.SourceError) as excinfo:
@@ -1957,7 +1957,7 @@ class TestServiceAccountMint:
         with _BackendStub(
             catalog_rows=[_catalog_row()],
             cta_rows=[],
-            credentials=("catalog-parity@wxyc.org", "hunter2-but-48-bytes"),
+            credentials=("catalog-parity@wxyc.invalid", "hunter2-but-48-bytes"),
         ) as elsewhere:
             with _RedirectingStub(elsewhere.base_url) as redirector:
                 self._use_credentials(mod, monkeypatch, elsewhere)
@@ -1983,7 +1983,7 @@ class TestServiceAccountMint:
         with _BackendStub(
             catalog_rows=[_catalog_row(legacy_release_id=72_101)],
             cta_rows=[],
-            credentials=("catalog-parity@wxyc.org", "hunter2-but-48-bytes"),
+            credentials=("catalog-parity@wxyc.invalid", "hunter2-but-48-bytes"),
         ) as stub:
             self._use_credentials(mod, monkeypatch, stub)
             mod._build_library_db_from_backend(stub.base_url, str(out))
