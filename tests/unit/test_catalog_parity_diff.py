@@ -26,6 +26,7 @@ import subprocess
 import sys
 import threading
 import time
+import unicodedata
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -754,6 +755,498 @@ class TestDiffLibraryDbs:
         backend_conn.close()
 
         assert result.cta_missing == 0
+        assert result.cta_extra == 0
+
+
+def _row(**overrides: Any) -> dict[str, Any]:
+    """One raw library.db row for the field-classification tests below.
+
+    Merges onto ``_DEFAULT_ROW`` (id 1) the same way ``_make_library_db``
+    does, so a classifier test only has to name the field(s) it cares about.
+    """
+    merged: dict[str, Any] = {"id": 1, **_DEFAULT_ROW}
+    merged.update(overrides)
+    return merged
+
+
+class TestClassifyField:
+    """``classify_field(col, mysql_row, backend_row)`` -- Part 1's per-column
+    model: agree / normalized / mismatch, derived by replaying Backend's own
+    ETL transforms (``lib/backend_catalog_norm.py``) against the raw
+    mysql-sourced value.
+    """
+
+    # --- artist ---------------------------------------------------------
+
+    def test_artist_agrees_when_backend_equals_mysql_verbatim(self) -> None:
+        mod = _load_module()
+        mysql_row = _row(artist="Stereolab")
+        backend_row = _row(artist="Stereolab")
+        assert mod.classify_field("artist", mysql_row, backend_row) == ("agree", None)
+
+    def test_artist_various_artists_drop_is_normalized(self) -> None:
+        mod = _load_module()
+        mysql_row = _row(artist="Various Artists - latin")
+        backend_row = _row(artist="Various Artists")
+        tier, cls = mod.classify_field("artist", mysql_row, backend_row)
+        assert tier == "normalized"
+        assert cls == "various_artists"
+
+    def test_artist_tab_and_newline_substituted_before_normalizing(self) -> None:
+        mod = _load_module()
+        mysql_row = _row(artist="Jessica Pratt\n(reissue)")
+        backend_row = _row(artist="Jessica Pratt (reissue)")
+        tier, cls = mod.classify_field("artist", mysql_row, backend_row)
+        assert tier == "normalized"
+        assert cls == "trimmed_or_substituted"
+
+    def test_artist_fold_equal_stored_spelling_is_normalized(self) -> None:
+        """``ensureArtist`` returns the STORED spelling on a fold match, e.g.
+        an existing artist row already spelled in NFD (decomposed) form --
+        not reproducible by replaying ``normalize_artist_name`` alone."""
+        mod = _load_module()
+        nfc = "Nilüfer Yanya"  # ü = U+00FC
+        nfd = unicodedata.normalize("NFD", nfc)  # u + U+0308 (combining diaeresis)
+        assert nfc != nfd, "the two composition forms must be byte-distinct for this test"
+        mysql_row = _row(artist=nfc)
+        backend_row = _row(artist=nfd)
+        tier, cls = mod.classify_field("artist", mysql_row, backend_row)
+        assert tier == "normalized"
+        assert cls == "fold_equal"
+
+    def test_artist_genuine_difference_is_a_mismatch(self) -> None:
+        mod = _load_module()
+        mysql_row = _row(artist="Stereolab")
+        backend_row = _row(artist="Cat Power")
+        assert mod.classify_field("artist", mysql_row, backend_row)[0] == "mismatch"
+
+    # --- call_letters -----------------------------------------------------
+
+    def test_call_letters_agree_when_equal(self) -> None:
+        mod = _load_module()
+        mysql_row = _row(call_letters="ST")
+        backend_row = _row(call_letters="ST")
+        assert mod.classify_field("call_letters", mysql_row, backend_row) == ("agree", None)
+
+    def test_call_letters_uppercased_is_normalized(self) -> None:
+        mod = _load_module()
+        mysql_row = _row(call_letters="st")
+        backend_row = _row(call_letters="ST")
+        tier, cls = mod.classify_field("call_letters", mysql_row, backend_row)
+        assert tier == "normalized"
+        assert cls == "uppercased"
+
+    def test_call_letters_va_override_from_artist_not_from_the_code_itself(self) -> None:
+        """On a VA row ``normalize_code_letters`` is never called -- the
+        ``isVarious`` branch short-circuits straight to "V/A" regardless of
+        what the mysql-side code letters actually were."""
+        mod = _load_module()
+        mysql_row = _row(artist="Various Artists", call_letters="XY")
+        backend_row = _row(artist="Various Artists", call_letters="V/A")
+        tier, cls = mod.classify_field("call_letters", mysql_row, backend_row)
+        assert tier == "normalized"
+        assert cls == "various"
+
+    def test_call_letters_empty_falls_back_to_double_question_mark(self) -> None:
+        mod = _load_module()
+        mysql_row = _row(call_letters=None)
+        backend_row = _row(call_letters="??")
+        tier, cls = mod.classify_field("call_letters", mysql_row, backend_row)
+        assert tier == "normalized"
+        assert cls == "fallback_unknown"
+
+    def test_call_letters_whitespace_only_also_falls_back(self) -> None:
+        """Whitespace-only mysql call letters is the same 'nothing to derive
+        from' case as None/empty -- ``normalize_code_letters`` returns None
+        for all three, so the fallback class must match regardless of which
+        falsy-ish shape the raw value took."""
+        mod = _load_module()
+        mysql_row = _row(call_letters="   ")
+        backend_row = _row(call_letters="??")
+        tier, cls = mod.classify_field("call_letters", mysql_row, backend_row)
+        assert tier == "normalized"
+        assert cls == "fallback_unknown"
+
+    def test_call_letters_stored_casing_is_normalized_case_insensitively(self) -> None:
+        """An artist row created outside this ETL keeps its own casing;
+        ``ensureArtist`` resolves on ``lower(code_letters)`` and never
+        rewrites it, so a case-only difference from the derived (uppercase)
+        expectation is normalized, not a defect."""
+        mod = _load_module()
+        mysql_row = _row(call_letters="ST")
+        backend_row = _row(call_letters="St")
+        tier, cls = mod.classify_field("call_letters", mysql_row, backend_row)
+        assert tier == "normalized"
+
+    def test_call_letters_genuine_difference_is_a_mismatch(self) -> None:
+        mod = _load_module()
+        mysql_row = _row(call_letters="ST")
+        backend_row = _row(call_letters="XY")
+        assert mod.classify_field("call_letters", mysql_row, backend_row)[0] == "mismatch"
+
+    # --- genre --------------------------------------------------------
+
+    def test_genre_agrees_when_equal(self) -> None:
+        mod = _load_module()
+        mysql_row = _row(genre="Rock")
+        backend_row = _row(genre="Rock")
+        assert mod.classify_field("genre", mysql_row, backend_row) == ("agree", None)
+
+    def test_genre_case_difference_is_normalized(self) -> None:
+        mod = _load_module()
+        mysql_row = _row(genre="rock")
+        backend_row = _row(genre="Rock")
+        tier, cls = mod.classify_field("genre", mysql_row, backend_row)
+        assert tier == "normalized"
+        assert cls == "case_folded"
+
+    def test_genre_genuine_difference_is_a_mismatch(self) -> None:
+        mod = _load_module()
+        mysql_row = _row(genre="Rock")
+        backend_row = _row(genre="Electronic")
+        assert mod.classify_field("genre", mysql_row, backend_row)[0] == "mismatch"
+
+    # --- format ---------------------------------------------------------
+
+    def test_format_agrees_when_equal(self) -> None:
+        mod = _load_module()
+        mysql_row = _row(format="cd")
+        backend_row = _row(format="cd")
+        assert mod.classify_field("format", mysql_row, backend_row) == ("agree", None)
+
+    def test_format_separator_dropped_is_normalized(self) -> None:
+        mod = _load_module()
+        mysql_row = _row(format="Vinyl - LP")
+        backend_row = _row(format='vinyl 12"')
+        tier, cls = mod.classify_field("format", mysql_row, backend_row)
+        assert tier == "normalized"
+        assert cls == "format_derived"
+
+    def test_format_case_difference_is_normalized(self) -> None:
+        mod = _load_module()
+        mysql_row = _row(format="cd")
+        backend_row = _row(format="CD")
+        tier, cls = mod.classify_field("format", mysql_row, backend_row)
+        assert tier == "normalized"
+        assert cls == "format_derived"
+
+    def test_format_unparseable_mysql_value_is_a_mismatch(self) -> None:
+        mod = _load_module()
+        mysql_row = _row(format="cassette")
+        backend_row = _row(format="cd")
+        assert mod.classify_field("format", mysql_row, backend_row)[0] == "mismatch"
+
+    def test_format_genuine_difference_is_a_mismatch(self) -> None:
+        mod = _load_module()
+        mysql_row = _row(format="cd")
+        backend_row = _row(format="vinyl")
+        assert mod.classify_field("format", mysql_row, backend_row)[0] == "mismatch"
+
+    # --- artist_call_number ---------------------------------------------
+
+    def test_artist_call_number_agrees_when_equal(self) -> None:
+        mod = _load_module()
+        mysql_row = _row(artist_call_number=100)
+        backend_row = _row(artist_call_number=100)
+        assert mod.classify_field("artist_call_number", mysql_row, backend_row) == ("agree", None)
+
+    def test_artist_call_number_null_coalesces_to_zero(self) -> None:
+        mod = _load_module()
+        mysql_row = _row(artist="Stereolab", artist_call_number=None)
+        backend_row = _row(artist="Stereolab", artist_call_number=0)
+        tier, cls = mod.classify_field("artist_call_number", mysql_row, backend_row)
+        assert tier == "normalized"
+        assert cls == "null_coalesced_zero"
+
+    def test_artist_call_number_various_forces_zero_regardless_of_mysql_value(self) -> None:
+        mod = _load_module()
+        mysql_row = _row(artist="Various Artists", artist_call_number=100)
+        backend_row = _row(artist="Various Artists", artist_call_number=0)
+        tier, cls = mod.classify_field("artist_call_number", mysql_row, backend_row)
+        assert tier == "normalized"
+        assert cls == "various"
+
+    def test_artist_call_number_genuine_difference_is_a_mismatch(self) -> None:
+        mod = _load_module()
+        mysql_row = _row(artist="Stereolab", artist_call_number=100)
+        backend_row = _row(artist="Stereolab", artist_call_number=999)
+        assert mod.classify_field("artist_call_number", mysql_row, backend_row)[0] == "mismatch"
+
+    # --- release_call_number ----------------------------------------------
+
+    def test_release_call_number_agrees_when_equal(self) -> None:
+        mod = _load_module()
+        mysql_row = _row(release_call_number=1)
+        backend_row = _row(release_call_number=1)
+        assert mod.classify_field("release_call_number", mysql_row, backend_row) == (
+            "agree",
+            None,
+        )
+
+    def test_release_call_number_null_coalesces_to_zero(self) -> None:
+        mod = _load_module()
+        mysql_row = _row(release_call_number=None)
+        backend_row = _row(release_call_number=0)
+        tier, cls = mod.classify_field("release_call_number", mysql_row, backend_row)
+        assert tier == "normalized"
+        assert cls == "null_coalesced_zero"
+
+    def test_release_call_number_genuine_difference_is_a_mismatch(self) -> None:
+        mod = _load_module()
+        mysql_row = _row(release_call_number=1)
+        backend_row = _row(release_call_number=2)
+        assert mod.classify_field("release_call_number", mysql_row, backend_row)[0] == "mismatch"
+
+    # --- title / alternate_artist_name / album_artist ----------------------
+
+    @pytest.mark.parametrize("col", ["title", "alternate_artist_name", "album_artist"])
+    def test_tab_newline_columns_substitute_before_byte_compare(self, col: str) -> None:
+        mod = _load_module()
+        mysql_row = _row(**{col: "Value\twith\ntab and newline"})
+        backend_row = _row(**{col: "Value with tab and newline"})
+        tier, cls = mod.classify_field(col, mysql_row, backend_row)
+        assert tier == "normalized"
+        assert cls == "tab_newline_substituted"
+
+    @pytest.mark.parametrize("col", ["title", "alternate_artist_name", "album_artist"])
+    def test_tab_newline_columns_require_byte_identity_beyond_that(self, col: str) -> None:
+        mod = _load_module()
+        mysql_row = _row(**{col: "Same Value"})
+        backend_row = _row(**{col: "Different Value"})
+        tier, _cls = mod.classify_field(col, mysql_row, backend_row)
+        assert tier == "mismatch"
+
+    # --- cross_reference_names -------------------------------------------
+
+    def test_cross_reference_names_agrees_when_equal(self) -> None:
+        mod = _load_module()
+        mysql_row = _row(cross_reference_names="Csillagrablók | Hermanos Gutiérrez")
+        backend_row = _row(cross_reference_names="Csillagrablók | Hermanos Gutiérrez")
+        assert mod.classify_field("cross_reference_names", mysql_row, backend_row) == (
+            "agree",
+            None,
+        )
+
+    def test_cross_reference_names_reordering_is_normalized(self) -> None:
+        """MySQL's GROUP_CONCAT has no ORDER BY; Backend's array is ordered
+        differently -- order is never significant."""
+        mod = _load_module()
+        mysql_row = _row(cross_reference_names="Csillagrablók | Hermanos Gutiérrez")
+        backend_row = _row(cross_reference_names="Hermanos Gutiérrez | Csillagrablók")
+        tier, cls = mod.classify_field("cross_reference_names", mysql_row, backend_row)
+        assert tier == "normalized"
+        assert cls == "fold_equal"
+
+    def test_cross_reference_names_fold_equal_spelling_is_normalized(self) -> None:
+        mod = _load_module()
+        nfc = "Nilüfer Yanya"  # ü = U+00FC
+        nfd = unicodedata.normalize("NFD", nfc)  # u + U+0308
+        assert nfc != nfd, "the two composition forms must be byte-distinct for this test"
+        mysql_row = _row(cross_reference_names=f"Csillagrablók | {nfc}")
+        backend_row = _row(cross_reference_names=f"Csillagrablók | {nfd}")
+        tier, cls = mod.classify_field("cross_reference_names", mysql_row, backend_row)
+        assert tier == "normalized"
+        assert cls == "fold_equal"
+
+    def test_cross_reference_names_cardinality_loss_is_normalized_not_mismatch(self) -> None:
+        """A fold-collapse or a never-imported crossref both shrink Backend's
+        set relative to MySQL's, and the row can't distinguish the two -- so
+        this ships as a reported residual, not a gated defect."""
+        mod = _load_module()
+        mysql_row = _row(cross_reference_names="Csillagrablók | Hermanos Gutiérrez")
+        backend_row = _row(cross_reference_names="Csillagrablók")
+        tier, cls = mod.classify_field("cross_reference_names", mysql_row, backend_row)
+        assert tier == "normalized"
+        assert cls == "cardinality_loss"
+
+    def test_cross_reference_names_extra_backend_item_is_a_mismatch(self) -> None:
+        """Backend holding an alias unexplainable from mysql at all is a
+        genuine defect, not a residual."""
+        mod = _load_module()
+        mysql_row = _row(cross_reference_names="Csillagrablók")
+        backend_row = _row(cross_reference_names="Csillagrablók | Hermanos Gutiérrez")
+        assert mod.classify_field("cross_reference_names", mysql_row, backend_row)[0] == "mismatch"
+
+
+class TestColumnModelsDriftGuard:
+    """Mirrors ``test_select_statements_match_sync_library_sh``'s style: set
+    equality, not containment, so an added OR removed diffed column fails."""
+
+    def test_column_models_keys_match_diff_columns_exactly(self) -> None:
+        mod = _load_module()
+        assert set(mod.COLUMN_MODELS) == set(mod.DIFF_COLUMNS)
+
+
+class TestClassifyMatchedRows:
+    """``_classify_matched_rows`` -- the row-level engine behind
+    ``diff_library_dbs``'s ``field_mismatches`` -- also computes the
+    ``normalizations`` (column -> class -> count) shape a later step wires
+    into ``ParityDiff``.
+    """
+
+    def test_normalized_tier_is_excluded_from_field_mismatches(self) -> None:
+        mod = _load_module()
+        mysql_rows = {1: _row(genre="rock")}
+        backend_rows = {1: _row(genre="Rock")}
+        field_mismatches, normalizations = mod._classify_matched_rows(mysql_rows, backend_rows, [1])
+        assert field_mismatches["genre"] == 0
+        assert normalizations["genre"]["case_folded"] == 1
+
+    def test_field_mismatches_still_counts_genuine_mismatches(self) -> None:
+        mod = _load_module()
+        mysql_rows = {1: _row(genre="Rock")}
+        backend_rows = {1: _row(genre="Electronic")}
+        field_mismatches, normalizations = mod._classify_matched_rows(mysql_rows, backend_rows, [1])
+        assert field_mismatches["genre"] == 1
+        assert "genre" not in normalizations
+
+    def test_normalizations_is_keyed_column_then_class(self) -> None:
+        mod = _load_module()
+        mysql_rows = {1: _row(call_letters="st"), 2: _row(id=2, call_letters="xy")}
+        backend_rows = {1: _row(call_letters="ST"), 2: _row(id=2, call_letters="XY")}
+        _, normalizations = mod._classify_matched_rows(mysql_rows, backend_rows, [1, 2])
+        assert normalizations["call_letters"] == {"uppercased": 2}
+
+    def test_field_mismatches_stays_fully_keyed_over_diff_columns(self) -> None:
+        """Zeros included, even when nothing at all is a mismatch --
+        ``_print_human`` subscripts every ``DIFF_COLUMNS`` entry unguarded."""
+        mod = _load_module()
+        mysql_rows = {1: _row()}
+        backend_rows = {1: _row()}
+        field_mismatches, _ = mod._classify_matched_rows(mysql_rows, backend_rows, [1])
+        assert set(field_mismatches) == set(mod.DIFF_COLUMNS)
+        assert all(v == 0 for v in field_mismatches.values())
+
+
+class TestFieldMismatchesTieringEndToEnd:
+    """The headline change: ``field_mismatches`` stops counting deliberate
+    Backend normalizations (Part 1's baseline classes) and only counts
+    genuine defects."""
+
+    def test_a_row_with_only_deliberate_normalizations_has_zero_mismatches(
+        self, tmp_path: Path
+    ) -> None:
+        mod = _load_module()
+        mysql_db = tmp_path / "mysql.db"
+        backend_db = tmp_path / "backend.db"
+        _make_library_db(
+            mysql_db,
+            [
+                {
+                    "id": 1,
+                    "artist": "Various Artists - latin",
+                    "call_letters": "xy",
+                    "artist_call_number": None,
+                    "release_call_number": None,
+                    "genre": "rock",
+                    "format": "vinyl - lp",
+                }
+            ],
+        )
+        _make_library_db(
+            backend_db,
+            [
+                {
+                    "id": 1,
+                    "artist": "Various Artists",
+                    "call_letters": "V/A",
+                    "artist_call_number": 0,
+                    "release_call_number": 0,
+                    "genre": "Rock",
+                    "format": 'vinyl 12"',
+                }
+            ],
+        )
+
+        result = mod.run_diff(str(mysql_db), str(backend_db))
+        assert result.matched == 1
+        assert set(result.field_mismatches) == set(mod.DIFF_COLUMNS)
+        assert all(v == 0 for v in result.field_mismatches.values())
+
+    def test_field_mismatches_still_flags_a_genuine_defect_among_normalizations(
+        self, tmp_path: Path
+    ) -> None:
+        """Deliberate normalizations elsewhere in the row don't mask a real
+        defect in one column."""
+        mod = _load_module()
+        mysql_db = tmp_path / "mysql.db"
+        backend_db = tmp_path / "backend.db"
+        _make_library_db(
+            mysql_db,
+            [{"id": 1, "call_letters": "xy", "genre": "rock"}],
+        )
+        _make_library_db(
+            backend_db,
+            # call_letters/genre are deliberate normalizations; artist is a
+            # genuine, unrelated defect.
+            [{"id": 1, "call_letters": "XY", "genre": "Rock", "artist": "Cat Power"}],
+        )
+
+        result = mod.run_diff(str(mysql_db), str(backend_db))
+        assert result.field_mismatches["call_letters"] == 0
+        assert result.field_mismatches["genre"] == 0
+        assert result.field_mismatches["artist"] == 1
+
+
+class TestCtaModelling:
+    """The CTA multiset gets the same TAB/NL substitution as the main library
+    columns, plus the empty-artist row-drop rule Backend's importer applies
+    (``parseLegacyCompilationTrackRows``, ``job.ts:710-711``)."""
+
+    def test_cta_tab_newline_substituted_before_comparing(self, tmp_path: Path) -> None:
+        mod = _load_module()
+        mysql_db = tmp_path / "mysql.db"
+        backend_db = tmp_path / "backend.db"
+        _make_library_db(
+            mysql_db,
+            [{"id": 1}],
+            cta_rows=[(1, "Duke Ellington\tJohn Coltrane", "In a Sentimental\nMood")],
+        )
+        _make_library_db(
+            backend_db,
+            [{"id": 1}],
+            cta_rows=[(1, "Duke Ellington John Coltrane", "In a Sentimental Mood")],
+        )
+
+        result = mod.run_diff(str(mysql_db), str(backend_db))
+        assert result.cta_missing == 0
+        assert result.cta_extra == 0
+
+    def test_cta_empty_artist_row_is_expected_missing_not_drift(self, tmp_path: Path) -> None:
+        mod = _load_module()
+        mysql_db = tmp_path / "mysql.db"
+        backend_db = tmp_path / "backend.db"
+        _make_library_db(
+            mysql_db,
+            [{"id": 1}],
+            cta_rows=[
+                (1, "  ", "Untitled Track"),
+                (1, "Juana Molina", "la paradoja"),
+            ],
+        )
+        _make_library_db(
+            backend_db,
+            [{"id": 1}],
+            cta_rows=[(1, "Juana Molina", "la paradoja")],
+        )
+
+        result = mod.run_diff(str(mysql_db), str(backend_db))
+        assert result.cta_missing == 0
+        assert result.cta_extra == 0
+
+    def test_cta_genuinely_missing_row_still_counts(self, tmp_path: Path) -> None:
+        mod = _load_module()
+        mysql_db = tmp_path / "mysql.db"
+        backend_db = tmp_path / "backend.db"
+        _make_library_db(
+            mysql_db,
+            [{"id": 1}],
+            cta_rows=[(1, "Juana Molina", "la paradoja")],
+        )
+        _make_library_db(backend_db, [{"id": 1}], cta_rows=[])
+
+        result = mod.run_diff(str(mysql_db), str(backend_db))
+        assert result.cta_missing == 1
         assert result.cta_extra == 0
 
 
