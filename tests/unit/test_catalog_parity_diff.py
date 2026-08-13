@@ -28,7 +28,7 @@ import sys
 import threading
 import time
 import unicodedata
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable
@@ -1804,6 +1804,407 @@ class TestMainCli:
         assert result.returncode == 0
         payload = json.loads(result.stdout)
         assert payload["matched"] == 1
+
+
+class TestClassificationRequiresLedger:
+    """Field tiering is unconditional; row-level expected/unexplained
+    classification and ``clean`` are not computed at all without a ledger."""
+
+    def test_without_ledger_everything_is_unexplained_and_clean_is_none(
+        self, tmp_path: Path
+    ) -> None:
+        mod = _load_module()
+        mysql_db = tmp_path / "mysql.db"
+        backend_db = tmp_path / "backend.db"
+        _make_library_db(mysql_db, [{"id": 1, "genre": "db_only"}, {"id": 2}])
+        _make_library_db(backend_db, [{"id": 2}, {"id": 1_000_042}])
+
+        mysql_conn = sqlite3.connect(mysql_db)
+        backend_conn = sqlite3.connect(backend_db)
+        result = mod.diff_library_dbs(mysql_conn, backend_conn, ledger=None)
+        mysql_conn.close()
+        backend_conn.close()
+
+        assert result.clean is None
+        assert result.missing_expected == 0
+        assert result.extra_expected == 0
+        assert result.missing_unexplained == result.missing_in_backend
+        assert result.extra_unexplained == result.extra_in_backend
+
+    def test_ledger_defaults_to_none_for_existing_callers(self, tmp_path: Path) -> None:
+        """The pre-existing diff_library_dbs/run_diff call sites pass no
+        ledger at all -- confirm that call shape still works and yields the
+        no-ledger (clean=None) behaviour rather than erroring."""
+        mod = _load_module()
+        mysql_db = tmp_path / "mysql.db"
+        backend_db = tmp_path / "backend.db"
+        _make_library_db(mysql_db, [{"id": 1}])
+        _make_library_db(backend_db, [{"id": 1}])
+
+        mysql_conn = sqlite3.connect(mysql_db)
+        backend_conn = sqlite3.connect(backend_db)
+        result = mod.diff_library_dbs(mysql_conn, backend_conn)
+        mysql_conn.close()
+        backend_conn.close()
+
+        assert result.clean is None
+
+
+class TestParityDiffFieldOrder:
+    """Field order is constrained by the dataclass (Part 3): the new fields
+    append after ``cta_extra`` in declaration order, with defaulted fields
+    (``normalizations`` and the two id lists) last."""
+
+    def test_declaration_order_matches_the_json_contract(self) -> None:
+        mod = _load_module()
+        names = [f.name for f in fields(mod.ParityDiff)]
+        assert names == [
+            "matched",
+            "missing_in_backend",
+            "extra_in_backend",
+            "field_mismatches",
+            "cta_missing",
+            "cta_extra",
+            "clean",
+            "missing_unexplained",
+            "missing_expected",
+            "extra_unexplained",
+            "extra_expected",
+            "normalizations",
+            "missing_in_backend_ids",
+            "extra_in_backend_ids",
+        ]
+
+    def test_module_imports_without_typeerror(self) -> None:
+        """A non-default field trailing a defaulted one makes @dataclass raise
+        TypeError at class-definition time -- i.e. at import. Re-importing
+        under a fresh module name (rather than relying on _load_module()'s
+        cache) proves THIS load succeeds, not a memoized earlier one."""
+        spec = importlib.util.spec_from_file_location(
+            "catalog_parity_diff_reimport_check", SCRIPT_PATH
+        )
+        assert spec is not None and spec.loader is not None
+        fresh = importlib.util.module_from_spec(spec)
+        # Needed for `from __future__ import annotations` dataclasses to
+        # resolve their string-annotated field types at decoration time --
+        # mirrors _load_module()'s own sys.modules registration above.
+        sys.modules["catalog_parity_diff_reimport_check"] = fresh
+        spec.loader.exec_module(fresh)  # raises TypeError if field order is wrong
+        assert fresh.ParityDiff is not None
+
+
+class TestCleanVerdictEndToEnd:
+    """``clean`` is true only on zero unexplained missing/extra, zero field
+    mismatches, and CTA within its documented baseline."""
+
+    def test_clean_true_when_everything_matches_and_cta_within_baseline(
+        self, tmp_path: Path
+    ) -> None:
+        mod = _load_module()
+        mysql_db = tmp_path / "mysql.db"
+        backend_db = tmp_path / "backend.db"
+        rows = [{"id": 1, "title": "DOGA", "artist": "Juana Molina"}]
+        _make_library_db(mysql_db, rows)
+        _make_library_db(backend_db, rows)
+
+        mysql_conn = sqlite3.connect(mysql_db)
+        backend_conn = sqlite3.connect(backend_db)
+        ledger = _ledger(cta_missing_baseline=0, cta_extra_baseline=0)
+        result = mod.diff_library_dbs(mysql_conn, backend_conn, ledger=ledger)
+        mysql_conn.close()
+        backend_conn.close()
+
+        assert result.clean is True
+
+    def test_clean_false_on_an_unexplained_missing_row(self, tmp_path: Path) -> None:
+        mod = _load_module()
+        mysql_db = tmp_path / "mysql.db"
+        backend_db = tmp_path / "backend.db"
+        _make_library_db(mysql_db, [{"id": 1}, {"id": 2, "genre": "Rock", "format": "CD"}])
+        _make_library_db(backend_db, [{"id": 1}])
+
+        mysql_conn = sqlite3.connect(mysql_db)
+        backend_conn = sqlite3.connect(backend_db)
+        ledger = _ledger(cta_missing_baseline=0, cta_extra_baseline=0)
+        result = mod.diff_library_dbs(mysql_conn, backend_conn, ledger=ledger)
+        mysql_conn.close()
+        backend_conn.close()
+
+        assert result.clean is False
+        assert result.missing_unexplained == 1
+
+    def test_clean_false_on_a_genuine_field_mismatch(self, tmp_path: Path) -> None:
+        mod = _load_module()
+        mysql_db = tmp_path / "mysql.db"
+        backend_db = tmp_path / "backend.db"
+        _make_library_db(mysql_db, [{"id": 1, "genre": "Rock"}])
+        _make_library_db(backend_db, [{"id": 1, "genre": "Electronic"}])
+
+        mysql_conn = sqlite3.connect(mysql_db)
+        backend_conn = sqlite3.connect(backend_db)
+        ledger = _ledger(cta_missing_baseline=0, cta_extra_baseline=0)
+        result = mod.diff_library_dbs(mysql_conn, backend_conn, ledger=ledger)
+        mysql_conn.close()
+        backend_conn.close()
+
+        assert result.clean is False
+
+    def test_normalization_alone_does_not_break_clean(self, tmp_path: Path) -> None:
+        """A deliberate normalization (case-different genre) is reported,
+        never gating."""
+        mod = _load_module()
+        mysql_db = tmp_path / "mysql.db"
+        backend_db = tmp_path / "backend.db"
+        _make_library_db(mysql_db, [{"id": 1, "genre": "rock"}])
+        _make_library_db(backend_db, [{"id": 1, "genre": "Rock"}])
+
+        mysql_conn = sqlite3.connect(mysql_db)
+        backend_conn = sqlite3.connect(backend_db)
+        ledger = _ledger(cta_missing_baseline=0, cta_extra_baseline=0)
+        result = mod.diff_library_dbs(mysql_conn, backend_conn, ledger=ledger)
+        mysql_conn.close()
+        backend_conn.close()
+
+        assert result.clean is True
+        assert result.normalizations["genre"]["case_folded"] == 1
+
+    def test_clean_false_without_a_populated_cta_baseline(self, tmp_path: Path) -> None:
+        """A ledger with no baseline yet (None/None, the shipped default)
+        cannot certify CTA is within bounds -- clean stays False even when
+        everything else matches, matching 'until step 6, clean cannot be
+        true.'"""
+        mod = _load_module()
+        mysql_db = tmp_path / "mysql.db"
+        backend_db = tmp_path / "backend.db"
+        rows = [{"id": 1}]
+        _make_library_db(mysql_db, rows)
+        _make_library_db(backend_db, rows)
+
+        mysql_conn = sqlite3.connect(mysql_db)
+        backend_conn = sqlite3.connect(backend_db)
+        result = mod.diff_library_dbs(mysql_conn, backend_conn, ledger=_ledger())
+        mysql_conn.close()
+        backend_conn.close()
+
+        assert result.clean is False
+
+
+class TestResidueLedgerCli:
+    """``--residue-ledger`` / ``--fail-on-drift`` CLI wiring."""
+
+    def _write_ledger(self, path: Path, *, cta_missing_baseline=0, cta_extra_baseline=0) -> None:
+        path.write_text(
+            json.dumps(
+                {
+                    "measured_date": "2026-08-11",
+                    "collapsed_mysql_ids": {},
+                    "baselines": {
+                        "measured_date": "2026-08-11",
+                        "normalizations": {},
+                        "cta_missing": cta_missing_baseline,
+                        "cta_extra": cta_extra_baseline,
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    def test_fail_on_drift_with_residue_ledger_none_exits_2(self, tmp_path: Path) -> None:
+        mod = _load_module()
+        mysql_db = tmp_path / "mysql.db"
+        backend_db = tmp_path / "backend.db"
+        _make_library_db(mysql_db, [{"id": 1}])
+        _make_library_db(backend_db, [{"id": 1}])
+
+        exit_code = mod.main(
+            [
+                "--mysql-db",
+                str(mysql_db),
+                "--backend-db",
+                str(backend_db),
+                "--residue-ledger",
+                "none",
+                "--fail-on-drift",
+            ]
+        )
+        assert exit_code == 2
+
+    def test_residue_ledger_none_alone_reports_clean_null(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture
+    ) -> None:
+        mod = _load_module()
+        mysql_db = tmp_path / "mysql.db"
+        backend_db = tmp_path / "backend.db"
+        _make_library_db(mysql_db, [{"id": 1}])
+        _make_library_db(backend_db, [{"id": 1}])
+
+        exit_code = mod.main(
+            [
+                "--mysql-db",
+                str(mysql_db),
+                "--backend-db",
+                str(backend_db),
+                "--residue-ledger",
+                "none",
+                "--json",
+            ]
+        )
+        assert exit_code == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["clean"] is None
+
+    def test_residue_ledger_missing_path_exits_3(self, tmp_path: Path) -> None:
+        mod = _load_module()
+        mysql_db = tmp_path / "mysql.db"
+        backend_db = tmp_path / "backend.db"
+        _make_library_db(mysql_db, [{"id": 1}])
+        _make_library_db(backend_db, [{"id": 1}])
+
+        exit_code = mod.main(
+            [
+                "--mysql-db",
+                str(mysql_db),
+                "--backend-db",
+                str(backend_db),
+                "--residue-ledger",
+                str(tmp_path / "does-not-exist.json"),
+            ]
+        )
+        assert exit_code == 3
+
+    def test_residue_ledger_malformed_json_exits_3(self, tmp_path: Path) -> None:
+        mod = _load_module()
+        mysql_db = tmp_path / "mysql.db"
+        backend_db = tmp_path / "backend.db"
+        _make_library_db(mysql_db, [{"id": 1}])
+        _make_library_db(backend_db, [{"id": 1}])
+        bad_ledger = tmp_path / "ledger.json"
+        bad_ledger.write_text("not json{{{", encoding="utf-8")
+
+        exit_code = mod.main(
+            [
+                "--mysql-db",
+                str(mysql_db),
+                "--backend-db",
+                str(backend_db),
+                "--residue-ledger",
+                str(bad_ledger),
+            ]
+        )
+        assert exit_code == 3
+
+    def test_fail_on_drift_exits_4_when_not_clean(self, tmp_path: Path) -> None:
+        mod = _load_module()
+        mysql_db = tmp_path / "mysql.db"
+        backend_db = tmp_path / "backend.db"
+        _make_library_db(mysql_db, [{"id": 1}, {"id": 2, "genre": "Rock", "format": "CD"}])
+        _make_library_db(backend_db, [{"id": 1}])
+        ledger_path = tmp_path / "ledger.json"
+        self._write_ledger(ledger_path)
+
+        exit_code = mod.main(
+            [
+                "--mysql-db",
+                str(mysql_db),
+                "--backend-db",
+                str(backend_db),
+                "--residue-ledger",
+                str(ledger_path),
+                "--fail-on-drift",
+            ]
+        )
+        assert exit_code == 4
+
+    def test_fail_on_drift_exits_0_when_clean(self, tmp_path: Path) -> None:
+        mod = _load_module()
+        mysql_db = tmp_path / "mysql.db"
+        backend_db = tmp_path / "backend.db"
+        rows = [{"id": 1}]
+        _make_library_db(mysql_db, rows)
+        _make_library_db(backend_db, rows)
+        ledger_path = tmp_path / "ledger.json"
+        self._write_ledger(ledger_path)
+
+        exit_code = mod.main(
+            [
+                "--mysql-db",
+                str(mysql_db),
+                "--backend-db",
+                str(backend_db),
+                "--residue-ledger",
+                str(ledger_path),
+                "--fail-on-drift",
+            ]
+        )
+        assert exit_code == 0
+
+    def test_default_residue_ledger_resolves_from_an_arbitrary_cwd(self, tmp_path: Path) -> None:
+        """The default --residue-ledger path must resolve relative to the
+        module, never the cwd -- an operator's mktemp -d workflow launches
+        this from anywhere. Runs as a real subprocess with cwd=tmp_path (a
+        directory with no vendor/ nearby) to prove it, not just call the
+        function in-process where cwd never mattered to begin with."""
+        mysql_db = tmp_path / "mysql.db"
+        backend_db = tmp_path / "backend.db"
+        _make_library_db(mysql_db, [{"id": 1}])
+        _make_library_db(backend_db, [{"id": 1}])
+
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(SCRIPT_PATH),
+                "--mysql-db",
+                str(mysql_db),
+                "--backend-db",
+                str(backend_db),
+                "--json",
+            ],
+            capture_output=True,
+            text=True,
+            cwd=str(tmp_path),
+        )
+
+        assert result.returncode == 0, result.stderr
+        payload = json.loads(result.stdout)
+        # clean is not None only when a ledger actually loaded -- proving the
+        # module-relative default found the real vendored ledger.json despite
+        # running from a cwd with nothing under it.
+        assert payload["clean"] is not None
+
+    def test_print_human_and_log_carry_the_verdict(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        mod = _load_module()
+        mysql_db = tmp_path / "mysql.db"
+        backend_db = tmp_path / "backend.db"
+        rows = [{"id": 1}]
+        _make_library_db(mysql_db, rows)
+        _make_library_db(backend_db, rows)
+        ledger_path = tmp_path / "ledger.json"
+        self._write_ledger(ledger_path)
+
+        with caplog.at_level(logging.INFO):
+            exit_code = mod.main(
+                [
+                    "--mysql-db",
+                    str(mysql_db),
+                    "--backend-db",
+                    str(backend_db),
+                    "--residue-ledger",
+                    str(ledger_path),
+                ]
+            )
+        assert exit_code == 0
+
+        human_out = capsys.readouterr().out
+        assert "clean" in human_out
+
+        final_record = next(
+            r for r in caplog.records if r.message == "catalog parity diff complete"
+        )
+        assert final_record.clean is True
+        assert final_record.missing_unexplained == 0
+        assert final_record.extra_unexplained == 0
 
 
 class TestBackendProducer:
