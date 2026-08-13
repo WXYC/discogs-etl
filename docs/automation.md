@@ -113,7 +113,12 @@ After a successful run, verify the library-metadata-lookup health endpoint retur
 
 ## Unwired secrets (catalog parity)
 
-Two repo secrets exist that **no workflow reads yet**. They authenticate the Backend-sourced producer in `scripts/catalog_parity_diff.py` against `GET /library/catalog` — the catalog-parity soak on [wiki#89](https://github.com/WXYC/wiki/issues/89), which runs by hand today. [#370](https://github.com/WXYC/discogs-etl/issues/370) gave the harness a `clean` verdict and a `--fail-on-drift` exit code (4) for exactly this purpose, but that flag still has no consumer: a scheduled workflow needs the Kattare SSH tunnel and the MariaDB client (`sync-library.yml` is the shape to copy), which is real scope and was deliberately not folded into #370. Until that follow-up workflow is filed and lands, these secrets are set so the soak can run unattended from a runner or a laptop without a credential detour, and the seven-consecutive-clean-days streak stays a hand-run invocation.
+Two repo secrets exist that **no workflow reads yet**. They authenticate the Backend-sourced producer in `scripts/catalog_parity_diff.py` against `GET /library/catalog` — the catalog-parity soak on [wiki#89](https://github.com/WXYC/wiki/issues/89), which runs by hand today. [#370](https://github.com/WXYC/discogs-etl/issues/370) gave the harness a `clean` verdict and a `--fail-on-drift` exit code (4) for exactly this purpose, but that flag still has no consumer: a scheduled workflow needs the Kattare SSH tunnel and the MariaDB client (`sync-library.yml` is the shape to copy), which is real scope and was deliberately not folded into #370. That workflow is now filed as **[#378](https://github.com/WXYC/discogs-etl/issues/378)**, which #346 is blocked by; until it lands, these secrets are set so the soak can run unattended from a runner or a laptop without a credential detour, and the seven-consecutive-clean-days streak stays a hand-run invocation.
+
+Two things that cost time on the first live run ([#346's step-8a measurement](https://github.com/WXYC/discogs-etl/issues/346#issuecomment-5287728924)) and that #378 has to carry, so they are recorded here rather than only in that comment:
+
+- **The MySQL producer needs a MariaDB client.** The Homebrew MySQL 9.7 client **segfaults (exit 139)** against tubafrenzy's MySQL 5.1.56. `sync-library.yml` installs `mariadb-client` for exactly this reason.
+- **`--default-character-set=utf8` is load-bearing.** Without it the connection negotiates latin1 and the dump is not valid UTF-8, which fails `parse_library_tsv` outright rather than showing up as drift. `scripts/sync-library.sh` passes it on both SELECTs.
 
 | Secret | Description |
 |--------|-------------|
