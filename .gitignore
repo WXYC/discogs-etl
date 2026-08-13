@@ -17,5 +17,6 @@ artist_mappings.json
 # Allow test fixture files
 !tests/fixtures/**/*.db
 !tests/fixtures/**/*.csv
+!tests/fixtures/**/*.tsv
 worklog/
 .DS_Store

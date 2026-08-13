@@ -138,6 +138,7 @@ from urllib.request import (
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from lib.backend_catalog_norm import (  # noqa: E402
     fold_artist_name,
+    is_db_only_genre,
     normalize_artist_name,
     normalize_code_letters,
     parse_format_and_discs,
@@ -205,6 +206,127 @@ class ParityDiff:
     cta_extra: int
     missing_in_backend_ids: list[int] = field(default_factory=list)
     extra_in_backend_ids: list[int] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class ResidueLedger:
+    """The vendored discogs-etl#370 expected-residue ledger
+    (``vendor/parity-residue/ledger.json``, pinned by
+    ``parity-residue-pin.txt``).
+
+    ``collapsed_ids`` is the ONE genuinely frozen enumeration: the 599
+    ``findExistingRelease`` duplicate-collapse mysql ids (skip path 7 in the
+    plan's Rule B table), which cannot be re-derived from a library.db row.
+    Everything else Rule A/B classify (a minted backend id, a db_only genre,
+    an unparseable format, an empty artist name or album title) is computed
+    directly from row data and needs no ledger entry at all -- see
+    ``_rule_b_missing_reason`` and ``_is_minted_id``.
+
+    ``normalizations_baseline`` / ``cta_missing_baseline`` /
+    ``cta_extra_baseline`` are step 6's concern (the plan's CTA-baseline
+    commit) and are ``{}`` / ``None`` / ``None`` until that step populates
+    them -- see ``vendor/parity-residue/ledger.json``'s ``baselines`` block
+    and ``scripts/vendor_parity_residue.py``.
+    """
+
+    collapsed_ids: frozenset[int]
+    normalizations_baseline: dict[str, dict[str, int]]
+    cta_missing_baseline: int | None
+    cta_extra_baseline: int | None
+    measured_date: str | None
+
+
+def load_residue_ledger(path: str | Path) -> ResidueLedger:
+    """Load and validate a ``ResidueLedger`` from a vendored ``ledger.json``.
+
+    Raises ``SourceError`` for a missing file, unreadable/malformed JSON, or
+    a payload missing the required ``collapsed_mysql_ids`` key -- the same
+    contract as an unreadable ``library.db`` (exit 3 at the CLI).
+    """
+    p = Path(path)
+    if not p.is_file():
+        raise SourceError(f"residue ledger not found: {p}")
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        raise SourceError(f"residue ledger unreadable or malformed: {p} ({exc})") from exc
+    try:
+        collapsed_raw = data["collapsed_mysql_ids"]
+        collapsed_ids = frozenset(int(k) for k in collapsed_raw)
+        baselines = data.get("baselines") or {}
+        normalizations_baseline = baselines.get("normalizations", {})
+        cta_missing_baseline = baselines.get("cta_missing")
+        cta_extra_baseline = baselines.get("cta_extra")
+        measured_date = data.get("measured_date")
+    except (KeyError, TypeError, ValueError) as exc:
+        raise SourceError(f"residue ledger malformed: {p} ({exc})") from exc
+    return ResidueLedger(
+        collapsed_ids=collapsed_ids,
+        normalizations_baseline=normalizations_baseline,
+        cta_missing_baseline=cta_missing_baseline,
+        cta_extra_baseline=cta_extra_baseline,
+        measured_date=measured_date,
+    )
+
+
+def _default_residue_ledger_path() -> Path:
+    """The vendored ledger's path, resolved from this module's own location
+    -- NEVER from the current working directory.
+
+    A cwd-relative default would fail every invocation launched from
+    anywhere but the repo root, starting with the ``mktemp -d`` block in
+    ``docs/architecture.md``'s "Catalog parity producers" section that an
+    operator copies verbatim to run the soak. Precedent:
+    ``alembic/versions/0004_wxyc_identity_match_fns.py``'s ``_REPO_ROOT`` and
+    ``tests/integration/test_wxyc_identity_match_parity.py``'s ``REPO_ROOT``.
+    """
+    return Path(__file__).resolve().parent.parent / "vendor" / "parity-residue" / "ledger.json"
+
+
+# BS#1963 mints extra_in_backend ids from here up; those releases have no
+# tubafrenzy counterpart by construction. The set grows during the soak as
+# librarians add through dj-site, so it is a RULE (Rule A), never an
+# enumeration -- enumerating it would go stale within a day.
+_MINTED_ID_FLOOR = 1_000_000
+
+
+def _is_minted_id(backend_id: int) -> bool:
+    """Rule A: a backend-only id at or above the minted floor is expected
+    residue by construction, with no ledger entry required."""
+    return backend_id >= _MINTED_ID_FLOOR
+
+
+def _rule_b_missing_reason(mysql_row: Mapping[str, object]) -> str | None:
+    """Rule B, the row-derivable half only (skip paths 1/3/5/6 -- ``db_only``
+    genre, an unparseable format, an empty artist name, an empty album
+    title). Checked in ``job.ts``'s own skip order so a row that would have
+    tripped an earlier check there is attributed to that one here too.
+
+    Returns ``None`` for paths 2/4 (a genre/format id absent from Backend's
+    OWN lookup tables) and paths 7/8 (the 599 duplicate-collapse and a
+    Backend-side parse failure) -- none of those are computable from a
+    mysql-sourced library.db row alone, so they correctly fall through as
+    unexplained rather than being guessed at.
+
+    Both the artist and title checks are spelled ``_normalize(value) is
+    None`` rather than ``value.strip() == ""``: ``LIBRARY_SELECT_SQL`` has
+    no ``IFNULL`` wrapper (unlike Backend's own extraction SQL), so a SQL
+    NULL reaches library.db as NULL, not ``''``, for these two columns. A
+    bare ``.strip() == ""`` predicate would miss every such row, and reusing
+    ``_normalize`` -- rather than restating its NULL/''/'NULL' literals --
+    means this predicate cannot drift from the comparison it qualifies.
+    """
+    genre = mysql_row.get("genre")
+    if is_db_only_genre(genre if isinstance(genre, str) else None):
+        return "db_only_genre"
+    fmt = mysql_row.get("format")
+    if parse_format_and_discs(fmt if isinstance(fmt, str) else "") is None:
+        return "unparseable_format"
+    if _normalize(mysql_row.get("artist")) is None:
+        return "empty_artist_name"
+    if _normalize(mysql_row.get("title")) is None:
+        return "empty_album_title"
+    return None
 
 
 def _normalize(value: object) -> object:
@@ -728,6 +850,42 @@ def _load_cta_counts(conn: sqlite3.Connection) -> Counter[tuple[object, ...]]:
             continue
         counter[tuple(_normalize(record[col]) for col in CTA_COLUMNS)] += 1
     return counter
+
+
+def _classify_row_expectations(
+    mysql_rows: Mapping[int, Mapping[str, object]],
+    missing_ids: Sequence[int],
+    extra_ids: Sequence[int],
+    ledger: ResidueLedger,
+) -> tuple[int, int, int, int]:
+    """Split ``missing_ids`` / ``extra_ids`` into expected vs. unexplained.
+
+    An id is expected-missing when Rule B's row-derivable predicate matches
+    its mysql row (``_rule_b_missing_reason``) OR it is one of the ledger's
+    enumerated 599 collapse ids -- either is sufficient, so a stale ledger
+    entry that Rule B would ALSO have explained does not double count.
+
+    An id is expected-extra when Rule A's minted-id predicate matches (there
+    is no enumerated extra-id set yet -- see ``ResidueLedger``'s docstring).
+
+    A ledger id that does not appear in ``missing_ids`` at all (already
+    resolved, or never was missing) is silently a no-op here: this function
+    only ever looks UP an actual missing/extra id in the ledger, never the
+    other way around, so a stale ledger entry cannot raise.
+
+    Returns ``(missing_expected, missing_unexplained, extra_expected,
+    extra_unexplained)``.
+    """
+    missing_expected = 0
+    for id_ in missing_ids:
+        if id_ in ledger.collapsed_ids or _rule_b_missing_reason(mysql_rows[id_]) is not None:
+            missing_expected += 1
+    missing_unexplained = len(missing_ids) - missing_expected
+
+    extra_expected = sum(1 for id_ in extra_ids if _is_minted_id(id_))
+    extra_unexplained = len(extra_ids) - extra_expected
+
+    return missing_expected, missing_unexplained, extra_expected, extra_unexplained
 
 
 def diff_library_dbs(

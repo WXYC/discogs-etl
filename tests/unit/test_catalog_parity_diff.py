@@ -1369,6 +1369,192 @@ class TestCtaModelling:
         assert result.cta_extra == 0
 
 
+def _ledger(**overrides: Any) -> Any:
+    """A ResidueLedger with no enumerated ids and no baseline -- the "rules
+    only" starting point for tests that must prove a row is expected WITHOUT
+    an enumerated ledger entry."""
+    mod = _load_module()
+    defaults: dict[str, Any] = {
+        "collapsed_ids": frozenset(),
+        "normalizations_baseline": {},
+        "cta_missing_baseline": None,
+        "cta_extra_baseline": None,
+        "measured_date": None,
+    }
+    defaults.update(overrides)
+    return mod.ResidueLedger(**defaults)
+
+
+class TestResidueLedgerLoader:
+    """``load_residue_ledger`` reads the vendored ``ledger.json`` shape."""
+
+    def _write_ledger_json(self, path: Path, **overrides: Any) -> None:
+        payload = {
+            "measured_date": "2026-08-11",
+            "collapsed_mysql_ids": {"8": 7, "151": 150},
+            "baselines": {
+                "measured_date": None,
+                "normalizations": {},
+                "cta_missing": None,
+                "cta_extra": None,
+            },
+        }
+        payload.update(overrides)
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+    def test_loads_collapsed_ids_and_baselines(self, tmp_path: Path) -> None:
+        mod = _load_module()
+        path = tmp_path / "ledger.json"
+        self._write_ledger_json(
+            path,
+            baselines={
+                "measured_date": "2026-08-13",
+                "normalizations": {"genre": {"case_folded": 42}},
+                "cta_missing": 2771,
+                "cta_extra": 6932,
+            },
+        )
+
+        ledger = mod.load_residue_ledger(path)
+
+        assert ledger.collapsed_ids == frozenset({8, 151})
+        assert ledger.normalizations_baseline == {"genre": {"case_folded": 42}}
+        assert ledger.cta_missing_baseline == 2771
+        assert ledger.cta_extra_baseline == 6932
+        assert ledger.measured_date == "2026-08-11"
+
+    def test_missing_file_raises_source_error(self, tmp_path: Path) -> None:
+        mod = _load_module()
+        with pytest.raises(mod.SourceError):
+            mod.load_residue_ledger(tmp_path / "does-not-exist.json")
+
+    def test_malformed_json_raises_source_error(self, tmp_path: Path) -> None:
+        mod = _load_module()
+        path = tmp_path / "ledger.json"
+        path.write_text("not json{{{", encoding="utf-8")
+        with pytest.raises(mod.SourceError):
+            mod.load_residue_ledger(path)
+
+    def test_missing_collapsed_key_raises_source_error(self, tmp_path: Path) -> None:
+        mod = _load_module()
+        path = tmp_path / "ledger.json"
+        path.write_text(
+            json.dumps({"measured_date": "2026-08-11", "baselines": {}}), encoding="utf-8"
+        )
+        with pytest.raises(mod.SourceError):
+            mod.load_residue_ledger(path)
+
+    def test_real_vendored_ledger_loads(self) -> None:
+        """Sanity check against the actual vendored file this repo ships."""
+        mod = _load_module()
+        ledger = mod.load_residue_ledger(REPO_ROOT / "vendor" / "parity-residue" / "ledger.json")
+        assert len(ledger.collapsed_ids) == 599
+
+
+class TestRuleBMissingReason:
+    """``_rule_b_missing_reason`` -- skip paths 1/3/5/6, purely from a row's
+    own data. Unit-level (no sqlite, no ledger, no diff_library_dbs): that
+    wiring is discogs-etl#370 step 5's concern, not step 4's."""
+
+    def test_db_only_genre_is_a_reason(self) -> None:
+        mod = _load_module()
+        assert mod._rule_b_missing_reason(_row(genre="  Db_Only  ")) == "db_only_genre"
+
+    def test_unparseable_format_is_a_reason(self) -> None:
+        mod = _load_module()
+        assert mod._rule_b_missing_reason(_row(format="cassette")) == "unparseable_format"
+
+    def test_null_artist_name_is_a_reason(self) -> None:
+        """The NULL note: LIBRARY_SELECT_SQL has no IFNULL wrapper, so a SQL
+        NULL artist reaches library.db as NULL, not ''. The predicate must
+        catch both -- it is spelled ``_normalize(value) is None``, which
+        collapses NULL and '' identically."""
+        mod = _load_module()
+        assert mod._rule_b_missing_reason(_row(artist=None)) == "empty_artist_name"
+
+    def test_whitespace_only_artist_name_is_the_same_reason_as_null(self) -> None:
+        mod = _load_module()
+        assert mod._rule_b_missing_reason(_row(artist="   ")) == "empty_artist_name"
+
+    def test_empty_album_title_is_a_reason(self) -> None:
+        mod = _load_module()
+        assert mod._rule_b_missing_reason(_row(title="")) == "empty_album_title"
+
+    def test_ordinary_row_has_no_reason(self) -> None:
+        """Stand-in for skip paths 2/4/7/8 (not row-derivable): a row with no
+        db_only genre, a parseable format, and non-empty artist/title has no
+        rule to explain it at all."""
+        mod = _load_module()
+        assert mod._rule_b_missing_reason(_row(genre="Rock", format="CD")) is None
+
+
+class TestIsMintedId:
+    """Rule A: ``id >= 1_000_000`` is expected residue by construction
+    (BS#1963 mints there) -- no ledger entry required."""
+
+    def test_minted_id_is_true(self) -> None:
+        mod = _load_module()
+        assert mod._is_minted_id(1_000_042) is True
+
+    def test_floor_itself_is_minted(self) -> None:
+        mod = _load_module()
+        assert mod._is_minted_id(1_000_000) is True
+
+    def test_below_floor_is_not_minted(self) -> None:
+        mod = _load_module()
+        assert mod._is_minted_id(999_999) is False
+
+
+class TestClassifyRowExpectations:
+    """``_classify_row_expectations`` -- the pure function combining Rule
+    A, Rule B, and the frozen 599-id enumeration. No sqlite, no ParityDiff:
+    just the (missing_ids, extra_ids) -> counts arithmetic."""
+
+    def test_rule_b_match_is_expected_without_a_ledger_entry(self) -> None:
+        # Return shape: (missing_expected, missing_unexplained, extra_expected, extra_unexplained)
+        mod = _load_module()
+        mysql_rows = {1: _row(id=1, genre="db_only")}
+        result = mod._classify_row_expectations(mysql_rows, [1], [], _ledger())
+        assert result == (1, 0, 0, 0)
+
+    def test_no_rule_match_and_no_ledger_entry_is_unexplained(self) -> None:
+        mod = _load_module()
+        mysql_rows = {1: _row(id=1, genre="Rock", format="CD")}
+        result = mod._classify_row_expectations(mysql_rows, [1], [], _ledger())
+        assert result == (0, 1, 0, 0)
+
+    def test_minted_extra_id_is_expected_without_a_ledger_entry(self) -> None:
+        mod = _load_module()
+        result = mod._classify_row_expectations({}, [], [1_000_042], _ledger())
+        assert result == (0, 0, 1, 0)
+
+    def test_non_minted_extra_id_is_unexplained(self) -> None:
+        mod = _load_module()
+        result = mod._classify_row_expectations({}, [], [42], _ledger())
+        assert result == (0, 0, 0, 1)
+
+    def test_enumerated_id_is_expected_missing_even_with_ordinary_row_data(self) -> None:
+        """The 599 collapse ids are the one thing that genuinely needs a
+        ledger ENTRY (not just a rule): an ordinary row with no rule-matching
+        field is only expected-missing because it is enumerated."""
+        mod = _load_module()
+        mysql_rows = {11406: _row(id=11406, genre="Rock", format="CD")}
+        ledger = _ledger(collapsed_ids=frozenset({11406}))
+        result = mod._classify_row_expectations(mysql_rows, [11406], [], ledger)
+        assert result == (1, 0, 0, 0)
+
+    def test_ledger_id_absent_from_missing_ids_does_not_raise(self) -> None:
+        """A stale ledger entry (an id the ledger names but today's
+        missing_ids does not contain at all) must not crash -- it simply
+        never gets looked up, since this function only ever looks UP an
+        actual missing id in the ledger, never the other way around."""
+        mod = _load_module()
+        mysql_rows = {1: _row(id=1)}
+        ledger = _ledger(collapsed_ids=frozenset({999_999}))
+        result = mod._classify_row_expectations(mysql_rows, [], [], ledger)
+        assert result == (0, 0, 0, 0)
+
+
 class TestRunDiff:
     """run_diff() opens both files read-only and raises SourceError on bad input."""
 
