@@ -24,6 +24,8 @@ out: ``fold_artist_name`` must NOT collapse them together.
 
 from __future__ import annotations
 
+import unicodedata
+
 import pytest
 
 from lib.backend_catalog_norm import (
@@ -159,18 +161,40 @@ class TestParseFormatAndDiscs:
 
 
 # --- fold_artist_name (migration 0134 twin) --------------------------------
+#
+# The NFD (decomposed) form of each name is derived with
+# `unicodedata.normalize`, not typed as a second source literal: a
+# hand-typed "distinct codepoints" literal routinely gets silently
+# NFC-normalized back to the same bytes as its NFC sibling by an editor,
+# clipboard, or file-write pipeline, which would make the "all variants fold
+# equal" tests below pass trivially without ever exercising the NFD path.
+# Deriving it programmatically guarantees the two are byte-distinct.
 
 _NILUFER_NFC = "Nilüfer Yanya"  # ü = U+00FC
-_NILUFER_NFD = "Nilüfer Yanya"  # u + U+0308 (combining diaeresis)
+_NILUFER_NFD = unicodedata.normalize("NFD", _NILUFER_NFC)  # u + U+0308 (combining diaeresis)
 _NILUFER_ASCII = "Nilufer Yanya"
 
 _CSILLAG_NFC = "Csillagrablók"  # ó = U+00F3
-_CSILLAG_NFD = "Csillagrablók"  # o + U+0301 (combining acute)
+_CSILLAG_NFD = unicodedata.normalize("NFD", _CSILLAG_NFC)  # o + U+0301 (combining acute)
 _CSILLAG_ASCII = "Csillagrablok"
 
 _HERMANOS_NFC = "Hermanos Gutiérrez"  # é = U+00E9
-_HERMANOS_NFD = "Hermanos Gutiérrez"  # e + U+0301
+_HERMANOS_NFD = unicodedata.normalize("NFD", _HERMANOS_NFC)  # e + U+0301
 _HERMANOS_ASCII = "Hermanos Gutierrez"
+
+
+@pytest.mark.parametrize(
+    "nfc, nfd",
+    [
+        (_NILUFER_NFC, _NILUFER_NFD),
+        (_CSILLAG_NFC, _CSILLAG_NFD),
+        (_HERMANOS_NFC, _HERMANOS_NFD),
+    ],
+)
+def test_nfc_and_nfd_fixtures_are_byte_distinct(nfc: str, nfd: str) -> None:
+    """Guards the fixtures themselves: if this fails, the NFD variant collapsed
+    back to NFC somewhere and the fold-equality tests below would be vacuous."""
+    assert nfc != nfd
 
 
 class TestFoldArtistName:

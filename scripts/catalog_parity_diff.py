@@ -61,6 +61,25 @@ this diff automatically instead of becoming an undiffed blind spot.
 module's docstring), so it is excluded from the diffed column set below
 rather than compared as a trivially-always-equal no-op.
 
+**Field-level modeling (discogs-etl#370).** A field-by-field byte compare
+overcounts: most of what looks like drift between the two sides is actually
+Backend's own ``library-etl`` ETL running deterministic transforms on the way
+in (VA-folding an artist name, uppercasing code letters, coercing a NULL
+call number to ``0``, ...). ``COLUMN_MODELS`` (keyed by column name, one
+entry per ``DIFF_COLUMNS`` member -- see the drift-guard test asserting set
+equality between the two) replays those transforms, ported to Python in
+``lib/backend_catalog_norm.py``, to derive what Backend *should* hold from
+the raw mysql-sourced value. Each matched row's field then classifies as
+"agree" (byte-identical), "normalized" (Backend equals the *derived*
+expectation, not the raw mysql value -- a deliberate, counted-not-drift
+transform), or "mismatch" (neither -- a genuine defect). **This redefines
+``field_mismatches``**: it now counts only the "mismatch" tier, not every
+byte-level difference -- a column that differs solely by a deliberate
+normalization (case folding, VA collapsing, a coerced NULL) no longer counts
+toward it. The normalized-tier counts themselves are tallied by
+``_classify_matched_rows`` (column -> class -> count) but are not yet part of
+this module's public ``ParityDiff``/``--json`` contract.
+
 Usage::
 
     python scripts/catalog_parity_diff.py \\
@@ -101,7 +120,7 @@ import tempfile
 import time
 import zlib
 from collections import Counter
-from collections.abc import Callable, Iterable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -116,6 +135,12 @@ from urllib.request import (
 )
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from lib.backend_catalog_norm import (  # noqa: E402
+    fold_artist_name,
+    normalize_artist_name,
+    normalize_code_letters,
+    parse_format_and_discs,
+)
 from lib.library_db import (  # noqa: E402
     CROSS_REFERENCE_SEPARATOR,
     LIBRARY_COLUMNS,
@@ -193,6 +218,348 @@ def _normalize(value: object) -> object:
     return value
 
 
+# --- Per-column expectation model (discogs-etl#370, plan Part 1) ----------
+#
+# Each diffed column classifies into one of three tiers, computed by
+# comparing the Backend-sourced value against what Backend's own ETL
+# (`lib/backend_catalog_norm.py`, ported from `job.ts`) would derive from the
+# raw mysql-sourced value:
+#
+#   - "agree"      -- backend == mysql, byte-for-byte (under `_normalize`).
+#   - "normalized" -- backend == expected(mysql) != mysql. A deliberate,
+#     row-derivable Backend transform -- counted, not drift.
+#   - "mismatch"   -- neither of the above. Backend disagrees with its own
+#     ETL's spec: a genuine defect.
+#
+# `artist` (and the two multiset/VA-coupled columns downstream of it,
+# `call_letters` and `cross_reference_names`) get a fourth wrinkle folded
+# into the "normalized" tier: `ensureArtist` can return an existing row's
+# STORED spelling on a fold match, which is not reproducible by replaying
+# `normalize_artist_name` alone. A backend value that is fold-equal (but not
+# byte-equal) to the derived expectation is still "normalized", tagged with
+# its own class so the count is visible separately.
+
+
+def _tab_nl_sub(value: object) -> object:
+    """Mirror Backend's ``REPLACE(REPLACE(col, '\\t', ' '), '\\n', ' ')``.
+
+    Four of the diffed columns (``title``, ``artist``, ``alternate_artist_name``,
+    ``album_artist``) are wrapped in this at extraction on Backend's side
+    (``job.ts:281-296``); the harness's own ``LIBRARY_SELECT_SQL`` has no such
+    wrapper, so the mysql-sourced ``library.db`` still carries the raw
+    tab/newline byte. Applied to the raw mysql value *before* any further
+    derivation, since the SQL-level replace runs first in production.
+
+    A no-op for anything that isn't a string (``None``, an int call number).
+    """
+    if not isinstance(value, str):
+        return value
+    return value.replace("\t", " ").replace("\n", " ")
+
+
+def _case_insensitive_equal(a: object, b: object) -> bool:
+    """True when both sides are non-None and equal ignoring case."""
+    if a is None or b is None:
+        return False
+    return str(a).lower() == str(b).lower()
+
+
+def _classify_artist(
+    mysql_row: Mapping[str, object], backend_row: Mapping[str, object]
+) -> tuple[str, str | None]:
+    """``artist``: TAB/NL sub -> ``normalize_artist_name`` -> fold tier."""
+    mysql_raw = mysql_row["artist"]
+    backend_value = backend_row["artist"]
+    if _normalize(backend_value) == _normalize(mysql_raw):
+        return ("agree", None)
+
+    substituted = _tab_nl_sub(mysql_raw)
+    info = normalize_artist_name(substituted if isinstance(substituted, str) else "")
+    expected = info.name
+    if _normalize(backend_value) == _normalize(expected):
+        return ("normalized", "various_artists" if info.is_various else "trimmed_or_substituted")
+
+    norm_backend = _normalize(backend_value)
+    norm_expected = _normalize(expected)
+    if (
+        norm_backend is not None
+        and norm_expected is not None
+        and fold_artist_name(str(norm_backend)) == fold_artist_name(str(norm_expected))
+    ):
+        return ("normalized", "fold_equal")
+
+    return ("mismatch", None)
+
+
+def _classify_call_letters(
+    mysql_row: Mapping[str, object], backend_row: Mapping[str, object]
+) -> tuple[str, str | None]:
+    """``call_letters``: ``normalize_code_letters(...) or '??'``, VA override
+    from ``artist``, compared case-insensitively.
+
+    On a VA row ``normalize_code_letters`` is never called at all -- the
+    ``isVarious`` branch short-circuits straight to ``"V/A"`` (``job.ts:993-996``)
+    -- so the VA class belongs to a different population than the ordinary
+    uppercase/'??' classes below it.
+    """
+    mysql_raw = mysql_row["call_letters"]
+    backend_value = backend_row["call_letters"]
+    if _normalize(backend_value) == _normalize(mysql_raw):
+        return ("agree", None)
+
+    artist_substituted = _tab_nl_sub(mysql_row["artist"])
+    artist_info = normalize_artist_name(
+        artist_substituted if isinstance(artist_substituted, str) else ""
+    )
+    if artist_info.is_various:
+        expected: str | None = "V/A"
+        cls = "various"
+    else:
+        derived = normalize_code_letters(mysql_raw if isinstance(mysql_raw, str) else None)
+        expected = derived or "??"
+        cls = "uppercased" if derived is not None else "fallback_unknown"
+
+    if _case_insensitive_equal(_normalize(backend_value), _normalize(expected)):
+        return ("normalized", cls)
+    return ("mismatch", None)
+
+
+def _classify_genre(
+    mysql_row: Mapping[str, object], backend_row: Mapping[str, object]
+) -> tuple[str, str | None]:
+    """``genre``: lookup-resolved, compared case-insensitively.
+
+    ``genreMap`` is keyed on ``.toLowerCase()`` (``job.ts:951``, ``:966``)
+    while the export emits the stored ``genres.genre_name``
+    (``catalog-export.service.ts:233``) -- so a case-only difference is a
+    deliberate normalization, and a genuine rename on either side stays
+    invisible to this harness (recorded limitation, not fixed here).
+    """
+    mysql_raw = mysql_row["genre"]
+    backend_value = backend_row["genre"]
+    if _normalize(backend_value) == _normalize(mysql_raw):
+        return ("agree", None)
+    if _case_insensitive_equal(_normalize(backend_value), _normalize(mysql_raw)):
+        return ("normalized", "case_folded")
+    return ("mismatch", None)
+
+
+def _classify_format(
+    mysql_row: Mapping[str, object], backend_row: Mapping[str, object]
+) -> tuple[str, str | None]:
+    """``format``: ``parse_format_and_discs``, then compared case-insensitively.
+
+    Same lookup-resolved shape as ``genre`` (``formatMap`` keyed on
+    ``.toLowerCase()``, ``job.ts:954``, ``:980``) layered on top of the
+    format-string derivation.
+    """
+    mysql_raw = mysql_row["format"]
+    backend_value = backend_row["format"]
+    if _normalize(backend_value) == _normalize(mysql_raw):
+        return ("agree", None)
+
+    parsed = parse_format_and_discs(mysql_raw if isinstance(mysql_raw, str) else "")
+    if parsed is None:
+        # Backend's own ETL would have skipped this row entirely (job.ts:976)
+        # rather than write an unresolvable format -- on a row that DID make
+        # it into both sides, an unparseable mysql format can't explain
+        # whatever backend actually holds.
+        return ("mismatch", None)
+
+    if _case_insensitive_equal(_normalize(backend_value), _normalize(parsed.format_name)):
+        return ("normalized", "format_derived")
+    return ("mismatch", None)
+
+
+def _classify_artist_call_number(
+    mysql_row: Mapping[str, object], backend_row: Mapping[str, object]
+) -> tuple[str, str | None]:
+    """``artist_call_number``: ``0`` when VA, else ``mysql ?? 0``.
+
+    ``job.ts:996``: ``isVarious ? VARIOUS_ARTISTS_CODE_NUMBER : (artist_call_numbers ?? 0)``.
+    The ``ensureGenreArtistCrossref`` last-write-wins coupling on
+    ``(artist_id, genre_id)`` (``job.ts:456-470``) means a delta here is not
+    automatically a defect -- this classifier ships the simple model; sizing
+    that residual is a later step's concern, not this one's.
+    """
+    mysql_raw = mysql_row["artist_call_number"]
+    backend_value = backend_row["artist_call_number"]
+    if _normalize(backend_value) == _normalize(mysql_raw):
+        return ("agree", None)
+
+    artist_substituted = _tab_nl_sub(mysql_row["artist"])
+    artist_info = normalize_artist_name(
+        artist_substituted if isinstance(artist_substituted, str) else ""
+    )
+    if artist_info.is_various:
+        expected: object = 0
+        cls = "various"
+    else:
+        expected = mysql_raw if mysql_raw is not None else 0
+        cls = "null_coalesced_zero"
+
+    if _normalize(backend_value) == _normalize(expected):
+        return ("normalized", cls)
+    return ("mismatch", None)
+
+
+def _classify_release_call_number(
+    mysql_row: Mapping[str, object], backend_row: Mapping[str, object]
+) -> tuple[str, str | None]:
+    """``release_call_number``: ``mysql ?? 0`` -- no VA branch (``job.ts:1100``)."""
+    mysql_raw = mysql_row["release_call_number"]
+    backend_value = backend_row["release_call_number"]
+    if _normalize(backend_value) == _normalize(mysql_raw):
+        return ("agree", None)
+    expected = mysql_raw if mysql_raw is not None else 0
+    if _normalize(backend_value) == _normalize(expected):
+        return ("normalized", "null_coalesced_zero")
+    return ("mismatch", None)
+
+
+def _make_tab_nl_classifier(
+    column: str,
+) -> Callable[[Mapping[str, object], Mapping[str, object]], tuple[str, str | None]]:
+    """``title`` / ``alternate_artist_name`` / ``album_artist``: TAB/NL sub,
+    then byte-identical. No further transform -- these three (plus ``artist``,
+    modeled separately above) are the four columns ``buildReleaseQuery`` wraps
+    in ``REPLACE(REPLACE(...), '\\t', ' '), '\\n', ' ')`` (``job.ts:281-296``).
+    """
+
+    def classify(
+        mysql_row: Mapping[str, object], backend_row: Mapping[str, object]
+    ) -> tuple[str, str | None]:
+        mysql_raw = mysql_row[column]
+        backend_value = backend_row[column]
+        if _normalize(backend_value) == _normalize(mysql_raw):
+            return ("agree", None)
+        expected = _tab_nl_sub(mysql_raw)
+        if _normalize(backend_value) == _normalize(expected):
+            return ("normalized", "tab_newline_substituted")
+        return ("mismatch", None)
+
+    return classify
+
+
+def _split_cross_refs(value: object) -> list[str]:
+    """Split a ``cross_reference_names`` field on the imported separator.
+
+    ``_normalize`` first, so NULL / '' / whitespace-only all yield an empty
+    list rather than a single-element list containing an empty string.
+    """
+    normalized = _normalize(value)
+    if normalized is None:
+        return []
+    return [item for item in str(normalized).split(CROSS_REFERENCE_SEPARATOR) if item != ""]
+
+
+def _classify_cross_reference_names(
+    mysql_row: Mapping[str, object], backend_row: Mapping[str, object]
+) -> tuple[str, str | None]:
+    """``cross_reference_names``: multiset compare under the fold tier.
+
+    MySQL's ``GROUP_CONCAT(DISTINCT ...)`` has no ``ORDER BY``
+    (``catalog_parity_diff.py``'s own ``LIBRARY_SELECT_SQL``), and Backend's
+    export is an ordered array -- so order is never significant here, only
+    membership under the fold.
+
+    Cardinality loss is reported as a residual, not gated: Backend can hold
+    FEWER fold-distinct aliases than MySQL for two byte-indistinguishable
+    reasons (a MySQL-side fold-collapse the ``array_agg(DISTINCT ...)`` also
+    performs, or a crossref ``importReleaseCrossrefs`` never imported because
+    an artist/genre/album lookup missed). Nothing in the row distinguishes
+    the two, so a backend fold-set that is a SUBSET of the derived mysql
+    fold-set is "normalized", not "mismatch". Backend holding an alias that
+    is NOT explainable from mysql at all is a genuine defect.
+    """
+    mysql_raw = mysql_row["cross_reference_names"]
+    backend_value = backend_row["cross_reference_names"]
+    if _normalize(backend_value) == _normalize(mysql_raw):
+        return ("agree", None)
+
+    mysql_fold_keys: set[str] = set()
+    for item in _split_cross_refs(mysql_raw):
+        substituted = _tab_nl_sub(item)
+        info = normalize_artist_name(substituted if isinstance(substituted, str) else "")
+        mysql_fold_keys.add(fold_artist_name(info.name))
+
+    backend_fold_keys = {fold_artist_name(item) for item in _split_cross_refs(backend_value)}
+
+    if backend_fold_keys == mysql_fold_keys:
+        return ("normalized", "fold_equal")
+    if backend_fold_keys <= mysql_fold_keys:
+        return ("normalized", "cardinality_loss")
+    return ("mismatch", None)
+
+
+# Keyed by column name (never a positional/ordered table) so
+# `TestColumnModelsDriftGuard` can assert `set(COLUMN_MODELS) == set(DIFF_COLUMNS)`
+# -- set equality, not containment, so an added OR removed diffed column
+# fails this test rather than silently falling through unmodelled.
+COLUMN_MODELS: dict[
+    str, Callable[[Mapping[str, object], Mapping[str, object]], tuple[str, str | None]]
+] = {
+    "title": _make_tab_nl_classifier("title"),
+    "artist": _classify_artist,
+    "call_letters": _classify_call_letters,
+    "artist_call_number": _classify_artist_call_number,
+    "release_call_number": _classify_release_call_number,
+    "genre": _classify_genre,
+    "format": _classify_format,
+    "alternate_artist_name": _make_tab_nl_classifier("alternate_artist_name"),
+    "album_artist": _make_tab_nl_classifier("album_artist"),
+    "cross_reference_names": _classify_cross_reference_names,
+}
+
+
+def classify_field(
+    col: str, mysql_row: Mapping[str, object], backend_row: Mapping[str, object]
+) -> tuple[str, str | None]:
+    """Classify one column's value pair into ``(tier, normalization_class)``.
+
+    ``tier`` is one of ``"agree"``, ``"normalized"``, ``"mismatch"``.
+    ``normalization_class`` names which of Part 1's baseline classes explains
+    the difference, and is only non-``None`` when ``tier == "normalized"``.
+    """
+    return COLUMN_MODELS[col](mysql_row, backend_row)
+
+
+def _classify_matched_rows(
+    mysql_rows: Mapping[int, Mapping[str, object]],
+    backend_rows: Mapping[int, Mapping[str, object]],
+    matched_ids: Iterable[int],
+) -> tuple[dict[str, int], dict[str, dict[str, int]]]:
+    """Classify every ``DIFF_COLUMNS`` field on every matched id.
+
+    Returns ``(field_mismatches, normalizations)``:
+
+    - ``field_mismatches`` counts only the ``"mismatch"`` tier, fully keyed
+      over ``DIFF_COLUMNS`` with zeros included (``_print_human`` subscripts
+      it directly for every column with no ``.get()``, so a tiering change
+      that drops a zero-count key would turn the default invocation into a
+      ``KeyError``).
+    - ``normalizations`` counts the ``"normalized"`` tier, keyed
+      column -> class -> count. Not yet wired into ``ParityDiff`` -- that
+      lands with the dataclass field-order change in a later step; this
+      function is where the counting itself lives so that step can wire it
+      in without re-deriving the classification.
+    """
+    field_mismatches: dict[str, int] = dict.fromkeys(DIFF_COLUMNS, 0)
+    normalizations: dict[str, dict[str, int]] = {}
+    for id_ in matched_ids:
+        mrow = mysql_rows[id_]
+        brow = backend_rows[id_]
+        for col in DIFF_COLUMNS:
+            tier, cls = classify_field(col, mrow, brow)
+            if tier == "mismatch":
+                field_mismatches[col] += 1
+            elif tier == "normalized":
+                bucket = normalizations.setdefault(col, {})
+                key = cls or "unspecified"
+                bucket[key] = bucket.get(key, 0) + 1
+    return field_mismatches, normalizations
+
+
 def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
     row = conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)
@@ -258,18 +625,42 @@ def _load_library_rows(conn: sqlite3.Connection, label: str) -> dict[int, dict[s
     return result
 
 
-def _load_cta_counts(conn: sqlite3.Connection) -> Counter[tuple[object, ...]]:
+def _load_cta_counts(
+    conn: sqlite3.Connection, *, apply_legacy_model: bool = False
+) -> Counter[tuple[object, ...]]:
     """Read compilation_track_artist as a normalized multiset.
 
     Returns an empty Counter (never raises) when the table is absent --
     the table is optional, matching tsv_to_sqlite.py's graceful-degradation
     handling of pre-V008 fixtures / Backend-Service-sourced catalogs.
+
+    ``apply_legacy_model=True`` (the mysql side only -- the backend side
+    already reflects both of these) additionally:
+
+    - applies the same TAB/NL substitution Backend's own extraction SQL
+      applies to ``ARTIST_NAME`` / ``TRACK_TITLE`` at import time
+      (``job.ts:727-729``); the harness's own ``COMPILATION_TRACK_SELECT_SQL``
+      has no such wrapper (and stays that way -- see
+      ``test_select_statements_match_sync_library_sh``), so the mysql-sourced
+      table still carries the raw byte.
+    - drops any row whose substituted, trimmed ``artist_name`` is empty,
+      mirroring ``parseLegacyCompilationTrackRows``'s row-drop rule
+      (``job.ts:710-711``) -- Backend's importer never writes such a row, so
+      it is expected-missing rather than genuine drift.
     """
     if not _table_exists(conn, "compilation_track_artist"):
         return Counter()
     cols = ", ".join(CTA_COLUMNS)
     rows = conn.execute(f"SELECT {cols} FROM compilation_track_artist").fetchall()
-    return Counter(tuple(_normalize(v) for v in row) for row in rows)
+    counter: Counter[tuple[object, ...]] = Counter()
+    for release_id, artist_name, track_title in rows:
+        if apply_legacy_model:
+            artist_name = _tab_nl_sub(artist_name)
+            track_title = _tab_nl_sub(track_title)
+            if _normalize(artist_name) is None:
+                continue
+        counter[(_normalize(release_id), _normalize(artist_name), _normalize(track_title))] += 1
+    return counter
 
 
 def diff_library_dbs(
@@ -290,15 +681,14 @@ def diff_library_dbs(
     missing_ids = sorted(mysql_ids - backend_ids)
     extra_ids = sorted(backend_ids - mysql_ids)
 
-    field_mismatches: dict[str, int] = dict.fromkeys(DIFF_COLUMNS, 0)
-    for id_ in matched_ids:
-        mrow = mysql_rows[id_]
-        brow = backend_rows[id_]
-        for col in DIFF_COLUMNS:
-            if _normalize(mrow[col]) != _normalize(brow[col]):
-                field_mismatches[col] += 1
+    field_mismatches, normalizations = _classify_matched_rows(mysql_rows, backend_rows, matched_ids)
+    if normalizations:
+        # Not yet part of the `ParityDiff` contract (that lands with the
+        # dataclass field-order change in a later step) -- logged so the
+        # counting is visible in the meantime rather than silently discarded.
+        logger.debug("catalog parity normalizations", extra={"normalizations": normalizations})
 
-    mysql_cta = _load_cta_counts(mysql_conn)
+    mysql_cta = _load_cta_counts(mysql_conn, apply_legacy_model=True)
     backend_cta = _load_cta_counts(backend_conn)
     cta_missing = sum((mysql_cta - backend_cta).values())
     cta_extra = sum((backend_cta - mysql_cta).values())
