@@ -64,8 +64,9 @@
 #     from apps/backend/services/catalog-export.service.ts:360-377).
 #     140,617 mysql rows / 2,586 releases vs 144,778 backend rows / 2,576.
 #
-#     These are a CEILING, not a target (the `clean` term is `<=`), and both
-#     numbers are expected to FALL. What they currently hold:
+#     These are a CEILING, not a target (the `clean` term is `<=`). Which
+#     direction each number moves as the residue is repaired is NOT obvious
+#     -- see the note below the decomposition. What they currently hold:
 #
 #       cta_missing 2701 = 869 rows in 10 mysql-only releases, every one of
 #         them a collapsed_mysql_ids id below (so they are already this
