@@ -53,6 +53,37 @@ class TestParseCollapsedTsv:
             mod.parse_collapsed_tsv(bad)
 
 
+class TestEmptyBaselines:
+    def test_each_empty_baselines_block_is_independent(self, tmp_path: Path) -> None:
+        """Two "empty" baselines blocks must not share one nested dict.
+
+        ``dict(EMPTY_BASELINES)`` is a SHALLOW copy, so every caller got the
+        module constant's own ``normalizations`` dict. Latent while it stays
+        empty, but step 6 populates that key -- and doing so in place would
+        write straight through into the constant, poisoning every subsequent
+        "empty" block for the life of the process.
+        """
+        mod = _load_module()
+        first = mod.empty_baselines()
+        second = mod.empty_baselines()
+
+        first["normalizations"]["genre"] = {"case_folded": 1}
+
+        assert second["normalizations"] == {}
+        assert mod.EMPTY_BASELINES["normalizations"] == {}
+
+    def test_first_vendor_run_does_not_poison_the_constant(self, tmp_path: Path) -> None:
+        mod = _load_module()
+        source_dir = _write_source_dir(tmp_path)
+        out_dir = tmp_path / "out"
+
+        mod.vendor_parity_residue(source_dir, out_dir, measured_date="2026-08-11")
+        data = json.loads((out_dir / "ledger.json").read_text(encoding="utf-8"))
+        data["baselines"]["normalizations"]["genre"] = {"case_folded": 1}
+
+        assert mod.EMPTY_BASELINES["normalizations"] == {}
+
+
 class TestVendorParityResidue:
     def test_writes_ledger_json_and_copies_narrative(self, tmp_path: Path) -> None:
         mod = _load_module()

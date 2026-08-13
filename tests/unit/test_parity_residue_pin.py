@@ -65,7 +65,14 @@ def test_pin_file_sha256s_match_vendored_files() -> None:
 def test_only_two_source_files_are_vendored() -> None:
     """residue-absent-12.txt and residue-orphan-115.txt are deliberately
     excluded (see parity-residue-pin.txt) -- guard against a future vendor
-    run silently widening what gets copied in."""
+    run silently widening what gets copied in.
+
+    Dotfiles are filtered out rather than compared: on macOS a .DS_Store
+    appears the moment Finder touches the directory, and letting it redden
+    this assertion would report an OS artifact as a vendoring bug. The
+    guard's actual intent -- no third residue file silently copied in --
+    survives the filter, since every vendorable artifact is a named,
+    non-hidden file."""
     vendor_dir = REPO_ROOT / "vendor" / "parity-residue"
-    names = {p.name for p in vendor_dir.iterdir() if p.is_file()}
+    names = {p.name for p in vendor_dir.iterdir() if p.is_file() and not p.name.startswith(".")}
     assert names == {"ledger.json", "residue-ledger.md"}

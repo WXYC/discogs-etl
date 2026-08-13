@@ -1450,6 +1450,72 @@ class TestResidueLedgerLoader:
         ledger = mod.load_residue_ledger(REPO_ROOT / "vendor" / "parity-residue" / "ledger.json")
         assert len(ledger.collapsed_ids) == 599
 
+    @pytest.mark.parametrize(
+        "baselines",
+        [
+            pytest.param("oops", id="string"),
+            pytest.param(["oops"], id="list"),
+            pytest.param(3, id="int"),
+        ],
+    )
+    def test_truthy_non_dict_baselines_raises_source_error(
+        self, tmp_path: Path, baselines: object
+    ) -> None:
+        """A malformed ``baselines`` must exit 3 like any other bad source.
+
+        ``data.get("baselines") or {}`` only substitutes for a FALSY value, so
+        a truthy non-dict reached ``.get`` and raised ``AttributeError`` --
+        which is not in the caught tuple, so it escaped ``main``'s
+        ``except SourceError`` and surfaced as exit 1 with a traceback. Exit 1
+        is deliberately reserved for an uncaught crash so a CI runner can tell
+        it apart from a drift verdict (exit 4), which made this a contract
+        violation, not just an ugly error.
+        """
+        mod = _load_module()
+        path = tmp_path / "ledger.json"
+        path.write_text(
+            json.dumps({"collapsed_mysql_ids": {"8": 7}, "baselines": baselines}),
+            encoding="utf-8",
+        )
+        with pytest.raises(mod.SourceError):
+            mod.load_residue_ledger(path)
+
+    @pytest.mark.parametrize("key", ["cta_missing", "cta_extra"])
+    def test_non_integer_cta_baseline_raises_source_error(self, tmp_path: Path, key: str) -> None:
+        """A non-integer CTA baseline must fail at LOAD time, not at compare time.
+
+        Left unvalidated it survives the loader and defers the failure to
+        ``cta_missing <= "0"`` inside ``diff_library_dbs``, which raises
+        ``TypeError`` from the blanket handler as exit 3 -- right code, but
+        from the wrong place and with a message that points at the diff
+        rather than at the ledger the operator has to fix.
+        """
+        mod = _load_module()
+        path = tmp_path / "ledger.json"
+        baselines = {"normalizations": {}, "cta_missing": 0, "cta_extra": 0}
+        baselines[key] = "0"
+        path.write_text(
+            json.dumps({"collapsed_mysql_ids": {"8": 7}, "baselines": baselines}),
+            encoding="utf-8",
+        )
+        with pytest.raises(mod.SourceError):
+            mod.load_residue_ledger(path)
+
+    def test_non_dict_normalizations_baseline_raises_source_error(self, tmp_path: Path) -> None:
+        mod = _load_module()
+        path = tmp_path / "ledger.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "collapsed_mysql_ids": {"8": 7},
+                    "baselines": {"normalizations": "oops"},
+                }
+            ),
+            encoding="utf-8",
+        )
+        with pytest.raises(mod.SourceError):
+            mod.load_residue_ledger(path)
+
 
 class TestRuleBMissingReason:
     """``_rule_b_missing_reason`` -- skip paths 1/3/5/6, purely from a row's
@@ -1475,6 +1541,53 @@ class TestRuleBMissingReason:
     def test_whitespace_only_artist_name_is_the_same_reason_as_null(self) -> None:
         mod = _load_module()
         assert mod._rule_b_missing_reason(_row(artist="   ")) == "empty_artist_name"
+
+    @pytest.mark.parametrize("column", ["artist", "title"])
+    def test_literal_null_string_counts_as_absent_and_why(self, column: str) -> None:
+        """A recorded trade-off, not an oversight.
+
+        `mysql -B -N` on this server renders a genuine SQL NULL as the
+        literal 4-character text "NULL" rather than the `\\N` sentinel
+        (verified in prod -- see scripts/sync-library.sh's SELECT comment,
+        which IFNULL-wrapped ALBUM_ARTIST for exactly this reason after
+        64,780 rows leaked a literal 'NULL' into library_fts).
+        `parse_library_tsv` only maps `\\N`, and TITLE / PRESENTATION_NAME
+        are the two columns LIBRARY_SELECT_SQL leaves unwrapped -- so a
+        SQL-NULL title arrives here as the string "NULL", and nothing in the
+        row can distinguish it from an album genuinely titled "NULL".
+
+        The cost of matching it: a genuinely-missing row titled "NULL" is
+        filed as expected residue. The cost of NOT matching it: the ledger's
+        six empty-TITLE ids stay unexplained forever and `clean` is
+        unreachable, which is the failure this predicate exists to prevent.
+        The second is the one that breaks the gate, so the predicate matches.
+
+        Narrowing this to `.strip() == ""` is safe only AFTER TITLE and
+        PRESENTATION_NAME get the same IFNULL treatment in both SELECTs.
+        """
+        mod = _load_module()
+        expected = {"artist": "empty_artist_name", "title": "empty_album_title"}[column]
+        assert mod._rule_b_missing_reason(_row(**{column: "NULL"})) == expected
+
+    def test_cta_drop_rule_does_not_share_the_null_string_leniency(self, tmp_path: Path) -> None:
+        """The CTA counterpart is deliberately narrower, and that asymmetry
+        is correct rather than an inconsistency.
+
+        COMPILATION_TRACK_ARTIST.ARTIST_NAME is documented NOT NULL and is
+        also left unwrapped, so a "NULL" in that column can only ever be a
+        genuine artist name -- never a SQL NULL. `_load_cta_counts` therefore
+        keeps the ported `str.strip() == ""` rule and must NOT drift toward
+        `_normalize`. Each predicate tracks its own column's nullability.
+        """
+        mod = _load_module()
+        db = tmp_path / "cta.db"
+        _make_library_db(db, [{"id": 1}], cta_rows=[(1, "NULL", "la paradoja")])
+        conn = sqlite3.connect(db)
+        counts = mod._load_cta_counts(conn)
+        conn.close()
+
+        # Kept, not dropped: sum of 1 means the "NULL"-named artist survived.
+        assert sum(counts.values()) == 1
 
     def test_empty_album_title_is_a_reason(self) -> None:
         mod = _load_module()

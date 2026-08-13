@@ -50,6 +50,7 @@ the build otherwise.
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import logging
 import shutil
@@ -68,12 +69,23 @@ _HEADER_ROW = ("mysql_id", "backend_kept_legacy_id")
 # Structurally present, clearly unpopulated -- step 6 of the plan measures
 # and fills these in. Kept as its own constant so a re-vendor that finds no
 # existing ledger.json still produces a shape step 5's loader can parse.
+#
+# Read it through `empty_baselines()`, never by copying it directly: it holds
+# a nested dict, so `dict(EMPTY_BASELINES)` hands every caller the SAME
+# `normalizations` object as the constant. Step 6 populates that key, and an
+# in-place write would reach through the shallow copy and poison the constant
+# for the rest of the process.
 EMPTY_BASELINES: dict[str, object] = {
     "measured_date": None,
     "normalizations": {},
     "cta_missing": None,
     "cta_extra": None,
 }
+
+
+def empty_baselines() -> dict[str, object]:
+    """A fresh, fully independent copy of the unpopulated ``baselines`` shape."""
+    return copy.deepcopy(EMPTY_BASELINES)
 
 
 def parse_collapsed_tsv(path: Path) -> dict[int, int]:
@@ -115,13 +127,13 @@ def _load_existing_baselines(ledger_json_path: Path) -> dict[str, object]:
     run has nothing to preserve, and that is not an error.
     """
     if not ledger_json_path.is_file():
-        return dict(EMPTY_BASELINES)
+        return empty_baselines()
     try:
         existing = json.loads(ledger_json_path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
-        return dict(EMPTY_BASELINES)
+        return empty_baselines()
     baselines = existing.get("baselines") if isinstance(existing, dict) else None
-    return baselines if isinstance(baselines, dict) else dict(EMPTY_BASELINES)
+    return baselines if isinstance(baselines, dict) else empty_baselines()
 
 
 def vendor_parity_residue(source_dir: Path, out_dir: Path, *, measured_date: str) -> None:

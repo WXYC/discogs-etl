@@ -286,9 +286,21 @@ class ResidueLedger:
 def load_residue_ledger(path: str | Path) -> ResidueLedger:
     """Load and validate a ``ResidueLedger`` from a vendored ``ledger.json``.
 
-    Raises ``SourceError`` for a missing file, unreadable/malformed JSON, or
-    a payload missing the required ``collapsed_mysql_ids`` key -- the same
-    contract as an unreadable ``library.db`` (exit 3 at the CLI).
+    Raises ``SourceError`` for a missing file, unreadable/malformed JSON, a
+    payload missing the required ``collapsed_mysql_ids`` key, or a
+    structurally wrong ``baselines`` block -- the same contract as an
+    unreadable ``library.db`` (exit 3 at the CLI).
+
+    **Every shape check happens here rather than at the point of use**, and
+    that placement is the contract. Two failure modes motivate it: a truthy
+    non-dict ``baselines`` (``"oops"``) used to reach ``.get`` and raise
+    ``AttributeError``, which escaped ``main``'s ``except SourceError`` and
+    surfaced as **exit 1** -- the code deliberately reserved for an uncaught
+    crash, so a CI runner could no longer tell a corrupt ledger from an
+    interpreter fault. And a non-integer CTA baseline used to survive the
+    load and fail later at ``cta_missing <= "0"`` inside ``diff_library_dbs``:
+    the right exit code by luck, from the wrong place, with a message
+    pointing at the diff instead of at the file the operator has to fix.
     """
     p = Path(path)
     if not p.is_file():
@@ -297,16 +309,32 @@ def load_residue_ledger(path: str | Path) -> ResidueLedger:
         data = json.loads(p.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError) as exc:
         raise SourceError(f"residue ledger unreadable or malformed: {p} ({exc})") from exc
+    if not isinstance(data, dict):
+        raise SourceError(f"residue ledger malformed: {p} (top level is not an object)")
     try:
         collapsed_raw = data["collapsed_mysql_ids"]
         collapsed_ids = frozenset(int(k) for k in collapsed_raw)
-        baselines = data.get("baselines") or {}
-        normalizations_baseline = baselines.get("normalizations", {})
-        cta_missing_baseline = baselines.get("cta_missing")
-        cta_extra_baseline = baselines.get("cta_extra")
         measured_date = data.get("measured_date")
     except (KeyError, TypeError, ValueError) as exc:
         raise SourceError(f"residue ledger malformed: {p} ({exc})") from exc
+
+    baselines = data.get("baselines") or {}
+    if not isinstance(baselines, dict):
+        raise SourceError(f"residue ledger malformed: {p} (baselines is not an object)")
+    normalizations_baseline = baselines.get("normalizations", {})
+    if not isinstance(normalizations_baseline, dict):
+        raise SourceError(
+            f"residue ledger malformed: {p} (baselines.normalizations is not an object)"
+        )
+    cta_missing_baseline = baselines.get("cta_missing")
+    cta_extra_baseline = baselines.get("cta_extra")
+    for key, value in (("cta_missing", cta_missing_baseline), ("cta_extra", cta_extra_baseline)):
+        # bool is an int subclass, and `True <= 5` would silently compare as
+        # 1 -- an unpopulated-looking baseline that quietly gates.
+        if value is not None and (isinstance(value, bool) or not isinstance(value, int)):
+            raise SourceError(
+                f"residue ledger malformed: {p} (baselines.{key} is not an integer or null)"
+            )
     return ResidueLedger(
         collapsed_ids=collapsed_ids,
         normalizations_baseline=normalizations_baseline,
@@ -346,8 +374,9 @@ def _is_minted_id(backend_id: int) -> bool:
 def _rule_b_missing_reason(mysql_row: Mapping[str, object]) -> str | None:
     """Rule B, the row-derivable half only (skip paths 1/3/5/6 -- ``db_only``
     genre, an unparseable format, an empty artist name, an empty album
-    title). Checked in ``job.ts``'s own skip order so a row that would have
-    tripped an earlier check there is attributed to that one here too.
+    title). Checked in ``job.ts``'s own skip order, though only for
+    legibility: just the None/not-None result is consumed today, and the
+    reason string is never reported, so no output depends on the ordering.
 
     Returns ``None`` for paths 2/4 (a genre/format id absent from Backend's
     OWN lookup tables) and paths 7/8 (the 599 duplicate-collapse and a
@@ -355,13 +384,46 @@ def _rule_b_missing_reason(mysql_row: Mapping[str, object]) -> str | None:
     mysql-sourced library.db row alone, so they correctly fall through as
     unexplained rather than being guessed at.
 
-    Both the artist and title checks are spelled ``_normalize(value) is
-    None`` rather than ``value.strip() == ""``: ``LIBRARY_SELECT_SQL`` has
-    no ``IFNULL`` wrapper (unlike Backend's own extraction SQL), so a SQL
-    NULL reaches library.db as NULL, not ``''``, for these two columns. A
-    bare ``.strip() == ""`` predicate would miss every such row, and reusing
-    ``_normalize`` -- rather than restating its NULL/''/'NULL' literals --
-    means this predicate cannot drift from the comparison it qualifies.
+    **The artist and title checks are spelled ``_normalize(value) is None``,
+    and the reason is the producer's wire format -- not a preference for
+    reusing the comparator.** ``_normalize`` also collapses the literal
+    4-character string ``"NULL"``, which looks like over-matching (an album
+    genuinely titled ``NULL`` is a legal row Backend imports rather than
+    skips, so forgiving its absence would file real drift as expected). It is
+    nonetheless the only correct predicate here, because for *these two
+    columns* the wire cannot tell the two apart:
+
+    - ``mysql -B -N`` **on this server prints a genuine SQL NULL as the
+      literal text ``"NULL"``**, not as the ``\\N`` sentinel -- verified in
+      prod and documented at ``scripts/sync-library.sh``'s SELECT comment,
+      which fixed exactly this for ``ALBUM_ARTIST`` (64,780 rows had leaked a
+      literal ``'NULL'`` into ``library_fts``).
+    - ``parse_library_tsv`` maps only ``\\N`` to ``None``. It has no handling
+      for the literal string, so that mapping never fires for these columns.
+    - ``TITLE`` and ``PRESENTATION_NAME`` are the two columns
+      ``LIBRARY_SELECT_SQL`` leaves **unwrapped** by ``IFNULL`` (unlike
+      ``ALTERNATE_ARTIST_NAME`` / ``ALBUM_ARTIST`` / the crossref subquery).
+
+    So a SQL-NULL title arrives here as the string ``"NULL"``, and
+    ``value is None or value.strip() == ""`` would miss it -- leaving the
+    ledger's six empty-``TITLE`` ids (``residue-ledger.md`` Set 2)
+    permanently unexplained and ``clean`` permanently unreachable, which is
+    the failure this whole predicate exists to prevent.
+
+    ``_load_cta_counts`` uses the narrower ``str.strip() == ""`` for what
+    reads like the same rule, and the two are **correctly** different rather
+    than an inconsistency: ``COMPILATION_TRACK_ARTIST.ARTIST_NAME`` is
+    documented ``NOT NULL`` and also unwrapped, so a ``"NULL"`` there can
+    only ever be a genuine artist name -- never a SQL NULL. The predicate
+    tracks each column's nullability, not one house style.
+
+    The real fix is at the SQL layer, where ``sync-library.sh`` already put
+    it for the other columns: ``IFNULL``-wrap ``TITLE`` and
+    ``PRESENTATION_NAME`` in both SELECTs so a SQL NULL arrives as ``''`` and
+    this can narrow to ``.strip() == ""``. That changes the pinned
+    production SELECTs, so it is a follow-up rather than part of #370, and
+    plan step 8's prod run settles which representation the six ids actually
+    take with a single query.
     """
     genre = mysql_row.get("genre")
     if is_db_only_genre(genre if isinstance(genre, str) else None):
