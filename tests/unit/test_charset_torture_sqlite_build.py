@@ -68,24 +68,27 @@ def test_tsv_to_sqlite_roundtrip(
 def test_compilation_track_artist_tab_newline_unicode_survives(tmp_path) -> None:
     r"""A CTA track_title carrying an embedded tab, an embedded newline, AND unicode
     must survive the compilation_track_artist import intact -- not get silently
-    dropped by the 3-column field-count guard.
+    dropped by the 3-column field-count guard, and unescaped back to the real
+    bytes (WXYC/discogs-etl#370).
 
     mysql -B -N already escapes embedded tab/newline/backslash bytes in field
     values into the two-char sequences \\t / \\n / \\\\ before they ever reach the
     TSV (this is why the `library` table survives such data -- see
     test_tab_in_field_value / test_newline_in_field_value in
     test_tsv_to_sqlite.py). So a literal DB-column tab/newline never appears as a
-    raw tab/newline byte in the TSV; splitting on real tab/newline bytes is safe,
-    and the escaped 2-char sequences are stored as-is (not unescaped back to a
-    real tab/newline), same as the `library` table's existing behavior. See
-    WXYC/discogs-etl#332.
+    raw tab/newline byte in the TSV; splitting on real tab/newline bytes is safe.
+    The escaped 2-char sequences are then unescaped back to a real tab/newline,
+    same as the `library` table's behavior -- the unicode passes through
+    untouched either way, since it was never escaped on the wire. See
+    WXYC/discogs-etl#332 and #370.
     """
     # Simulates mysql -B -N output for a track_title that originally contained a
     # real tab, a real newline, and unicode: the tab/newline arrive pre-escaped
     # as the two-char sequences below; the unicode passes through untouched.
-    track_title = "Side A\\tTrack 1\\nEncore éà 中文 موسيقى"
+    wire_track_title = "Side A\\tTrack 1\\nEncore éà 中文 موسيقى"
+    expected_track_title = "Side A\tTrack 1\nEncore éà 中文 موسيقى"
     cta_path = tmp_path / "cta.tsv"
-    cta_path.write_text(f"1\tVarious Artists\t{track_title}\n", encoding="utf-8")
+    cta_path.write_text(f"1\tVarious Artists\t{wire_track_title}\n", encoding="utf-8")
 
     # 11 fields (WXYC/discogs-etl#334 appended cross_reference_names as the
     # 11th column); the trailing \N keeps this row valid under the current
@@ -106,4 +109,5 @@ def test_compilation_track_artist_tab_newline_unicode_survives(tmp_path) -> None
     conn.close()
 
     assert row is not None, "CTA row silently dropped"
-    assert row[0] == track_title
+    # Unescaped: real TAB and newline bytes, not the two-char sequences.
+    assert row[0] == expected_track_title

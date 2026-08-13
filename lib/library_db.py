@@ -217,13 +217,76 @@ def build_library_db(
     return count
 
 
+def _unescape_mysql_field(value: str) -> str:
+    r"""Undo ``mysql -B -N``'s (no ``--raw``) escaping of a TSV field.
+
+    A single left-to-right pass: ``\\``->``\``, ``\t``->TAB, ``\n``->NL,
+    ``\0``->NUL. Any other backslash (including one immediately followed by
+    ``N``, which is not one of these four) passes through unchanged, because
+    that is the only escape vocabulary ``mysql -B -N`` uses.
+
+    Deliberately **not** a sequence of ``str.replace`` calls: for a field
+    holding a literal backslash immediately followed by ``t`` (wire: the
+    three chars ``\\t``, an escaped backslash then a bare ``t``), a chained
+    ``.replace("\\t", " ")`` would match at offset 1 -- the second backslash
+    plus the ``t`` -- and corrupt the result to backslash+space instead of
+    the correct backslash+``t``. A single left-to-right scan consumes the
+    ``\\`` pair first and gets it right. See
+    ``tests/unit/test_tsv_to_sqlite.py`` for the pinned case.
+    """
+    out: list[str] = []
+    i = 0
+    n = len(value)
+    while i < n:
+        ch = value[i]
+        if ch == "\\" and i + 1 < n and value[i + 1] in ("\\", "t", "n", "0"):
+            escape = value[i + 1]
+            out.append({"\\": "\\", "t": "\t", "n": "\n", "0": "\x00"}[escape])
+            i += 2
+        else:
+            out.append(ch)
+            i += 1
+    return "".join(out)
+
+
+def _parse_nullable_field(raw: str) -> str | None:
+    r"""Test the ``\N`` NULL sentinel against the *raw* wire field, then
+    unescape only the survivors.
+
+    Order matters: unescaping before testing would turn a field holding a
+    literal backslash immediately followed by ``N`` (wire: the three chars
+    ``\\N``) into the same two-char ``\N`` spelling as the sentinel, and the
+    value would be silently read as SQL NULL -- data loss introduced by the
+    unescape itself. So the sentinel test runs first, against the field as
+    it arrived on the wire, and only a field that survives that test gets
+    unescaped. See WXYC/discogs-etl#370 and
+    ``tests/unit/test_tsv_to_sqlite.py``.
+    """
+    if raw == "\\N":
+        return None
+    return _unescape_mysql_field(raw)
+
+
 def parse_library_tsv(tsv_path: str) -> Iterable[Sequence[object]]:
-    """Yield ``library`` row tuples from a ``mysql -B -N`` TSV dump.
+    r"""Yield ``library`` row tuples from a ``mysql -B -N`` TSV dump.
 
     The file has 11 tab-separated fields per line, matching
-    ``LIBRARY_INSERT_COLUMNS``. MySQL ``\\N`` becomes SQL NULL. Rows without
-    exactly 11 fields are skipped with a WARNING on stderr (never silently
-    dropped).
+    ``LIBRARY_INSERT_COLUMNS``. MySQL ``\N`` becomes SQL NULL (tested
+    against the raw field, before unescaping -- see
+    ``_parse_nullable_field``). Every surviving field is then unescaped:
+    ``mysql -B -N`` (no ``--raw``) escapes embedded backslash/tab/newline/NUL
+    bytes into the two-char sequences ``\\``/``\t``/``\n``/``\0``, and this
+    parser undoes that so the served catalog holds the real bytes rather
+    than their escaped spelling. Rows without exactly 11 fields are skipped
+    with a WARNING on stderr (never silently dropped).
+
+    **Fragile by construction**: this only produces the right bytes because
+    Backend-Service's producer runs ``mysql ... --raw`` (escaping disabled)
+    while this repo's producers do not. All three call sites depend on that
+    asymmetry holding: ``scripts/tsv_to_sqlite.py``,
+    ``scripts/catalog_parity_diff.py``, and Backend-Service's
+    ``shared/database/src/legacy/sql.mirror.ts`` (the ``--raw`` side). A flag
+    change on either side silently invalidates the unescape here.
 
     A generator, so warnings interleave with the inserts they describe.
     """
@@ -236,23 +299,28 @@ def parse_library_tsv(tsv_path: str) -> Iterable[Sequence[object]]:
                     file=sys.stderr,
                 )
                 continue
-            # MySQL -B outputs \N for NULL
-            yield [None if v == "\\N" else v for v in fields]
+            yield [_parse_nullable_field(v) for v in fields]
 
 
 def parse_compilation_track_tsv(tsv_path: str) -> Iterable[Sequence[object]]:
-    """Yield ``compilation_track_artist`` row triples from a ``mysql -B -N`` TSV.
+    r"""Yield ``compilation_track_artist`` row triples from a ``mysql -B -N`` TSV.
 
     3 columns (``library_release_id``, ``artist_name``, ``track_title``) as
     produced against tubafrenzy's ``COMPILATION_TRACK_ARTIST`` table.
-    ``track_title`` is nullable (MySQL ``\\N``); the other two are not, and a
-    row missing either is skipped with a WARNING.
+    ``track_title`` is nullable (MySQL ``\N``, tested against the raw field
+    -- see ``_parse_nullable_field``); the other two are not, and a row
+    missing either is skipped with a WARNING.
 
     ``artist_name`` and ``track_title`` are free text and can themselves
-    contain embedded tab/newline/backslash bytes -- ``mysql -B -N`` escapes
-    those into two-char ``\\t`` / ``\\n`` / ``\\\\`` sequences before they ever
-    reach the TSV, which is why splitting on real tab/newline bytes (the same
-    approach ``parse_library_tsv`` relies on) is safe here too.
+    contain embedded backslash/tab/newline/NUL bytes. ``mysql -B -N`` (no
+    ``--raw``) escapes those into the two-char sequences ``\\``/``\t``/``\n``/
+    ``\0`` before they ever reach the TSV; splitting on real tab/newline
+    bytes (the same approach ``parse_library_tsv`` relies on) is safe here
+    too, because the escaping happens on the wire before the split ever
+    sees it. Every surviving field is then unescaped back to the real
+    bytes, same as ``parse_library_tsv`` -- this parser is **not** safe to
+    reuse unchanged; see that function's docstring for the ``--raw``
+    fragility both parsers share.
     """
     with open(tsv_path, encoding="utf-8") as f:
         for line in f:
@@ -265,7 +333,7 @@ def parse_compilation_track_tsv(tsv_path: str) -> Iterable[Sequence[object]]:
                 )
                 continue
             library_release_id_raw, artist_name, track_title = (
-                None if v == "\\N" else v for v in fields
+                _parse_nullable_field(v) for v in fields
             )
             if library_release_id_raw is None or artist_name is None:
                 print(
