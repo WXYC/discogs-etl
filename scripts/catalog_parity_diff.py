@@ -77,9 +77,24 @@ transform), or "mismatch" (neither -- a genuine defect). **This redefines
 byte-level difference -- a column that differs solely by a deliberate
 normalization (case folding, VA collapsing, a coerced NULL) no longer counts
 toward it. The normalized-tier counts themselves are tallied by
-``_classify_matched_rows`` (column -> class -> count) but are not yet part of
-this module's public ``ParityDiff``/``--json`` contract -- until they are, an
-INFO log line is their only surface.
+``_classify_matched_rows`` (column -> class -> count) and are reported on
+``ParityDiff.normalizations`` (and the ``--json`` contract) -- reported,
+never gating. ``_print_human`` does not carry them, so an INFO log line
+remains their only surface for the default (non-``--json``) invocation.
+
+**Row-level expected/unexplained classification and the ``clean`` verdict
+(discogs-etl#370, ``ResidueLedger``).** ``missing_in_backend`` /
+``extra_in_backend`` count every id-level divergence, including known,
+documented residue (a duplicate tubafrenzy row Backend's ETL correctly
+collapsed, a BS#1963-minted id with no tubafrenzy counterpart, a row
+Backend's ETL deliberately skipped). ``--residue-ledger`` (defaulting to the
+vendored ``vendor/parity-residue/ledger.json``) splits each into *expected*
+(explained by a rule or the vendored enumeration) and *unexplained* (a
+genuine divergence). ``clean`` is ``True`` only when every unexplained count
+is zero, ``field_mismatches`` is all-zero, and CTA drift is within its
+documented baseline; it is ``False`` on any of those failing, and ``None``
+-- absent, not failed -- when no ledger was supplied at all (``--residue-ledger
+none``).
 
 Usage::
 
@@ -90,16 +105,27 @@ Usage::
 
 Exit codes:
 
-- ``0`` -- ran successfully. A nonzero diff count is still exit 0; the
-  operator reads the counts (and, in ``--json`` mode, the id lists) to judge
-  parity.
-- ``2`` -- bad arguments (missing required flags).
+- ``0`` -- ran successfully. A nonzero diff count is still exit 0 (unless
+  ``--fail-on-drift`` is given and the verdict is not clean -- see ``4``
+  below); the operator reads the counts (and, in ``--json`` mode, the id
+  lists and ``clean``) to judge parity.
+- ``2`` -- bad arguments (missing required flags, or ``--fail-on-drift``
+  combined with ``--residue-ledger none``).
 - ``3`` -- source/read error: missing file, unreadable database, a required
   table (``library``) absent from one of the inputs, a malformed input
   (duplicate ``library.id``, which a valid library.db's primary key forbids),
-  or **any** producer failure (unreachable source, missing credentials, a
-  refused overwrite, an inconsistent snapshot, an empty catalog export, a
-  contract-violating row, a missing ``mysql`` binary, a malformed DSN).
+  a missing/unreadable/malformed ``--residue-ledger``, or **any** producer
+  failure (unreachable source, missing credentials, a refused overwrite, an
+  inconsistent snapshot, an empty catalog export, a contract-violating row, a
+  missing ``mysql`` binary, a malformed DSN).
+- ``4`` -- ``--fail-on-drift`` was given and the verdict is not clean.
+- ``1`` -- reserved for an uncaught crash (the blanket ``except Exception``
+  around both the producer and diff phases exists precisely so this doesn't
+  happen for a known failure mode -- see those two ``try`` blocks in
+  ``main``). Deliberately never returned for a diff *result*: reusing it for
+  "not clean" would make an interpreter crash and a drift verdict
+  indistinguishable to a CI runner, which is why drift gets its own code (4)
+  instead.
 
 Never writes to either input: both files are opened as read-only SQLite
 connections (``mode=ro``).
@@ -195,7 +221,22 @@ class ParityDiff:
     """Outcome of diffing two library.db files.
 
     Field order matches the CLI's ``--json`` contract (``dataclasses.asdict``
-    preserves declaration order), with the two id lists appended at the end.
+    preserves declaration order). ``matched`` through ``cta_extra`` are
+    unchanged from before discogs-etl#370; the six new fields
+    (``clean`` through ``normalizations``) are appended after ``cta_extra``
+    rather than leading with ``clean``, so the existing key *set* keeps its
+    order. ``normalizations`` needs a ``default_factory`` (it can be empty),
+    which is why it comes after the five new plain-typed fields rather than
+    among them -- Python forbids a non-default field after a defaulted one,
+    and the two id lists (also ``default_factory``) already sit last.
+
+    ``clean``, ``missing_expected``, ``missing_unexplained``,
+    ``extra_expected``, and ``extra_unexplained`` require a
+    ``ResidueLedger`` (see ``diff_library_dbs`` / ``run_diff``). Without one,
+    the *_expected counts are 0, the *_unexplained counts equal the raw
+    missing/extra counts, and ``clean`` is ``None`` -- absent, not failed.
+    ``normalizations`` is populated unconditionally either way (field tiering
+    has no dependency on a ledger); it is reported, never gating.
     """
 
     matched: int
@@ -204,6 +245,12 @@ class ParityDiff:
     field_mismatches: dict[str, int]
     cta_missing: int
     cta_extra: int
+    clean: bool | None
+    missing_unexplained: int
+    missing_expected: int
+    extra_unexplained: int
+    extra_expected: int
+    normalizations: dict[str, dict[str, int]] = field(default_factory=dict)
     missing_in_backend_ids: list[int] = field(default_factory=list)
     extra_in_backend_ids: list[int] = field(default_factory=list)
 
@@ -889,12 +936,19 @@ def _classify_row_expectations(
 
 
 def diff_library_dbs(
-    mysql_conn: sqlite3.Connection, backend_conn: sqlite3.Connection
+    mysql_conn: sqlite3.Connection,
+    backend_conn: sqlite3.Connection,
+    ledger: ResidueLedger | None = None,
 ) -> ParityDiff:
     """Compute the full parity diff between two already-open library.db connections.
 
     Assumes both connections have a ``library`` table (callers -- ``run_diff``
     -- are responsible for validating that up front via ``_require_table``).
+
+    ``ledger`` gates only the ROW-LEVEL expected/unexplained classification
+    and ``clean`` (see ``ParityDiff``'s docstring) -- field tiering
+    (``field_mismatches`` / ``normalizations``) runs identically either way,
+    with or without one.
     """
     mysql_rows = _load_library_rows(mysql_conn, "mysql")
     backend_rows = _load_library_rows(backend_conn, "backend")
@@ -908,20 +962,47 @@ def diff_library_dbs(
 
     field_mismatches, normalizations = _classify_matched_rows(mysql_rows, backend_rows, matched_ids)
     if normalizations:
-        # Not yet part of the `ParityDiff` contract (that lands with the
-        # dataclass field-order change in a later step), so this log line is
-        # the counts' only surface until then. INFO, not DEBUG: `init_logger`
-        # pins the root level at INFO and this CLI has no verbosity flag, so a
-        # DEBUG record here would be unreachable in every invocation the
-        # harness actually has -- "logged rather than discarded" would be
-        # discarded. One line per run, and on stderr, so `--json`'s
-        # one-object-on-stdout contract is untouched.
+        # `ParityDiff.normalizations` now carries these, but only `--json`
+        # renders that field -- `_print_human` does not -- so this line stays
+        # as the counts' surface for the default invocation. INFO, not DEBUG:
+        # `init_logger` pins the root level at INFO and this CLI has no
+        # verbosity flag, so a DEBUG record here would be unreachable in every
+        # invocation the harness actually has -- "logged rather than
+        # discarded" would be discarded. One line per run, and on stderr, so
+        # `--json`'s one-object-on-stdout contract is untouched.
         logger.info("catalog parity normalizations", extra={"normalizations": normalizations})
 
     mysql_cta = _load_cta_counts(mysql_conn)
     backend_cta = _load_cta_counts(backend_conn)
     cta_missing = sum((mysql_cta - backend_cta).values())
     cta_extra = sum((backend_cta - mysql_cta).values())
+
+    if ledger is None:
+        clean = None
+        missing_expected = 0
+        missing_unexplained = len(missing_ids)
+        extra_expected = 0
+        extra_unexplained = len(extra_ids)
+    else:
+        (
+            missing_expected,
+            missing_unexplained,
+            extra_expected,
+            extra_unexplained,
+        ) = _classify_row_expectations(mysql_rows, missing_ids, extra_ids, ledger)
+
+        cta_within_baseline = (
+            ledger.cta_missing_baseline is not None
+            and ledger.cta_extra_baseline is not None
+            and cta_missing <= ledger.cta_missing_baseline
+            and cta_extra <= ledger.cta_extra_baseline
+        )
+        clean = (
+            missing_unexplained == 0
+            and extra_unexplained == 0
+            and sum(field_mismatches.values()) == 0
+            and cta_within_baseline
+        )
 
     return ParityDiff(
         matched=len(matched_ids),
@@ -930,12 +1011,18 @@ def diff_library_dbs(
         field_mismatches=field_mismatches,
         cta_missing=cta_missing,
         cta_extra=cta_extra,
+        clean=clean,
+        missing_unexplained=missing_unexplained,
+        missing_expected=missing_expected,
+        extra_unexplained=extra_unexplained,
+        extra_expected=extra_expected,
+        normalizations=normalizations,
         missing_in_backend_ids=missing_ids,
         extra_in_backend_ids=extra_ids,
     )
 
 
-def run_diff(mysql_db: str, backend_db: str) -> ParityDiff:
+def run_diff(mysql_db: str, backend_db: str, ledger: ResidueLedger | None = None) -> ParityDiff:
     """Open both library.db files read-only, validate schema, and diff them.
 
     Raises ``SourceError`` for any file/table problem on either side. Never
@@ -947,7 +1034,7 @@ def run_diff(mysql_db: str, backend_db: str) -> ParityDiff:
         backend_conn = _open_readonly(backend_db, "backend")
         try:
             _require_table(backend_conn, "library", "backend")
-            return diff_library_dbs(mysql_conn, backend_conn)
+            return diff_library_dbs(mysql_conn, backend_conn, ledger=ledger)
         finally:
             backend_conn.close()
     finally:
@@ -2144,6 +2231,28 @@ def _build_arg_parser() -> argparse.ArgumentParser:
             f"${BACKEND_TOKEN_ENV} for a one-off with a JWT already in hand."
         ),
     )
+    p.add_argument(
+        "--residue-ledger",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Path to the vendored discogs-etl#370 residue ledger JSON. Defaults "
+            "to vendor/parity-residue/ledger.json, resolved relative to this "
+            "script's own location (never the cwd), so the soak needs no "
+            "argument. Pass the literal 'none' to run without a ledger -- "
+            "row-level expected/unexplained classification and `clean` are "
+            "then unavailable (`clean` reports null rather than false)."
+        ),
+    )
+    p.add_argument(
+        "--fail-on-drift",
+        action="store_true",
+        help=(
+            "Exit 4 when the verdict is not clean. Cannot be combined with "
+            "--residue-ledger none (exit 2) -- that combination asks to fail "
+            "on drift while refusing the definition of expected drift."
+        ),
+    )
     return p
 
 
@@ -2160,6 +2269,11 @@ def _print_human(result: ParityDiff) -> None:
         print(f"  {col:<24} {result.field_mismatches[col]:>6}")
     print(f"cta_missing:        {result.cta_missing:>10}")
     print(f"cta_extra:          {result.cta_extra:>10}")
+    print(f"clean:              {result.clean!s:>10}")
+    print(f"missing_expected:   {result.missing_expected:>10}")
+    print(f"missing_unexplained:{result.missing_unexplained:>10}")
+    print(f"extra_expected:     {result.extra_expected:>10}")
+    print(f"extra_unexplained:  {result.extra_unexplained:>10}")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -2184,6 +2298,19 @@ def main(argv: list[str] | None = None) -> int:
 
     if not args.mysql_db or not args.backend_db:
         print("error: --mysql-db and --backend-db are both required.", file=sys.stderr)
+        parser.print_usage(sys.stderr)
+        return 2
+
+    residue_ledger_arg = args.residue_ledger
+    ledger_disabled = (
+        residue_ledger_arg is not None and residue_ledger_arg.strip().lower() == "none"
+    )
+    if args.fail_on_drift and ledger_disabled:
+        print(
+            "error: --fail-on-drift cannot be combined with --residue-ledger none -- "
+            "that asks to fail on drift while refusing the definition of expected drift.",
+            file=sys.stderr,
+        )
         parser.print_usage(sys.stderr)
         return 2
 
@@ -2212,7 +2339,21 @@ def main(argv: list[str] | None = None) -> int:
         return 3
 
     try:
-        result = run_diff(args.mysql_db, args.backend_db)
+        if ledger_disabled:
+            ledger: ResidueLedger | None = None
+        else:
+            ledger_path = (
+                Path(residue_ledger_arg)
+                if residue_ledger_arg is not None
+                else _default_residue_ledger_path()
+            )
+            ledger = load_residue_ledger(ledger_path)
+    except SourceError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 3
+
+    try:
+        result = run_diff(args.mysql_db, args.backend_db, ledger=ledger)
     except SourceError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 3
@@ -2235,8 +2376,16 @@ def main(argv: list[str] | None = None) -> int:
             "extra_in_backend": result.extra_in_backend,
             "cta_missing": result.cta_missing,
             "cta_extra": result.cta_extra,
+            "clean": result.clean,
+            "missing_expected": result.missing_expected,
+            "missing_unexplained": result.missing_unexplained,
+            "extra_expected": result.extra_expected,
+            "extra_unexplained": result.extra_unexplained,
         },
     )
+
+    if args.fail_on_drift and not result.clean:
+        return 4
     return 0
 
 
