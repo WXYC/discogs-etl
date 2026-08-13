@@ -165,8 +165,10 @@ log "Fetched $ROW_COUNT rows from MySQL"
 # export dropped in the #65 slim-down -- WXYC/discogs-etl#332). Reuses the same
 # MySQL auth as the query above. artist_name/track_title are free text but mysql
 # -B -N already escapes embedded tab/newline/backslash bytes in field values, so
-# the tab/newline-based TSV parser in lib/library_db.py (shared with the
-# LIBRARY_RELEASE export above) is safe to reuse unchanged.
+# the tab/newline-based split in lib/library_db.py (shared with the
+# LIBRARY_RELEASE export above) is safe to reuse unchanged -- but the escaped
+# bytes it splits on are then unescaped back to real backslash/tab/newline/NUL
+# bytes (WXYC/discogs-etl#370), not passed through as the two-char sequences.
 # Degrades gracefully: pre-V008 fixtures / the Backend-Service catalog source have
 # no COMPILATION_TRACK_ARTIST table, so a "doesn't exist" failure here is expected
 # and must not fail the overall library sync (or any other CTA-fetch error, since

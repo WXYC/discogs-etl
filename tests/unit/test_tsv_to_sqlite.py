@@ -636,10 +636,11 @@ class TestTsvToSqlite:
         assert row[0] is None
 
     def test_tab_in_field_value(self, tmp_path: Path) -> None:
-        r"""MySQL escapes literal tabs in fields as \t; they should be unescaped."""
-        # MySQL -B -N escapes real tabs inside data as the two-char sequence \t.
-        # Our code splits on real tabs (\t), so literal \t in the data arrives as
-        # the two characters backslash-t, which are preserved as-is in the field.
+        r"""MySQL escapes literal tabs in fields as \t; the parser unescapes it
+        back to a real TAB byte (WXYC/discogs-etl#370)."""
+        # MySQL -B -N (no --raw) escapes a real tab inside data as the two-char
+        # sequence \t. We split on real tabs, so the two chars backslash-t stay
+        # intact within the field -- then must be unescaped to a single TAB.
         tsv = "1\tAluminum\\tTunes\tStereolab\tST\t100\t1\tRock\tCD\t\\N\t\\N\t\\N\n"
         tsv_file = tmp_path / "input.tsv"
         tsv_file.write_text(tsv, encoding="utf-8")
@@ -651,13 +652,15 @@ class TestTsvToSqlite:
         title = conn.execute("SELECT title FROM library WHERE id = 1").fetchone()[0]
         conn.close()
 
-        # The escaped sequence \t is stored literally (two chars: backslash + t)
-        assert title == "Aluminum\\tTunes"
+        # Unescaped: a single real TAB byte, not the two-char sequence.
+        assert title == "Aluminum\tTunes"
 
     def test_newline_in_field_value(self, tmp_path: Path) -> None:
-        r"""MySQL escapes literal newlines in fields as \n; they should be preserved."""
-        # Similar to tabs: MySQL -B outputs literal \n (two chars) for embedded newlines.
-        # Since we split on real newlines, the two-char sequence stays intact.
+        r"""MySQL escapes literal newlines in fields as \n; the parser unescapes
+        it back to a real newline byte (WXYC/discogs-etl#370)."""
+        # Similar to tabs: MySQL -B -N (no --raw) outputs literal \n (two chars)
+        # for an embedded newline. We split on real newlines, so the two-char
+        # sequence stays intact within the field -- then must be unescaped.
         tsv = "1\tNotes\\nMore notes\tAutechre\tAU\t300\t3\tElectronic\tCD\t\\N\t\\N\t\\N\n"
         tsv_file = tmp_path / "input.tsv"
         tsv_file.write_text(tsv, encoding="utf-8")
@@ -669,5 +672,263 @@ class TestTsvToSqlite:
         title = conn.execute("SELECT title FROM library WHERE id = 1").fetchone()[0]
         conn.close()
 
-        # The escaped sequence \n is stored literally (two chars: backslash + n)
-        assert title == "Notes\\nMore notes"
+        # Unescaped: a single real newline byte, not the two-char sequence.
+        assert title == "Notes\nMore notes"
+
+    def test_backslash_in_field_value(self, tmp_path: Path) -> None:
+        r"""MySQL escapes a literal backslash in a field as \\; the parser
+        unescapes it back to a single backslash byte."""
+        # Source data holds one backslash character; mysql -B -N (no --raw)
+        # escapes it to the two-char wire sequence \\.
+        tsv = "1\tFoo\\\\Bar\tStereolab\tST\t100\t1\tRock\tCD\t\\N\t\\N\t\\N\n"
+        tsv_file = tmp_path / "input.tsv"
+        tsv_file.write_text(tsv, encoding="utf-8")
+        db_path = tmp_path / "library.db"
+
+        tsv_to_sqlite(str(tsv_file), str(db_path))
+
+        conn = sqlite3.connect(str(db_path))
+        title = conn.execute("SELECT title FROM library WHERE id = 1").fetchone()[0]
+        conn.close()
+
+        assert title == "Foo\\Bar"
+
+    def test_nul_in_field_value(self, tmp_path: Path) -> None:
+        r"""MySQL escapes an embedded NUL byte as \0; the parser writes a real
+        NUL byte. Measured at 0 rows on the 2026-07-19 prod snapshot -- this
+        pins the tie-break decided in plans/346-parity-clean-definition.md
+        rather than leaving \0 unhandled."""
+        tsv = "1\tFoo\\0Bar\tStereolab\tST\t100\t1\tRock\tCD\t\\N\t\\N\t\\N\n"
+        tsv_file = tmp_path / "input.tsv"
+        tsv_file.write_text(tsv, encoding="utf-8")
+        db_path = tmp_path / "library.db"
+
+        tsv_to_sqlite(str(tsv_file), str(db_path))
+
+        conn = sqlite3.connect(str(db_path))
+        title = conn.execute("SELECT title FROM library WHERE id = 1").fetchone()[0]
+        conn.close()
+
+        assert title == "Foo\x00Bar"
+
+    def test_backslash_then_literal_t_is_not_corrupted_by_naive_replace(
+        self, tmp_path: Path
+    ) -> None:
+        r"""Source data holding a literal backslash immediately followed by the
+        letter 't' proves the unescape is a single left-to-right pass, not a
+        sequence of str.replace calls.
+
+        On the wire this is three characters: \\t -- an escaped backslash (the
+        real backslash byte in the source), then an unescaped literal 't'. A
+        naive `.replace("\\t", " ")` would match at offset 1 (the second
+        backslash plus the 't') and corrupt the result to backslash+space; a
+        single left-to-right scan consumes the \\ pair first and correctly
+        yields backslash+t.
+        """
+        tsv = "1\t\\\\t\tStereolab\tST\t100\t1\tRock\tCD\t\\N\t\\N\t\\N\n"
+        tsv_file = tmp_path / "input.tsv"
+        tsv_file.write_text(tsv, encoding="utf-8")
+        db_path = tmp_path / "library.db"
+
+        tsv_to_sqlite(str(tsv_file), str(db_path))
+
+        conn = sqlite3.connect(str(db_path))
+        title = conn.execute("SELECT title FROM library WHERE id = 1").fetchone()[0]
+        conn.close()
+
+        assert title == "\\t"
+        assert title != "\t"  # not a real TAB -- the naive-replace failure mode
+
+    def test_literal_backslash_n_survives_unescape_and_is_not_null(self, tmp_path: Path) -> None:
+        r"""Source data literally spelled backslash-N must survive as the
+        two-char string \N and must NOT collapse to SQL NULL.
+
+        On the wire this is three characters: \\N -- an escaped backslash
+        (the real backslash byte in the source), then an unescaped literal
+        'N'. Unescaping before testing the \N NULL sentinel would turn this
+        into the same two-char \N spelling as the sentinel and silently drop
+        the value -- so the sentinel test must run against the raw
+        (pre-unescape) field, per WXYC/discogs-etl#370.
+        """
+        tsv = "1\t\\\\N\tStereolab\tST\t100\t1\tRock\tCD\t\\N\t\\N\t\\N\n"
+        tsv_file = tmp_path / "input.tsv"
+        tsv_file.write_text(tsv, encoding="utf-8")
+        db_path = tmp_path / "library.db"
+
+        tsv_to_sqlite(str(tsv_file), str(db_path))
+
+        conn = sqlite3.connect(str(db_path))
+        title = conn.execute("SELECT title FROM library WHERE id = 1").fetchone()[0]
+        conn.close()
+
+        assert title == "\\N"
+        assert title is not None
+
+
+class TestCtaEscaping:
+    """Escaping tests for parse_compilation_track_tsv (WXYC/discogs-etl#370).
+
+    The only route into that parser from this file is ``tsv_to_sqlite``'s
+    optional ``cta_tsv_path`` argument (``scripts/tsv_to_sqlite.py:60``);
+    every test above passes only the two positional (library) arguments and
+    never reaches it. Re-runs the same four escapes plus both ordering
+    hazards from ``TestTsvToSqlite`` above, but against ``artist_name`` --
+    the CTA field with the ordering hazard that actually matters, since
+    ``artist_name`` is NOT NULL (``lib/library_db.py:270-276``): a `\\N`
+    collision there drops the whole row, not just one column.
+    """
+
+    def _library_tsv(self, tmp_path: Path, release_id: str = "1") -> Path:
+        """A single valid library row -- tsv_to_sqlite always needs one,
+        independent of what's under test in the CTA TSV."""
+        tsv = _make_tsv(
+            [
+                [
+                    release_id,
+                    "Aluminum Tunes",
+                    "Stereolab",
+                    "ST",
+                    "100",
+                    "1",
+                    "Rock",
+                    "CD",
+                    "\\N",
+                    "\\N",
+                    "\\N",
+                ]
+            ]
+        )
+        tsv_file = tmp_path / "library.tsv"
+        tsv_file.write_text(tsv, encoding="utf-8")
+        return tsv_file
+
+    def _cta_tsv(self, tmp_path: Path, rows: list[list[str]]) -> Path:
+        cta_file = tmp_path / "cta.tsv"
+        cta_file.write_text(_make_tsv(rows), encoding="utf-8")
+        return cta_file
+
+    def test_cta_tab_in_artist_name(self, tmp_path: Path) -> None:
+        r"""MySQL escapes a literal tab in artist_name as \t; the CTA parser
+        unescapes it back to a real TAB byte."""
+        library_tsv = self._library_tsv(tmp_path)
+        cta_tsv = self._cta_tsv(tmp_path, [["1", "Burning\\tStar", "Some Track"]])
+        db_path = tmp_path / "library.db"
+
+        tsv_to_sqlite(str(library_tsv), str(db_path), str(cta_tsv))
+
+        conn = sqlite3.connect(str(db_path))
+        row = conn.execute(
+            "SELECT library_release_id, artist_name FROM compilation_track_artist"
+        ).fetchone()
+        conn.close()
+
+        assert row == (1, "Burning\tStar")
+
+    def test_cta_newline_in_artist_name(self, tmp_path: Path) -> None:
+        r"""MySQL escapes a literal newline in artist_name as \n; the CTA
+        parser unescapes it back to a real newline byte."""
+        library_tsv = self._library_tsv(tmp_path)
+        cta_tsv = self._cta_tsv(tmp_path, [["1", "Side A\\nSide B", "Some Track"]])
+        db_path = tmp_path / "library.db"
+
+        tsv_to_sqlite(str(library_tsv), str(db_path), str(cta_tsv))
+
+        conn = sqlite3.connect(str(db_path))
+        artist_name = conn.execute("SELECT artist_name FROM compilation_track_artist").fetchone()[0]
+        conn.close()
+
+        assert artist_name == "Side A\nSide B"
+
+    def test_cta_backslash_in_artist_name(self, tmp_path: Path) -> None:
+        r"""MySQL escapes a literal backslash in artist_name as \\; the CTA
+        parser unescapes it back to a single backslash byte."""
+        library_tsv = self._library_tsv(tmp_path)
+        cta_tsv = self._cta_tsv(tmp_path, [["1", "Stereo\\\\lab", "Some Track"]])
+        db_path = tmp_path / "library.db"
+
+        tsv_to_sqlite(str(library_tsv), str(db_path), str(cta_tsv))
+
+        conn = sqlite3.connect(str(db_path))
+        artist_name = conn.execute("SELECT artist_name FROM compilation_track_artist").fetchone()[0]
+        conn.close()
+
+        assert artist_name == "Stereo\\lab"
+
+    def test_cta_nul_in_artist_name(self, tmp_path: Path) -> None:
+        r"""MySQL escapes an embedded NUL byte in artist_name as \0; the CTA
+        parser writes a real NUL byte."""
+        library_tsv = self._library_tsv(tmp_path)
+        cta_tsv = self._cta_tsv(tmp_path, [["1", "Foo\\0Bar", "Some Track"]])
+        db_path = tmp_path / "library.db"
+
+        tsv_to_sqlite(str(library_tsv), str(db_path), str(cta_tsv))
+
+        conn = sqlite3.connect(str(db_path))
+        artist_name = conn.execute("SELECT artist_name FROM compilation_track_artist").fetchone()[0]
+        conn.close()
+
+        assert artist_name == "Foo\x00Bar"
+
+    def test_cta_backslash_then_literal_t_is_not_corrupted_by_naive_replace(
+        self, tmp_path: Path
+    ) -> None:
+        r"""Same single-left-to-right-pass proof as the library parser test of
+        the same name, against artist_name: on the wire \\t is three chars
+        (an escaped backslash, then a literal 't'); a naive
+        `.replace("\\t", " ")` would corrupt it to backslash+space."""
+        library_tsv = self._library_tsv(tmp_path)
+        cta_tsv = self._cta_tsv(tmp_path, [["1", "\\\\t", "Some Track"]])
+        db_path = tmp_path / "library.db"
+
+        tsv_to_sqlite(str(library_tsv), str(db_path), str(cta_tsv))
+
+        conn = sqlite3.connect(str(db_path))
+        artist_name = conn.execute("SELECT artist_name FROM compilation_track_artist").fetchone()[0]
+        conn.close()
+
+        assert artist_name == "\\t"
+        assert artist_name != "\t"
+
+    def test_cta_literal_backslash_n_artist_survives_row_not_dropped(self, tmp_path: Path) -> None:
+        r"""artist_name is NOT NULL (lib/library_db.py:270-276): a raw \N
+        there drops the whole row with a WARNING. Source data literally
+        spelled backslash-N must survive as the two-char string \N and must
+        NOT be misread as the NULL sentinel and dropped -- the data-loss
+        variant this ordering exists to prevent, per
+        WXYC/discogs-etl#370. On the wire this is three chars: \\N (an
+        escaped backslash, then a literal 'N').
+
+        Also pins that the ordering fix leaves library_release_id's
+        int()-cast (lib/library_db.py:277-285), which runs after the
+        sentinel test, undisturbed.
+        """
+        library_tsv = self._library_tsv(tmp_path)
+        cta_tsv = self._cta_tsv(tmp_path, [["1", "\\\\N", "Some Track"]])
+        db_path = tmp_path / "library.db"
+
+        tsv_to_sqlite(str(library_tsv), str(db_path), str(cta_tsv))
+
+        conn = sqlite3.connect(str(db_path))
+        rows = conn.execute(
+            "SELECT library_release_id, artist_name FROM compilation_track_artist"
+        ).fetchall()
+        conn.close()
+
+        # The row survives -- it is not dropped as a false NULL-artist_name.
+        assert rows == [(1, "\\N")]
+
+    def test_cta_track_title_null_sentinel_still_works(self, tmp_path: Path) -> None:
+        r"""The real \N sentinel (two chars, exactly) in the nullable
+        track_title column still maps to SQL NULL -- the ordering fix must
+        not disturb this existing, still-correct case."""
+        library_tsv = self._library_tsv(tmp_path)
+        cta_tsv = self._cta_tsv(tmp_path, [["1", "Stereolab", "\\N"]])
+        db_path = tmp_path / "library.db"
+
+        tsv_to_sqlite(str(library_tsv), str(db_path), str(cta_tsv))
+
+        conn = sqlite3.connect(str(db_path))
+        track_title = conn.execute("SELECT track_title FROM compilation_track_artist").fetchone()[0]
+        conn.close()
+
+        assert track_title is None
