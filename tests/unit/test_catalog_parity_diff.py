@@ -1968,6 +1968,60 @@ class TestCleanVerdictEndToEnd:
         assert result.clean is True
         assert result.normalizations["genre"]["case_folded"] == 1
 
+    def test_cta_above_baseline_is_not_clean(self, tmp_path: Path) -> None:
+        """CTA drift beyond the recorded baseline fails the verdict."""
+        mod = _load_module()
+        mysql_db = tmp_path / "mysql.db"
+        backend_db = tmp_path / "backend.db"
+        _make_library_db(
+            mysql_db,
+            [{"id": 1}],
+            cta_rows=[(1, "Duke Ellington", "In a Sentimental Mood")],
+        )
+        _make_library_db(backend_db, [{"id": 1}], cta_rows=[])
+
+        mysql_conn = sqlite3.connect(mysql_db)
+        backend_conn = sqlite3.connect(backend_db)
+        ledger = _ledger(cta_missing_baseline=0, cta_extra_baseline=0)
+        result = mod.diff_library_dbs(mysql_conn, backend_conn, ledger=ledger)
+        mysql_conn.close()
+        backend_conn.close()
+
+        assert result.cta_missing == 1
+        assert result.clean is False
+
+    def test_cta_below_baseline_is_still_clean(self, tmp_path: Path) -> None:
+        """The baseline is a CEILING, not an equality target.
+
+        The plan fixes the two baseline values but never states the
+        comparison operator, so this pins the interpretation: a CTA delta
+        that has *shrunk* below its recorded baseline is the migration
+        working, and must not fail a soak day. Without this case every
+        baseline assertion in the suite uses 0-vs-0, where ``<=`` and ``==``
+        are indistinguishable -- a later edit to either operator would stay
+        green.
+        """
+        mod = _load_module()
+        mysql_db = tmp_path / "mysql.db"
+        backend_db = tmp_path / "backend.db"
+        _make_library_db(
+            mysql_db,
+            [{"id": 1}],
+            cta_rows=[(1, "Duke Ellington", "In a Sentimental Mood")],
+        )
+        _make_library_db(backend_db, [{"id": 1}], cta_rows=[])
+
+        mysql_conn = sqlite3.connect(mysql_db)
+        backend_conn = sqlite3.connect(backend_db)
+        ledger = _ledger(cta_missing_baseline=5, cta_extra_baseline=5)
+        result = mod.diff_library_dbs(mysql_conn, backend_conn, ledger=ledger)
+        mysql_conn.close()
+        backend_conn.close()
+
+        assert result.cta_missing == 1
+        assert result.cta_extra == 0
+        assert result.clean is True
+
     def test_clean_false_without_a_populated_cta_baseline(self, tmp_path: Path) -> None:
         """A ledger with no baseline yet (None/None, the shipped default)
         cannot certify CTA is within bounds -- clean stays False even when
