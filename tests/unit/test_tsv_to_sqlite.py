@@ -774,8 +774,9 @@ class TestCtaEscaping:
     never reaches it. Re-runs the same four escapes plus both ordering
     hazards from ``TestTsvToSqlite`` above, but against ``artist_name`` --
     the CTA field with the ordering hazard that actually matters, since
-    ``artist_name`` is NOT NULL (``lib/library_db.py:270-276``): a `\\N`
-    collision there drops the whole row, not just one column.
+    ``artist_name`` is NOT NULL (the NULL-guard in
+    ``lib/library_db.py::parse_compilation_track_tsv``): a `\\N` collision
+    there drops the whole row, not just one column.
     """
 
     def _library_tsv(self, tmp_path: Path, release_id: str = "1") -> Path:
@@ -890,7 +891,8 @@ class TestCtaEscaping:
         assert artist_name != "\t"
 
     def test_cta_literal_backslash_n_artist_survives_row_not_dropped(self, tmp_path: Path) -> None:
-        r"""artist_name is NOT NULL (lib/library_db.py:270-276): a raw \N
+        r"""artist_name is NOT NULL (the NULL-guard in
+        lib/library_db.py::parse_compilation_track_tsv): a raw \N
         there drops the whole row with a WARNING. Source data literally
         spelled backslash-N must survive as the two-char string \N and must
         NOT be misread as the NULL sentinel and dropped -- the data-loss
@@ -899,8 +901,8 @@ class TestCtaEscaping:
         escaped backslash, then a literal 'N').
 
         Also pins that the ordering fix leaves library_release_id's
-        int()-cast (lib/library_db.py:277-285), which runs after the
-        sentinel test, undisturbed.
+        int()-cast -- which runs after the sentinel test in
+        parse_compilation_track_tsv -- undisturbed.
         """
         library_tsv = self._library_tsv(tmp_path)
         cta_tsv = self._cta_tsv(tmp_path, [["1", "\\\\N", "Some Track"]])
