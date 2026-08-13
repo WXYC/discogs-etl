@@ -65,8 +65,12 @@ from typing import NamedTuple
 VARIOUS_ARTISTS_NAME = "Various Artists"
 
 # job.ts:81 -- literal, including the lack of a `\s*` between `-` and `rock`
-# (so a "- rock" with a space does NOT satisfy this branch; see the module's
-# test file for why that still produces the right overall answer).
+# (so a "- rock" with a space does NOT satisfy this branch). Kept even though
+# it decides nothing: no string can satisfy both this and `_VARIOUS_RE` below
+# (this one needs two hyphens, that one permits at most one), so removing the
+# branch would change no answer today. It stays because the point of the port
+# is to track job.ts byte-for-byte -- a later edit to either regex must
+# diverge here loudly rather than silently. See the module's test file.
 _VARIOUS_ROCK_LETTER_RE = re.compile(r"various\s*artists\s*-rock\s*-[a-z]", re.IGNORECASE)
 
 # job.ts:84

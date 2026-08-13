@@ -78,7 +78,8 @@ byte-level difference -- a column that differs solely by a deliberate
 normalization (case folding, VA collapsing, a coerced NULL) no longer counts
 toward it. The normalized-tier counts themselves are tallied by
 ``_classify_matched_rows`` (column -> class -> count) but are not yet part of
-this module's public ``ParityDiff``/``--json`` contract.
+this module's public ``ParityDiff``/``--json`` contract -- until they are, an
+INFO log line is their only surface.
 
 Usage::
 
@@ -173,6 +174,14 @@ class SourceError(RuntimeError):
 # column added to `lib/library_db.py` must widen the diff automatically, or
 # it becomes a permanently-undiffed blind spot in the tool that certifies
 # the cutover.
+#
+# Since #370 that widening also *demands* a `COLUMN_MODELS` entry: an
+# unmodelled column raises `KeyError` out of `classify_field` rather than
+# quietly falling back to a byte compare. That is deliberate -- a silent
+# fallback is the blind spot in a different costume, and it would be a
+# comparison nobody chose, inside the tool certifying the cutover. The loud
+# failure is caught in CI by `TestColumnModelsDriftGuard`, which is where a
+# newly-added column is discovered, not on an operator's console.
 DIFF_COLUMNS = tuple(c for c in LIBRARY_COLUMNS if c not in ("id", "label"))
 
 # compilation_track_artist has no primary key of its own; it is compared as
@@ -246,9 +255,22 @@ def _tab_nl_sub(value: object) -> object:
     Four of the diffed columns (``title``, ``artist``, ``alternate_artist_name``,
     ``album_artist``) are wrapped in this at extraction on Backend's side
     (``job.ts:281-296``); the harness's own ``LIBRARY_SELECT_SQL`` has no such
-    wrapper, so the mysql-sourced ``library.db`` still carries the raw
-    tab/newline byte. Applied to the raw mysql value *before* any further
-    derivation, since the SQL-level replace runs first in production.
+    wrapper, so the mysql side is where the byte survives. Applied to the raw
+    mysql value *before* any further derivation, since the SQL-level replace
+    runs first in production.
+
+    **Inert until WXYC/discogs-etl#371 lands, which makes that a merge-order
+    dependency and not just a "no overlapping files" one.** ``mysql -B -N``
+    escapes an embedded tab into the two characters ``\\`` + ``t`` before the
+    TSV is ever written, and ``lib/library_db.parse_library_tsv`` passes that
+    through unchanged today -- so the mysql-sourced ``library.db`` holds the
+    escape sequence, not the byte, and this substitution matches nothing. The
+    ``tab_newline_substituted`` class therefore measures zero and rows carrying
+    embedded tabs stay counted as mismatches (#371 measured that population at
+    0 rows on the 2026-07-19 prod snapshot, so this is prophylactic rather than
+    an active miscount). #371 is the producer-side unescape that turns the
+    sequence back into the byte; until it merges, this function is correct but
+    unreachable.
 
     A no-op for anything that isn't a string (``None``, an int call number).
     """
@@ -317,7 +339,19 @@ def _classify_call_letters(
     else:
         derived = normalize_code_letters(mysql_raw if isinstance(mysql_raw, str) else None)
         expected = derived or "??"
-        cls = "uppercased" if derived is not None else "fallback_unknown"
+        if derived is None:
+            cls = "fallback_unknown"
+        elif derived == "V/A":
+            # The unanchored `/Z-[A-Z]/` branch -- a THIRD population, distinct
+            # from both plain uppercasing and the `isVarious` branch above.
+            # `Z--` does not reach it (no letter after the hyphen), which is
+            # the split the plan's R11 measurement turns on, and these class
+            # names are the key space the residue ledger's `baselines` block
+            # shares -- so it needs its own name or the ledger cannot size the
+            # Z-code cohort at all.
+            cls = "various_artists_code"
+        else:
+            cls = "uppercased"
 
     if _case_insensitive_equal(_normalize(backend_value), _normalize(expected)):
         return ("normalized", cls)
@@ -329,7 +363,7 @@ def _classify_genre(
 ) -> tuple[str, str | None]:
     """``genre``: lookup-resolved, compared case-insensitively.
 
-    ``genreMap`` is keyed on ``.toLowerCase()`` (``job.ts:951``, ``:966``)
+    ``genreMap`` is keyed on ``.toLowerCase()`` (``job.ts:951``, ``:965``)
     while the export emits the stored ``genres.genre_name``
     (``catalog-export.service.ts:233``) -- so a case-only difference is a
     deliberate normalization, and a genuine rename on either side stays
@@ -377,6 +411,15 @@ def _classify_artist_call_number(
     """``artist_call_number``: ``0`` when VA, else ``mysql ?? 0``.
 
     ``job.ts:996``: ``isVarious ? VARIOUS_ARTISTS_CODE_NUMBER : (artist_call_numbers ?? 0)``.
+
+    The ``?? 0`` fires on more than a SQL NULL: Backend reads this column
+    through ``toNullableNumber`` (``job.ts:69-74``), which maps empty/blank
+    text *and* anything ``Number()`` cannot make finite -- the literal
+    ``"NULL"`` included -- to null first. That is exactly ``_normalize``'s own
+    equivalence class, so the coalesce branches on it rather than on
+    ``is not None``; branching on the raw value files the artifact shapes
+    ``_normalize`` exists to absorb as defects.
+
     The ``ensureGenreArtistCrossref`` last-write-wins coupling on
     ``(artist_id, genre_id)`` (``job.ts:456-470``) means a delta here is not
     automatically a defect -- this classifier ships the simple model; sizing
@@ -395,7 +438,7 @@ def _classify_artist_call_number(
         expected: object = 0
         cls = "various"
     else:
-        expected = mysql_raw if mysql_raw is not None else 0
+        expected = mysql_raw if _normalize(mysql_raw) is not None else 0
         cls = "null_coalesced_zero"
 
     if _normalize(backend_value) == _normalize(expected):
@@ -406,12 +449,16 @@ def _classify_artist_call_number(
 def _classify_release_call_number(
     mysql_row: Mapping[str, object], backend_row: Mapping[str, object]
 ) -> tuple[str, str | None]:
-    """``release_call_number``: ``mysql ?? 0`` -- no VA branch (``job.ts:1100``)."""
+    """``release_call_number``: ``mysql ?? 0`` -- no VA branch (``job.ts:1100``).
+
+    Same ``toNullableNumber`` coercion as ``artist_call_number`` above, so the
+    coalesce keys on ``_normalize`` rather than on ``is not None``.
+    """
     mysql_raw = mysql_row["release_call_number"]
     backend_value = backend_row["release_call_number"]
     if _normalize(backend_value) == _normalize(mysql_raw):
         return ("agree", None)
-    expected = mysql_raw if mysql_raw is not None else 0
+    expected = mysql_raw if _normalize(mysql_raw) is not None else 0
     if _normalize(backend_value) == _normalize(expected):
         return ("normalized", "null_coalesced_zero")
     return ("mismatch", None)
@@ -520,6 +567,10 @@ def classify_field(
     ``tier`` is one of ``"agree"``, ``"normalized"``, ``"mismatch"``.
     ``normalization_class`` names which of Part 1's baseline classes explains
     the difference, and is only non-``None`` when ``tier == "normalized"``.
+
+    Raises ``KeyError`` on a column with no model. Unguarded on purpose -- see
+    the ``DIFF_COLUMNS`` comment above for why a ``.get()`` fallback to a bare
+    byte compare would be worse than the exception.
     """
     return COLUMN_MODELS[col](mysql_row, backend_row)
 
@@ -625,41 +676,57 @@ def _load_library_rows(conn: sqlite3.Connection, label: str) -> dict[int, dict[s
     return result
 
 
-def _load_cta_counts(
-    conn: sqlite3.Connection, *, apply_legacy_model: bool = False
-) -> Counter[tuple[object, ...]]:
+def _load_cta_counts(conn: sqlite3.Connection) -> Counter[tuple[object, ...]]:
     """Read compilation_track_artist as a normalized multiset.
 
     Returns an empty Counter (never raises) when the table is absent --
     the table is optional, matching tsv_to_sqlite.py's graceful-degradation
     handling of pre-V008 fixtures / Backend-Service-sourced catalogs.
 
-    ``apply_legacy_model=True`` (the mysql side only -- the backend side
-    already reflects both of these) additionally:
+    Two legacy-ETL transforms are replayed, and both are applied to **either**
+    side, not just the mysql one:
 
-    - applies the same TAB/NL substitution Backend's own extraction SQL
-      applies to ``ARTIST_NAME`` / ``TRACK_TITLE`` at import time
-      (``job.ts:727-729``); the harness's own ``COMPILATION_TRACK_SELECT_SQL``
-      has no such wrapper (and stays that way -- see
-      ``test_select_statements_match_sync_library_sh``), so the mysql-sourced
-      table still carries the raw byte.
-    - drops any row whose substituted, trimmed ``artist_name`` is empty,
-      mirroring ``parseLegacyCompilationTrackRows``'s row-drop rule
-      (``job.ts:710-711``) -- Backend's importer never writes such a row, so
-      it is expected-missing rather than genuine drift.
+    - the TAB/NL substitution Backend's own extraction SQL applies to
+      ``ARTIST_NAME`` / ``TRACK_TITLE`` at import time (``job.ts:727-729``);
+      the harness's own ``COMPILATION_TRACK_SELECT_SQL`` has no such wrapper
+      (and stays that way -- see ``test_select_statements_match_sync_library_sh``).
+    - the row-drop for an empty ``artist_name``, mirroring
+      ``parseLegacyCompilationTrackRows`` (``job.ts:710-711``) -- Backend's
+      importer never writes such a row, so a mysql-side one is
+      expected-missing rather than genuine drift.
+
+    **Symmetry is the whole point, and getting it wrong inverts the tool.**
+    Applying either transform to one counter only deletes a row from that side
+    while the other keeps it, so two byte-identical rows report as ``cta_extra``
+    -- the harness manufacturing drift out of agreement, in a gate whose job is
+    to certify seven consecutive clean days. Where the "backend already
+    reflects this" assumption holds, applying it to both sides is a no-op;
+    where it does not, applying it to both is what keeps agreement reading as
+    agreement.
+
+    The drop test is ``str.strip() == ""``, the ported rule -- deliberately NOT
+    ``_normalize``, which also collapses the literal string ``"NULL"``. That is
+    a legal 4-character artist name Backend keeps, so screening the drop
+    through ``_normalize`` would file a genuinely-missing "NULL" row as
+    expected.
     """
     if not _table_exists(conn, "compilation_track_artist"):
         return Counter()
     cols = ", ".join(CTA_COLUMNS)
     rows = conn.execute(f"SELECT {cols} FROM compilation_track_artist").fetchall()
     counter: Counter[tuple[object, ...]] = Counter()
-    for release_id, artist_name, track_title in rows:
-        if apply_legacy_model:
-            artist_name = _tab_nl_sub(artist_name)
-            track_title = _tab_nl_sub(track_title)
-            if _normalize(artist_name) is None:
-                continue
-        counter[(_normalize(release_id), _normalize(artist_name), _normalize(track_title))] += 1
+    for row in rows:
+        # Keyed by name off CTA_COLUMNS rather than unpacked positionally, so
+        # a widened CTA shape widens the multiset instead of raising a bare
+        # unpacking ValueError -- the same auto-widening property DIFF_COLUMNS
+        # has.
+        record = dict(zip(CTA_COLUMNS, row, strict=True))
+        record["artist_name"] = _tab_nl_sub(record["artist_name"])
+        record["track_title"] = _tab_nl_sub(record["track_title"])
+        artist_name = record["artist_name"]
+        if isinstance(artist_name, str) and artist_name.strip() == "":
+            continue
+        counter[tuple(_normalize(record[col]) for col in CTA_COLUMNS)] += 1
     return counter
 
 
@@ -684,11 +751,16 @@ def diff_library_dbs(
     field_mismatches, normalizations = _classify_matched_rows(mysql_rows, backend_rows, matched_ids)
     if normalizations:
         # Not yet part of the `ParityDiff` contract (that lands with the
-        # dataclass field-order change in a later step) -- logged so the
-        # counting is visible in the meantime rather than silently discarded.
-        logger.debug("catalog parity normalizations", extra={"normalizations": normalizations})
+        # dataclass field-order change in a later step), so this log line is
+        # the counts' only surface until then. INFO, not DEBUG: `init_logger`
+        # pins the root level at INFO and this CLI has no verbosity flag, so a
+        # DEBUG record here would be unreachable in every invocation the
+        # harness actually has -- "logged rather than discarded" would be
+        # discarded. One line per run, and on stderr, so `--json`'s
+        # one-object-on-stdout contract is untouched.
+        logger.info("catalog parity normalizations", extra={"normalizations": normalizations})
 
-    mysql_cta = _load_cta_counts(mysql_conn, apply_legacy_model=True)
+    mysql_cta = _load_cta_counts(mysql_conn)
     backend_cta = _load_cta_counts(backend_conn)
     cta_missing = sum((mysql_cta - backend_cta).values())
     cta_extra = sum((backend_cta - mysql_cta).values())

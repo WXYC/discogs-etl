@@ -20,6 +20,7 @@ import base64
 import gzip
 import importlib.util
 import json
+import logging
 import re
 import sqlite3
 import subprocess
@@ -878,6 +879,34 @@ class TestClassifyField:
         tier, cls = mod.classify_field("call_letters", mysql_row, backend_row)
         assert tier == "normalized"
 
+    def test_call_letters_z_code_gets_its_own_class_not_uppercased(self) -> None:
+        """The unanchored ``/Z-[A-Z]/`` -> "V/A" return is a THIRD population,
+        distinct from both plain uppercasing and the ``isVarious`` branch.
+
+        ``lib/backend_catalog_norm.normalize_code_letters``'s docstring turns on
+        exactly this split (the plan's R11 ``Z--`` measurement), and these class
+        names are the key space the residue ledger's ``baselines`` block will
+        share -- so filing the Z-code cohort under "uppercased" would make the
+        ledger unable to size the one distinction the port preserves.
+        """
+        mod = _load_module()
+        mysql_row = _row(artist="Stereolab", call_letters="Z-S")
+        backend_row = _row(artist="Stereolab", call_letters="V/A")
+        tier, cls = mod.classify_field("call_letters", mysql_row, backend_row)
+        assert tier == "normalized"
+        assert cls == "various_artists_code"
+
+    def test_call_letters_z_dash_dash_is_not_a_z_code(self) -> None:
+        """``Z--`` does not match ``/Z-[A-Z]/`` -- it keeps its value via the
+        3-char branch, so it is ordinary uppercasing, not the Z-code class.
+        3,104 rows on the 2026-07-19 prod snapshot ride on this distinction."""
+        mod = _load_module()
+        mysql_row = _row(artist="Stereolab", call_letters="z--")
+        backend_row = _row(artist="Stereolab", call_letters="Z--")
+        tier, cls = mod.classify_field("call_letters", mysql_row, backend_row)
+        assert tier == "normalized"
+        assert cls == "uppercased"
+
     def test_call_letters_genuine_difference_is_a_mismatch(self) -> None:
         mod = _load_module()
         mysql_row = _row(call_letters="ST")
@@ -966,6 +995,22 @@ class TestClassifyField:
         assert tier == "normalized"
         assert cls == "various"
 
+    @pytest.mark.parametrize("raw", ["", "   ", "NULL"])
+    def test_artist_call_number_coalesces_normalize_null_shapes(self, raw: str) -> None:
+        """Backend reads this column through ``toNullableNumber``, which maps
+        empty *and* non-numeric text to null before the ``?? 0``. So every shape
+        ``_normalize`` already treats as NULL -- ``''``, whitespace, and the
+        literal ``"NULL"`` the mysql export pipeline is known to emit -- derives
+        ``0``, not just a true SQL NULL. Branching on ``mysql_raw is not None``
+        instead files them as defects.
+        """
+        mod = _load_module()
+        mysql_row = _row(artist="Stereolab", artist_call_number=raw)
+        backend_row = _row(artist="Stereolab", artist_call_number=0)
+        tier, cls = mod.classify_field("artist_call_number", mysql_row, backend_row)
+        assert tier == "normalized"
+        assert cls == "null_coalesced_zero"
+
     def test_artist_call_number_genuine_difference_is_a_mismatch(self) -> None:
         mod = _load_module()
         mysql_row = _row(artist="Stereolab", artist_call_number=100)
@@ -986,6 +1031,16 @@ class TestClassifyField:
     def test_release_call_number_null_coalesces_to_zero(self) -> None:
         mod = _load_module()
         mysql_row = _row(release_call_number=None)
+        backend_row = _row(release_call_number=0)
+        tier, cls = mod.classify_field("release_call_number", mysql_row, backend_row)
+        assert tier == "normalized"
+        assert cls == "null_coalesced_zero"
+
+    @pytest.mark.parametrize("raw", ["", "   ", "NULL"])
+    def test_release_call_number_coalesces_normalize_null_shapes(self, raw: str) -> None:
+        """Same ``toNullableNumber`` coercion as ``artist_call_number``."""
+        mod = _load_module()
+        mysql_row = _row(release_call_number=raw)
         backend_row = _row(release_call_number=0)
         tier, cls = mod.classify_field("release_call_number", mysql_row, backend_row)
         assert tier == "normalized"
@@ -1187,6 +1242,31 @@ class TestFieldMismatchesTieringEndToEnd:
         assert result.field_mismatches["genre"] == 0
         assert result.field_mismatches["artist"] == 1
 
+    def test_normalization_counts_reach_a_real_invocation(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """``normalizations`` is not in ``ParityDiff`` yet, so the log line is
+        its ONLY surface until the ledger PR wires it in.
+
+        ``init_logger`` pins the root level at INFO and this CLI has no
+        verbosity flag, so a ``logger.debug`` here is unreachable in every
+        invocation the harness actually has -- "logged rather than discarded"
+        would be discarded. Pinned at INFO, one line per run, on stderr so the
+        ``--json`` stdout contract is untouched.
+        """
+        mod = _load_module()
+        mysql_db = tmp_path / "mysql.db"
+        backend_db = tmp_path / "backend.db"
+        _make_library_db(mysql_db, [{"id": 1, "genre": "rock"}])
+        _make_library_db(backend_db, [{"id": 1, "genre": "Rock"}])
+
+        with caplog.at_level(logging.INFO, logger="catalog_parity_diff"):
+            mod.run_diff(str(mysql_db), str(backend_db))
+
+        records = [r for r in caplog.records if "normalizations" in r.__dict__]
+        assert records, "the normalization counts never reached the log"
+        assert records[0].normalizations == {"genre": {"case_folded": 1}}
+
 
 class TestCtaModelling:
     """The CTA multiset gets the same TAB/NL substitution as the main library
@@ -1210,6 +1290,45 @@ class TestCtaModelling:
 
         result = mod.run_diff(str(mysql_db), str(backend_db))
         assert result.cta_missing == 0
+        assert result.cta_extra == 0
+
+    @pytest.mark.parametrize("artist_name", ["  ", "\t", "NULL"])
+    def test_cta_identical_row_never_manufactures_drift(
+        self, tmp_path: Path, artist_name: str
+    ) -> None:
+        """Agreement must never come out of the harness as drift.
+
+        The legacy model has to be applied to BOTH multisets, not just the
+        mysql one: a one-sided drop deletes a row from one counter while the
+        other keeps it, and the difference reports as ``cta_extra`` on data
+        that is byte-identical on both sides. In a tool whose job is to certify
+        seven consecutive clean parity days, that is the worst failure
+        direction there is.
+        """
+        mod = _load_module()
+        mysql_db = tmp_path / "mysql.db"
+        backend_db = tmp_path / "backend.db"
+        for path in (mysql_db, backend_db):
+            _make_library_db(path, [{"id": 1}], cta_rows=[(1, artist_name, "la paradoja")])
+
+        result = mod.run_diff(str(mysql_db), str(backend_db))
+        assert result.cta_missing == 0
+        assert result.cta_extra == 0
+
+    def test_cta_literal_null_artist_is_a_name_not_an_empty_row(self, tmp_path: Path) -> None:
+        """``parseLegacyCompilationTrackRows`` drops on ``trim().length === 0``
+        (``job.ts:710-711``) -- so the 4-character name "NULL" is kept, and
+        Backend not holding it is genuine drift. Screening the drop through
+        ``_normalize`` (which also swallows the literal ``"NULL"``) would file
+        that missing row as expected instead."""
+        mod = _load_module()
+        mysql_db = tmp_path / "mysql.db"
+        backend_db = tmp_path / "backend.db"
+        _make_library_db(mysql_db, [{"id": 1}], cta_rows=[(1, "NULL", "la paradoja")])
+        _make_library_db(backend_db, [{"id": 1}], cta_rows=[])
+
+        result = mod.run_diff(str(mysql_db), str(backend_db))
+        assert result.cta_missing == 1
         assert result.cta_extra == 0
 
     def test_cta_empty_artist_row_is_expected_missing_not_drift(self, tmp_path: Path) -> None:
