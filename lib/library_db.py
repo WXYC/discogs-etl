@@ -233,6 +233,17 @@ def _unescape_mysql_field(value: str) -> str:
     the correct backslash+``t``. A single left-to-right scan consumes the
     ``\\`` pair first and gets it right. See
     ``tests/unit/test_tsv_to_sqlite.py`` for the pinned case.
+
+    ``\0``->NUL is a deliberate tie-break taken at 0 observed rows (see
+    ``plans/346-parity-clean-definition.md``), and its blast radius is wider
+    than SQLite: besides truncating the value for any ``sqlite3_column_text``
+    consumer, ``scripts/sync-library.sh`` feeds the CTA table into LML's
+    ``build_compilation_track_location``, which writes those columns into
+    **PostgreSQL** ``text`` -- which cannot hold U+0000 at all (server raises
+    22021; ``tests/fixtures/charset-torture.json`` records the same). That
+    build is soft-failed, so one NUL-bearing row would stop the recall index
+    updating behind nothing louder than a WARNING. If a live measurement ever
+    finds such a row, that belongs in the follow-up ticket's criteria.
     """
     out: list[str] = []
     i = 0
@@ -280,13 +291,38 @@ def parse_library_tsv(tsv_path: str) -> Iterable[Sequence[object]]:
     than their escaped spelling. Rows without exactly 11 fields are skipped
     with a WARNING on stderr (never silently dropped).
 
-    **Fragile by construction**: this only produces the right bytes because
-    Backend-Service's producer runs ``mysql ... --raw`` (escaping disabled)
-    while this repo's producers do not. All three call sites depend on that
-    asymmetry holding: ``scripts/tsv_to_sqlite.py``,
-    ``scripts/catalog_parity_diff.py``, and Backend-Service's
-    ``shared/database/src/legacy/sql.mirror.ts`` (the ``--raw`` side). A flag
-    change on either side silently invalidates the unescape here.
+    **Fragile by construction, and the dependency is one-sided.** The
+    unescape is correct only while *this repo's* producers keep escaping
+    enabled: ``scripts/sync-library.sh`` and ``catalog_parity_diff.py``'s
+    ``_mysql_invocation`` both run ``mysql -B -N`` **without** ``--raw``.
+    Adding ``--raw`` to either silently inverts this function -- the wire
+    would then carry real bytes, and a title holding the literal two chars
+    backslash-``t`` would be converted into a TAB that was never in the
+    source. The two callers of this parser are ``scripts/tsv_to_sqlite.py``
+    and ``scripts/catalog_parity_diff.py``.
+
+    Backend-Service's ``shared/database/src/legacy/sql.mirror.ts`` does run
+    ``--raw``, but that is **not** a dependency of this function: its stdout
+    is parsed by Backend's own TypeScript and never reaches here, and the
+    parity harness reads Backend over HTTP JSON
+    (``catalog_parity_diff.py::_build_from_backend_snapshot``), not from
+    mirror output. Its flag matters only to whether the two sides end up
+    *comparable* -- both holding true bytes -- so do not read it as
+    load-bearing for this parser.
+
+    **Carriage return is outside the escape vocabulary, and this parser does
+    not handle it.** ``mysql``'s ``safe_put_field`` escapes exactly NUL, TAB,
+    NL and backslash, never CR, while this ``open()`` runs in universal-
+    newline mode -- so a raw CR in source data is read as a line terminator.
+    Mid-row it splits the line and both fragments fail the field-count check
+    (dropped, with a WARNING); in the **final** column the first fragment
+    still has the right field count and is accepted with the value silently
+    truncated at the CR. Unlike the four escapes above this class leaves no
+    trace in the built artifact -- a ``char(13)`` probe against ``library.db``
+    cannot see a row that was dropped or truncated on the way in -- so it has
+    to be measured against MySQL (``INSTR(TITLE, CHAR(13))``). Deliberately
+    left unfixed here: correcting it changes which rows are ingested, which
+    needs that measurement first. See WXYC/discogs-etl#370.
 
     A generator, so warnings interleave with the inserts they describe.
     """

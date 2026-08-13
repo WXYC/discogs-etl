@@ -21,6 +21,18 @@ SQLITE_BUILD_XFAIL_INPUTS: dict[tuple[str, str], str] = {
     ),
 }
 
+# NOTE (WXYC/discogs-etl#370): test_tsv_to_sqlite_roundtrip writes corpus inputs
+# into the TSV *raw* (unescaped) and asserts byte-identity, so it now implicitly
+# requires that no corpus input contains a sequence the parser unescapes. It
+# passes today only because the corpus's one backslash entry is `back\slash` —
+# `\s` is outside the vocabulary and passes through untouched. A future corpus
+# entry containing `\\`, `\t`, `\n` or `\0` would redden this job even though the
+# parser is behaving correctly; the fix then is to escape the input on the way
+# into the TSV (as the CTA test below does), not to change the parser. Worth
+# knowing because charset-torture.json is the shared cross-repo artifact governed
+# by check-charset-corpus-drift.yml@gha/v1, so the reddening commit could land in
+# wxyc-shared rather than here.
+
 
 @pytest.mark.parametrize("entry", CORPUS_ENTRIES, ids=entry_id)
 def test_tsv_to_sqlite_roundtrip(
