@@ -76,9 +76,13 @@ def test_ledger_cta_baselines_are_populated() -> None:
     back to the ``EMPTY_BASELINES`` shape.
 
     Deliberately asserts only shape and sign, never the literal numbers: the
-    pair is a **ceiling**, expected to fall as the residue behind it is
-    repaired (see the pin's CTA-baseline note), and a test that froze today's
-    values would redden on exactly the improvement the gate wants.
+    pair is a **ceiling**, and repairing the residue behind it moves the two
+    numbers in directions that are not obvious -- clearing the mojibake
+    duplicates from Backend alone would convert that class from ``cta_extra``
+    to ``cta_missing`` rather than removing it (see the pin's CTA-baseline
+    note). A test that froze today's values would redden on a legitimate
+    re-measurement in either direction, including the improvement the gate
+    exists to wait for.
     """
     baselines = json.loads(LEDGER_JSON.read_text(encoding="utf-8"))["baselines"]
     assert baselines["measured_date"] is not None, (
