@@ -77,12 +77,26 @@ class TestNormalizeArtistName:
         assert result.is_various is True
 
     def test_various_artists_rock_letter_carveout_stays_literal(self) -> None:
-        """The VA carve-out is byte-exact: ``/^various\\s*artists\\s*-rock\\s*-[a-z]$/i``.
+        """Ported verbatim from the upstream case of the same name
+        (``library-etl.test.ts:200-205``): this row keeps its raw name and is
+        NOT Various Artists.
 
-        This is the load-bearing carve-out the plan calls out at
-        ``:200-205`` -- a reimplementation from description (rather than a
-        literal port) would plausibly drop it and misclassify this row as
-        Various Artists.
+        **The carve-out regex is not what makes that true, and the port has to
+        stay literal anyway.** ``"various artists - rock - a"`` matches neither
+        regex: the carve-out needs ``-rock`` with no space (job.ts:81), and the
+        general VA pattern's optional tail is ``\\s*-\\s*[a-z]+`` -- one hyphen,
+        letters only -- so it cannot consume a second ``- a``. Both fail and the
+        value falls through unchanged. In fact no string satisfies both
+        patterns at once (the carve-out requires two hyphens, the general
+        pattern permits one), which makes the carve-out branch unreachable *as
+        a decision*: deleting it changes no answer.
+
+        That is a property of the upstream source, not a licence to
+        paraphrase. The parity harness's job is to derive what Backend
+        actually holds, and it can only do that by matching job.ts
+        byte-for-byte -- including its dead branches, so that a *future* edit
+        to either regex diverges here loudly instead of silently. Recorded
+        rather than "simplified away" for the same reason.
         """
         result = normalize_artist_name("various artists - rock - a")
         assert result.name == "various artists - rock - a"
