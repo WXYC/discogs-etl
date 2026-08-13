@@ -1,0 +1,59 @@
+# discogs-etl catalog-parity residue vendor pin (discogs-etl#370).
+#
+# UNLIKE wxyc-etl-pin.txt, this pin has no upstream to point at. wxyc-etl-pin.txt
+# pins a released tag (wxyc_etl_version) with a real source commit; the residue
+# data here comes from an untracked personal repo (jakebromberg/wxyc-workspace,
+# plans/tubafrenzy-phase3-close-out/) with no tag and no commit to record. So
+# `vendor/parity-residue/` -- not this file -- is the source of truth, and this
+# pin degrades to a self-hash: it catches a hand-edit of
+# vendor/parity-residue/*.json (the realistic failure mode), but it CANNOT
+# catch a wrong vendoring in the first place, because there is no upstream
+# artifact to diff against. Stating that plainly here is better than a pin
+# that looks like it verifies provenance it does not.
+#
+# Measured 2026-08-11 against prod tubafrenzy MySQL (wxycmusic) and prod
+# Backend PG (wxyc_schema). Full narrative, reproduction notes, and the
+# non-vendored artist-side numbers: vendor/parity-residue/residue-ledger.md.
+#
+# Only 2 of the source repo's 4 residue files are vendored:
+#
+#   - residue-collapsed-599.tsv -> vendor/parity-residue/ledger.json
+#     (converted). This is the frozen enumeration Part 2's Rule B cannot
+#     derive -- skip path 7, findExistingRelease's duplicate-collapse.
+#   - residue-ledger.md -> vendor/parity-residue/residue-ledger.md (copied
+#     verbatim). The provenance narrative this pin cites in place of a
+#     source commit.
+#
+# residue-absent-12.txt is NOT vendored: it is Rule B's own OUTPUT,
+# re-derived per row from skip paths 1/3/5/6 (db_only genre, an unparseable
+# format, an empty artist name, an empty album title) by
+# scripts/catalog_parity_diff.py itself. Freezing it reintroduces the exact
+# staleness residue-ledger.md warns about ("db_only is still being used, so
+# this set grows slowly while /wxycdb stays open").
+#
+# residue-orphan-115.txt is NOT vendored: it is superseded by BS#2108's
+# delete script, which has not run yet and must emit its own kept-set
+# artifact once it does. Pinning today's 115 would freeze the pre-delete
+# state into a post-delete gate. Until BS#2108 lands, every one of those 115
+# ids reports as extra_unexplained, which is accurate -- the delete is a
+# soak prerequisite, not yet satisfied.
+#
+# Re-derivation procedure (manual; needs the Kattare MySQL + Backend PG
+# access described in residue-ledger.md's "Reproducing" section):
+#   1. Re-run the residue-ledger.md queries against live prod.
+#   2. Re-derive residue-collapsed-599.tsv and residue-ledger.md the same way.
+#   3. python scripts/vendor_parity_residue.py \
+#        --source-dir <path-to-tubafrenzy-phase3-close-out> \
+#        --measured-date <YYYY-MM-DD>
+#      (defaults --out-dir to vendor/parity-residue/)
+#   4. Recompute the SHA-256 of both output files and update this file.
+#
+# The `baselines` block inside ledger.json (per-class normalization counts,
+# the CTA missing/extra pair) is a later step's concern (plan step 6) and is
+# not covered by this pin's re-derivation procedure -- it is populated and
+# reviewed independently, and its own change still moves ledger_json_sha256
+# below.
+
+ledger_json_sha256        = cfff4513b9c41d6f43eacec485d226c78648a3f2a2b3d790d097a71f9453048a
+residue_ledger_md_sha256  = a4ae0db356bfae54d7195905cb4f99dcfac5282ab17b09a660161b617469ba71
+measured_date             = 2026-08-11

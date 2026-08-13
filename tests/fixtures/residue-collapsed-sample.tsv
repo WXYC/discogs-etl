@@ -1,0 +1,13 @@
+# Hand-committed sample mirroring the shape of residue-collapsed-599.tsv
+# (discogs-etl#370, Part 2's "frozen enumeration"). NOT produced by
+# tests/fixtures/create_fixtures.py -- the real 600-line file lives in the
+# source repo's plans/tubafrenzy-phase3-close-out/, which is untracked and
+# never present in CI, so scripts/vendor_parity_residue.py is exercised
+# against this small sample instead of the live path. The three data rows
+# below are the real file's first three pairs (public release ids, not
+# sensitive), kept byte-identical so a fixture regen wouldn't silently
+# change what's being tested.
+mysql_id	backend_kept_legacy_id
+8	7
+151	150
+236	235
