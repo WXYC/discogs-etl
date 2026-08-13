@@ -51,6 +51,8 @@ WXYC is a freeform station — use representative artists (Stereolab, Juana Moli
 - **[wxyc-catalog](https://github.com/WXYC/wxyc-catalog)** -- Catalog source protocol (tubafrenzy + Backend-Service backends), `wxyc-export-to-sqlite` / `wxyc-enrich-library-artists` / `wxyc-extract-library-labels` CLIs
 - **[wxyc-shared](https://github.com/WXYC/wxyc-shared)** -- Cross-repo test-utility fixtures (canonical example artists)
 
+`parity-residue-pin.txt` (discogs-etl#370) is **not** the same shape as `wxyc-etl-pin.txt`: the latter pins a released tag with a real upstream source commit, while the residue ledger's source is an untracked personal repo with neither, so that pin is a self-hash only -- see its own header before treating a missing provenance field as a bug to fix.
+
 ## `entity.*` schema ownership
 
 The `entity.*` schema in the cache database is **owned by this repo** and is created/migrated **only** through alembic (`alembic/versions/0012_entity_release_identity.py`, `0013_adopt_entity_identity.py`). It holds the cross-service identity contract (`entity.identity`, `entity.release_identity`, reconciliation logs) read by LML, Backend-Service, and semantic-index. Per [discogs-etl#288](https://github.com/WXYC/discogs-etl/issues/288) (Option 3):
