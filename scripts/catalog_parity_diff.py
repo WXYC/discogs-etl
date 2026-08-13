@@ -384,7 +384,11 @@ def _normalize(value: object) -> object:
     source separately -- see WXYC/discogs-etl#346) are all treated as equal,
     and collapse to ``None``. Surrounding whitespace is stripped. No other
     transform is applied: no case folding, no accent folding, no internal
-    whitespace collapsing.
+    whitespace collapsing -- that stays true of THIS function specifically.
+    The per-column expectation model above (``COLUMN_MODELS`` /
+    ``classify_field``) layers case folding, accent folding, and other
+    tiered transforms on top of ``_normalize``'s output; see that section's
+    comment block for what a given column actually tolerates end to end.
     """
     if value is None:
         return None
