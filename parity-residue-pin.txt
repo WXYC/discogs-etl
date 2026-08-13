@@ -48,12 +48,58 @@
 #      (defaults --out-dir to vendor/parity-residue/)
 #   4. Recompute the SHA-256 of both output files and update this file.
 #
-# The `baselines` block inside ledger.json (per-class normalization counts,
-# the CTA missing/extra pair) is a later step's concern (plan step 6) and is
-# not covered by this pin's re-derivation procedure -- it is populated and
-# reviewed independently, and its own change still moves ledger_json_sha256
-# below.
+# The `baselines` block inside ledger.json is NOT covered by the
+# re-derivation procedure above -- it is measured and reviewed independently,
+# and its own change still moves ledger_json_sha256 below. vendor_parity_residue.py
+# reads the existing block forward on a re-vendor rather than resetting it, so
+# step 3's procedure does not clobber this measurement.
+#
+#   normalizations  -- still {}. Informational only: the plan's resolved
+#     question 2 settled that normalization counts do NOT gate `clean`, and
+#     populating it needs a full two-sided library.db build, not the CTA pair.
+#
+#   cta_missing / cta_extra -- measured 2026-08-13 against the live pair
+#     (tubafrenzy MySQL wxycmusic via the Kattare tunnel; Backend prod PG
+#     wxyc_schema, replaying getCompilationTrackExportRows' five INNER JOINs
+#     from apps/backend/services/catalog-export.service.ts:360-377).
+#     140,617 mysql rows / 2,586 releases vs 144,778 backend rows / 2,576.
+#
+#     These are a CEILING, not a target (the `clean` term is `<=`), and both
+#     numbers are expected to FALL. What they currently hold:
+#
+#       cta_missing 2701 = 869 rows in 10 mysql-only releases, every one of
+#         them a collapsed_mysql_ids id below (so they are already this
+#         ledger's own expected residue, arriving as CTA rows rather than
+#         library rows) + 56 mojibake originals + 1,776 other.
+#       cta_extra 6862 = 4,879 rows where Backend holds BOTH a byte-clean
+#         copy and a double-encoded (CP1252 mojibake) copy of the same track,
+#         across 780 releases, + 1,983 other. This is BS#1996's cohort
+#         (5,084 mojibake rows here; that issue counted 5,310) and it is
+#         still OPEN, so these are NOT remediation leftovers. The id ordering
+#         says the opposite: in 638 of the 768 affected releases the mojibake
+#         block sits ENTIRELY ABOVE the clean rows (0 releases the other way,
+#         130 interleaved), so the corrupted rows were inserted LATER. The
+#         mysql side is corrupted today -- 5,147 of its CTA rows read as
+#         double-encoded -- so tubafrenzy's text was mangled at some point
+#         and the insert-only importer re-imported it as NEW rows alongside
+#         the pre-corruption clean ones. Nothing collapsed them: the two
+#         strings differ, and no unique constraint spans the pair (a dup
+#         check on (library_id, artist_name, track_title) reports zero).
+#
+#     Which way this resolves changes the number, so do not assume it only
+#     falls. Backend's mysql-matching copies are the CORRUPTED ones, so the
+#     4,879 extra are its clean rows: deleting Backend's corrupted duplicates
+#     alone would convert them to cta_missing rather than removing the drift.
+#     Repairing tubafrenzy's source is what actually collapses this class.
+#     Re-measure and reset the ceiling once either lands -- but never raise a
+#     number merely to make a red soak day pass, which inverts the gate.
+#
+#     The net (+4,161 backend rows) reconciles the two prior measurements
+#     that looked contradictory: D6's documented "4,161 extra" is this NET
+#     row-count surplus, while the 2026-08-12 run's 2,771/6,932 is the
+#     two-directional MULTISET split of that same net (6,932 - 2,771 = 4,161).
+#     Neither was wrong; they measure different things.
 
-ledger_json_sha256        = cfff4513b9c41d6f43eacec485d226c78648a3f2a2b3d790d097a71f9453048a
+ledger_json_sha256        = 62b77dfdec2fb53ed392fe03515523cd313f660cb73bce6e4c691739846a62a4
 residue_ledger_md_sha256  = a4ae0db356bfae54d7195905cb4f99dcfac5282ab17b09a660161b617469ba71
 measured_date             = 2026-08-11

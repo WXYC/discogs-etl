@@ -1,8 +1,8 @@
 {
   "baselines": {
-    "cta_extra": null,
-    "cta_missing": null,
-    "measured_date": null,
+    "cta_extra": 6862,
+    "cta_missing": 2701,
+    "measured_date": "2026-08-13",
     "normalizations": {}
   },
   "collapsed_mysql_ids": {

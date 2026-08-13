@@ -16,6 +16,7 @@ files already on disk.
 from __future__ import annotations
 
 import hashlib
+import json
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -60,6 +61,37 @@ def test_pin_file_sha256s_match_vendored_files() -> None:
             f"{path.relative_to(REPO_ROOT)} drifted from pin {key} -- re-vendor per "
             "parity-residue-pin.txt's re-derivation procedure and update the pin"
         )
+
+
+def test_ledger_cta_baselines_are_populated() -> None:
+    """The CTA baseline pair must stay measured, not null.
+
+    ``diff_library_dbs`` only reaches a ``clean`` verdict when
+    ``cta_missing``/``cta_extra`` are both within the ledger's baselines, and
+    its ``cta_within_baseline`` term is ``False`` outright while either is
+    ``None``. So an unpopulated block does not merely skip the CTA check --
+    it makes ``clean`` permanently unreachable, which is the exact failure
+    mode discogs-etl#370 exists to remove. Step 6 measured these against the
+    live prod pair; this asserts a later re-vendor never silently drops them
+    back to the ``EMPTY_BASELINES`` shape.
+
+    Deliberately asserts only shape and sign, never the literal numbers: the
+    pair is a **ceiling**, expected to fall as the residue behind it is
+    repaired (see the pin's CTA-baseline note), and a test that froze today's
+    values would redden on exactly the improvement the gate wants.
+    """
+    baselines = json.loads(LEDGER_JSON.read_text(encoding="utf-8"))["baselines"]
+    assert baselines["measured_date"] is not None, (
+        "baselines.measured_date is null -- an undated CTA ceiling cannot be "
+        "aged out or re-derived; see parity-residue-pin.txt"
+    )
+    for key in ("cta_missing", "cta_extra"):
+        value = baselines[key]
+        assert isinstance(value, int) and not isinstance(value, bool), (
+            f"baselines.{key} must be an int (got {value!r}) -- `clean` is "
+            "unreachable while it is null"
+        )
+        assert value >= 0, f"baselines.{key} must be non-negative (got {value})"
 
 
 def test_only_two_source_files_are_vendored() -> None:
