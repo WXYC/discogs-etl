@@ -82,7 +82,7 @@ toward it. The normalized-tier counts themselves are tallied by
 never gating. ``_print_human`` does not carry them, so an INFO log line
 remains their only surface for the default (non-``--json``) invocation.
 
-**Fold-collapse (discogs-etl#346, plan step 8).** One class of divergence is
+**Fold-collapse (discogs-etl#346, plan step 9).** One class of divergence is
 NOT a property of the row pair at all. tubafrenzy identifies an artist by
 ``LIBRARY_CODE`` row and 295 presentation names have more than one; Backend
 identifies by ``artists`` row via ``fold_artist_name``, so those collapse
@@ -591,7 +591,7 @@ def _classify_call_letters(
 def _derive_call_letters(mysql_row: Mapping[str, object]) -> tuple[str | None, str]:
     """Replay Backend's ``code_letters`` derivation for ONE mysql row.
 
-    Extracted so ``_fold_group_call_letters`` can ask the same question of a
+    Extracted so ``_fold_group_values`` can ask the same question of a
     *sibling* row without restating the rule -- the fold-collapse resolution
     is only sound if the value it accepts is one this same derivation would
     have produced.
@@ -796,17 +796,27 @@ def _classify_cross_reference_names(
     fold-set is "normalized", not "mismatch".
 
     **Cardinality GAIN is reported the same way, for the same reason
-    (WXYC/discogs-etl#346, plan step 8).** An earlier revision called a
+    (WXYC/discogs-etl#346, plan step 9).** An earlier revision called a
     superset "a genuine defect"; the 2026-08-13 prod run showed that is
     wrong, and wrong structurally rather than by degree.
-    ``LIBRARY_CODE_CROSS_REFERENCE`` is joined per *code*, but
-    ``LIBRARY_SELECT_SQL`` only reaches codes that carry a *release*. A
-    duplicate ``LIBRARY_CODE`` with zero releases is invisible to this
-    harness while ``ensureArtist`` still folds it into Backend's single
-    ``artists`` row -- so Backend legitimately carries aliases the mysql
-    query cannot return, no matter how healthy both sides are. Gating on
-    that measures the query's blind spot, not the migration. All 11 such
-    rows on prod were strict supersets; zero were any other shape.
+
+    The asymmetry is in the two sides' join grain.
+    ``LIBRARY_CODE_CROSS_REFERENCE`` is keyed by *code*, and
+    ``LIBRARY_SELECT_SQL``'s correlated subquery can only return aliases
+    attached to a code that carries a *release* -- a code with zero releases
+    is not in this harness's input at all. Backend has no such restriction:
+    its ``artists`` table is deduplicated onto ``fold_artist_name`` (see
+    ``_fold_identity_key``), so several codes -- release-carrying or not --
+    resolve to one ``artists`` row, and ``artist_crossreference`` hangs off
+    that row carrying the union of their aliases. Measured on prod: of the 6
+    distinct (artist, surplus-alias) pairs, 4 come from a duplicate code with
+    **zero** releases (``Odd Nosdam``, ``Kendra Smith``, ``Tom Carter``
+    twice), which ``LIBRARY_SELECT_SQL`` can never surface however healthy
+    both sides are.
+
+    So gating on a superset measures the query's blind spot, not the
+    migration. All 11 such rows on prod were strict supersets; zero were any
+    other shape.
 
     What stays gated is a set that is neither subset nor superset: Backend
     dropping one alias *and* gaining another. No fold-collapse or
@@ -872,9 +882,9 @@ def classify_field(
 
 
 # Columns whose divergence can be explained by a row OTHER than the one being
-# compared -- see `_resolve_fold_collapse`. Deliberately narrow: these are the
-# two attributes Backend stores once per folded artist (`artists.code_letters`)
-# or once per folded artist and genre (`genre_artist_crossreference.
+# compared -- see `_is_fold_collapsed`. Deliberately narrow: these are the two
+# attributes Backend stores once per folded artist (`artists.code_letters`) or
+# once per folded artist and genre (`genre_artist_crossreference.
 # artist_genre_code`), so a duplicate `LIBRARY_CODE` forces one value to win.
 # `cross_reference_names` collapses the same way but needs no group context --
 # it is a set union, so the widening is expressible per row as
@@ -883,11 +893,32 @@ FOLD_COLLAPSE_COLUMNS = ("call_letters", "artist_call_number")
 
 
 def _fold_identity_key(row: Mapping[str, object]) -> str:
-    """The key Backend's ``ensureArtist`` folds a mysql row's artist onto.
+    """The key Backend's ``artists`` table currently collapses a mysql row's
+    artist onto: ``fold_artist_name(normalize_artist_name(...))``, matching
+    the ``artist`` / ``call_letters`` classifiers' own derivation.
 
-    ``fold_artist_name(normalize_artist_name(...))``, matching the
-    ``artist``/``call_letters`` classifiers' own derivation -- so two mysql
-    rows share a key exactly when Backend gives them one ``artists`` row.
+    **This is an empirical property of the live data, NOT a restatement of
+    what ``ensureArtist`` would do today, and the difference matters.**
+    ``ensureArtist`` (``job.ts:388-427``) matches on
+    ``fold_artist_name(...)`` *and* ``lower(artists.code_letters)`` (plus
+    ``(genre_id, artist_genre_code)`` off ``genre_artist_crossreference`` for
+    a non-various artist), and INSERTs a fresh row when any of those miss --
+    read literally, two ``LIBRARY_CODE`` rows sharing a name but differing in
+    ``CALL_LETTERS`` would get two ``artists`` rows and would never collapse
+    at all. Prod says otherwise, because the table has since been
+    deduplicated onto the fold (the ``fold_artist_name`` work behind
+    migration 0134): measured 2026-08-13, **1** fold name out of 23,882
+    ``artists`` rows has more than one row, and **0** ``(fold name,
+    code_letters)`` pairs do. The lone exception (``Markolino Dimond``,
+    ``MA``/``DI``, one release each) does not appear in the resolved set.
+
+    So the key models the state the harness actually compares against. The
+    standing assumption is that the dedup holds; if ``artists`` is ever
+    allowed to re-accumulate fold-duplicates, a release linked to the *wrong*
+    one of two rows would be silently absorbed here rather than reported. Any
+    change to `ensureArtist`'s matching should re-measure those two counts
+    before trusting this resolution -- library.db carries no artist id, so
+    the harness cannot check it from its own inputs.
     """
     artist = _tab_nl_sub(row.get("artist"))
     info = normalize_artist_name(artist if isinstance(artist, str) else "")
@@ -897,15 +928,32 @@ def _fold_identity_key(row: Mapping[str, object]) -> str:
 def _build_fold_groups(
     mysql_rows: Mapping[int, Mapping[str, object]],
 ) -> dict[str, list[Mapping[str, object]]]:
-    """Index every mysql row by its Backend artist-fold key.
+    """Index every IMPORTABLE mysql row by its Backend artist-fold key.
 
-    Built from ALL mysql rows, not just matched ones: the sibling that
-    supplied the winning value is often a row Backend collapsed away
-    entirely (it is in ``missing_in_backend``), and excluding it would leave
-    the very collapse this resolution exists to explain unexplained.
+    Built from all mysql rows rather than only matched ones: the sibling that
+    supplied the winning value is often a row Backend collapsed away entirely
+    (it is in ``missing_in_backend``), and excluding it would leave the very
+    collapse this resolution exists to explain unexplained.
+
+    But rows Backend's ETL *skips* are excluded, because they can never have
+    written the value being explained. ``job.ts:959-990`` ``continue``s past a
+    ``db_only`` genre, an unresolvable genre, an unparseable format and an
+    empty artist name **before** reaching ``ensureArtist`` /
+    ``ensureGenreArtistCrossref``, so such a row contributes no
+    ``code_letters`` and no ``artist_genre_code``. Admitting one would weaken
+    the gate this resolution rests on -- "the value has to be one the mysql
+    side itself supplies" -- to "...or one a never-imported row happens to
+    carry". ``_rule_b_missing_reason`` is exactly that predicate, already
+    used for row-level expectation.
+
+    Inert on the 2026-08-13 prod pair (0 of 92 resolutions change), which is
+    the argument for landing it while it is free rather than after a skipped
+    sibling coincides with a real defect.
     """
     groups: dict[str, list[Mapping[str, object]]] = {}
     for row in mysql_rows.values():
+        if _rule_b_missing_reason(row) is not None:
+            continue
         groups.setdefault(_fold_identity_key(row), []).append(row)
     return groups
 
@@ -932,9 +980,26 @@ def _fold_group_values(
             values.add(str(normalized).upper() if isinstance(normalized, str) else normalized)
         return values
     if column == "artist_call_number":
+        # Case-insensitive, like `_classify_genre` and for the same reason:
+        # Backend resolves a genre through `genreMap.get(name.toLowerCase())`
+        # (`job.ts:951,965`), so two `GENRE.REFERENCE_NAME`s differing only in
+        # case land on ONE `genre_id` and therefore one crossref row. A
+        # byte-exact filter would drop that sibling and report a genuinely
+        # collapsed value as a mismatch.
+        #
+        # `_case_insensitive_equal` is False when either side is None, so the
+        # both-absent case is spelled out: two genre-less rows share a genre
+        # as surely as two rows both reading "Rock" do, and silently dropping
+        # that pairing would be the same bug in the other direction.
         genre = _normalize(mysql_row.get("genre"))
         for sibling in siblings:
-            if _normalize(sibling.get("genre")) != genre:
+            sibling_genre = _normalize(sibling.get("genre"))
+            same_genre = (
+                sibling_genre is None
+                if genre is None
+                else _case_insensitive_equal(sibling_genre, genre)
+            )
+            if not same_genre:
                 continue
             expected, _ = _derive_artist_call_number(sibling)
             values.add(_normalize(expected))
