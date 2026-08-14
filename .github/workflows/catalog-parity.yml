@@ -1,0 +1,187 @@
+name: Catalog Parity Soak
+
+# Diffs the MySQL-sourced (tubafrenzy) and Backend-sourced catalogs daily and
+# gates on the verdict, so wiki#89 AC#4 -- seven consecutive clean parity days
+# before the 2026-08-31 tubafrenzy turndown -- is a property of this run
+# history rather than of whoever last ran the harness on a laptop.
+#
+# discogs-etl#378. The harness itself is scripts/catalog_parity_diff.py (#370),
+# which owns the `clean` verdict, the vendored residue ledger, and the exit
+# codes this workflow reads.
+#
+# EXPECT EXIT 4 (a red run) UNTIL THE RESIDUE CLEARS. Exit 4 is the drift
+# *verdict*, not a broken workflow: as of the 2026-08-13 prod measurement
+# (#346) `clean` is false on 115 unexplained extra rows (BS#2108's pending
+# /wxycdb delete) plus 28 residual field mismatches. Both have owners. The
+# point of scheduling now is to have the streak instrumented before the
+# residue clears, not to be green today. `scripts/parity_run_summary.py`
+# renders which of the two it was, per run.
+
+on:
+  schedule:
+    # 09:37 UTC daily = 5:37 AM EDT / 4:37 AM EST, 2:37 AM PDT. Three
+    # deliberate choices:
+    #   * ~2h20m ahead of sync-library.yml's 12:00 UTC slot. Both scan the
+    #     same Kattare MySQL, whose HikariCP pool maxes at 5 connections, and
+    #     overlapping full-catalog scans are how that host wedges (2026-05-24).
+    #     tests/unit/test_catalog_parity_workflow.py checks that margin
+    #     against this job's timeout-minutes, so raising the timeout past the
+    #     gap fails in CI rather than in production.
+    #   * Off the top of the hour: GitHub queues scheduled workflows hardest
+    #     at :00, and a delayed run is a day the streak can silently lose.
+    #   * Quiet for catalogers. The two sides are snapshotted minutes apart,
+    #     so an edit landing between them reads as drift; pre-dawn Eastern is
+    #     when that is least likely. It also puts the run on the same calendar
+    #     date in UTC, Eastern, and Pacific, so "which day was this" has one
+    #     answer.
+    - cron: "37 9 * * *"
+  workflow_dispatch:
+
+# This workflow reads two live sources and writes nothing back: no push, no
+# release, no PR comment, no cloud credentials. contents:read is both the
+# floor and the ceiling. (sync-library.yml additionally needs id-token:write
+# for OIDC; there is no AWS step here.)
+permissions:
+  contents: read
+
+# A manual dispatch during the scheduled run would put two full-catalog scans
+# on the same MySQL at once -- the exact contention the schedule above is
+# chosen to avoid. Queue instead of cancelling: cancelling mid-run orphans the
+# backgrounded SSH tunnel and leaves the server-side scan running anyway.
+concurrency:
+  group: catalog-parity
+  cancel-in-progress: false
+
+jobs:
+  parity:
+    runs-on: ubuntu-latest
+    # Bounds a wedged tunnel or a hung export, which would otherwise burn the
+    # 6-hour runner default. Must stay below the gap to sync-library.yml's
+    # slot (see the cron comment); the wiring test enforces that.
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # No pip install step, deliberately: catalog_parity_diff.py is stdlib
+      # only apart from repo-local lib.* imports (it inserts the repo root on
+      # sys.path itself), and lib.observability degrades to basicConfig when
+      # wxyc_etl is absent. Adding a dependency to the harness's import graph
+      # means adding an install step here.
+
+      - name: Install MariaDB client
+        # Not interchangeable with the Oracle/Homebrew MySQL client: a 9.x
+        # client SEGFAULTS (exit 139) against tubafrenzy's MySQL 5.1.56.
+        # sync-library.yml installs the same package for the same reason.
+        run: sudo apt-get install -y mariadb-client
+
+      - uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+
+      - name: Add Kattare host key
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -H "$LIBRARY_SSH_HOST" >> ~/.ssh/known_hosts
+        env:
+          LIBRARY_SSH_HOST: ${{ secrets.LIBRARY_SSH_HOST }}
+
+      - name: Open SSH tunnel to Kattare MySQL
+        # Kattare's MySQL only resolves from inside Kattare's network, so the
+        # harness talks to a local forward. ExitOnForwardFailure is what makes
+        # this step fail on a bind failure: `ssh -f -N -L` otherwise
+        # backgrounds happily with no forward, and the failure resurfaces
+        # several minutes later as an opaque producer error (exit 3) with the
+        # real cause off-screen.
+        run: |
+          set -euo pipefail
+          ssh -f -N -L "13306:${LIBRARY_DB_HOST}:3306" \
+            "${LIBRARY_SSH_USER}@${LIBRARY_SSH_HOST}" \
+            -o ExitOnForwardFailure=yes -o ConnectTimeout=10
+        env:
+          LIBRARY_SSH_HOST: ${{ secrets.LIBRARY_SSH_HOST }}
+          LIBRARY_SSH_USER: ${{ secrets.LIBRARY_SSH_USER }}
+          LIBRARY_DB_HOST: ${{ secrets.LIBRARY_DB_HOST }}
+
+      - name: Run catalog parity diff
+        run: |
+          set -euo pipefail
+
+          # Fresh scratch per run, never cached: the harness refuses to write
+          # over an existing --mysql-db/--backend-db by design, so a reused
+          # path turns every run after the first into exit 3.
+          PARITY_DIR="$(mktemp -d)"
+          {
+            echo "PARITY_DIR=$PARITY_DIR"
+            echo "PARITY_DATE=$(date -u +%Y-%m-%d)"
+          } >> "$GITHUB_ENV"
+
+          # Capture the harness's status instead of failing on it. GitHub
+          # skips every later step once one fails, so failing here would
+          # discard the artifact upload AND the summary that explains what
+          # exit 4 means -- the two things that make a red run legible. The
+          # "Report parity verdict" step below re-raises this code.
+          set +e
+          python scripts/catalog_parity_diff.py \
+            --mysql-source "mysql://${LIBRARY_DB_USER}@127.0.0.1:13306/${LIBRARY_DB_NAME}" \
+            --mysql-db "$PARITY_DIR/mysql.db" \
+            --backend-source "$BACKEND_CATALOG_URL" \
+            --backend-db "$PARITY_DIR/backend.db" \
+            --fail-on-drift \
+            --json > "$PARITY_DIR/parity.json"
+          rc=$?
+          set -e
+
+          echo "PARITY_EXIT_CODE=$rc" >> "$GITHUB_ENV"
+          echo "catalog_parity_diff.py exited $rc"
+        env:
+          # No --residue-ledger: the default resolves vendor/parity-residue/
+          # ledger.json relative to the script, never the cwd. Passing the
+          # literal 'none' would make --fail-on-drift exit 2 by design.
+          #
+          # The DSN carries no password. It reaches the harness on argv, where
+          # `ps` and any set -x would expose it; the harness reads
+          # $LIBRARY_DB_PASSWORD into MYSQL_PWD instead.
+          LIBRARY_DB_USER: ${{ secrets.LIBRARY_DB_USER }}
+          LIBRARY_DB_NAME: ${{ secrets.LIBRARY_DB_NAME }}
+          LIBRARY_DB_PASSWORD: ${{ secrets.LIBRARY_DB_PASSWORD }}
+          # Public hostname, so a variable with a default rather than a secret
+          # -- overridable to point a dispatch at staging.
+          BACKEND_CATALOG_URL: ${{ vars.BACKEND_CATALOG_URL || 'https://api.wxyc.org' }}
+          # The service account's password, not a token: the JWT Backend
+          # accepts expires in 15 minutes, so the harness signs in per run.
+          BACKEND_CATALOG_EMAIL: ${{ secrets.BACKEND_CATALOG_EMAIL }}
+          BACKEND_CATALOG_PASSWORD: ${{ secrets.BACKEND_CATALOG_PASSWORD }}
+
+      - name: Upload parity report
+        # always(), because exit 4 is the case worth auditing and the default
+        # would skip precisely those days. A 7-day streak has to be provable
+        # after the fact from these artifacts.
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: catalog-parity-${{ env.PARITY_DATE }}-${{ github.run_id }}
+          path: ${{ env.PARITY_DIR }}/parity.json
+          retention-days: 30
+          # On exit 2/3 there may be no readable report. Failing the upload
+          # there would bury the producer error that actually needs reading.
+          if-no-files-found: warn
+
+      - name: Report parity verdict
+        if: always()
+        # Renders the exit-code taxonomy into the step summary and re-raises
+        # the code, so THIS is the step that fails the job -- with exit 4
+        # legible as a verdict and 1/2/3 legible as infrastructure. Defaults
+        # to 3 when the harness never ran (a tunnel or checkout failure is a
+        # producer failure, and "no verdict was computed" is the honest
+        # summary for it).
+        run: |
+          set -euo pipefail
+          args=(--exit-code "${PARITY_EXIT_CODE:-3}")
+          if [ -n "${PARITY_DIR:-}" ]; then
+            args+=(--json "$PARITY_DIR/parity.json")
+          fi
+          python scripts/parity_run_summary.py "${args[@]}" >> "$GITHUB_STEP_SUMMARY"
