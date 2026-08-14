@@ -256,3 +256,46 @@ Properties worth knowing before reading a parity report:
 - **`cross_reference_names` can no longer gate on cardinality in either direction, and that is a property of the query, not a concession.** `LIBRARY_CODE_CROSS_REFERENCE` is joined per *code*, but `LIBRARY_SELECT_SQL` only reaches codes that carry a release — so a duplicate code with zero releases is invisible here while Backend still folds it in. Both directions are reported per class, so a spike is still visible in `normalizations`; it just does not block `clean`.
 
 Both producers refuse to write to a path that already exists: the harness only ever builds scratch copies and must never be able to clobber a real `library.db`. Each builds into a hidden `.partial` file beside its target and renames it into place only on success, so a failed run leaves nothing behind for the next day's run to refuse — but the two `--*-db` paths still have to be fresh, hence the `mktemp -d` above.
+
+#### U+FFFD pair capture (`--capture-fffd-cta-pairs`, WXYC/Backend-Service#2152)
+
+A one-off sibling mode, not part of the daily-sync producer story above: `--capture-fffd-cta-pairs PATH` pairs every Backend `compilation_track_artist` row holding a literal U+FFFD REPLACEMENT CHARACTER against its tubafrenzy MySQL truth, and writes the result as JSON to `PATH` (`-` for stdout). It exists because the 2026-08-13 prod parity run ([#346](https://github.com/WXYC/discogs-etl/issues/346) step 8a) found 14 such values and no laptop can capture them: `BACKEND_CATALOG_EMAIL`/`BACKEND_CATALOG_PASSWORD` are repo secrets, and the Homebrew MySQL 9.x client segfaults against tubafrenzy's MySQL 5.1 (`mariadb-client` is what works — see [#378](https://github.com/WXYC/discogs-etl/issues/378)). CI is the only place both sides are reachable at once; this mode rides that.
+
+```bash
+PARITY_DIR=$(mktemp -d)
+export LIBRARY_DB_PASSWORD=...
+export BACKEND_CATALOG_EMAIL=catalog-parity@wxyc.invalid
+export BACKEND_CATALOG_PASSWORD=...
+
+python scripts/catalog_parity_diff.py \
+    --capture-fffd-cta-pairs "$PARITY_DIR/fffd-pairs.json" \
+    --mysql-source "mysql://$LIBRARY_DB_USER@127.0.0.1:13306/$LIBRARY_DB_NAME" \
+    --mysql-db "$PARITY_DIR/mysql.db" \
+    --backend-source https://api.wxyc.org
+```
+
+`--backend-source` is required (not `--backend-db`): the bulk `GET /library/catalog/compilation-tracks` export deliberately omits both the CTA row id and `track_position` (api.yaml's `CatalogCompilationTrackRow` docstring says shipping them "would break parity" with library.db's 3-column CTA table), so this mode makes one further call per affected release — `GET /library/{id}/compilation-tracks` (`CompilationTrack`, BS#1964), keyed on Backend's own serial id rather than `legacy_release_id` — to recover `track_position`. `track_position` is not itself corrupted by this bug (it carries no non-ASCII content), so Backend's live value is trustworthy without a MySQL cross-check; the pairing rule below never touches it.
+
+**The pairing rule** (`lib/fffd_pair_capture.py`, no I/O, unit-tested in isolation): the corruption is one-byte-in-one-codepoint-out, so character length is preserved (`La Bête` → `La B<U+FFFD>te`, both 7 characters) and every non-U+FFFD position is untouched. For each corrupt Backend value, a MySQL row is a candidate only if it has the same character length and agrees at every non-U+FFFD position on every corrupt column, **and** matches byte-for-byte on any column that is *not* corrupt (the anchor that keeps a match from wandering onto the wrong track within the same release). Exactly one candidate resolves the row; zero or more than one reports it **unresolved**, with the candidates considered — never a guess, and never an accent-stripped or visually-similar substitute (this is exactly the population — `Csillagrablók`, `Bête`, `µ-Ziq` — where such a guess is a wrong answer). A row corrupt in both `artist_name` and `track_title` resolves as one row carrying both true values, never two.
+
+The JSON output is `{"resolved": [...], "unresolved": [...], "sql_values": "..."}`. Each resolved entry carries `legacy_release_id`, `track_position`, the corrupt and true value for each column (`null` on a column that was not corrupt), and `true_*_codepoints` — every non-ASCII character in the true value named individually as `{"index", "char", "codepoint"}` (e.g. `"U+00B5"`), so a reviewer can confirm `µ` MICRO SIGN was captured rather than `μ` GREEK SMALL LETTER MU without trusting a font. `sql_values` renders every resolved row as `pending_cta_repair` VALUES tuples in Backend-Service's `scripts/audit/bs_replacement_char_cta.sql` column order (`legacy_release_id, track_position, current_artist_name, current_track_title, true_artist_name, true_track_title`) — paste it in place of that block's placeholder row.
+
+**Manual fallback**, if CI is unavailable and someone with credentials needs to capture the pairs by hand — the same two reads this mode automates:
+
+```sql
+-- Enumerate the corrupt rows (Backend PG, read-only):
+SELECT cta.library_id, l.legacy_release_id, cta.track_position, cta.artist_name, cta.track_title
+FROM wxyc_schema.compilation_track_artist cta
+JOIN wxyc_schema.library l ON l.id = cta.library_id
+WHERE cta.artist_name LIKE E'%�%' OR cta.track_title LIKE E'%�%'
+ORDER BY l.legacy_release_id, cta.track_position;
+```
+
+```sql
+-- Read the true values for the same release (tubafrenzy MySQL, `--default-character-set=utf8` mandatory):
+SELECT LIBRARY_RELEASE_ID, ARTIST_NAME, TRACK_TITLE
+FROM COMPILATION_TRACK_ARTIST
+WHERE LIBRARY_RELEASE_ID = <legacy_release_id>;
+```
+
+Match rows by character length and non-U+FFFD position agreement exactly as above — read the true value, never reconstruct it.

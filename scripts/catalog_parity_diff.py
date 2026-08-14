@@ -186,6 +186,14 @@ from lib.backend_catalog_norm import (  # noqa: E402
     normalize_code_letters,
     parse_format_and_discs,
 )
+from lib.fffd_pair_capture import (  # noqa: E402
+    CtaRow,
+    ResolvedFffdPair,
+    UnresolvedFffdPair,
+    find_fffd_pairs,
+    has_fffd,
+    render_pending_cta_repair_values,
+)
 from lib.library_db import (  # noqa: E402
     CROSS_REFERENCE_SEPARATOR,
     LIBRARY_COLUMNS,
@@ -1189,6 +1197,40 @@ def _load_cta_counts(conn: sqlite3.Connection) -> Counter[tuple[object, ...]]:
     return counter
 
 
+def _load_cta_rows(conn: sqlite3.Connection, label: str) -> list[CtaRow]:
+    """Read ``compilation_track_artist`` as individual rows, for
+    ``--capture-fffd-cta-pairs`` (WXYC/Backend-Service#2152).
+
+    Unlike ``_load_cta_counts``, this returns each row's own identity rather
+    than a normalized multiset, and applies NO normalization at all -- no
+    ``_normalize``, no ``_tab_nl_sub``. The FFFD pairing rule
+    (``lib/fffd_pair_capture.find_fffd_pairs``) is a literal,
+    position-by-position comparison against the raw MySQL-sourced string;
+    the general harness's normalization passes are calibrated for the
+    field-mismatch diff, not for this, and applying one here would risk
+    silently absorbing the very corruption this mode exists to capture.
+
+    Returns ``[]`` (with a loud warning, not a silent one) when the table is
+    absent -- matching ``_load_cta_counts``'s graceful degradation for the
+    general diff, but logged here because an empty capture on an otherwise
+    successful run reads as "nothing to do" while a missing table usually
+    means the wrong ``--mysql-db`` path was passed.
+    """
+    if not _table_exists(conn, "compilation_track_artist"):
+        logger.warning(
+            "library.db has no compilation_track_artist table; the FFFD capture will "
+            "find zero candidates for every corrupt Backend row",
+            extra={"step": "fffd_cta_capture", "side": label},
+        )
+        return []
+    cols = ", ".join(CTA_COLUMNS)
+    rows = conn.execute(f"SELECT {cols} FROM compilation_track_artist").fetchall()
+    return [
+        CtaRow(legacy_release_id=int(row[0]), artist_name=row[1], track_title=row[2])
+        for row in rows
+    ]
+
+
 def _classify_row_expectations(
     mysql_rows: Mapping[int, Mapping[str, object]],
     missing_ids: Sequence[int],
@@ -1714,6 +1756,38 @@ def _catalog_cta_row_to_library_row(row: dict[str, Any]) -> tuple[object, ...]:
     )
 
 
+def _catalog_row_to_id_map_entry(row: dict[str, Any]) -> tuple[int, int]:
+    """Map one CatalogExportRow to ``(legacy_release_id, Backend serial id)``.
+
+    Needed only by ``--capture-fffd-cta-pairs``. The bulk CTA export
+    deliberately omits both the CTA row id and ``track_position``
+    (api.yaml's ``CatalogCompilationTrackRow`` docstring: "shipping them
+    would break parity" with library.db's 3-column CTA table), so
+    ``track_position`` has to come from the per-release
+    ``GET /library/{id}/compilation-tracks`` endpoint instead
+    (``CompilationTrack``, BS#1964) -- which is keyed on Backend's own
+    serial id, not ``legacy_release_id``. ``_catalog_row_to_library_row``
+    reads that serial id only to quote it in a diagnostic and then discards
+    it; this sibling mapper exists to keep the mapping around.
+    """
+    legacy_release_id = _require_legacy_release_id(row, "catalog")
+    backend_id = row.get("id")
+    if backend_id is None:
+        raise SourceError(
+            f"catalog export row for legacy_release_id {legacy_release_id} has no 'id' "
+            "field; api.yaml's CatalogExportRow marks it required, and "
+            "--capture-fffd-cta-pairs needs it to resolve track_position via "
+            "GET /library/{id}/compilation-tracks"
+        )
+    try:
+        return legacy_release_id, int(backend_id)
+    except (TypeError, ValueError) as exc:
+        raise SourceError(
+            f"catalog export row for legacy_release_id {legacy_release_id} has a "
+            f"non-integer 'id' ({backend_id!r})"
+        ) from exc
+
+
 def _resolve_https_base_url(source: str, *, source_label: str, secret_description: str) -> str:
     """Validate and normalize a base URL that a secret is about to travel to.
 
@@ -2226,12 +2300,26 @@ def _fetch_ndjson_once(
 
 
 def _fetch_consistent_snapshot(
-    base_url: str, token_source: _TokenSource
+    base_url: str,
+    token_source: _TokenSource,
+    *,
+    catalog_mapper: Callable[[dict[str, Any]], _Row] = _catalog_row_to_library_row,
 ) -> tuple[list[_Row], list[_Row]]:
     """Fetch both exports, retrying until they describe the same catalog snapshot.
 
-    Returns rows already mapped into ``library`` / ``compilation_track_artist``
-    shape, so both id sets are plain ints and nothing raw survives the fetch.
+    Returns rows mapped by ``catalog_mapper`` (defaulting to the ``library``
+    row shape the general Backend producer builds a library.db from) and by
+    the fixed ``_catalog_cta_row_to_library_row`` -- the CTA side stays fixed
+    because the dangling-id cross-check below (and every caller) needs
+    ``row[0]`` to be ``legacy_release_id`` on a plain subscriptable sequence;
+    a caller wanting a different CTA row shape (``--capture-fffd-cta-pairs``,
+    WXYC/Backend-Service#2152, wants a ``CtaRow`` dataclass) maps the
+    returned tuples afterward rather than this function taking on a second
+    varying mapper. ``--capture-fffd-cta-pairs`` passes
+    ``catalog_mapper=_catalog_row_to_id_map_entry`` to keep the Backend
+    serial id the default mapper discards -- the torn-snapshot retry logic
+    and the dangling-id cross-check are unaffected either way, since element
+    0 of both catalog-row shapes is ``legacy_release_id``.
 
     Note that ``Last-Modified`` is an HTTP-date, i.e. whole seconds: two
     distinct watermarks inside the same second compare equal, so a write
@@ -2244,7 +2332,7 @@ def _fetch_consistent_snapshot(
     reason = "no attempt was made"
     for attempt in range(1, _SNAPSHOT_ATTEMPTS + 1):
         catalog_rows, catalog_watermark = _fetch_ndjson(
-            base_url + _CATALOG_PATH, token_source, _catalog_row_to_library_row
+            base_url + _CATALOG_PATH, token_source, catalog_mapper
         )
         cta_rows, cta_watermark = _fetch_ndjson(
             base_url + _COMPILATION_TRACKS_PATH, token_source, _catalog_cta_row_to_library_row
@@ -2284,6 +2372,235 @@ def _fetch_consistent_snapshot(
         f"could not read a consistent catalog snapshot from {base_url} in "
         f"{_SNAPSHOT_ATTEMPTS} attempts: {reason}"
     )
+
+
+# --- WXYC/Backend-Service#2152 U+FFFD pair capture --------------------------
+#
+# A narrow, one-off sibling of the two producers above, not a general-purpose
+# third one: it never writes a library.db at all. It fetches the same
+# Backend catalog snapshot the general producer does, but keeps the fields
+# that one discards (the Backend serial id, each CTA row's own identity)
+# because they are exactly what this mode needs and the general shape
+# doesn't carry.
+
+
+def _fetch_backend_fffd_capture_inputs(
+    base_url: str, token_source: _TokenSource
+) -> tuple[dict[int, int], list[CtaRow]]:
+    """Fetch the Backend catalog snapshot in the shape ``--capture-fffd-cta-pairs``
+    needs: a ``legacy_release_id -> Backend serial id`` map (for the
+    track_position follow-up below) and every CTA row as its own ``CtaRow``
+    (for FFFD pairing) -- the same torn-snapshot-safe fetch
+    ``_fetch_consistent_snapshot`` already does for the general producer,
+    just keeping the Backend serial id on the catalog side via
+    ``_catalog_row_to_id_map_entry``, and wrapped into ``CtaRow`` on the CTA
+    side after the fetch returns (``_fetch_consistent_snapshot`` keeps its
+    CTA mapper fixed -- see that function's docstring for why).
+    """
+    id_map_rows, cta_rows = _fetch_consistent_snapshot(
+        base_url,
+        token_source,
+        catalog_mapper=_catalog_row_to_id_map_entry,
+    )
+    id_map = dict(id_map_rows)
+    backend_rows = [CtaRow(*row) for row in cta_rows]
+    return id_map, backend_rows
+
+
+def _fetch_compilation_tracks_once(
+    base_url: str, backend_id: int, token: str
+) -> list[dict[str, Any]]:
+    """One ``GET /library/{id}/compilation-tracks``. Raises ``_AuthStatusError``
+    so the caller can refresh, matching ``_fetch_ndjson_once``'s shape --
+    this is a single small JSON object, not gzipped NDJSON, so it does not
+    reuse that function directly.
+    """
+    url = f"{base_url}/library/{backend_id}/compilation-tracks"
+    request = Request(
+        url,
+        headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+    )
+    try:
+        with _opener.open(request, timeout=_HTTP_TIMEOUT_SECONDS) as response:
+            body = response.read()
+    except HTTPError as exc:
+        # Must precede the URLError clause below, same reasoning as
+        # _fetch_ndjson_once: HTTPError subclasses URLError.
+        detail = ""
+        try:
+            detail = exc.read().decode("utf-8", "replace")[:200].replace("\n", " ").strip()
+        except Exception:  # noqa: BLE001 - a body we cannot read is not the failure
+            pass
+        raise _AuthStatusError(exc.code, detail, exc.headers) from exc
+    except (URLError, OSError) as exc:
+        raise SourceError(f"failed to fetch {url}: {exc}") from exc
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise SourceError(f"{url} returned a body that could not be parsed as JSON: {exc}") from exc
+    tracks = payload.get("tracks") if isinstance(payload, dict) else None
+    if not isinstance(tracks, list):
+        raise SourceError(f"{url} returned no 'tracks' array (the CompilationTrackList contract)")
+    return tracks
+
+
+def _fetch_compilation_tracks(
+    base_url: str, backend_id: int, token_source: _TokenSource
+) -> list[dict[str, Any]]:
+    """``GET /library/{id}/compilation-tracks`` with one 401-refresh retry,
+    matching ``_fetch_ndjson``'s shape. A 404 (the release vanished between
+    the catalog snapshot and this follow-up call -- rare, but the snapshot
+    and this call are not one transaction) degrades to an empty list rather
+    than failing the whole capture: the affected row(s) simply come back
+    with ``track_position = None``, which is a legal, not fatal, output.
+    """
+    url = f"{base_url}/library/{backend_id}/compilation-tracks"
+    for attempt in (1, 2):
+        try:
+            return _fetch_compilation_tracks_once(base_url, backend_id, token_source.token())
+        except _AuthStatusError as exc:
+            if exc.code == 401 and attempt == 1:
+                logger.info(
+                    "compilation-tracks fetch returned 401; refreshing the service-account token",
+                    extra={"step": "fffd_cta_capture", "url": url},
+                )
+                token_source.invalidate()
+                continue
+            if exc.code == 404:
+                return []
+            raise SourceError(f"failed to fetch {url}: HTTP {exc.code}: {exc.detail}") from exc
+    raise AssertionError("unreachable: the retry loop either returns or raises")
+
+
+def _resolve_fffd_track_positions(
+    base_url: str,
+    token_source: _TokenSource,
+    id_map: Mapping[int, int],
+    corrupt_rows: Sequence[CtaRow],
+) -> dict[tuple[int, str, str], str]:
+    """Fetch ``track_position`` for every corrupt row's release, keyed on
+    each Backend row's own (still-corrupt) ``(legacy_release_id,
+    artist_name, track_title)`` tuple.
+
+    The bulk CTA export never carries ``track_position`` at all (see
+    ``_catalog_row_to_id_map_entry``'s docstring), so this is the one place
+    ``--capture-fffd-cta-pairs`` needs a second kind of Backend call beyond
+    the two bulk exports the rest of the harness already makes.
+    ``track_position`` is not itself corrupted by the U+FFFD bug -- it
+    carries no non-ASCII content -- so Backend's own live value is
+    trustworthy without any MySQL cross-check; the pairing rule in
+    ``lib/fffd_pair_capture`` never touches this value, only reports it.
+
+    One fetch per distinct affected release (deduplicated on Backend's own
+    serial id, not on ``legacy_release_id``, since that is what the HTTP
+    path is keyed on), and each fetch's response fills in EVERY track on
+    that release -- not just the one row that triggered it -- so a
+    compilation with several corrupt tracks costs one call, not several.
+
+    A release this cannot resolve a position for (missing from ``id_map`` --
+    only reachable if the catalog snapshot tore between the bulk fetch and
+    here, since both mappers key on the same ``legacy_release_id``; the
+    compilation-tracks fetch 404ing; or no track in the response matching
+    the row's own corrupt tuple, e.g. a concurrent edit) is simply absent
+    from the returned mapping. ``find_fffd_pairs`` treats a missing key as
+    ``track_position = None``, a legal value, not a failure.
+    """
+    positions: dict[tuple[int, str, str], str] = {}
+    fetched_backend_ids: set[int] = set()
+    for row in corrupt_rows:
+        backend_id = id_map.get(row.legacy_release_id)
+        if backend_id is None or backend_id in fetched_backend_ids:
+            continue
+        fetched_backend_ids.add(backend_id)
+        tracks = _fetch_compilation_tracks(base_url, backend_id, token_source)
+        for track in tracks:
+            artist_name = track.get("artist_name")
+            position = track.get("track_position")
+            if artist_name is None or position is None:
+                continue
+            track_title = track.get("track_title")
+            track_title = track_title if track_title is not None else ""
+            positions[(row.legacy_release_id, artist_name, track_title)] = position
+    return positions
+
+
+def _resolved_fffd_pair_to_dict(pair: ResolvedFffdPair) -> dict[str, Any]:
+    return {
+        "legacy_release_id": pair.legacy_release_id,
+        "track_position": pair.track_position,
+        "current_artist_name": pair.current_artist_name,
+        "current_track_title": pair.current_track_title,
+        "true_artist_name": pair.true_artist_name,
+        "true_track_title": pair.true_track_title,
+        "true_artist_name_codepoints": [
+            {"index": c.index, "char": c.char, "codepoint": c.codepoint}
+            for c in pair.true_artist_name_codepoints
+        ],
+        "true_track_title_codepoints": [
+            {"index": c.index, "char": c.char, "codepoint": c.codepoint}
+            for c in pair.true_track_title_codepoints
+        ],
+    }
+
+
+def _unresolved_fffd_pair_to_dict(pair: UnresolvedFffdPair) -> dict[str, Any]:
+    return {
+        "legacy_release_id": pair.legacy_release_id,
+        "track_position": pair.track_position,
+        "current_artist_name": pair.current_artist_name,
+        "current_track_title": pair.current_track_title,
+        "reason": pair.reason,
+        "candidates": [
+            {"artist_name": c.artist_name, "track_title": c.track_title} for c in pair.candidates
+        ],
+    }
+
+
+def capture_fffd_cta_pairs(mysql_db: str, backend_source: str) -> dict[str, Any]:
+    """Run the WXYC/Backend-Service#2152 U+FFFD pair-capture mode end to end.
+
+    Reads MySQL truth from ``mysql_db``'s ``compilation_track_artist`` table
+    (already built, or built fresh by the caller via ``--mysql-source`` --
+    see ``main``'s ``--capture-fffd-cta-pairs`` branch), fetches Backend's
+    live CTA rows plus the per-release ``track_position`` follow-up over HTTP
+    (``backend_source``, the same service-account credentials
+    ``--backend-source`` already uses elsewhere in this harness), pairs them
+    (``lib/fffd_pair_capture.find_fffd_pairs``), and returns the ``--json``
+    contract::
+
+        {"resolved": [...], "unresolved": [...], "sql_values": "..."}
+
+    ``sql_values`` is every resolved row rendered as
+    ``pending_cta_repair`` VALUES tuples
+    (``scripts/audit/bs_replacement_char_cta.sql`` in Backend-Service),
+    ready to paste in place of that block's placeholder row.
+
+    Raises ``SourceError`` for any source/read/fetch failure, matching every
+    other producer in this file -- caught by ``main`` as exit 3.
+    """
+    mysql_conn = _open_readonly(mysql_db, "mysql")
+    try:
+        mysql_rows = _load_cta_rows(mysql_conn, "mysql")
+    finally:
+        mysql_conn.close()
+
+    base_url = _resolve_backend_base_url(backend_source)
+    token_source = _TokenSource(base_url)
+    try:
+        id_map, backend_rows = _fetch_backend_fffd_capture_inputs(base_url, token_source)
+        corrupt_rows = [
+            row for row in backend_rows if has_fffd(row.artist_name) or has_fffd(row.track_title)
+        ]
+        positions = _resolve_fffd_track_positions(base_url, token_source, id_map, corrupt_rows)
+    finally:
+        token_source.close()
+
+    resolved, unresolved = find_fffd_pairs(backend_rows, mysql_rows, track_positions=positions)
+    return {
+        "resolved": [_resolved_fffd_pair_to_dict(pair) for pair in resolved],
+        "unresolved": [_unresolved_fffd_pair_to_dict(pair) for pair in unresolved],
+        "sql_values": render_pending_cta_repair_values(resolved),
+    }
 
 
 def _build_library_db_from_backend(source: str, output_path: str) -> None:
@@ -2543,6 +2860,21 @@ def _build_arg_parser() -> argparse.ArgumentParser:
             "on drift while refusing the definition of expected drift."
         ),
     )
+    p.add_argument(
+        "--capture-fffd-cta-pairs",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Run the WXYC/Backend-Service#2152 U+FFFD pair-capture mode instead of "
+            "the normal diff: pair every Backend compilation_track_artist row "
+            "containing a literal U+FFFD against its MySQL truth, and write the "
+            "result as JSON to PATH ('-' for stdout). Requires --backend-source "
+            "(the bulk CTA export omits track_position, so this mode also calls "
+            "GET /library/{id}/compilation-tracks per affected release) and either "
+            "--mysql-source or a pre-built --mysql-db. Never guesses: an ambiguous "
+            "or unmatched row is reported unresolved, not silently approximated."
+        ),
+    )
     return p
 
 
@@ -2566,10 +2898,81 @@ def _print_human(result: ParityDiff) -> None:
     print(f"extra_unexplained:  {result.extra_unexplained:>10}")
 
 
+def _run_capture_fffd_cta_pairs_cli(
+    args: argparse.Namespace, parser: argparse.ArgumentParser
+) -> int:
+    """``main``'s ``--capture-fffd-cta-pairs`` branch.
+
+    Deliberately its own validation, not threaded through the general
+    per-source ``--*-source requires --*-db`` loop below: this mode never
+    touches ``--backend-db`` at all (see ``capture_fffd_cta_pairs``'s
+    docstring for why), so that loop's ``--backend-source requires
+    --backend-db`` check would wrongly refuse a perfectly valid invocation.
+    """
+    if not args.backend_source:
+        print(
+            "error: --capture-fffd-cta-pairs requires --backend-source (the bulk CTA "
+            "export omits track_position, so this mode needs a live Backend to fetch "
+            "it via GET /library/{id}/compilation-tracks).",
+            file=sys.stderr,
+        )
+        parser.print_usage(sys.stderr)
+        return 2
+    if args.mysql_source is not None and not args.mysql_db:
+        print(
+            "error: --mysql-source requires --mysql-db, the path to write the built library.db to.",
+            file=sys.stderr,
+        )
+        parser.print_usage(sys.stderr)
+        return 2
+    if not args.mysql_source and not args.mysql_db:
+        print(
+            "error: --capture-fffd-cta-pairs requires --mysql-source or a pre-built --mysql-db.",
+            file=sys.stderr,
+        )
+        parser.print_usage(sys.stderr)
+        return 2
+
+    try:
+        if args.mysql_source is not None:
+            _require_absent(args.mysql_db, "mysql")
+            _build_library_db_from_mysql(args.mysql_source, args.mysql_db)
+        report = capture_fffd_cta_pairs(args.mysql_db, args.backend_source)
+    except SourceError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 3
+    except Exception as exc:
+        logger.exception("fffd cta pair capture failed")
+        print(f"error: {exc}", file=sys.stderr)
+        return 3
+
+    payload = json.dumps(report)
+    if args.capture_fffd_cta_pairs == "-":
+        print(payload)
+    else:
+        Path(args.capture_fffd_cta_pairs).write_text(payload + "\n", encoding="utf-8")
+
+    resolved_count = len(report["resolved"])
+    unresolved_count = len(report["unresolved"])
+    _report(f"FFFD capture: {resolved_count} resolved, {unresolved_count} unresolved")
+    logger.info(
+        "fffd cta pair capture complete",
+        extra={
+            "step": "fffd_cta_capture",
+            "resolved": resolved_count,
+            "unresolved": unresolved_count,
+        },
+    )
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = _build_arg_parser()
     args = parser.parse_args(argv)
     init_logger(repo="discogs-etl", tool="discogs-etl catalog_parity_diff")
+
+    if args.capture_fffd_cta_pairs is not None:
+        return _run_capture_fffd_cta_pairs_cli(args, parser)
 
     # Each --*-source needs its matching --*-db as the output path, so the
     # required-flags check runs before any build.
