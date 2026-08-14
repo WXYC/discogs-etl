@@ -1125,7 +1125,7 @@ class TestClassifyField:
         ``ensureArtist`` -- so Backend legitimately holds aliases that
         ``LIBRARY_SELECT_SQL``'s release-keyed subquery can never return. The
         2026-08-13 prod run measured 11 such rows and **zero** of any other
-        shape (WXYC/discogs-etl#346).
+        shape (WXYC/discogs-etl#346 step 8).
 
         Treating a superset as a defect would therefore gate the release on a
         divergence that is an artifact of what the query can see, not of the
@@ -1209,7 +1209,7 @@ class TestClassifyMatchedRows:
 
 class TestFoldCollapseResolution:
     """Fold-collapse: the cross-row widening measured on prod 2026-08-13
-    (WXYC/discogs-etl#346, plan step 8).
+    (WXYC/discogs-etl#346, plan step 9).
 
     tubafrenzy's unit of artist identity is the ``LIBRARY_CODE`` row and
     nothing stops two of them sharing a ``PRESENTATION_NAME`` (295 names do,
@@ -1330,7 +1330,45 @@ class TestFoldCollapseResolution:
         assert field_mismatches["artist_call_number"] == 0
         assert normalizations["artist_call_number"]["fold_collapsed"] == 1
 
-    def test_fold_collapse_only_applies_to_its_three_columns(self) -> None:
+    def test_a_sibling_backend_never_imported_cannot_supply_the_value(self) -> None:
+        """``job.ts:959-990`` skips a ``db_only`` genre (and an unparseable
+        format, and an empty artist/title) *before* reaching ``ensureArtist``
+        / ``ensureGenreArtistCrossref``, so such a row wrote no
+        ``code_letters`` and no ``artist_genre_code``. Letting it into the
+        group would soften the gate from "a value the mysql side supplies" to
+        "a value some never-imported row happens to carry" -- and the row
+        whose value it laundered would be a genuine defect."""
+        mod = _load_module()
+        mysql_rows = {
+            1: _row(artist="Cat Power", call_letters="CA"),
+            2: _row(id=2, artist="Cat Power", call_letters="ZZ", genre="db_only"),
+        }
+        backend_rows = {1: _row(artist="Cat Power", call_letters="ZZ")}
+        field_mismatches, normalizations = mod._classify_matched_rows(mysql_rows, backend_rows, [1])
+        assert field_mismatches["call_letters"] == 1
+        assert "call_letters" not in normalizations
+
+    def test_artist_call_number_sibling_genre_match_is_case_insensitive(self) -> None:
+        """Backend resolves a genre through ``genreMap.get(name.toLowerCase())``
+        (``job.ts:951,965``), so two ``GENRE.REFERENCE_NAME``s differing only
+        in case share one ``genre_id`` and therefore one crossref row --
+        matching ``_classify_genre``'s own case-insensitive comparison."""
+        mod = _load_module()
+        mysql_rows = {
+            1: _row(artist="Cuong Vu", genre="Jazz", artist_call_number=7),
+            2: _row(id=2, artist="Cuong Vu", genre="jazz", artist_call_number=19),
+        }
+        backend_rows = {
+            1: _row(artist="Cuong Vu", genre="Jazz", artist_call_number=19),
+            2: _row(id=2, artist="Cuong Vu", genre="jazz", artist_call_number=19),
+        }
+        field_mismatches, normalizations = mod._classify_matched_rows(
+            mysql_rows, backend_rows, [1, 2]
+        )
+        assert field_mismatches["artist_call_number"] == 0
+        assert normalizations["artist_call_number"]["fold_collapsed"] == 1
+
+    def test_fold_collapse_does_not_apply_to_unmodelled_columns(self) -> None:
         """``title`` has no fold-identity story: a sibling holding the value
         must not launder a genuine content divergence."""
         mod = _load_module()
