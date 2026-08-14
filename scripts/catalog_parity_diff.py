@@ -2932,6 +2932,20 @@ def _run_capture_fffd_cta_pairs_cli(
         )
         parser.print_usage(sys.stderr)
         return 2
+    if args.capture_fffd_cta_pairs != "-":
+        # Pre-flight, before a single byte is fetched. This mode only runs in
+        # CI (repo-secret credentials + a working mariadb-client), so a path
+        # error discovered after the MySQL export and every Backend fetch
+        # throws away a report that is expensive to re-take -- and the retry
+        # then trips _require_absent on the half-built --mysql-db.
+        parent = Path(args.capture_fffd_cta_pairs).parent
+        if not parent.is_dir():
+            print(
+                f"error: --capture-fffd-cta-pairs directory does not exist: {parent}",
+                file=sys.stderr,
+            )
+            parser.print_usage(sys.stderr)
+            return 2
 
     try:
         if args.mysql_source is not None:
@@ -2947,10 +2961,23 @@ def _run_capture_fffd_cta_pairs_cli(
         return 3
 
     payload = json.dumps(report)
+    write_failed = False
     if args.capture_fffd_cta_pairs == "-":
         print(payload)
     else:
-        Path(args.capture_fffd_cta_pairs).write_text(payload + "\n", encoding="utf-8")
+        try:
+            Path(args.capture_fffd_cta_pairs).write_text(payload + "\n", encoding="utf-8")
+        except OSError as exc:
+            # Everything expensive already happened; the capture is in hand and
+            # only the destination failed. Emit it on stdout rather than let it
+            # die with the process -- the operator can redirect and retry.
+            write_failed = True
+            print(
+                f"error: could not write {args.capture_fffd_cta_pairs} ({exc}); "
+                "the capture follows on stdout",
+                file=sys.stderr,
+            )
+            print(payload)
 
     resolved_count = len(report["resolved"])
     unresolved_count = len(report["unresolved"])
@@ -2963,7 +2990,15 @@ def _run_capture_fffd_cta_pairs_cli(
             "unresolved": unresolved_count,
         },
     )
-    return 0
+    if write_failed:
+        return 3
+    # Exit 4 carries the same meaning it does for the diff: the run itself was
+    # fine and the ANSWER is not clean. An unresolved row is as actionable as a
+    # crash and, at exit 0, just as invisible -- and this mode exists to hand
+    # WXYC/Backend-Service#2152 a specific set of pairs, so "captured nothing
+    # usable" must not read as success. The report is written either way; the
+    # unresolved rows and their candidates are the whole diagnostic.
+    return 4 if unresolved_count else 0
 
 
 def main(argv: list[str] | None = None) -> int:

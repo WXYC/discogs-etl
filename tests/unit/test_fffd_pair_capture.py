@@ -204,6 +204,93 @@ class TestFindFffdPairs:
 
         assert resolved[0].track_position is None
 
+    def test_mysql_row_carrying_its_own_fffd_is_never_emitted_as_truth(self) -> None:
+        """The MySQL side is the source of truth ONLY while it is itself clean.
+
+        Position-wise agreement treats a Backend U+FFFD as matching anything,
+        so a MySQL value holding a U+FFFD at the same position agrees with it
+        trivially. Emitting that as ``true_track_title`` would write the
+        corruption straight into the repair script while reporting success --
+        the one failure mode this module's "never approximate" contract
+        cannot tolerate, because the consumer applies it as an UPDATE.
+        """
+        backend = [CtaRow(50340, "Csillagrablók", "Rem�nytelen T�nc")]
+        mysql = [CtaRow(50340, "Csillagrablók", "Rem�nytelen T�nc")]
+
+        resolved, unresolved = find_fffd_pairs(backend, mysql)
+
+        assert resolved == []
+        assert unresolved[0].reason == "corrupt_candidates"
+        assert unresolved[0].candidates == (mysql[0],)
+
+    def test_corrupt_candidates_is_distinct_from_zero_candidates(self) -> None:
+        """ "tubafrenzy lost the byte too" needs a different remedy from "no row
+        matched" -- the former means no re-import recovers it, so the reasons
+        must not collapse into one."""
+        backend = [CtaRow(1, "Various Artists", "La B�te")]
+
+        _, no_match = find_fffd_pairs(backend, [CtaRow(1, "Various Artists", "Fade Away")])
+        _, source_corrupt = find_fffd_pairs(backend, [CtaRow(1, "Various Artists", "La B�te")])
+
+        assert no_match[0].reason == "zero_candidates"
+        assert no_match[0].candidates == ()
+        assert source_corrupt[0].reason == "corrupt_candidates"
+
+    def test_a_clean_candidate_still_resolves_alongside_a_corrupt_sibling(self) -> None:
+        """The guard rejects corrupt candidates; it does not poison the release."""
+        backend = [CtaRow(1, "Nilüfer Yanya", "Th� Dealer")]
+        clean = CtaRow(1, "Nilüfer Yanya", "Thé Dealer")
+        mysql = [CtaRow(1, "Nilüfer Yanya", "Th� Dealer"), clean]
+
+        resolved, unresolved = find_fffd_pairs(backend, mysql)
+
+        assert unresolved == []
+        assert resolved[0].true_track_title == "Thé Dealer"
+
+    def test_byte_identical_mysql_siblings_resolve_because_the_truth_is_unambiguous(
+        self,
+    ) -> None:
+        """Duplicate CTA rows are ordinary in this catalog (documented
+        double-entry rate), and two byte-identical candidates carry ONE
+        answer -- counting them as ambiguous would strand a row whose true
+        value is not in doubt."""
+        backend = [CtaRow(1, "Hermanos Guti�rrez", "El Bueno Y El Malo")]
+        mysql = [
+            CtaRow(1, "Hermanos Gutiérrez", "El Bueno Y El Malo"),
+            CtaRow(1, "Hermanos Gutiérrez", "El Bueno Y El Malo"),
+        ]
+
+        resolved, unresolved = find_fffd_pairs(backend, mysql)
+
+        assert unresolved == []
+        assert len(resolved) == 1
+        assert resolved[0].true_artist_name == "Hermanos Gutiérrez"
+
+    def test_siblings_differing_in_the_corrupt_column_stay_ambiguous(self) -> None:
+        """Deduplication is byte-exact, so it cannot launder a genuine
+        two-answer case into a resolution."""
+        backend = [CtaRow(1, "Various Artists", "L� Vie")]
+        mysql = [CtaRow(1, "Various Artists", "Là Vie"), CtaRow(1, "Various Artists", "Lá Vie")]
+
+        resolved, unresolved = find_fffd_pairs(backend, mysql)
+
+        assert resolved == []
+        assert unresolved[0].reason == "multiple_candidates"
+        assert len(unresolved[0].candidates) == 2
+
+    def test_duplicate_backend_rows_each_emit_their_own_pending_row(self) -> None:
+        """Both corrupt copies need repairing, and the consumer's UPDATE keys
+        on the current values -- so one pending row per corrupt Backend row,
+        not one per distinct value."""
+        backend = [CtaRow(1, "Various Artists", "La B�te"), CtaRow(1, "Various Artists", "La B�te")]
+        mysql = [CtaRow(1, "Various Artists", "La Bête")]
+
+        resolved, unresolved = find_fffd_pairs(backend, mysql)
+
+        assert unresolved == []
+        assert len(resolved) == 2
+        assert {row.true_track_title for row in resolved} == {"La Bête"}
+
     def test_dataclasses_are_frozen(self) -> None:
         entry = CodepointEntry(index=0, char="é", codepoint="U+00E9")
         pair = ResolvedFffdPair(
