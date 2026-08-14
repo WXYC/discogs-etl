@@ -36,6 +36,11 @@ on:
     #     answer.
     - cron: "37 9 * * *"
   workflow_dispatch:
+    inputs:
+      capture_fffd_cta_pairs:
+        description: "Also capture U+FFFD compilation_track_artist pairs (BS#2152)"
+        type: boolean
+        default: false
 
 # This workflow reads two live sources and writes nothing back: no push, no
 # release, no PR comment, no cloud credentials. contents:read is both the
@@ -153,6 +158,57 @@ jobs:
           BACKEND_CATALOG_EMAIL: ${{ secrets.BACKEND_CATALOG_EMAIL }}
           BACKEND_CATALOG_PASSWORD: ${{ secrets.BACKEND_CATALOG_PASSWORD }}
 
+      - name: Capture U+FFFD CTA pairs
+        # discogs-etl#382's pair-capture mode, for BS#2152's pending repair
+        # rows. It lives in this job rather than a workflow of its own for one
+        # reason: it needs the BACKEND_CATALOG_* service account (repo secrets)
+        # and a MariaDB client that survives MySQL 5.1.56 -- a pair that
+        # coexists nowhere else -- and reusing the library.db the step above
+        # already built means it costs Kattare NOTHING. A sibling workflow
+        # would have to re-export the full catalog, and two concurrent
+        # full-catalog scans against that 5-connection HikariCP pool is how
+        # the host wedges (2026-05-24).
+        #
+        # `inputs.` and not `github.event.inputs.`: the latter yields the
+        # STRING "false" for an unchecked box, and a non-empty string is
+        # truthy, so the capture would run on every dispatch.
+        #
+        # Exits 0 and 4 are the two codes that mean the harness ran end to end,
+        # so mysql.db is whole. On 2/3 it may be half-built, and pairing
+        # against a partial catalog reports MySQL rows as `zero_candidates` --
+        # a wrong answer shaped exactly like a real finding.
+        if: >-
+          inputs.capture_fffd_cta_pairs
+          && (env.PARITY_EXIT_CODE == '0' || env.PARITY_EXIT_CODE == '4')
+        run: |
+          set -euo pipefail
+
+          # Same capture-don't-raise treatment as the harness step, for the
+          # same reason: this mode's exit 4 means "rows left unresolved", and
+          # failing here would skip the upload of a capture that costs a full
+          # Backend pass to re-take.
+          set +e
+          python scripts/catalog_parity_diff.py \
+            --mysql-db "$PARITY_DIR/mysql.db" \
+            --backend-source "$BACKEND_CATALOG_URL" \
+            --capture-fffd-cta-pairs "$PARITY_DIR/fffd-pairs.json"
+          rc=$?
+          set -e
+
+          # Its own sentinel. Both modes exit 4 meaning different things, and
+          # one variable for both would make the daily verdict unreadable.
+          echo "CAPTURE_EXIT_CODE=$rc" >> "$GITHUB_ENV"
+          echo "catalog_parity_diff.py --capture-fffd-cta-pairs exited $rc"
+        env:
+          # No LIBRARY_DB_* here, deliberately: this step reads the already-
+          # built SQLite and never opens the tunnel. Backend is the only live
+          # source it touches (the bulk CTA export omits track_position, so it
+          # also calls GET /library/{id}/compilation-tracks per affected
+          # release).
+          BACKEND_CATALOG_URL: ${{ vars.BACKEND_CATALOG_URL || 'https://api.wxyc.org' }}
+          BACKEND_CATALOG_EMAIL: ${{ secrets.BACKEND_CATALOG_EMAIL }}
+          BACKEND_CATALOG_PASSWORD: ${{ secrets.BACKEND_CATALOG_PASSWORD }}
+
       - name: Upload parity report
         # always(), because exit 4 is the case worth auditing and the default
         # would skip precisely those days. A 7-day streak has to be provable
@@ -172,7 +228,37 @@ jobs:
           # actually needs reading.
           if-no-files-found: warn
 
+      - name: Upload U+FFFD capture
+        # A partial capture still ships: the resolved rows are a valid repair
+        # set whether or not every row paired, so this uploads on the
+        # incomplete path too. Skipped-capture runs upload nothing and warn.
+        if: always() && inputs.capture_fffd_cta_pairs
+        uses: actions/upload-artifact@v4
+        with:
+          # Distinct from the parity artifact's name -- upload-artifact@v4
+          # refuses a duplicate name on a run, and both ship from this job.
+          name: catalog-parity-fffd-exit${{ env.CAPTURE_EXIT_CODE || 'na' }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.PARITY_DIR }}/fffd-pairs.json
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: Report U+FFFD capture
+        # Its own renderer and its own re-raise. Defaults to 3 -- "no capture
+        # was taken" -- which is also what a skipped capture step leaves
+        # behind, and the honest summary for it.
+        if: always() && inputs.capture_fffd_cta_pairs
+        run: |
+          set -euo pipefail
+          args=(--exit-code "${CAPTURE_EXIT_CODE:-3}")
+          if [ -n "${PARITY_DIR:-}" ]; then
+            args+=(--json "$PARITY_DIR/fffd-pairs.json")
+          fi
+          python scripts/fffd_capture_summary.py "${args[@]}" >> "$GITHUB_STEP_SUMMARY"
+
       - name: Report parity verdict
+        # always() is load-bearing twice over now: it survives the harness
+        # step's failure AND the capture report's re-raise above. The daily
+        # verdict is the headline and has to be the last word.
         if: always()
         # Renders the exit-code taxonomy into the step summary and re-raises
         # the code, so THIS is the step that fails the job -- with exit 4
