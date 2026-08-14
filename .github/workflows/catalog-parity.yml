@@ -114,10 +114,7 @@ jobs:
           # over an existing --mysql-db/--backend-db by design, so a reused
           # path turns every run after the first into exit 3.
           PARITY_DIR="$(mktemp -d)"
-          {
-            echo "PARITY_DIR=$PARITY_DIR"
-            echo "PARITY_DATE=$(date -u +%Y-%m-%d)"
-          } >> "$GITHUB_ENV"
+          echo "PARITY_DIR=$PARITY_DIR" >> "$GITHUB_ENV"
 
           # Capture the harness's status instead of failing on it. GitHub
           # skips every later step once one fails, so failing here would
@@ -163,19 +160,9 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          # run_attempt, not just run_id: run_id is stable across re-runs, and
-          # upload-artifact v4 refuses to create a name that already exists on
-          # the run. Without it, "Re-run failed jobs" after a transient exit 3
-          # -- the case the taxonomy exists to make re-runnable -- fails its
-          # upload, so the attempt that finally produced a verdict is the one
-          # with no artifact.
-          #
-          # The exit code is in the name because this list IS the streak
-          # evidence: a producer failure still leaves a (zero-byte)
-          # parity.json behind, since the redirect below creates the file
-          # before the harness runs, so a name-only reading otherwise cannot
-          # tell a no-verdict day from a clean one.
-          name: catalog-parity-${{ env.PARITY_DATE || 'nodate' }}-exit${{ env.PARITY_EXIT_CODE || 'na' }}-${{ github.run_id }}-${{ github.run_attempt }}
+          # Both the exit code and run_attempt are load-bearing, not decoration
+          # -- see "Reading the artifact trail" in docs/automation.md.
+          name: catalog-parity-exit${{ env.PARITY_EXIT_CODE || 'na' }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ env.PARITY_DIR }}/parity.json
           retention-days: 30
           # Only reachable when the harness step never ran (PARITY_DIR unset,

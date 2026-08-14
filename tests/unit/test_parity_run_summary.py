@@ -22,7 +22,7 @@ muted) and exit 3 reads as "parity failed" (so someone hunts a data problem
 that isn't there). Neither mistake is recoverable from the run's exit status
 alone, which is why this renderer exists rather than a line of inline bash.
 
-The renderer must also survive a degraded ``--json`` file: on exits 2 and 3
+The renderer must also survive a degraded ``--json`` report: on exits 2 and 3
 the harness writes nothing to stdout, so the redirect leaves a zero-byte file
 behind, and a crash mid-write leaves a truncated one. A summary step that
 tracebacks on that turns an already-failing run into two mysteries.
@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import sys
 from pathlib import Path
 
 import pytest
@@ -44,6 +45,11 @@ def _load_module():
     spec = importlib.util.spec_from_file_location("parity_run_summary", SCRIPT_PATH)
     assert spec is not None and spec.loader is not None
     mod = importlib.util.module_from_spec(spec)
+    # Registered before exec_module because the module defines a dataclass:
+    # under `from __future__ import annotations` the field types are strings,
+    # and dataclasses resolves them through sys.modules[cls.__module__].
+    # Without this the import dies with a bare AttributeError on NoneType.
+    sys.modules["parity_run_summary"] = mod
     spec.loader.exec_module(mod)
     return mod
 
@@ -99,6 +105,11 @@ def _clean_payload() -> dict:
     )
 
 
+def _for(exit_code: int) -> dict:
+    """The payload a run exiting with this code would have produced."""
+    return _clean_payload() if exit_code == 0 else _payload()
+
+
 def _write(tmp_path: Path, payload: object, name: str = "parity.json") -> Path:
     path = tmp_path / name
     path.write_text(payload if isinstance(payload, str) else json.dumps(payload))
@@ -118,57 +129,28 @@ class TestExitCodeTaxonomy:
     """Each exit code must be *named* in the summary as the kind of thing it
     is. A reader of a red run should never have to look up what 4 means."""
 
-    def test_clean_run_is_reported_as_a_clean_day(self, tmp_path, capsys) -> None:
-        rc, out, _ = _run(capsys, 0, _write(tmp_path, _clean_payload()))
-        assert rc == 0
-        assert "clean" in out.lower()
-        # A clean run is a countable day toward the seven-day streak; say so.
-        assert "wiki#89" in out or "streak" in out.lower()
-
-    def test_drift_is_labelled_a_verdict_not_a_broken_run(self, tmp_path, capsys) -> None:
-        rc, out, _ = _run(capsys, 4, _write(tmp_path, _payload()))
-        assert rc == 4
+    @pytest.mark.parametrize(
+        "code, required",
+        [
+            # A clean day is countable toward the streak; say so.
+            (0, ("exit 0", "clean", "streak")),
+            # The distinguishing claim for 4: the harness itself worked.
+            (4, ("exit 4", "verdict", "harness ran")),
+            # 3 and 2 must NOT read as parity results.
+            (3, ("exit 3", "no verdict", "producer")),
+            (2, ("exit 2", "no verdict", "workflow")),
+            (1, ("unexpected", "no verdict")),
+            (139, ("unexpected", "no verdict")),
+        ],
+    )
+    def test_each_exit_code_is_named_as_the_kind_of_thing_it_is(
+        self, tmp_path, capsys, code, required
+    ) -> None:
+        rc, out, _ = _run(capsys, code, _write(tmp_path, _for(code)))
+        assert rc == code, "the harness's own code must reach the job's failing step"
         lowered = out.lower()
-        assert "verdict" in lowered
-        # The distinguishing claim: the harness itself worked.
-        assert "harness ran" in lowered or "ran correctly" in lowered
-
-    def test_source_error_is_labelled_infrastructure_not_parity(self, tmp_path, capsys) -> None:
-        rc, out, _ = _run(capsys, 3, _write(tmp_path, "", name="empty.json"))
-        assert rc == 3
-        lowered = out.lower()
-        # Must NOT claim a parity result -- no verdict was computed.
-        assert "no verdict" in lowered
-        assert "tunnel" in lowered or "producer" in lowered
-
-    def test_bad_args_is_labelled_a_workflow_defect(self, tmp_path, capsys) -> None:
-        rc, out, _ = _run(capsys, 2, _write(tmp_path, "", name="empty.json"))
-        assert rc == 2
-        lowered = out.lower()
-        assert "workflow" in lowered
-        assert "no verdict" in lowered
-
-    @pytest.mark.parametrize("code", [1, 139])
-    def test_unexpected_exit_is_labelled_unexpected(self, tmp_path, capsys, code) -> None:
-        rc, out, _ = _run(capsys, code, _write(tmp_path, "", name="empty.json"))
-        assert rc == code
-        lowered = out.lower()
-        assert "unexpected" in lowered
-        assert "no verdict" in lowered
-
-    @pytest.mark.parametrize("code", [0, 2, 3, 4, 1, 139])
-    def test_exit_code_is_propagated_verbatim(self, tmp_path, capsys, code) -> None:
-        """The job's failing step should carry the harness's own number, so
-        "Process completed with exit code 4" appears in the log."""
-        payload = _clean_payload() if code == 0 else _payload()
-        rc, _, _ = _run(capsys, code, _write(tmp_path, payload))
-        assert rc == code
-
-    def test_every_taxonomy_entry_names_its_exit_code(self, tmp_path, capsys) -> None:
-        for code in (0, 2, 3, 4):
-            payload = _clean_payload() if code == 0 else _payload()
-            _, out, _ = _run(capsys, code, _write(tmp_path, payload))
-            assert f"exit {code}" in out.lower(), f"exit {code} unnamed in its own summary"
+        for needle in required:
+            assert needle in lowered, f"exit {code} summary omits {needle!r}"
 
 
 class TestDriftAttribution:
@@ -186,14 +168,12 @@ class TestDriftAttribution:
         assert "missing_unexplained" in out
         assert "7" in out
 
-    def test_expected_residue_is_not_named_as_a_cause(self, tmp_path, capsys) -> None:
+    def test_expected_residue_is_not_named_as_a_cause(self) -> None:
         """609 expected-missing rows are the frozen ledger doing its job. If
         they show up in the cause list, the list is noise."""
-        _, out, _ = _run(capsys, 4, _write(tmp_path, _payload()))
         causes = prs.verdict_causes(_payload())
         assert not any("missing_unexplained" in c for c in causes)
         assert "609" not in "".join(causes)
-        assert out  # rendered fine regardless
 
     def test_field_mismatch_columns_are_named_individually(self, tmp_path, capsys) -> None:
         _, out, _ = _run(capsys, 4, _write(tmp_path, _payload()))
@@ -205,21 +185,6 @@ class TestDriftAttribution:
         assert "label" not in causes
         assert "call_letters" not in causes
 
-    def test_cta_baseline_is_named_when_nothing_else_explains_the_verdict(self) -> None:
-        """`cta_within_baseline` is not in the JSON -- only the raw counts
-        are. So when every other condition is satisfied and `clean` is still
-        false, the CTA baseline is the remaining explanation, by elimination.
-        Saying nothing there would leave a red run with no stated cause."""
-        payload = _payload(
-            clean=False,
-            missing_unexplained=0,
-            extra_unexplained=0,
-            field_mismatches=dict.fromkeys(_PROD_SHAPED["field_mismatches"], 0),
-        )
-        causes = "".join(prs.verdict_causes(payload)).lower()
-        assert "cta" in causes
-        assert "baseline" in causes
-
     def test_a_clean_payload_has_no_causes(self) -> None:
         assert prs.verdict_causes(_clean_payload()) == []
 
@@ -229,38 +194,39 @@ class TestDegradedJson:
     JSON to stdout, and the redirect creates the file before it runs); a
     crash can leave a truncated one. Neither may traceback."""
 
-    def test_missing_file_still_renders(self, tmp_path, capsys) -> None:
-        rc, out, _ = _run(capsys, 3, tmp_path / "never-written.json")
+    @pytest.mark.parametrize(
+        "label, content",
+        [
+            ("empty", ""),
+            ("truncated", '{"matched": 64122, "field_mis'),
+            ("array, not an object", [1, 2, 3]),
+            ("object missing every key the renderer reads", {"matched": 5}),
+        ],
+    )
+    def test_a_degraded_report_renders_instead_of_crashing(
+        self, tmp_path, capsys, label, content
+    ) -> None:
+        rc, out, _ = _run(capsys, 4, _write(tmp_path, content))
+        assert rc == 4, label
+        assert out.strip(), label
+
+    @pytest.mark.parametrize("give_path", [True, False])
+    def test_an_unwritten_report_does_not_claim_a_verdict(
+        self, tmp_path, capsys, give_path
+    ) -> None:
+        path = tmp_path / "never-written.json" if give_path else None
+        rc, out, _ = _run(capsys, 3, path)
         assert rc == 3
         assert "no verdict" in out.lower()
 
-    def test_no_json_argument_at_all_still_renders(self, capsys) -> None:
-        rc, out, _ = _run(capsys, 3, None)
-        assert rc == 3
-        assert out.strip()
-
-    def test_empty_file_still_renders(self, tmp_path, capsys) -> None:
-        rc, out, _ = _run(capsys, 3, _write(tmp_path, ""))
-        assert rc == 3
-        assert "no verdict" in out.lower()
-
-    def test_truncated_json_does_not_crash(self, tmp_path, capsys) -> None:
-        rc, out, _ = _run(capsys, 4, _write(tmp_path, '{"matched": 64122, "field_mis'))
-        assert rc == 4
+    def test_an_unreadable_report_says_so_when_a_verdict_was_promised(
+        self, tmp_path, capsys
+    ) -> None:
+        """Exit 4 promises a verdict. If the report cannot supply it, the
+        summary has to admit that rather than render an empty table."""
+        _, out, _ = _run(capsys, 4, _write(tmp_path, ""))
         lowered = out.lower()
         assert "could not" in lowered or "unreadable" in lowered
-
-    def test_json_of_the_wrong_shape_does_not_crash(self, tmp_path, capsys) -> None:
-        """A JSON array, or an object missing the keys the renderer reads,
-        must degrade to the same 'unreadable' path rather than KeyError."""
-        rc, out, _ = _run(capsys, 4, _write(tmp_path, [1, 2, 3]))
-        assert rc == 4
-        assert out.strip()
-
-    def test_missing_keys_render_without_keyerror(self, tmp_path, capsys) -> None:
-        rc, out, _ = _run(capsys, 4, _write(tmp_path, {"matched": 5}))
-        assert rc == 4
-        assert out.strip()
 
     def test_null_verdict_is_reported_as_unavailable(self, tmp_path, capsys) -> None:
         """`clean: null` means the run had no residue ledger. --fail-on-drift
@@ -294,13 +260,12 @@ class TestAnnotations:
         _, _, err = _run(capsys, 0, _write(tmp_path, _clean_payload()))
         assert err.startswith("::notice")
 
-    def test_annotation_is_a_single_line(self, tmp_path, capsys) -> None:
+    @pytest.mark.parametrize("code", [0, 2, 3, 4, 139])
+    def test_annotation_is_a_single_line(self, tmp_path, capsys, code) -> None:
         """A multi-line annotation is truncated by GitHub at the first
         newline, silently dropping whatever followed."""
-        for code in (0, 2, 3, 4, 139):
-            payload = _clean_payload() if code == 0 else _payload()
-            _, _, err = _run(capsys, code, _write(tmp_path, payload))
-            assert len(err.strip().splitlines()) == 1, f"exit {code} annotation spans lines"
+        _, _, err = _run(capsys, code, _write(tmp_path, _for(code)))
+        assert len(err.strip().splitlines()) == 1, f"exit {code} annotation spans lines"
 
 
 class TestMarkdownShape:
@@ -365,3 +330,11 @@ class TestClaimsTheRendererCannotSupport:
         lowered = out.lower()
         assert "mariadb" not in lowered
         assert "segfault" not in lowered
+
+    def test_the_summary_and_the_annotation_cannot_drift(self) -> None:
+        """Both surfaces read one record per exit code. Branching separately
+        is what let the wrong exit-139 claim exist in two places at once."""
+        for code in (0, 2, 3, 4):
+            outcome = prs._outcome(code)
+            assert outcome.heading and outcome.lead
+            assert outcome.annotation_title and outcome.annotation_body

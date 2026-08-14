@@ -47,6 +47,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -55,10 +56,124 @@ BAD_ARGS = 2
 SOURCE_ERROR = 3
 DRIFT = 4
 
-# Row-set and CTA counters, in report order. `field_mismatches` renders
-# separately (it is a per-column dict) and the *_expected/*_unexplained splits
-# annotate their parent count rather than getting rows of their own.
+# Row-set counters, in report order. `field_mismatches` renders separately (it
+# is a per-column dict) and the *_expected/*_unexplained splits annotate their
+# parent count rather than getting rows of their own.
 _ROW_SET_METRICS = ("matched", "missing_in_backend", "extra_in_backend")
+
+
+@dataclass(frozen=True)
+class _Outcome:
+    """Everything one exit code means, in one place.
+
+    The step summary and the annotation say the same thing in two registers,
+    and they used to branch on the exit code separately, in parallel prose.
+    They drifted: the catch-all's claim that exit 139 is a segfaulting mysql
+    client was wrong in both, and fixing one would not have fixed the other.
+    One record per code makes that class of drift impossible rather than
+    merely currently-absent.
+    """
+
+    heading: str
+    lead: str
+    annotation_title: str
+    annotation_body: str
+    verdict_computed: bool
+
+
+_OUTCOMES: dict[int, _Outcome] = {
+    CLEAN: _Outcome(
+        heading="Catalog parity: clean",
+        lead=(
+            "**Exit 0 -- the catalogs agree.** This run counts as one clean day toward "
+            "[wiki#89](https://github.com/WXYC/wiki/issues/89) AC#4's seven-consecutive-day "
+            "streak. The streak is a property of consecutive *runs*, so a skipped or "
+            "cancelled day resets it."
+        ),
+        annotation_title="Catalog parity clean",
+        annotation_body=(
+            "The MySQL-sourced and Backend-sourced catalogs agree; this run counts toward "
+            "the wiki#89 seven-day streak."
+        ),
+        verdict_computed=True,
+    ),
+    DRIFT: _Outcome(
+        heading="Catalog parity: drift verdict",
+        lead=(
+            "**Exit 4 -- this is a verdict, not a malfunction.** The harness ran correctly "
+            "end to end; the MySQL-sourced and Backend-sourced catalogs do not agree. "
+            "Expect this on every run until "
+            "[BS#2108](https://github.com/WXYC/Backend-Service/issues/2108)'s pending "
+            "`/wxycdb` delete and the residual field mismatches clear -- see the causes "
+            "below for which condition actually fired today."
+        ),
+        annotation_title="Catalog parity drift",
+        annotation_body=(
+            "Verdict (exit 4), not a broken run -- the harness completed and the catalogs disagree."
+        ),
+        verdict_computed=True,
+    ),
+    SOURCE_ERROR: _Outcome(
+        heading="Catalog parity: producer failure",
+        lead=(
+            "**Exit 3 -- infrastructure, not data.** One of the two `library.db` inputs "
+            "could not be built: the Kattare SSH tunnel, the MySQL export, or the Backend "
+            "service-account sign-in. **No verdict was computed** -- this run says nothing "
+            "about parity, and neither breaks nor extends the clean-day streak. Check the "
+            "producer error on stderr in the harness step above. A MySQL client killed by a "
+            "signal lands here too rather than surfacing 139, because the harness reports "
+            "any non-zero client status as a producer failure -- so if it was the export "
+            "that failed, confirm the runner installed **mariadb-client**: the Oracle and "
+            "Homebrew 9.x clients segfault against tubafrenzy's MySQL 5.1.56."
+        ),
+        annotation_title="Catalog parity producer failure",
+        annotation_body=(
+            "Exit 3: a library.db input could not be built (SSH tunnel, MySQL export, or "
+            "Backend sign-in). No parity verdict was computed."
+        ),
+        verdict_computed=False,
+    ),
+    BAD_ARGS: _Outcome(
+        heading="Catalog parity: workflow defect",
+        lead=(
+            "**Exit 2 -- the harness rejected its own arguments.** This is a bug in "
+            "`.github/workflows/catalog-parity.yml`, not in the catalogs. The usual cause "
+            "is `--fail-on-drift` combined with `--residue-ledger none`, which asks the "
+            "harness to fail on drift while refusing the definition of expected drift. "
+            "**No verdict was computed.**"
+        ),
+        annotation_title="Catalog parity workflow defect",
+        annotation_body=(
+            "Exit 2: the harness rejected its arguments -- a bug in catalog-parity.yml, "
+            "not in the catalogs. No parity verdict was computed."
+        ),
+        verdict_computed=False,
+    ),
+}
+
+
+def _outcome(exit_code: int) -> _Outcome:
+    """The record for this exit code, synthesising one for the catch-all."""
+    known = _OUTCOMES.get(exit_code)
+    if known is not None:
+        return known
+    return _Outcome(
+        heading="Catalog parity: unexpected failure",
+        lead=(
+            f"**Exit {exit_code} -- unexpected.** This is outside the harness's documented "
+            "exit taxonomy (0, 2, 3, 4), so it is the harness itself crashing, or the step "
+            "being killed from outside (the job timeout, a cancellation, the runner going "
+            "away). Note that a *client* dying on a signal does not reach here: the harness "
+            "reports any non-zero client status as a producer failure, exit 3. **No verdict "
+            "was computed.**"
+        ),
+        annotation_title="Catalog parity crashed",
+        annotation_body=(
+            f"Exit {exit_code} is outside the harness's exit taxonomy (0/2/3/4). No parity "
+            "verdict was computed."
+        ),
+        verdict_computed=False,
+    )
 
 
 def load_payload(path: str | None) -> tuple[dict[str, Any] | None, str | None]:
@@ -149,63 +264,6 @@ def _as_int(value: object) -> int:
         return 0
 
 
-def _taxonomy(exit_code: int) -> tuple[str, str, bool]:
-    """``(heading, lead paragraph, whether a verdict was computed)``."""
-    if exit_code == CLEAN:
-        return (
-            "Catalog parity: clean",
-            "**Exit 0 -- the catalogs agree.** This run counts as one clean day toward "
-            "[wiki#89](https://github.com/WXYC/wiki/issues/89) AC#4's seven-consecutive-day "
-            "streak. The streak is a property of consecutive *runs*, so a skipped or "
-            "cancelled day resets it.",
-            True,
-        )
-    if exit_code == DRIFT:
-        return (
-            "Catalog parity: drift verdict",
-            "**Exit 4 -- this is a verdict, not a malfunction.** The harness ran correctly "
-            "end to end; the MySQL-sourced and Backend-sourced catalogs do not agree. "
-            "Expect this on every run until [BS#2108](https://github.com/WXYC/Backend-Service/issues/2108)'s "
-            "pending `/wxycdb` delete and the residual field mismatches clear -- see the "
-            "causes below for which condition actually fired today.",
-            True,
-        )
-    if exit_code == SOURCE_ERROR:
-        return (
-            "Catalog parity: producer failure",
-            "**Exit 3 -- infrastructure, not data.** One of the two `library.db` inputs "
-            "could not be built: the Kattare SSH tunnel, the MySQL export, or the Backend "
-            "service-account sign-in. **No verdict was computed** -- this run says nothing "
-            "about parity, and neither breaks nor extends the clean-day streak. Check the "
-            "producer error on stderr in the harness step above. A MySQL client killed by a "
-            "signal lands here too rather than surfacing 139, because the harness reports "
-            "any non-zero client status as a producer failure -- so if it was the export "
-            "that failed, confirm the runner installed **mariadb-client**: the Oracle and "
-            "Homebrew 9.x clients segfault against tubafrenzy's MySQL 5.1.56.",
-            False,
-        )
-    if exit_code == BAD_ARGS:
-        return (
-            "Catalog parity: workflow defect",
-            "**Exit 2 -- the harness rejected its own arguments.** This is a bug in "
-            "`.github/workflows/catalog-parity.yml`, not in the catalogs. The usual cause "
-            "is `--fail-on-drift` combined with `--residue-ledger none`, which asks the "
-            "harness to fail on drift while refusing the definition of expected drift. "
-            "**No verdict was computed.**",
-            False,
-        )
-    return (
-        "Catalog parity: unexpected failure",
-        f"**Exit {exit_code} -- unexpected.** This is outside the harness's documented exit "
-        "taxonomy (0, 2, 3, 4), so it is the harness itself crashing, or the step being "
-        "killed from outside (the job timeout, a cancellation, the runner going away). "
-        "Note that a *client* dying on a signal does not reach here: the harness reports "
-        "any non-zero client status as a producer failure, exit 3. **No verdict was "
-        "computed.**",
-        False,
-    )
-
-
 def _render_report(payload: dict[str, Any]) -> list[str]:
     """The metrics tables. Every lookup tolerates an absent key."""
     lines: list[str] = []
@@ -256,8 +314,8 @@ def _render_report(payload: dict[str, Any]) -> list[str]:
 
 
 def render(exit_code: int, payload: dict[str, Any] | None, problem: str | None) -> str:
-    heading, lead, verdict_computed = _taxonomy(exit_code)
-    lines = [f"## {heading}", "", lead, ""]
+    outcome = _outcome(exit_code)
+    lines = [f"## {outcome.heading}", "", outcome.lead, ""]
 
     if payload is not None:
         lines.extend(_render_report(payload))
@@ -267,7 +325,7 @@ def render(exit_code: int, payload: dict[str, Any] | None, problem: str | None) 
             lines.append("")
             lines.extend(f"- {cause}" for cause in causes)
             lines.append("")
-    elif verdict_computed:
+    elif outcome.verdict_computed:
         # The exit code promised a verdict and the report cannot supply it.
         lines.append(f"> The `--json` report could not be read: {problem}.")
         lines.append("")
@@ -290,37 +348,16 @@ def annotation(exit_code: int, payload: dict[str, Any] | None) -> str:
     GitHub truncates an annotation at its first newline, so a multi-line
     message silently loses everything after the first line.
     """
-    if exit_code == CLEAN:
-        return (
-            "::notice title=Catalog parity clean::"
-            "The MySQL-sourced and Backend-sourced catalogs agree; this run counts "
-            "toward the wiki#89 seven-day streak."
-        )
+    outcome = _outcome(exit_code)
+    kind = "notice" if exit_code == CLEAN else "error"
+    body = outcome.annotation_body
     if exit_code == DRIFT:
+        # The one code whose annotation earns per-run detail: which counters
+        # moved is the thing worth seeing without opening the run.
         causes = verdict_causes(payload)
-        detail = "; ".join(_plain(cause) for cause in causes) if causes else "see the run summary"
-        return (
-            "::error title=Catalog parity drift::"
-            f"Verdict (exit 4), not a broken run -- the harness completed and the catalogs "
-            f"disagree. {detail}."
-        )
-    if exit_code == SOURCE_ERROR:
-        return (
-            "::error title=Catalog parity producer failure::"
-            "Exit 3: a library.db input could not be built (SSH tunnel, MySQL export, or "
-            "Backend sign-in). No parity verdict was computed."
-        )
-    if exit_code == BAD_ARGS:
-        return (
-            "::error title=Catalog parity workflow defect::"
-            "Exit 2: the harness rejected its arguments -- a bug in catalog-parity.yml, "
-            "not in the catalogs. No parity verdict was computed."
-        )
-    return (
-        "::error title=Catalog parity crashed::"
-        f"Exit {exit_code} is outside the harness's exit taxonomy (0/2/3/4). No parity "
-        "verdict was computed."
-    )
+        detail = "; ".join(_plain(c) for c in causes) if causes else "see the run summary"
+        body = f"{body} {detail}."
+    return f"::{kind} title={outcome.annotation_title}::{body}"
 
 
 def _plain(markdown: str) -> str:
