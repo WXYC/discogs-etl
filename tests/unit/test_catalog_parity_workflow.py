@@ -27,6 +27,15 @@ what this file pins:
 5. **The scratch paths must be fresh.** The harness refuses to overwrite an
    existing ``--*-db`` by design, so a cached scratch directory turns every
    run after the first into exit 3.
+6. **The U+FFFD capture must stay off the schedule and off Kattare.**
+   ``--capture-fffd-cta-pairs`` (#382) needs the same repo-secret credentials
+   and the same MariaDB client as the soak, which is why it lives here rather
+   than in a workflow of its own -- but it is a manual, one-shot repair
+   capture for
+   [BS#2152](https://github.com/WXYC/Backend-Service/issues/2152), not a daily
+   measurement. It runs only on an explicit dispatch, and it reuses the
+   ``library.db`` the soak already built rather than taking a second
+   full-catalog export against the same 5-connection pool.
 """
 
 from __future__ import annotations
@@ -265,6 +274,117 @@ class TestArtifact:
         dangle."""
         name = upload["with"]["name"]
         assert "||" in name, f"no fallback for the unset case in {name!r}"
+
+
+class TestFffdCaptureDispatch:
+    """``--capture-fffd-cta-pairs`` (#382) reachable from CI, and only there.
+
+    The capture mode shipped in #383 with no way to run it: it needs the
+    ``BACKEND_CATALOG_*`` service account (repo secrets, so no laptop can hold
+    them) and a MariaDB client that does not segfault against MySQL 5.1.56 --
+    a pair that coexists only inside this workflow. This class pins the
+    invocation path, and pins it *narrow*.
+    """
+
+    @pytest.fixture(scope="class")
+    def dispatch_inputs(self, workflow) -> dict[str, Any]:
+        dispatch = _triggers(workflow)["workflow_dispatch"]
+        assert isinstance(dispatch, dict) and dispatch.get("inputs"), (
+            "workflow_dispatch needs an inputs block to carry the capture toggle"
+        )
+        return dispatch["inputs"]
+
+    @pytest.fixture(scope="class")
+    def capture_step(self, job) -> dict[str, Any]:
+        return _step(job, "Capture U+FFFD")
+
+    def test_capture_is_an_opt_in_dispatch_input(self, dispatch_inputs) -> None:
+        toggle = dispatch_inputs.get("capture_fffd_cta_pairs")
+        assert toggle, f"no capture toggle; have {sorted(dispatch_inputs)}"
+        assert toggle.get("type") == "boolean"
+
+    def test_capture_defaults_to_off(self, dispatch_inputs) -> None:
+        """The daily soak must stay a pure measurement. A capture default of
+        true would put a per-release Backend fetch loop on every scheduled run
+        forever, to collect a repair set that is wanted once."""
+        assert dispatch_inputs["capture_fffd_cta_pairs"].get("default") is False
+
+    def test_scheduled_runs_cannot_trigger_a_capture(self, capture_step) -> None:
+        """``inputs`` is null on a schedule event, so gating on it is what
+        keeps the cron path unchanged. Losing the reference (a `true` left
+        behind after testing) is the regression this catches."""
+        assert "inputs.capture_fffd_cta_pairs" in str(capture_step.get("if", ""))
+
+    def test_capture_reuses_the_already_built_mysql_db(self, capture_step) -> None:
+        """The whole reason this lives in the soak's job. A second
+        ``--mysql-source`` would open a second full-catalog export against
+        Kattare's 5-connection HikariCP pool inside the same job -- the exact
+        contention the 09:37 slot and the concurrency group exist to avoid."""
+        run = capture_step["run"]
+        assert "--mysql-db" in run
+        assert "--mysql-source" not in run, (
+            "the capture must reuse the soak's library.db, not re-export from Kattare"
+        )
+
+    def test_capture_runs_only_when_the_harness_completed(self, capture_step) -> None:
+        """Exits 0 and 4 are the two codes that mean the harness ran end to
+        end, so ``mysql.db`` is whole. On exit 2/3 it may be half-built or
+        absent, and pairing against a partial catalog would report MySQL rows
+        as ``zero_candidates`` -- a wrong answer that looks like a finding."""
+        gate = str(capture_step.get("if", ""))
+        assert "PARITY_EXIT_CODE" in gate, f"capture is not gated on the harness verdict: {gate!r}"
+
+    def test_capture_exit_code_does_not_overwrite_the_parity_one(self, capture_step) -> None:
+        """Both modes exit 4, meaning different things: drift for the soak,
+        *unresolved rows* for the capture. One sentinel for both would make
+        the daily verdict unreadable."""
+        run = capture_step["run"]
+        assert "CAPTURE_EXIT_CODE" in run
+        assert "PARITY_EXIT_CODE=" not in run
+
+    def test_capture_writes_into_the_per_run_scratch_dir(self, capture_step) -> None:
+        assert "$PARITY_DIR" in capture_step["run"]
+
+    def test_capture_does_not_fail_its_own_step(self, capture_step) -> None:
+        """Same reason as the harness step: failing here would skip the
+        upload, and the capture is expensive to re-take."""
+        assert "set +e" in capture_step["run"]
+
+    @pytest.fixture(scope="class")
+    def capture_upload(self, job) -> dict[str, Any]:
+        return _step(job, "Upload U+FFFD")
+
+    def test_capture_artifact_uploads_even_when_incomplete(self, capture_upload) -> None:
+        """A partial capture is still the input to BS#2152's repair -- the
+        resolved rows are usable whether or not every row paired."""
+        assert capture_upload.get("if", "").startswith("always()")
+
+    def test_capture_artifact_name_cannot_collide_with_the_parity_one(
+        self, capture_upload, job
+    ) -> None:
+        """``upload-artifact@v4`` refuses a duplicate name on the same run,
+        and the two artifacts ship from the same job."""
+        parity_name = _step(job, "Upload parity")["with"]["name"]
+        assert capture_upload["with"]["name"] != parity_name
+        assert "github.run_attempt" in capture_upload["with"]["name"]
+
+    def test_capture_verdict_is_rendered_and_re_raised_separately(self, job) -> None:
+        """A dedicated renderer, for the same reason ``parity_run_summary.py``
+        exists: read backwards, the capture's exit 4 (rows left unresolved)
+        looks like the soak's exit 4 (the catalogs disagree)."""
+        report = _step(job, "Report U+FFFD")
+        assert report.get("if", "").startswith("always()")
+        assert "scripts/fffd_capture_summary.py" in report["run"]
+        assert "GITHUB_STEP_SUMMARY" in report["run"]
+
+    def test_the_parity_verdict_still_reports_after_a_capture_failure(self, job) -> None:
+        """The capture report step re-raises, and GitHub skips later steps on
+        a failure -- so the daily verdict has to be ``always()`` to survive
+        it. It already is; this pins that the ordering stays safe."""
+        assert _step(job, "parity verdict").get("if") == "always()"
+
+    def test_capture_summary_script_exists(self) -> None:
+        assert (REPO_ROOT / "scripts" / "fffd_capture_summary.py").exists()
 
 
 class TestDocumentation:

@@ -261,6 +261,10 @@ Both producers refuse to write to a path that already exists: the harness only e
 
 A one-off sibling mode, not part of the daily-sync producer story above: `--capture-fffd-cta-pairs PATH` pairs every Backend `compilation_track_artist` row holding a literal U+FFFD REPLACEMENT CHARACTER against its tubafrenzy MySQL truth, and writes the result as JSON to `PATH` (`-` for stdout). It exists because the 2026-08-13 prod parity run ([#346](https://github.com/WXYC/discogs-etl/issues/346) step 8a) found 14 such values and no laptop can capture them: `BACKEND_CATALOG_EMAIL`/`BACKEND_CATALOG_PASSWORD` are repo secrets, and the Homebrew MySQL 9.x client segfaults against tubafrenzy's MySQL 5.1 (`mariadb-client` is what works — see [#378](https://github.com/WXYC/discogs-etl/issues/378)). CI is the only place both sides are reachable at once; this mode rides that.
 
+**To run it, dispatch `catalog-parity.yml` with `capture_fffd_cta_pairs` checked** ([#382](https://github.com/WXYC/discogs-etl/issues/382)) — Actions → Catalog Parity Soak → Run workflow. The capture is an opt-in step of the soak's own job rather than a workflow of its own, because that job is the one place the service-account secrets and a working `mariadb-client` already coexist, and because it can then reuse the `library.db` the soak just built (`--mysql-db`, no `--mysql-source`) instead of taking a second full-catalog export against Kattare's 5-connection pool. It runs only when the parity harness itself exited `0` or `4` — the two codes that mean the export completed, so the SQLite is whole; pairing against a half-built catalog would report MySQL rows as `zero_candidates`, a wrong answer shaped exactly like a real finding. The result uploads as `catalog-parity-fffd-exit<code>-<run_id>-<run_attempt>` and `scripts/fffd_capture_summary.py` renders the verdict. See [`automation.md`](automation.md#capturing-ufffd-cta-pairs-382).
+
+The invocation below is the manual equivalent, for a laptop that has a Kattare tunnel and the credentials:
+
 ```bash
 PARITY_DIR=$(mktemp -d)
 export LIBRARY_DB_PASSWORD=...
