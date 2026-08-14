@@ -233,6 +233,7 @@ class _BackendStub:
         credentials: tuple[str, str] | None = None,
         jwt_ttl_seconds: int = 900,
         unreadable_jwt_exp: bool = False,
+        compilation_tracks_by_id: dict[int, list[dict[str, Any]]] | None = None,
     ) -> None:
         self.catalog_rows = catalog_rows
         self.cta_rows = cta_rows
@@ -241,6 +242,13 @@ class _BackendStub:
         self.credentials = credentials
         self.jwt_ttl_seconds = jwt_ttl_seconds
         self.unreadable_jwt_exp = unreadable_jwt_exp
+        # GET /library/{id}/compilation-tracks (BS#1964), keyed on the
+        # Backend serial id -- distinct from the bulk
+        # /library/catalog/compilation-tracks export above, and the only
+        # source of `track_position` (WXYC/Backend-Service#2152's
+        # --capture-fffd-cta-pairs mode). A missing key answers 404, an
+        # empty list answers 200 with `tracks: []`.
+        self.compilation_tracks_by_id = compilation_tracks_by_id or {}
         # What a forced 429 puts in its retry hint. The express limiter's
         # window is 15 minutes, so a hint far longer than any retry the
         # producer is willing to wait out is the realistic case, not an
@@ -395,6 +403,20 @@ class _BackendStub:
                     if bearer not in stub.jwts:
                         self._send_json(401, {"error": "Unauthorized: Invalid or expired token."})
                         return
+                by_id_match = re.match(r"^/library/(\d+)/compilation-tracks$", self.path)
+                if by_id_match is not None:
+                    backend_id = int(by_id_match.group(1))
+                    if backend_id not in stub.compilation_tracks_by_id:
+                        self.send_error(404)
+                        return
+                    self._send_json(
+                        200,
+                        {
+                            "library_id": backend_id,
+                            "tracks": stub.compilation_tracks_by_id[backend_id],
+                        },
+                    )
+                    return
                 if self.path == "/library/catalog":
                     rows = stub.catalog_rows
                 elif self.path == "/library/catalog/compilation-tracks":
@@ -2991,6 +3013,314 @@ class TestBackendProducer:
             ).fetchall() == [(72_101,)]
         finally:
             conn.close()
+
+
+class TestCatalogRowToIdMapEntry:
+    """``_catalog_row_to_id_map_entry`` -- the id-map sibling of
+    ``_catalog_row_to_library_row``, keeping the Backend serial id the
+    general producer discards (WXYC/Backend-Service#2152)."""
+
+    def test_maps_legacy_release_id_to_backend_serial_id(self) -> None:
+        mod = _load_module()
+        row = _catalog_row(legacy_release_id=72_101)
+        assert row["id"] != row["legacy_release_id"]  # the fixture's own invariant
+
+        assert mod._catalog_row_to_id_map_entry(row) == (72_101, row["id"])
+
+    def test_missing_id_field_raises(self) -> None:
+        mod = _load_module()
+        row = _catalog_row(legacy_release_id=72_101)
+        del row["id"]
+        with pytest.raises(mod.SourceError, match="no 'id' field"):
+            mod._catalog_row_to_id_map_entry(row)
+
+    def test_non_integer_id_field_raises(self) -> None:
+        mod = _load_module()
+        row = _catalog_row(legacy_release_id=72_101, id="not-a-number")
+        with pytest.raises(mod.SourceError, match="non-integer 'id'"):
+            mod._catalog_row_to_id_map_entry(row)
+
+
+class TestFetchCompilationTracksById:
+    """``_fetch_compilation_tracks``: GET /library/{id}/compilation-tracks
+    (BS#1964), the only source of ``track_position`` for the FFFD capture
+    mode (the bulk CTA export omits it -- see
+    ``_catalog_row_to_id_map_entry``'s docstring)."""
+
+    def test_happy_path_returns_the_tracks_list(self) -> None:
+        mod = _load_module()
+        with _BackendStub(
+            catalog_rows=[],
+            cta_rows=[],
+            compilation_tracks_by_id={
+                5_001: [
+                    {
+                        "id": 1,
+                        "artist_name": "Csillagrablók",
+                        "track_title": "Reménytelen Tánc",
+                        "track_position": "3",
+                    }
+                ]
+            },
+        ) as stub:
+            token_source = mod._TokenSource.__new__(mod._TokenSource)
+            token_source._static = "svc-token"
+            tracks = mod._fetch_compilation_tracks(stub.base_url, 5_001, token_source)
+
+        assert tracks == [
+            {
+                "id": 1,
+                "artist_name": "Csillagrablók",
+                "track_title": "Reménytelen Tánc",
+                "track_position": "3",
+            }
+        ]
+
+    def test_unknown_id_returns_empty_list_not_an_error(self) -> None:
+        """A 404 -- the release vanished between the catalog snapshot and
+        this follow-up call -- degrades gracefully; it is not this mode's
+        job to fail the whole capture over one stale id."""
+        mod = _load_module()
+        with _BackendStub(catalog_rows=[], cta_rows=[], compilation_tracks_by_id={}) as stub:
+            token_source = mod._TokenSource.__new__(mod._TokenSource)
+            token_source._static = "svc-token"
+            assert mod._fetch_compilation_tracks(stub.base_url, 5_001, token_source) == []
+
+    def test_refreshes_a_rejected_token_and_retries_once(self, monkeypatch) -> None:
+        mod = _load_module()
+        monkeypatch.setenv(mod.BACKEND_EMAIL_ENV, "parity@wxyc.invalid")
+        monkeypatch.setenv(mod.BACKEND_PASSWORD_ENV, "sekrit")
+        with _BackendStub(
+            catalog_rows=[],
+            cta_rows=[],
+            credentials=("parity@wxyc.invalid", "sekrit"),
+            compilation_tracks_by_id={
+                5_001: [
+                    {
+                        "artist_name": "µ-Ziq",
+                        "track_title": "Hasty Boom Alert",
+                        "track_position": "1",
+                    }
+                ]
+            },
+        ) as stub:
+            token_source = mod._TokenSource(stub.base_url)
+            # A stale/garbage bearer forces the 401-then-refresh path.
+            token_source._jwt = "stale-jwt"
+            token_source._jwt_expires_at = time.time() + 900
+            tracks = mod._fetch_compilation_tracks(stub.base_url, 5_001, token_source)
+
+        assert tracks[0]["artist_name"] == "µ-Ziq"
+
+
+class TestCaptureFffdCtaPairs:
+    """``capture_fffd_cta_pairs``: the WXYC/Backend-Service#2152 end-to-end
+    orchestration -- MySQL truth from an already-built library.db,
+    Backend's corrupt rows + track_position over HTTP, paired via
+    ``lib.fffd_pair_capture.find_fffd_pairs``."""
+
+    def test_resolves_a_corrupt_row_and_renders_sql_values(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        mod = _load_module()
+        monkeypatch.setenv(mod.BACKEND_TOKEN_ENV, "svc-token")
+        mysql_db = tmp_path / "mysql.db"
+        _make_library_db(
+            mysql_db,
+            rows=[],
+            cta_rows=[(50_340, "Csillagrablók", "Reménytelen Tánc")],
+        )
+        with _BackendStub(
+            catalog_rows=[_catalog_row(id=5_001, legacy_release_id=50_340)],
+            cta_rows=[
+                {
+                    "legacy_release_id": 50_340,
+                    "artist_name": "Csillagrablók",
+                    "track_title": "Rem�nytelen T�nc",
+                }
+            ],
+            compilation_tracks_by_id={
+                5_001: [
+                    {
+                        "artist_name": "Csillagrablók",
+                        "track_title": "Rem�nytelen T�nc",
+                        "track_position": "3",
+                    }
+                ]
+            },
+        ) as stub:
+            report = mod.capture_fffd_cta_pairs(str(mysql_db), stub.base_url)
+
+        assert report["unresolved"] == []
+        assert len(report["resolved"]) == 1
+        row = report["resolved"][0]
+        assert row["legacy_release_id"] == 50_340
+        assert row["track_position"] == "3"
+        assert row["true_artist_name"] is None
+        assert row["true_track_title"] == "Reménytelen Tánc"
+        assert [c["codepoint"] for c in row["true_track_title_codepoints"]] == [
+            "U+00E9",
+            "U+00E1",
+        ]
+        assert "'Reménytelen Tánc'" in report["sql_values"]
+        assert "50340" in report["sql_values"]
+
+    def test_zero_candidates_reports_unresolved_not_a_guess(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        mod = _load_module()
+        monkeypatch.setenv(mod.BACKEND_TOKEN_ENV, "svc-token")
+        mysql_db = tmp_path / "mysql.db"
+        _make_library_db(
+            mysql_db,
+            rows=[],
+            cta_rows=[(1, "Nilüfer Yanya", "Midnight Sky")],  # different track_title
+        )
+        with _BackendStub(
+            catalog_rows=[_catalog_row(id=5_002, legacy_release_id=1)],
+            cta_rows=[
+                {
+                    "legacy_release_id": 1,
+                    "artist_name": "Nil�fer Yanya",
+                    "track_title": "Midnight Sun",
+                }
+            ],
+            compilation_tracks_by_id={5_002: []},
+        ) as stub:
+            report = mod.capture_fffd_cta_pairs(str(mysql_db), stub.base_url)
+
+        assert report["resolved"] == []
+        assert len(report["unresolved"]) == 1
+        assert report["unresolved"][0]["reason"] == "zero_candidates"
+        assert report["sql_values"] == ""
+
+    def test_clean_rows_never_appear_in_either_list(self, tmp_path: Path, monkeypatch) -> None:
+        mod = _load_module()
+        monkeypatch.setenv(mod.BACKEND_TOKEN_ENV, "svc-token")
+        mysql_db = tmp_path / "mysql.db"
+        _make_library_db(mysql_db, rows=[], cta_rows=[(1, "Stereolab", "Miss Modular")])
+        with _BackendStub(
+            catalog_rows=[_catalog_row(id=5_003, legacy_release_id=1)],
+            cta_rows=[
+                {"legacy_release_id": 1, "artist_name": "Stereolab", "track_title": "Miss Modular"}
+            ],
+            compilation_tracks_by_id={5_003: []},
+        ) as stub:
+            report = mod.capture_fffd_cta_pairs(str(mysql_db), stub.base_url)
+
+        assert report == {"resolved": [], "unresolved": [], "sql_values": ""}
+
+
+class TestCaptureFffdCtaPairsCli:
+    """``main``'s ``--capture-fffd-cta-pairs`` branch: flag validation +
+    end-to-end wiring through the real CLI entry point."""
+
+    def test_requires_backend_source(self) -> None:
+        mod = _load_module()
+        assert mod.main(["--capture-fffd-cta-pairs", "-", "--mysql-db", "x"]) == 2
+
+    def test_requires_a_mysql_source_or_prebuilt_db(self) -> None:
+        mod = _load_module()
+        assert (
+            mod.main(["--capture-fffd-cta-pairs", "-", "--backend-source", "https://api.wxyc.org"])
+            == 2
+        )
+
+    def test_mysql_source_without_mysql_db_is_a_usage_error(self) -> None:
+        mod = _load_module()
+        assert (
+            mod.main(
+                [
+                    "--capture-fffd-cta-pairs",
+                    "-",
+                    "--backend-source",
+                    "https://api.wxyc.org",
+                    "--mysql-source",
+                    "mysql://u:p@h/db",
+                ]
+            )
+            == 2
+        )
+
+    def test_end_to_end_via_mysql_source_and_backend_source(
+        self, tmp_path: Path, monkeypatch, capsys: pytest.CaptureFixture
+    ) -> None:
+        mod = _load_module()
+        monkeypatch.setenv(mod.BACKEND_TOKEN_ENV, "svc-token")
+        monkeypatch.setattr(
+            mod,
+            "_mysql_runner",
+            _FakeMysqlRunner(
+                library_tsv="",
+                cta_tsv="50340\tCsillagrablók\tReménytelen Tánc\n",
+            ),
+        )
+        with _BackendStub(
+            catalog_rows=[_catalog_row(id=5_001, legacy_release_id=50_340)],
+            cta_rows=[
+                {
+                    "legacy_release_id": 50_340,
+                    "artist_name": "Csillagrablók",
+                    "track_title": "Rem�nytelen T�nc",
+                }
+            ],
+            compilation_tracks_by_id={
+                5_001: [
+                    {
+                        "artist_name": "Csillagrablók",
+                        "track_title": "Rem�nytelen T�nc",
+                        "track_position": "3",
+                    }
+                ]
+            },
+        ) as stub:
+            exit_code = mod.main(
+                [
+                    "--capture-fffd-cta-pairs",
+                    "-",
+                    "--mysql-source",
+                    "mysql://wxyc:sekrit@127.0.0.1/wxycmusic",
+                    "--mysql-db",
+                    str(tmp_path / "mysql.db"),
+                    "--backend-source",
+                    stub.base_url,
+                ]
+            )
+
+        assert exit_code == 0
+        report = json.loads(capsys.readouterr().out)
+        assert len(report["resolved"]) == 1
+        assert report["resolved"][0]["true_track_title"] == "Reménytelen Tánc"
+
+    def test_written_to_a_file_path_when_not_dash(self, tmp_path: Path, monkeypatch) -> None:
+        mod = _load_module()
+        monkeypatch.setenv(mod.BACKEND_TOKEN_ENV, "svc-token")
+        monkeypatch.setattr(
+            mod,
+            "_mysql_runner",
+            _FakeMysqlRunner(library_tsv="", cta_tsv=""),
+        )
+        out = tmp_path / "fffd-pairs.json"
+        with _BackendStub(catalog_rows=[], cta_rows=[]) as stub:
+            exit_code = mod.main(
+                [
+                    "--capture-fffd-cta-pairs",
+                    str(out),
+                    "--mysql-source",
+                    "mysql://wxyc:sekrit@127.0.0.1/wxycmusic",
+                    "--mysql-db",
+                    str(tmp_path / "mysql.db"),
+                    "--backend-source",
+                    stub.base_url,
+                ]
+            )
+
+        assert exit_code == 0
+        assert json.loads(out.read_text()) == {
+            "resolved": [],
+            "unresolved": [],
+            "sql_values": "",
+        }
 
 
 class TestServiceAccountMint:
