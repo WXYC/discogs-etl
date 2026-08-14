@@ -111,18 +111,45 @@ The `--notify` flag is always passed, so Slack notifications are sent on failure
 
 After a successful run, verify the library-metadata-lookup health endpoint returns healthy with the expected row count.
 
-## Unwired secrets (catalog parity)
+## Daily Catalog Parity Soak (`catalog-parity.yml`)
 
-Two repo secrets exist that **no workflow reads yet**. They authenticate the Backend-sourced producer in `scripts/catalog_parity_diff.py` against `GET /library/catalog` — the catalog-parity soak on [wiki#89](https://github.com/WXYC/wiki/issues/89), which runs by hand today. [#370](https://github.com/WXYC/discogs-etl/issues/370) gave the harness a `clean` verdict and a `--fail-on-drift` exit code (4) for exactly this purpose, but that flag still has no consumer: a scheduled workflow needs the Kattare SSH tunnel and the MariaDB client (`sync-library.yml` is the shape to copy), which is real scope and was deliberately not folded into #370. That workflow is now filed as **[#378](https://github.com/WXYC/discogs-etl/issues/378)**, which #346 is blocked by; until it lands, these secrets are set so the soak can run unattended from a runner or a laptop without a credential detour, and the seven-consecutive-clean-days streak stays a hand-run invocation.
+Builds both `library.db` sides from their live sources — tubafrenzy MySQL over the Kattare tunnel, and Backend-Service's `GET /library/catalog` NDJSON export — diffs them with `scripts/catalog_parity_diff.py --fail-on-drift`, and uploads the `--json` report as a run artifact. This is the mechanism behind [wiki#89](https://github.com/WXYC/wiki/issues/89) AC#4 (seven consecutive clean parity days before the 2026-08-31 tubafrenzy turndown): the streak is a property of this workflow's run history, auditable from the artifacts, rather than of whoever last ran the harness on a laptop. Filed as [#378](https://github.com/WXYC/discogs-etl/issues/378); the harness, the `clean` verdict, and the vendored residue ledger it reads are [#370](https://github.com/WXYC/discogs-etl/issues/370).
 
-Two things that cost time on the first live run ([#346's step-8a measurement](https://github.com/WXYC/discogs-etl/issues/346#issuecomment-5287728924)) and that #378 has to carry, so they are recorded here rather than only in that comment:
+**Cadence: 09:37 UTC daily** (5:37 AM EDT / 4:37 AM EST). Deliberately ~2h20m ahead of `sync-library.yml`'s noon-UTC slot — both scan the same Kattare MySQL, whose HikariCP pool maxes at 5 connections, and overlapping full-catalog scans are how that host wedges. `tests/unit/test_catalog_parity_workflow.py` checks that margin against the job's own `timeout-minutes`, so raising the timeout past the gap fails in CI rather than in production. Off the top of the hour because GitHub queues scheduled workflows hardest at `:00` and a delayed run is a day the streak can silently lose; pre-dawn Eastern because the two sides are snapshotted minutes apart, so a cataloger's edit landing between them reads as drift. A `concurrency` group keeps a manual `workflow_dispatch` from running alongside the scheduled one.
 
-- **The MySQL producer needs a MariaDB client.** The Homebrew MySQL 9.7 client **segfaults (exit 139)** against tubafrenzy's MySQL 5.1.56. `sync-library.yml` installs `mariadb-client` for exactly this reason.
-- **`--default-character-set=utf8` is load-bearing.** Without it the connection negotiates latin1 and the dump is not valid UTF-8, which fails `parse_library_tsv` outright rather than showing up as drift. `scripts/sync-library.sh` passes it on both SELECTs.
+**Expect exit 4 — a red run — until the residue clears.** Exit 4 is the drift *verdict*, not a broken workflow. As of the [2026-08-13 prod measurement](https://github.com/WXYC/discogs-etl/issues/346#issuecomment-5287728924), `clean` is false on 115 unexplained extra rows ([BS#2108](https://github.com/WXYC/Backend-Service/issues/2108)'s pending `/wxycdb` delete) plus 28 residual field mismatches ([BS#2152](https://github.com/WXYC/Backend-Service/issues/2152) and post-import content divergence). Both have owners; scheduling now is what gets the streak instrumented *before* the residue clears. The exit codes are not interchangeable, which is what `scripts/parity_run_summary.py` exists to say in the run summary:
+
+| Exit | Meaning | Is it a parity result? |
+|------|---------|------------------------|
+| `0` | The catalogs agree | Yes — one clean day toward the streak |
+| `4` | The harness ran correctly and the catalogs disagree | **Yes — a verdict.** The expected state today |
+| `3` | A producer could not build its input (SSH tunnel, MySQL export, Backend sign-in) | No — infrastructure. No verdict computed |
+| `2` | The harness rejected its arguments | No — a defect in `catalog-parity.yml` itself |
+| `1` (or any other) | Uncaught crash; `139` is the MySQL client segfaulting | No — outside the taxonomy |
+
+Read the wrong way round, exit 4 looks like a broken soak and gets muted while exit 3 looks like a parity failure and sends someone hunting a data problem that does not exist. The summary step renders the taxonomy, names which condition in the `clean` conjunction actually fired, and re-raises the harness's own code so the failing step carries that number.
+
+Two constraints that cost time on the first live run and are load-bearing for anyone reproducing it by hand:
+
+- **The MySQL producer needs a MariaDB client.** The Homebrew MySQL 9.7 client **segfaults (exit 139)** against tubafrenzy's MySQL 5.1.56. Both this workflow and `sync-library.yml` install `mariadb-client` for exactly this reason.
+- **`--default-character-set=utf8` is load-bearing.** Without it the connection negotiates latin1 and the dump is not valid UTF-8, which fails `parse_library_tsv` outright rather than showing up as drift. `catalog_parity_diff.py`'s `_mysql_invocation` passes it, as does `scripts/sync-library.sh` on both SELECTs.
+
+The scratch directory is a fresh `mktemp -d` per run and is never cached: the harness refuses to write over an existing `--mysql-db`/`--backend-db` by design, so a reused path turns every run after the first into exit 3. `--residue-ledger` is deliberately left off — the default resolves `vendor/parity-residue/ledger.json` relative to the script rather than the cwd, and the literal `none` would make `--fail-on-drift` exit 2.
+
+**Required GitHub secrets** (the SSH and `LIBRARY_DB_*` set is shared with `sync-library.yml` above):
 
 | Secret | Description |
 |--------|-------------|
+| `SSH_PRIVATE_KEY` | Private key authorized on Kattare |
+| `LIBRARY_SSH_HOST` | Kattare SSH hostname |
+| `LIBRARY_SSH_USER` | SSH username |
+| `LIBRARY_DB_HOST` | MySQL host (as seen from the SSH host); forwarded to `127.0.0.1:13306` |
+| `LIBRARY_DB_USER` | MySQL username |
+| `LIBRARY_DB_PASSWORD` | MySQL password. Reaches the client via `MYSQL_PWD`, **never** the DSN — the DSN is argv, visible to `ps` and echoed by any `set -x` |
+| `LIBRARY_DB_NAME` | MySQL database name |
 | `BACKEND_CATALOG_EMAIL` | Service-account email (`catalog-parity@wxyc.invalid`), `member` org role — the least-privileged role carrying `catalog:read` |
 | `BACKEND_CATALOG_PASSWORD` | That account's password. **Not a token**: the JWT Backend-Service accepts expires in 15 minutes, so the harness signs in and mints one per run |
 
-Mint and rotation procedure: [`architecture.md` → Minting and rotating the parity service account](architecture.md#minting-and-rotating-the-parity-service-account-365). Treat the pair as sensitive — the export it unlocks is the entire library catalog.
+**Optional Actions variable:** `BACKEND_CATALOG_URL` overrides the Backend base URL (default `https://api.wxyc.org`) — a variable rather than a secret because the hostname is public, and settable to point a `workflow_dispatch` run at staging.
+
+Mint and rotation procedure for the service account: [`architecture.md` → Minting and rotating the parity service account](architecture.md#minting-and-rotating-the-parity-service-account-365). Treat the pair as sensitive — the export it unlocks is the entire library catalog.
