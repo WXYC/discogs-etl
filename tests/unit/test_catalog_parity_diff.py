@@ -3322,6 +3322,149 @@ class TestCaptureFffdCtaPairsCli:
             "sql_values": "",
         }
 
+    def test_unresolved_rows_exit_4_with_the_report_still_written(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """ "Ran fine, captured nothing usable" must not read as success.
+
+        This mode exists to hand WXYC/Backend-Service#2152 a specific set of
+        pairs. A run where every corrupt row came back unresolved is exactly
+        as actionable as a crash and exactly as invisible at exit 0 -- the
+        same argument ``--fail-on-drift``'s exit 4 already makes for the diff,
+        so it reuses that code rather than inventing one. The report is still
+        written first: the unresolved rows and their candidates are the whole
+        diagnostic.
+        """
+        mod = _load_module()
+        monkeypatch.setenv(mod.BACKEND_TOKEN_ENV, "svc-token")
+        monkeypatch.setattr(
+            mod,
+            "_mysql_runner",
+            _FakeMysqlRunner(library_tsv="", cta_tsv="50340\tCsillagrablók\tEgy Másik Dal\n"),
+        )
+        out = tmp_path / "fffd-pairs.json"
+        with _BackendStub(
+            catalog_rows=[_catalog_row(id=5_001, legacy_release_id=50_340)],
+            cta_rows=[
+                {
+                    "legacy_release_id": 50_340,
+                    "artist_name": "Csillagrablók",
+                    "track_title": "Rem�nytelen T�nc",
+                }
+            ],
+            compilation_tracks_by_id={5_001: []},
+        ) as stub:
+            exit_code = mod.main(
+                [
+                    "--capture-fffd-cta-pairs",
+                    str(out),
+                    "--mysql-source",
+                    "mysql://wxyc:sekrit@127.0.0.1/wxycmusic",
+                    "--mysql-db",
+                    str(tmp_path / "mysql.db"),
+                    "--backend-source",
+                    stub.base_url,
+                ]
+            )
+
+        assert exit_code == 4
+        report = json.loads(out.read_text())
+        assert report["resolved"] == []
+        assert report["unresolved"][0]["reason"] == "zero_candidates"
+
+    def test_unwritable_output_path_is_rejected_before_any_source_work(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """A bad ``PATH`` must cost nothing.
+
+        This mode is only runnable in CI (repo-secret credentials plus a
+        working ``mariadb-client``), so discovering an unwritable path *after*
+        the MySQL export and every Backend fetch have completed throws away a
+        report that cannot casually be re-taken -- and the retry then trips
+        ``_require_absent`` on the half-built ``--mysql-db``.
+        """
+        mod = _load_module()
+        monkeypatch.setenv(mod.BACKEND_TOKEN_ENV, "svc-token")
+        runner = _FakeMysqlRunner(library_tsv="", cta_tsv="")
+        monkeypatch.setattr(mod, "_mysql_runner", runner)
+
+        exit_code = mod.main(
+            [
+                "--capture-fffd-cta-pairs",
+                str(tmp_path / "no-such-dir" / "fffd-pairs.json"),
+                "--mysql-source",
+                "mysql://wxyc:sekrit@127.0.0.1/wxycmusic",
+                "--mysql-db",
+                str(tmp_path / "mysql.db"),
+                "--backend-source",
+                "https://api.wxyc.org",
+            ]
+        )
+
+        assert exit_code == 2
+        assert runner.calls == []
+        assert not (tmp_path / "mysql.db").exists()
+
+    def test_a_late_write_failure_falls_back_to_stdout_rather_than_losing_the_capture(
+        self, tmp_path: Path, monkeypatch, capsys: pytest.CaptureFixture
+    ) -> None:
+        """The pre-flight check cannot cover a disk that fills mid-write."""
+        mod = _load_module()
+        monkeypatch.setenv(mod.BACKEND_TOKEN_ENV, "svc-token")
+        monkeypatch.setattr(
+            mod,
+            "_mysql_runner",
+            _FakeMysqlRunner(library_tsv="", cta_tsv="50340\tCsillagrablók\tReménytelen Tánc\n"),
+        )
+
+        out = tmp_path / "fffd-pairs.json"
+        real_write_text = Path.write_text
+
+        def _explode(self, *args, **kwargs):
+            # Scoped to the report itself -- the TSV the fake mysql runner
+            # writes goes through this same method and must still succeed.
+            if self == out:
+                raise OSError(28, "No space left on device")
+            return real_write_text(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "write_text", _explode)
+        with _BackendStub(
+            catalog_rows=[_catalog_row(id=5_001, legacy_release_id=50_340)],
+            cta_rows=[
+                {
+                    "legacy_release_id": 50_340,
+                    "artist_name": "Csillagrablók",
+                    "track_title": "Rem�nytelen T�nc",
+                }
+            ],
+            compilation_tracks_by_id={
+                5_001: [
+                    {
+                        "artist_name": "Csillagrablók",
+                        "track_title": "Rem�nytelen T�nc",
+                        "track_position": "3",
+                    }
+                ]
+            },
+        ) as stub:
+            exit_code = mod.main(
+                [
+                    "--capture-fffd-cta-pairs",
+                    str(out),
+                    "--mysql-source",
+                    "mysql://wxyc:sekrit@127.0.0.1/wxycmusic",
+                    "--mysql-db",
+                    str(tmp_path / "mysql.db"),
+                    "--backend-source",
+                    stub.base_url,
+                ]
+            )
+
+        assert exit_code == 3
+        captured = capsys.readouterr()
+        report = json.loads(captured.out)
+        assert report["resolved"][0]["true_track_title"] == "Reménytelen Tánc"
+
 
 class TestServiceAccountMint:
     """Minting and refreshing the Backend service-account JWT (#365).

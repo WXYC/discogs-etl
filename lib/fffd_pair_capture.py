@@ -137,7 +137,13 @@ def hex_codepoints(value: str) -> tuple[CodepointEntry, ...]:
     )
 
 
-def _column_agrees(backend_value: str, mysql_value: str, corrupt: bool) -> bool:
+def _column_agrees(
+    backend_value: str,
+    mysql_value: str,
+    corrupt: bool,
+    *,
+    allow_corrupt_source: bool = False,
+) -> bool:
     """Does ``mysql_value`` satisfy this column's half of the pairing rule?
 
     A column with no U+FFFD anchors the row's identity and must match
@@ -147,12 +153,67 @@ def _column_agrees(backend_value: str, mysql_value: str, corrupt: bool) -> bool:
     every position the Backend side did not lose to U+FFFD; multiple
     placeholders in one string (`Rem�nytelen T�nc`) fall out of
     the same position-by-position check with no special-casing.
+
+    **A U+FFFD on the MySQL side disqualifies the row** unless
+    ``allow_corrupt_source``. Position-wise agreement treats the Backend
+    placeholder as matching anything, so a MySQL value corrupt at the same
+    position would agree trivially and be emitted as the "true" value --
+    writing the corruption into the repair while reporting success. MySQL is
+    the source of truth only while it is itself clean; the relaxed form
+    exists solely so the caller can *report* that distinction (see
+    ``corrupt_candidates`` in :func:`find_fffd_pairs`), never to resolve on.
     """
     if not corrupt:
         return backend_value == mysql_value
+    if not allow_corrupt_source and has_fffd(mysql_value):
+        return False
     if len(backend_value) != len(mysql_value):
         return False
     return all(b == FFFD or b == m for b, m in zip(backend_value, mysql_value))
+
+
+def _row_agrees(
+    backend_row: CtaRow,
+    sibling: CtaRow,
+    artist_corrupt: bool,
+    title_corrupt: bool,
+    *,
+    allow_corrupt_source: bool,
+) -> bool:
+    """Does ``sibling`` satisfy the pairing rule on BOTH columns?"""
+    return _column_agrees(
+        backend_row.artist_name,
+        sibling.artist_name,
+        artist_corrupt,
+        allow_corrupt_source=allow_corrupt_source,
+    ) and _column_agrees(
+        backend_row.track_title,
+        sibling.track_title,
+        title_corrupt,
+        allow_corrupt_source=allow_corrupt_source,
+    )
+
+
+def _dedupe_candidates(candidates: Sequence[CtaRow]) -> list[CtaRow]:
+    """Collapse byte-identical candidates, preserving order.
+
+    Duplicate ``compilation_track_artist`` rows are ordinary in this catalog
+    (see the double-entry rate on discogs-etl#346), and two byte-identical
+    MySQL rows carry exactly ONE answer -- counting them as ambiguous would
+    strand a row whose true value is not in doubt. The comparison is
+    byte-exact on both captured columns, so it cannot collapse a genuine
+    two-answer case: anything that differs, in either column, still counts
+    separately and still reports ``multiple_candidates``.
+    """
+    seen: set[tuple[str, str]] = set()
+    unique: list[CtaRow] = []
+    for row in candidates:
+        key = (row.artist_name, row.track_title)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(row)
+    return unique
 
 
 def find_fffd_pairs(
@@ -200,12 +261,13 @@ def find_fffd_pairs(
             continue
 
         siblings = mysql_by_release.get(row.legacy_release_id, [])
-        candidates = [
-            sibling
-            for sibling in siblings
-            if _column_agrees(row.artist_name, sibling.artist_name, artist_corrupt)
-            and _column_agrees(row.track_title, sibling.track_title, title_corrupt)
-        ]
+        candidates = _dedupe_candidates(
+            [
+                s
+                for s in siblings
+                if _row_agrees(row, s, artist_corrupt, title_corrupt, allow_corrupt_source=False)
+            ]
+        )
         position = positions.get((row.legacy_release_id, row.artist_name, row.track_title))
 
         if len(candidates) == 1:
@@ -228,15 +290,33 @@ def find_fffd_pairs(
                     ),
                 )
             )
-        else:
+        elif candidates:
             unresolved.append(
                 UnresolvedFffdPair(
                     legacy_release_id=row.legacy_release_id,
                     track_position=position,
                     current_artist_name=row.artist_name,
                     current_track_title=row.track_title,
-                    reason="zero_candidates" if not candidates else "multiple_candidates",
+                    reason="multiple_candidates",
                     candidates=tuple(candidates),
+                )
+            )
+        else:
+            corrupt_candidates = _dedupe_candidates(
+                [
+                    s
+                    for s in siblings
+                    if _row_agrees(row, s, artist_corrupt, title_corrupt, allow_corrupt_source=True)
+                ]
+            )
+            unresolved.append(
+                UnresolvedFffdPair(
+                    legacy_release_id=row.legacy_release_id,
+                    track_position=position,
+                    current_artist_name=row.artist_name,
+                    current_track_title=row.track_title,
+                    reason="corrupt_candidates" if corrupt_candidates else "zero_candidates",
+                    candidates=tuple(corrupt_candidates),
                 )
             )
 
