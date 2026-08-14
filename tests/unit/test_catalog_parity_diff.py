@@ -1114,12 +1114,46 @@ class TestClassifyField:
         assert tier == "normalized"
         assert cls == "cardinality_loss"
 
-    def test_cross_reference_names_extra_backend_item_is_a_mismatch(self) -> None:
-        """Backend holding an alias unexplainable from mysql at all is a
-        genuine defect, not a residual."""
+    def test_cross_reference_names_cardinality_gain_is_normalized_not_mismatch(self) -> None:
+        """The symmetric counterpart of ``cardinality_loss`` above, and it
+        exists for the same reason: the row cannot distinguish the causes.
+
+        ``LIBRARY_CODE_CROSS_REFERENCE`` is joined per *code*, but this
+        harness only ever sees rows that carry a *release*. A duplicate
+        ``LIBRARY_CODE`` with zero releases is therefore invisible here while
+        still being folded into Backend's single ``artists`` row by
+        ``ensureArtist`` -- so Backend legitimately holds aliases that
+        ``LIBRARY_SELECT_SQL``'s release-keyed subquery can never return. The
+        2026-08-13 prod run measured 11 such rows and **zero** of any other
+        shape (WXYC/discogs-etl#346).
+
+        Treating a superset as a defect would therefore gate the release on a
+        divergence that is an artifact of what the query can see, not of the
+        data. Note this is deliberately *not* blanket acceptance -- a set that
+        is neither subset nor superset is still a mismatch, which the next
+        test pins.
+        """
         mod = _load_module()
         mysql_row = _row(cross_reference_names="Csillagrablók")
         backend_row = _row(cross_reference_names="Csillagrablók | Hermanos Gutiérrez")
+        tier, cls = mod.classify_field("cross_reference_names", mysql_row, backend_row)
+        assert tier == "normalized"
+        assert cls == "cardinality_gain"
+
+    def test_cross_reference_names_crossing_sets_are_still_a_mismatch(self) -> None:
+        """Backend dropping one alias *and* gaining another is neither a
+        subset nor a superset, and no fold-collapse or invisible-duplicate
+        story produces it. That stays gated -- it is what keeps this column
+        able to catch genuine crossref corruption at all."""
+        mod = _load_module()
+        mysql_row = _row(cross_reference_names="Csillagrablók | Jessica Pratt")
+        backend_row = _row(cross_reference_names="Csillagrablók | Hermanos Gutiérrez")
+        assert mod.classify_field("cross_reference_names", mysql_row, backend_row)[0] == "mismatch"
+
+    def test_cross_reference_names_disjoint_sets_are_still_a_mismatch(self) -> None:
+        mod = _load_module()
+        mysql_row = _row(cross_reference_names="Jessica Pratt")
+        backend_row = _row(cross_reference_names="Hermanos Gutiérrez")
         assert mod.classify_field("cross_reference_names", mysql_row, backend_row)[0] == "mismatch"
 
 
@@ -1171,6 +1205,149 @@ class TestClassifyMatchedRows:
         field_mismatches, _ = mod._classify_matched_rows(mysql_rows, backend_rows, [1])
         assert set(field_mismatches) == set(mod.DIFF_COLUMNS)
         assert all(v == 0 for v in field_mismatches.values())
+
+
+class TestFoldCollapseResolution:
+    """Fold-collapse: the cross-row widening measured on prod 2026-08-13
+    (WXYC/discogs-etl#346, plan step 8).
+
+    tubafrenzy's unit of artist identity is the ``LIBRARY_CODE`` row and
+    nothing stops two of them sharing a ``PRESENTATION_NAME`` (295 names do,
+    across 596 code rows). Backend's unit is the ``artists`` row, matched by
+    ``fold_artist_name``, so those collapse into one row that can hold only
+    ONE ``code_letters`` and one ``artist_genre_code`` per genre. Every
+    release under the *other* code then reads as a field mismatch against a
+    value that is perfectly legitimate -- just not that release's.
+
+    Unlike every other tier this is not a property of a row *pair*: deciding
+    it needs the whole mysql side, because the explanation lives in a
+    sibling row. So it resolves in ``_classify_matched_rows`` (which already
+    holds both full maps) rather than in ``classify_field``, and
+    ``COLUMN_MODELS`` stays per-pair and pure.
+
+    Deliberately NOT blanket acceptance -- the value Backend holds must be
+    one the mysql side itself supplies for that folded artist. A value from
+    nowhere is still a mismatch, and the negative tests below are the point
+    of the whole design.
+    """
+
+    def test_call_letters_from_a_fold_sibling_is_normalized(self) -> None:
+        mod = _load_module()
+        mysql_rows = {
+            1: _row(artist="Dosh", call_letters="DO"),
+            2: _row(id=2, artist="dosh", call_letters="DS"),
+        }
+        backend_rows = {
+            1: _row(artist="Dosh", call_letters="DO"),
+            2: _row(id=2, artist="dosh", call_letters="DO"),
+        }
+        field_mismatches, normalizations = mod._classify_matched_rows(
+            mysql_rows, backend_rows, [1, 2]
+        )
+        assert field_mismatches["call_letters"] == 0
+        assert normalizations["call_letters"]["fold_collapsed"] == 1
+
+    def test_call_letters_unknown_fallback_from_a_blank_sibling_is_normalized(self) -> None:
+        """``ensureArtist`` derives ``'??'`` from a duplicate whose
+        ``CALL_LETTERS`` is blank; the harness compares against the release's
+        own (populated) code, so the base classifier cannot absorb it. Two
+        such rows in the prod run -- Mudboy and Uniform."""
+        mod = _load_module()
+        mysql_rows = {
+            1: _row(artist="Mudboy", call_letters=""),
+            2: _row(id=2, artist="Mudboy", call_letters="MU"),
+        }
+        backend_rows = {
+            1: _row(artist="Mudboy", call_letters="??"),
+            2: _row(id=2, artist="Mudboy", call_letters="??"),
+        }
+        field_mismatches, normalizations = mod._classify_matched_rows(
+            mysql_rows, backend_rows, [1, 2]
+        )
+        assert field_mismatches["call_letters"] == 0
+        assert normalizations["call_letters"]["fold_collapsed"] == 1
+
+    def test_call_letters_with_no_fold_sibling_is_still_a_mismatch(self) -> None:
+        mod = _load_module()
+        mysql_rows = {1: _row(artist="Juana Molina", call_letters="JU")}
+        backend_rows = {1: _row(artist="Juana Molina", call_letters="ZZ")}
+        field_mismatches, normalizations = mod._classify_matched_rows(mysql_rows, backend_rows, [1])
+        assert field_mismatches["call_letters"] == 1
+        assert "call_letters" not in normalizations
+
+    def test_artist_call_number_from_a_same_genre_fold_sibling_is_normalized(self) -> None:
+        mod = _load_module()
+        mysql_rows = {
+            1: _row(artist="Bluegrass Album Band", genre="OCS", artist_call_number=8),
+            2: _row(id=2, artist="Bluegrass Album Band", genre="OCS", artist_call_number=18),
+        }
+        backend_rows = {
+            1: _row(artist="Bluegrass Album Band", genre="OCS", artist_call_number=8),
+            2: _row(id=2, artist="Bluegrass Album Band", genre="OCS", artist_call_number=8),
+        }
+        field_mismatches, normalizations = mod._classify_matched_rows(
+            mysql_rows, backend_rows, [1, 2]
+        )
+        assert field_mismatches["artist_call_number"] == 0
+        assert normalizations["artist_call_number"]["fold_collapsed"] == 1
+
+    def test_artist_call_number_sibling_in_another_genre_does_not_explain_it(self) -> None:
+        """``ensureGenreArtistCrossref`` is keyed ``(artist_id, genre_id)``,
+        so the collapse only ever happens WITHIN a genre. A same-artist row
+        filed under a different genre has its own crossref row and cannot
+        supply the value -- widening past the genre would silently accept a
+        real defect."""
+        mod = _load_module()
+        mysql_rows = {
+            1: _row(artist="Yellow Swans", genre="Rock", artist_call_number=40),
+            2: _row(id=2, artist="Yellow Swans", genre="Electronic", artist_call_number=45),
+        }
+        backend_rows = {
+            1: _row(artist="Yellow Swans", genre="Rock", artist_call_number=45),
+            2: _row(id=2, artist="Yellow Swans", genre="Electronic", artist_call_number=45),
+        }
+        field_mismatches, normalizations = mod._classify_matched_rows(
+            mysql_rows, backend_rows, [1, 2]
+        )
+        assert field_mismatches["artist_call_number"] == 1
+        assert "artist_call_number" not in normalizations
+
+    def test_artist_call_number_null_sibling_coalesces_to_zero(self) -> None:
+        """``job.ts:996``'s ``?? 0`` runs per row, so a sibling holding NULL
+        supplies ``0`` to the group, not NULL."""
+        mod = _load_module()
+        mysql_rows = {
+            1: _row(artist="Boys Life", genre="Rock", artist_call_number=12),
+            2: _row(id=2, artist="Boys Life", genre="Rock", artist_call_number=None),
+        }
+        backend_rows = {
+            1: _row(artist="Boys Life", genre="Rock", artist_call_number=0),
+            2: _row(id=2, artist="Boys Life", genre="Rock", artist_call_number=0),
+        }
+        field_mismatches, normalizations = mod._classify_matched_rows(
+            mysql_rows, backend_rows, [1, 2]
+        )
+        assert field_mismatches["artist_call_number"] == 0
+        assert normalizations["artist_call_number"]["fold_collapsed"] == 1
+
+    def test_fold_collapse_only_applies_to_its_three_columns(self) -> None:
+        """``title`` has no fold-identity story: a sibling holding the value
+        must not launder a genuine content divergence."""
+        mod = _load_module()
+        mysql_rows = {
+            1: _row(artist="Dosh", title="Tommy"),
+            2: _row(id=2, artist="Dosh", title="Wolves and Wishes"),
+        }
+        backend_rows = {
+            1: _row(artist="Dosh", title="Wolves and Wishes"),
+            2: _row(id=2, artist="Dosh", title="Wolves and Wishes"),
+        }
+        field_mismatches, _ = mod._classify_matched_rows(mysql_rows, backend_rows, [1, 2])
+        assert field_mismatches["title"] == 1
+
+    def test_fold_collapse_columns_are_a_subset_of_diff_columns(self) -> None:
+        mod = _load_module()
+        assert set(mod.FOLD_COLLAPSE_COLUMNS) <= set(mod.DIFF_COLUMNS)
 
 
 class TestFieldMismatchesTieringEndToEnd:

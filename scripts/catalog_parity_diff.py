@@ -82,6 +82,23 @@ toward it. The normalized-tier counts themselves are tallied by
 never gating. ``_print_human`` does not carry them, so an INFO log line
 remains their only surface for the default (non-``--json``) invocation.
 
+**Fold-collapse (discogs-etl#346, plan step 8).** One class of divergence is
+NOT a property of the row pair at all. tubafrenzy identifies an artist by
+``LIBRARY_CODE`` row and 295 presentation names have more than one; Backend
+identifies by ``artists`` row via ``fold_artist_name``, so those collapse
+into one row carrying a single ``code_letters`` and a single
+``artist_genre_code`` per genre. Releases under the losing code then diverge
+against a value that is legitimate but belongs to a sibling.
+``FOLD_COLLAPSE_COLUMNS`` (``call_letters``, ``artist_call_number``) resolve
+against the folded artist's whole mysql row group in
+``_classify_matched_rows`` -- which already holds both full maps, so
+``COLUMN_MODELS`` stays per-pair and pure -- and report ``fold_collapsed``.
+``cross_reference_names`` collapses identically but as a set union, so it
+needs no group context and expresses the same widening per row as
+``cardinality_gain``. The resolution is deliberately narrow: Backend's value
+must be one the mysql side itself supplies, so a defect on a duplicated
+artist is still gated.
+
 **Row-level expected/unexplained classification and the ``clean`` verdict
 (discogs-etl#370, ``ResidueLedger``).** ``missing_in_backend`` /
 ``extra_in_backend`` count every id-level divergence, including known,
@@ -564,6 +581,22 @@ def _classify_call_letters(
     if _normalize(backend_value) == _normalize(mysql_raw):
         return ("agree", None)
 
+    expected, cls = _derive_call_letters(mysql_row)
+
+    if _case_insensitive_equal(_normalize(backend_value), _normalize(expected)):
+        return ("normalized", cls)
+    return ("mismatch", None)
+
+
+def _derive_call_letters(mysql_row: Mapping[str, object]) -> tuple[str | None, str]:
+    """Replay Backend's ``code_letters`` derivation for ONE mysql row.
+
+    Extracted so ``_fold_group_call_letters`` can ask the same question of a
+    *sibling* row without restating the rule -- the fold-collapse resolution
+    is only sound if the value it accepts is one this same derivation would
+    have produced.
+    """
+    mysql_raw = mysql_row["call_letters"]
     artist_substituted = _tab_nl_sub(mysql_row["artist"])
     artist_info = normalize_artist_name(
         artist_substituted if isinstance(artist_substituted, str) else ""
@@ -588,9 +621,7 @@ def _classify_call_letters(
         else:
             cls = "uppercased"
 
-    if _case_insensitive_equal(_normalize(backend_value), _normalize(expected)):
-        return ("normalized", cls)
-    return ("mismatch", None)
+    return expected, cls
 
 
 def _classify_genre(
@@ -665,20 +696,31 @@ def _classify_artist_call_number(
     if _normalize(backend_value) == _normalize(mysql_raw):
         return ("agree", None)
 
+    expected, cls = _derive_artist_call_number(mysql_row)
+
+    if _normalize(backend_value) == _normalize(expected):
+        return ("normalized", cls)
+    return ("mismatch", None)
+
+
+def _derive_artist_call_number(mysql_row: Mapping[str, object]) -> tuple[object, str]:
+    """Replay Backend's ``artist_genre_code`` derivation for ONE mysql row.
+
+    Extracted for the same reason as ``_derive_call_letters``: the
+    fold-collapse resolution has to ask what a *sibling* row would have
+    written into the shared ``(artist_id, genre_id)`` crossref, and the
+    ``?? 0`` coalesce runs per row -- a sibling holding NULL contributes
+    ``0`` to the group, not NULL.
+    """
+    mysql_raw = mysql_row["artist_call_number"]
     artist_substituted = _tab_nl_sub(mysql_row["artist"])
     artist_info = normalize_artist_name(
         artist_substituted if isinstance(artist_substituted, str) else ""
     )
     if artist_info.is_various:
-        expected: object = 0
-        cls = "various"
-    else:
-        expected = mysql_raw if _normalize(mysql_raw) is not None else 0
-        cls = "null_coalesced_zero"
-
-    if _normalize(backend_value) == _normalize(expected):
-        return ("normalized", cls)
-    return ("mismatch", None)
+        return 0, "various"
+    expected = mysql_raw if _normalize(mysql_raw) is not None else 0
+    return expected, "null_coalesced_zero"
 
 
 def _classify_release_call_number(
@@ -751,8 +793,25 @@ def _classify_cross_reference_names(
     performs, or a crossref ``importReleaseCrossrefs`` never imported because
     an artist/genre/album lookup missed). Nothing in the row distinguishes
     the two, so a backend fold-set that is a SUBSET of the derived mysql
-    fold-set is "normalized", not "mismatch". Backend holding an alias that
-    is NOT explainable from mysql at all is a genuine defect.
+    fold-set is "normalized", not "mismatch".
+
+    **Cardinality GAIN is reported the same way, for the same reason
+    (WXYC/discogs-etl#346, plan step 8).** An earlier revision called a
+    superset "a genuine defect"; the 2026-08-13 prod run showed that is
+    wrong, and wrong structurally rather than by degree.
+    ``LIBRARY_CODE_CROSS_REFERENCE`` is joined per *code*, but
+    ``LIBRARY_SELECT_SQL`` only reaches codes that carry a *release*. A
+    duplicate ``LIBRARY_CODE`` with zero releases is invisible to this
+    harness while ``ensureArtist`` still folds it into Backend's single
+    ``artists`` row -- so Backend legitimately carries aliases the mysql
+    query cannot return, no matter how healthy both sides are. Gating on
+    that measures the query's blind spot, not the migration. All 11 such
+    rows on prod were strict supersets; zero were any other shape.
+
+    What stays gated is a set that is neither subset nor superset: Backend
+    dropping one alias *and* gaining another. No fold-collapse or
+    invisible-duplicate story produces that, so it remains the shape this
+    column can still catch.
     """
     mysql_raw = mysql_row["cross_reference_names"]
     backend_value = backend_row["cross_reference_names"]
@@ -769,8 +828,10 @@ def _classify_cross_reference_names(
 
     if backend_fold_keys == mysql_fold_keys:
         return ("normalized", "fold_equal")
-    if backend_fold_keys <= mysql_fold_keys:
+    if backend_fold_keys < mysql_fold_keys:
         return ("normalized", "cardinality_loss")
+    if backend_fold_keys > mysql_fold_keys:
+        return ("normalized", "cardinality_gain")
     return ("mismatch", None)
 
 
@@ -810,6 +871,95 @@ def classify_field(
     return COLUMN_MODELS[col](mysql_row, backend_row)
 
 
+# Columns whose divergence can be explained by a row OTHER than the one being
+# compared -- see `_resolve_fold_collapse`. Deliberately narrow: these are the
+# two attributes Backend stores once per folded artist (`artists.code_letters`)
+# or once per folded artist and genre (`genre_artist_crossreference.
+# artist_genre_code`), so a duplicate `LIBRARY_CODE` forces one value to win.
+# `cross_reference_names` collapses the same way but needs no group context --
+# it is a set union, so the widening is expressible per row as
+# `cardinality_gain` in `_classify_cross_reference_names`.
+FOLD_COLLAPSE_COLUMNS = ("call_letters", "artist_call_number")
+
+
+def _fold_identity_key(row: Mapping[str, object]) -> str:
+    """The key Backend's ``ensureArtist`` folds a mysql row's artist onto.
+
+    ``fold_artist_name(normalize_artist_name(...))``, matching the
+    ``artist``/``call_letters`` classifiers' own derivation -- so two mysql
+    rows share a key exactly when Backend gives them one ``artists`` row.
+    """
+    artist = _tab_nl_sub(row.get("artist"))
+    info = normalize_artist_name(artist if isinstance(artist, str) else "")
+    return fold_artist_name(info.name)
+
+
+def _build_fold_groups(
+    mysql_rows: Mapping[int, Mapping[str, object]],
+) -> dict[str, list[Mapping[str, object]]]:
+    """Index every mysql row by its Backend artist-fold key.
+
+    Built from ALL mysql rows, not just matched ones: the sibling that
+    supplied the winning value is often a row Backend collapsed away
+    entirely (it is in ``missing_in_backend``), and excluding it would leave
+    the very collapse this resolution exists to explain unexplained.
+    """
+    groups: dict[str, list[Mapping[str, object]]] = {}
+    for row in mysql_rows.values():
+        groups.setdefault(_fold_identity_key(row), []).append(row)
+    return groups
+
+
+def _fold_group_values(
+    column: str, siblings: Iterable[Mapping[str, object]], mysql_row: Mapping[str, object]
+) -> set[object]:
+    """Every value Backend could legitimately hold for ``column`` given the
+    folded artist's mysql rows.
+
+    ``artist_call_number`` is scoped to the row's own genre and
+    ``call_letters`` is not, and that asymmetry is the whole correctness
+    argument: ``ensureGenreArtistCrossref`` keys on ``(artist_id, genre_id)``
+    (``job.ts:456-470``) so the collapse happens *within* a genre, while
+    ``artists.code_letters`` is one column on the artist and collapses across
+    all of them. Widening the call-number scope past the genre would accept a
+    value no crossref row could have carried -- a real defect, laundered.
+    """
+    values: set[object] = set()
+    if column == "call_letters":
+        for sibling in siblings:
+            expected, _ = _derive_call_letters(sibling)
+            normalized = _normalize(expected)
+            values.add(str(normalized).upper() if isinstance(normalized, str) else normalized)
+        return values
+    if column == "artist_call_number":
+        genre = _normalize(mysql_row.get("genre"))
+        for sibling in siblings:
+            if _normalize(sibling.get("genre")) != genre:
+                continue
+            expected, _ = _derive_artist_call_number(sibling)
+            values.add(_normalize(expected))
+        return values
+    raise ValueError(f"no fold-collapse model for column {column!r}")
+
+
+def _is_fold_collapsed(
+    column: str,
+    mysql_row: Mapping[str, object],
+    backend_row: Mapping[str, object],
+    siblings: Iterable[Mapping[str, object]],
+) -> bool:
+    """True when Backend's value is one the folded artist's own mysql rows supply.
+
+    Note what this is NOT: it never accepts a value merely because the artist
+    has duplicates. The value has to be present in the group, which is what
+    keeps a genuine defect on a duplicated artist gated.
+    """
+    backend_value = _normalize(backend_row[column])
+    if column == "call_letters" and isinstance(backend_value, str):
+        backend_value = backend_value.upper()
+    return backend_value in _fold_group_values(column, siblings, mysql_row)
+
+
 def _classify_matched_rows(
     mysql_rows: Mapping[int, Mapping[str, object]],
     backend_rows: Mapping[int, Mapping[str, object]],
@@ -832,11 +982,20 @@ def _classify_matched_rows(
     """
     field_mismatches: dict[str, int] = dict.fromkeys(DIFF_COLUMNS, 0)
     normalizations: dict[str, dict[str, int]] = {}
+    # Built lazily: only a run that actually produces a fold-collapse
+    # candidate pays for indexing the whole mysql side.
+    fold_groups: dict[str, list[Mapping[str, object]]] | None = None
     for id_ in matched_ids:
         mrow = mysql_rows[id_]
         brow = backend_rows[id_]
         for col in DIFF_COLUMNS:
             tier, cls = classify_field(col, mrow, brow)
+            if tier == "mismatch" and col in FOLD_COLLAPSE_COLUMNS:
+                if fold_groups is None:
+                    fold_groups = _build_fold_groups(mysql_rows)
+                siblings = fold_groups.get(_fold_identity_key(mrow), ())
+                if _is_fold_collapsed(col, mrow, brow, siblings):
+                    tier, cls = "normalized", "fold_collapsed"
             if tier == "mismatch":
                 field_mismatches[col] += 1
             elif tier == "normalized":

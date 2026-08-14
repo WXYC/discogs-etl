@@ -266,3 +266,34 @@ Mitigation: ship the model and tests, then run against the real prod pair before
 1. **Ledger location** — `vendor/parity-residue/` for the id sets and `baselines` block, `parity-residue-pin.txt` at root for SHAs and provenance, per Part 2. (R3's "root-level `parity-residue-ledger.json`" is superseded — the `wxyc-etl` precedent is a vendor/pin *split*, not a root data file.) **`--residue-ledger PATH` points at the JSON under `vendor/parity-residue/`, not at the pin**, and defaults to it so the soak needs no argument.
 2. **Normalization counts gate?** — No. Matches the repo's posture: `catalog_parity_diff.py` already returns 0 on a nonzero diff by design.
 3. **Cross-repo drift** — deferred to the follow-up ticket above rather than blocking this PR.
+
+## Step 9 — fold-collapse widening (added after step 8's measurement)
+
+Step 8 said "if the residual is not small and explainable, that measurement is the deliverable and classification gets a follow-up ticket". The residual was **131**, and it turned out to be both small *and* explainable — 103 of it by a single property of the source — so the follow-up is this widening rather than a ticket.
+
+**The finding.** tubafrenzy identifies an artist by `LIBRARY_CODE` row; 295 presentation names have more than one (596 code rows, 542 carrying releases). Backend identifies by `artists` row via `fold_artist_name`, so duplicates collapse into one row holding a single `code_letters` and a single `artist_genre_code` per `(artist, genre)`. Releases filed under the losing code diverge against a value that is legitimate but belongs to a sibling. That one fact produced `artist_call_number` 59 + `call_letters` 33 + `cross_reference_names` 11 = 103.
+
+**Why widen rather than change the `clean` term.** This is the same argument the ledger already makes for the 599 collapsed releases — MySQL has two rows where Backend correctly has one — applied to fields instead of rows. Relaxing `sum(field_mismatches) == 0` instead would weaken the check for every *other* column to solve a problem in three of them. And the alternative fix, deduplicating 295 names in tubafrenzy, is librarian work that will not happen before 2026-08-31.
+
+**Design.** Fold-collapse is not a property of a row *pair*, so it does not belong in `COLUMN_MODELS`: deciding it needs the whole mysql side, because the explanation lives in a sibling row. `call_letters` and `artist_call_number` resolve in `_classify_matched_rows` (which already holds both full maps) against a fold-keyed index, reporting `fold_collapsed`. `COLUMN_MODELS` stays per-pair and pure, and the 22 existing call sites are untouched.
+
+`cross_reference_names` is the exception, and instructively so: it collapses the same way but as a *set union*, so the widening is expressible per row. `LIBRARY_CODE_CROSS_REFERENCE` is joined per code while `LIBRARY_SELECT_SQL` only reaches codes carrying a release — so a duplicate code with zero releases is structurally invisible to this harness while Backend still folds it in. All 11 prod rows were strict supersets. That makes a superset `cardinality_gain`, the exact symmetric counterpart of the `cardinality_loss` branch already there, resting on the identical "the row cannot distinguish the causes" argument. The earlier docstring's claim that a superset is "a genuine defect" was wrong structurally, not by degree.
+
+**What stays gated** — the whole design turns on these, and each has a negative test:
+
+- The value Backend holds must be one the folded artist's own mysql rows *supply*. Having duplicates is never itself sufficient.
+- `artist_call_number` is scoped to the row's own genre (`ensureGenreArtistCrossref` keys on `(artist_id, genre_id)`), so a same-artist row in another genre cannot supply it.
+- A cross-reference set that is neither subset nor superset — Backend dropping one alias *and* gaining another — stays a mismatch.
+- Fold-collapse applies only to its named columns; a sibling holding a `title` never launders a content divergence.
+
+**Measured effect** on the 2026-08-13 prod pair: `field_mismatches` **131 → 28**, with the 103 reappearing under `normalizations` as `call_letters.fold_collapsed` 33, `artist_call_number.fold_collapsed` 59, `cross_reference_names.cardinality_gain` 11. Nothing else moved.
+
+**Residual after this step: 28**, and none of it is a modelling gap — it is data that needs repairing:
+
+- 11 U+FFFD replacement chars stored in Backend where MySQL holds the real character ([Backend-Service#2152](https://github.com/WXYC/Backend-Service/issues/2152)); lossy, so it needs a re-import while tubafrenzy is still reachable.
+- 15 rows of post-import content divergence (`format` 7, `alternate_artist_name` 8) — insert-only ETL has no update path in either direction.
+- 2 genuine title differences.
+
+So `clean` now turns on those 28 plus `extra_unexplained` 115 ([Backend-Service#2108](https://github.com/WXYC/Backend-Service/issues/2108)'s delete), both of which are data work with owners, rather than on a definition that could never be satisfied.
+
+**Known cost, stated plainly.** `cross_reference_names` no longer gates on cardinality in either direction. That is a property of what `LIBRARY_SELECT_SQL` can see, not a concession — but the counts stay reported per class, so a spike is still visible in `normalizations` even though it cannot block the release.
