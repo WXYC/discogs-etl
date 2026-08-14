@@ -125,9 +125,13 @@ Builds both `library.db` sides from their live sources — tubafrenzy MySQL over
 | `4` | The harness ran correctly and the catalogs disagree | **Yes — a verdict.** The expected state today |
 | `3` | A producer could not build its input (SSH tunnel, MySQL export, Backend sign-in) | No — infrastructure. No verdict computed |
 | `2` | The harness rejected its arguments | No — a defect in `catalog-parity.yml` itself |
-| `1` (or any other) | Uncaught crash; `139` is the MySQL client segfaulting | No — outside the taxonomy |
+| `1` (or any other) | The harness crashed, or the step was killed from outside | No — outside the taxonomy |
 
 Read the wrong way round, exit 4 looks like a broken soak and gets muted while exit 3 looks like a parity failure and sends someone hunting a data problem that does not exist. The summary step renders the taxonomy, names which condition in the `clean` conjunction actually fired, and re-raises the harness's own code so the failing step carries that number.
+
+**A segfaulting MySQL client surfaces as exit 3, not 139.** `_default_mysql_runner` returns `completed.returncode == 0`, so any non-zero client status — including a signal death — becomes a `SourceError` and exits 3; Python never re-raises a child's signal as its own status. The client-version hint therefore lives in the exit-3 text, which is where it will actually be read. Two related limits worth knowing before trusting a summary: the renderer names which `clean` condition failed, but when `cta_within_baseline` is the only one left it **cannot tell an exceeded baseline from an absent one** (the report carries the raw CTA counts, not the baselines, and the harness treats a null baseline as not-within) — check the `baselines` block in `vendor/parity-residue/ledger.json` before reading that as CTA drift.
+
+**Reading the artifact trail.** Artifacts are named `catalog-parity-<date>-exit<code>-<run_id>-<run_attempt>`. The exit code is in the name because the list *is* the AC#4 evidence: a producer failure still leaves a zero-byte `parity.json` behind (the shell redirect creates the file before the harness runs), so a name-only reading could not otherwise tell a no-verdict day from a clean one. `run_attempt` is there because `run_id` is stable across re-runs and `actions/upload-artifact@v4` refuses to create a name that already exists on the run — without it, re-running a job after a transient exit 3 would fail its upload precisely when the retry finally produced a verdict.
 
 Two constraints that cost time on the first live run and are load-bearing for anyone reproducing it by hand:
 

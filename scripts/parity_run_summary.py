@@ -14,8 +14,9 @@ one that matters most is the one that looks least like itself:
        or the Backend service account. No verdict was computed
  2     the harness rejected its arguments -- a defect in the workflow file,
        nothing to do with the data
- 1     an uncaught crash (or any other code: a segfaulting mysql client
-       exits 139)
+ 1     an uncaught crash, or the step killed from outside. A mysql client
+       dying on a signal does NOT land here: ``_default_mysql_runner`` maps
+       any non-zero client status to a producer failure, so it surfaces as 3
 ===== ==========================================================================
 
 Read the wrong way round, exit 4 looks like a broken soak and gets muted,
@@ -126,9 +127,12 @@ def verdict_causes(payload: dict[str, Any] | None) -> list[str]:
 
     if not causes and payload.get("clean") is False:
         causes.append(
-            "the `compilation_track_artist` counts exceed the vendored CTA baseline -- "
-            "the only remaining condition in the `clean` conjunction, named here by "
-            "elimination because the report does not carry the baseline itself"
+            "`cta_within_baseline` is the only condition left in the `clean` conjunction, "
+            "so it is what failed -- but this cannot say which way. The report carries the "
+            "raw `compilation_track_artist` counts and not the baselines they are compared "
+            "against, and the harness treats a **not populated** (null) baseline as "
+            "not-within exactly like an **exceeded** one. Check the `baselines` block in "
+            "`vendor/parity-residue/ledger.json` before reading this as CTA drift"
         )
     return causes
 
@@ -173,7 +177,11 @@ def _taxonomy(exit_code: int) -> tuple[str, str, bool]:
             "could not be built: the Kattare SSH tunnel, the MySQL export, or the Backend "
             "service-account sign-in. **No verdict was computed** -- this run says nothing "
             "about parity, and neither breaks nor extends the clean-day streak. Check the "
-            "producer error on stderr in the harness step above.",
+            "producer error on stderr in the harness step above. A MySQL client killed by a "
+            "signal lands here too rather than surfacing 139, because the harness reports "
+            "any non-zero client status as a producer failure -- so if it was the export "
+            "that failed, confirm the runner installed **mariadb-client**: the Oracle and "
+            "Homebrew 9.x clients segfault against tubafrenzy's MySQL 5.1.56.",
             False,
         )
     if exit_code == BAD_ARGS:
@@ -189,9 +197,11 @@ def _taxonomy(exit_code: int) -> tuple[str, str, bool]:
     return (
         "Catalog parity: unexpected failure",
         f"**Exit {exit_code} -- unexpected.** This is outside the harness's documented exit "
-        "taxonomy (0, 2, 3, 4), so it is an uncaught crash or a signal from a child process "
-        "-- exit 139 is the MySQL client segfaulting, which means the runner picked up a "
-        "non-MariaDB client. **No verdict was computed.**",
+        "taxonomy (0, 2, 3, 4), so it is the harness itself crashing, or the step being "
+        "killed from outside (the job timeout, a cancellation, the runner going away). "
+        "Note that a *client* dying on a signal does not reach here: the harness reports "
+        "any non-zero client status as a producer failure, exit 3. **No verdict was "
+        "computed.**",
         False,
     )
 

@@ -236,10 +236,35 @@ class TestArtifact:
         assert ".json" in upload["with"]["path"]
 
     def test_a_missing_report_does_not_mask_the_real_failure(self, upload) -> None:
-        """upload-artifact v4 fails the step when nothing matches. On exit 2
-        or 3 there may be no readable report, and that failure would bury
-        the producer error that actually needs reading."""
+        """upload-artifact v4 fails the step when nothing matches. That only
+        happens when the harness step never ran at all (PARITY_DIR unset, so
+        the path degrades to a bare /parity.json) -- once it runs, the shell
+        redirect has already created the file. Warning there beats failing:
+        the producer error is what needs reading."""
         assert upload["with"].get("if-no-files-found") in {"warn", "ignore"}
+
+    def test_artifact_name_is_unique_per_attempt(self, upload) -> None:
+        """``github.run_id`` is stable across re-runs; only ``run_attempt``
+        increments. upload-artifact v4 refuses to create a name that already
+        exists on the run, so without the attempt a "Re-run failed jobs"
+        after a transient exit 3 -- the case the taxonomy exists to make
+        re-runnable -- fails its upload, and the one attempt that produced a
+        real verdict is the one with no artifact."""
+        assert "github.run_attempt" in upload["with"]["name"]
+
+    def test_artifact_name_carries_the_verdict(self, upload) -> None:
+        """A seven-day streak is reconstructed from this artifact list. A
+        producer failure leaves a zero-byte parity.json (the redirect creates
+        the file before the harness runs), so a name-only reading cannot tell
+        a no-verdict day from a clean one unless the name says so."""
+        assert "PARITY_EXIT_CODE" in upload["with"]["name"]
+
+    def test_artifact_name_survives_an_unset_exit_code(self, upload) -> None:
+        """When the harness step never ran, both env vars are empty. The
+        name must still resolve to something legible rather than a trailing
+        dangle."""
+        name = upload["with"]["name"]
+        assert "||" in name, f"no fallback for the unset case in {name!r}"
 
 
 class TestDocumentation:

@@ -319,3 +319,49 @@ class TestMarkdownShape:
         _, out, _ = _run(capsys, 4, _write(tmp_path, _payload()))
         assert "fold_collapsed" in out
         assert "fold_collapsed" not in "".join(prs.verdict_causes(_payload()))
+
+
+class TestClaimsTheRendererCannotSupport:
+    """The renderer exists to stop people misreading a run. Its own text is
+    held to the same standard: a confident sentence pointing at the wrong
+    cause is worse than the bare exit code it replaced."""
+
+    def test_cta_elimination_does_not_assert_an_exceeded_baseline(self) -> None:
+        """``cta_within_baseline`` is false when a baseline is *absent* as
+        well as when it is exceeded -- ``diff_library_dbs`` requires
+        ``ledger.cta_missing_baseline is not None and ...``, and
+        ``load_residue_ledger`` accepts null baselines (the ledger's own
+        shape before the 2026-08-13 CTA measurement). The report carries the
+        raw counts but not the baselines, so the renderer genuinely cannot
+        tell the two apart -- and must not pick one. A re-vendored ledger
+        with a null baselines block would otherwise send an operator hunting
+        CTA drift that is not there."""
+        payload = _payload(
+            clean=False,
+            missing_unexplained=0,
+            extra_unexplained=0,
+            field_mismatches=dict.fromkeys(_PROD_SHAPED["field_mismatches"], 0),
+        )
+        cause = "".join(prs.verdict_causes(payload)).lower()
+        assert "cta" in cause
+        # Both readings must be on the table, and the operator told where to look.
+        assert "not populated" in cause or "absent" in cause or "null" in cause
+        assert "ledger.json" in cause or "baselines" in cause
+
+    def test_producer_failure_names_the_client_version_trap(self, tmp_path, capsys) -> None:
+        """A non-MariaDB client dying on a signal surfaces as exit 3, not
+        139: ``_default_mysql_runner`` returns ``returncode == 0``, so the
+        signal death becomes False -> SourceError -> 3. The repo's most-cited
+        producer failure therefore belongs in the exit-3 text."""
+        _, out, _ = _run(capsys, 3, _write(tmp_path, "", name="empty.json"))
+        assert "mariadb" in out.lower()
+
+    def test_the_catch_all_does_not_blame_the_mysql_client(self, tmp_path, capsys) -> None:
+        """139 cannot reach this branch -- Python does not re-raise a child's
+        signal as its own exit status. Claiming it does sends the reader
+        looking for a client-version problem in the one case where the
+        harness itself misbehaved."""
+        _, out, _ = _run(capsys, 139, _write(tmp_path, "", name="empty.json"))
+        lowered = out.lower()
+        assert "mariadb" not in lowered
+        assert "segfault" not in lowered

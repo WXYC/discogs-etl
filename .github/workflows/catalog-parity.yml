@@ -163,11 +163,26 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: catalog-parity-${{ env.PARITY_DATE }}-${{ github.run_id }}
+          # run_attempt, not just run_id: run_id is stable across re-runs, and
+          # upload-artifact v4 refuses to create a name that already exists on
+          # the run. Without it, "Re-run failed jobs" after a transient exit 3
+          # -- the case the taxonomy exists to make re-runnable -- fails its
+          # upload, so the attempt that finally produced a verdict is the one
+          # with no artifact.
+          #
+          # The exit code is in the name because this list IS the streak
+          # evidence: a producer failure still leaves a (zero-byte)
+          # parity.json behind, since the redirect below creates the file
+          # before the harness runs, so a name-only reading otherwise cannot
+          # tell a no-verdict day from a clean one.
+          name: catalog-parity-${{ env.PARITY_DATE || 'nodate' }}-exit${{ env.PARITY_EXIT_CODE || 'na' }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ env.PARITY_DIR }}/parity.json
           retention-days: 30
-          # On exit 2/3 there may be no readable report. Failing the upload
-          # there would bury the producer error that actually needs reading.
+          # Only reachable when the harness step never ran (PARITY_DIR unset,
+          # so the path degrades to a bare /parity.json) -- once it runs, the
+          # redirect has already created the file. Warn rather than fail: a
+          # failed upload there would bury the tunnel or checkout error that
+          # actually needs reading.
           if-no-files-found: warn
 
       - name: Report parity verdict
