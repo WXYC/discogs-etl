@@ -456,6 +456,24 @@ def _rule_b_missing_reason(mysql_row: Mapping[str, object]) -> str | None:
     ``PRESENTATION_NAME`` are measured to hold zero SQL NULLs -- in both
     cases a ``"NULL"`` in the column can only be a genuine name/title, never
     a SQL NULL wearing a disguise.
+
+    **``_normalize`` itself deliberately keeps the ``"NULL"`` collapse, so
+    the harness is asymmetric on purpose and this is what that costs.** The
+    comparison path still routes through it -- ``_make_tab_nl_classifier``
+    opens with ``_normalize(backend_value) == _normalize(mysql_raw)`` -- so a
+    matched row whose mysql ``title`` is the literal ``"NULL"`` and whose
+    Backend ``title`` is ``''`` still reports ``agree`` rather than
+    ``mismatch``. That is not an oversight left behind by this narrowing: the
+    two predicates answer different questions. Classification asks whether
+    *this row's own* value is absent, where a literal ``"NULL"`` is a real
+    value and forgiving it hides drift. Comparison asks whether the two sides
+    agree, and the Backend side still holds rows written before
+    ``sync-library.sh``'s ``ALBUM_ARTIST`` ``IFNULL`` fix -- 64,780 of them
+    leaked the literal text ``'NULL'`` into ``library_fts`` -- so collapsing
+    it there is what lets a corrected mysql side compare equal to a
+    not-yet-rewritten Backend side. Narrowing ``_normalize`` would change all
+    ~14 of its call sites and manufacture drift across every column, so it
+    stays broad until those Backend-side values are rewritten.
     """
     genre = mysql_row.get("genre")
     if is_db_only_genre(genre if isinstance(genre, str) else None):

@@ -142,15 +142,28 @@ MYSQL_PORT="${DB_PORT:-3306}"
 # Python string-sniffing in tsv_to_sqlite.py, which would risk corrupting
 # that row instead. The other columns in this SELECT (ID, TITLE,
 # PRESENTATION_NAME, CALL_LETTERS, both CALL_NUMBERS, and both REFERENCE_NAME
-# columns) are left unwrapped deliberately, not on assumption: measured
-# 2026-08-14 against prod (WXYC/discogs-etl#375), `TITLE IS NULL` and
-# `PRESENTATION_NAME IS NULL` both count 0 -- zero SQL NULLs in either
-# column. TITLE is not fully clean, though -- six rows carry a byte-exact
+# columns) are left unwrapped.
+#
+# Two of those eight now have measured backing rather than an assumption:
+# on 2026-08-14 (WXYC/discogs-etl#375) `TITLE IS NULL` and
+# `PRESENTATION_NAME IS NULL` both counted 0 against prod. The other six
+# remain unmeasured and rest on the original "always populated" reading.
+# TITLE is not fully clean even so -- six rows carry a byte-exact
 # empty-string TITLE (ids 21107, 39290, 51871, 52374, 65301, 66329;
 # `LENGTH(TITLE) = 0`, not NULL and not whitespace), which downstream
 # consumers (catalog_parity_diff.py's `_rule_b_missing_reason`) already
-# handle as expected residue via a plain `.strip() == ""` check, so no
-# IFNULL is needed here for that either.
+# handle as expected residue via a plain `.strip() == ""` check, so that is
+# not a reason to wrap either.
+#
+# Note what a count does and does not establish: it is a point-in-time
+# reading of a mutable prod table, not a NOT NULL constraint. The tubafrenzy
+# MySQL user cannot read information_schema, so whether either column is
+# schema-nullable is unverified -- if a cataloger ever does insert a NULL,
+# `mysql -B -N` renders it as the literal text `NULL` and reproduces the
+# ALBUM_ARTIST failure above. That case is caught loudly rather than
+# silently now: `_rule_b_missing_reason` no longer forgives a literal
+# "NULL" as expected residue, so it surfaces as unexplained parity drift,
+# and THAT is the signal to come back here and add the IFNULL wrap.
 ETL_OUTPUT=$(mktemp)
 CSV_FILE=$(mktemp)
 if ! MYSQL_PWD="$LIBRARY_DB_PASSWORD" mysql -h "$MYSQL_HOST" -P "$MYSQL_PORT" -u "$LIBRARY_DB_USER" \

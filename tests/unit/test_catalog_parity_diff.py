@@ -1768,10 +1768,17 @@ class TestRuleBMissingReason:
         assert mod._rule_b_missing_reason(_row(format="cassette")) == "unparseable_format"
 
     def test_null_artist_name_is_a_reason(self) -> None:
-        """The NULL note: LIBRARY_SELECT_SQL has no IFNULL wrapper, so a SQL
-        NULL artist (PRESENTATION_NAME) would reach library.db as Python
-        None via parse_library_tsv's `\\N` mapping, not ''. The predicate
-        catches both explicitly (`value is None or value.strip() == ""`)."""
+        """A Python None must classify the same as '', so the predicate is
+        spelled `value is None or value.strip() == ""` rather than
+        `value.strip() == ""` alone. `parse_library_tsv` maps the `\\N`
+        sentinel to None (lib/library_db.py::_parse_nullable_field), and a
+        row mapping reaching this predicate can carry None from any source.
+
+        This says nothing about how a SQL NULL in *these two* columns would
+        arrive -- `mysql -B -N` on this server prints one as the literal text
+        "NULL" instead, which after #375 is reported as unexplained drift
+        rather than forgiven; see the sibling test below and
+        `_rule_b_missing_reason`'s own docstring."""
         mod = _load_module()
         assert mod._rule_b_missing_reason(_row(artist=None)) == "empty_artist_name"
 
@@ -1816,32 +1823,54 @@ class TestRuleBMissingReason:
         mod = _load_module()
         assert mod._rule_b_missing_reason(_row(title="Null")) is None
 
-    @pytest.mark.parametrize("ledger_id", [21107, 39290, 51871, 52374, 65301, 66329])
     def test_ledger_empty_title_ids_still_resolve_to_empty_album_title(
-        self, ledger_id: int
+        self, tmp_path: Path
     ) -> None:
-        """The six ledger ids (`residue-ledger.md` Set 2) are byte-exact
-        empty strings in prod, not SQL NULLs and not whitespace-only
-        (measured 2026-08-14: `LENGTH(TITLE) = 0` for all six) -- so the
-        narrowed `value is None or value.strip() == ""` check still catches
-        every one of them, same as the broad `_normalize` check did.
+        """The six ledger ids (`residue-ledger.md` Set 2) are byte-exact empty
+        strings in prod, not SQL NULLs and not whitespace-only (measured
+        2026-08-14: `LENGTH(TITLE) = 0` for all six) -- so the narrowed
+        `value is None or value.strip() == ""` check still catches every one
+        of them, same as the broad `_normalize` check did.
+
+        Built as real library.db rows and read back through
+        `_load_library_rows` rather than asserted against six hand-made dicts:
+        `_rule_b_missing_reason` never reads `id`, so a per-id parametrize
+        would be the same assertion six times over and would pin nothing about
+        the ids themselves. Going through sqlite makes the id load-bearing (it
+        keys the loaded mapping, and the row set is asserted whole) and pins
+        that a stored '' survives the round-trip as '' rather than arriving as
+        None -- the two representations this ticket had to tell apart.
         """
         mod = _load_module()
-        assert mod._rule_b_missing_reason(_row(id=ledger_id, title="")) == "empty_album_title"
+        ledger_ids = [21107, 39290, 51871, 52374, 65301, 66329]
+        db = tmp_path / "ledger-empty-titles.db"
+        _make_library_db(db, [{"id": ledger_id, "title": ""} for ledger_id in ledger_ids])
+        conn = sqlite3.connect(db)
+        rows = mod._load_library_rows(conn, "mysql")
+        conn.close()
+
+        assert sorted(rows) == sorted(ledger_ids)
+        assert all(row["title"] == "" for row in rows.values())
+        assert {ledger_id: mod._rule_b_missing_reason(rows[ledger_id]) for ledger_id in rows} == {
+            ledger_id: "empty_album_title" for ledger_id in ledger_ids
+        }
 
     def test_whitespace_only_title_is_the_same_reason_as_empty(self) -> None:
         mod = _load_module()
         assert mod._rule_b_missing_reason(_row(title="   ")) == "empty_album_title"
 
-    def test_cta_drop_rule_does_not_share_the_null_string_leniency(self, tmp_path: Path) -> None:
-        """The CTA counterpart is deliberately narrower, and that asymmetry
-        is correct rather than an inconsistency.
+    def test_cta_drop_rule_keeps_a_literal_null_named_artist(self, tmp_path: Path) -> None:
+        """The CTA drop rule and `_rule_b_missing_reason` now apply the same
+        rule, for the same reason on both sides.
 
-        COMPILATION_TRACK_ARTIST.ARTIST_NAME is documented NOT NULL and is
-        also left unwrapped, so a "NULL" in that column can only ever be a
-        genuine artist name -- never a SQL NULL. `_load_cta_counts` therefore
-        keeps the ported `str.strip() == ""` rule and must NOT drift toward
-        `_normalize`. Each predicate tracks its own column's nullability.
+        COMPILATION_TRACK_ARTIST.ARTIST_NAME is documented NOT NULL, and
+        TITLE / PRESENTATION_NAME are measured to hold zero SQL NULLs (#375),
+        so in every one of these columns a "NULL" can only be a genuine
+        name -- never a SQL NULL in disguise. Both predicates are therefore
+        `str.strip() == ""`, and neither must drift toward `_normalize`,
+        which would file a genuinely-missing "NULL"-named row as expected
+        residue. (Before #375 this asymmetry ran the other way and the
+        docstring here recorded it as deliberate; the measurement removed it.)
         """
         mod = _load_module()
         db = tmp_path / "cta.db"
