@@ -94,7 +94,10 @@ class TestPruneBuildScratchTablesSuffix:
 
 class TestPruneCopySwapTablesSuffix:
     def test_swap_uses_suffixed_source_table(self) -> None:
-        mock_conn, mock_cursor = _make_mock_conn(fetchone_value=(5,))
+        # fetchone_value backs every SELECT count(*) in the run, including the
+        # WXYC/discogs-etl#357 pre-swap row-count guard -- it must equal
+        # len({1, 2} | {3}) == 3 or the guard aborts before the RENAME.
+        mock_conn, mock_cursor = _make_mock_conn(fetchone_value=(3,))
         with patch.object(_vc.psycopg, "connect", return_value=mock_conn):
             _vc._prune_copy_swap_tables("postgresql:///test", {1, 2}, {3}, suffix="ab12cd34")
         sqls = _executed_sql(mock_cursor)
@@ -106,7 +109,10 @@ class TestPruneCopySwapTablesSuffix:
         invocations that both reach the swap would contend on it. See
         WXYC/discogs-etl#356.
         """
-        mock_conn, mock_cursor = _make_mock_conn(fetchone_value=(5,))
+        # Must equal len({1, 2} | {3}) == 3: fetchone_value backs the
+        # WXYC/discogs-etl#357 pre-swap row-count guard too, and a mismatch
+        # aborts before any RENAME this test asserts on is generated.
+        mock_conn, mock_cursor = _make_mock_conn(fetchone_value=(3,))
         with patch.object(_vc.psycopg, "connect", return_value=mock_conn):
             _vc._prune_copy_swap_tables("postgresql:///test", {1, 2}, {3}, suffix="ab12cd34")
         sqls = _executed_sql(mock_cursor)
@@ -118,12 +124,47 @@ class TestPruneCopySwapTablesSuffix:
             assert not any(s == f"ALTER TABLE {old_table} RENAME TO {old_table}_old" for s in sqls)
 
     def test_default_suffix_preserves_unsuffixed_backup_name(self) -> None:
-        mock_conn, mock_cursor = _make_mock_conn(fetchone_value=(5,))
+        # See test_backup_name_is_namespaced_too: 3 == len({1, 2} | {3}).
+        mock_conn, mock_cursor = _make_mock_conn(fetchone_value=(3,))
         with patch.object(_vc.psycopg, "connect", return_value=mock_conn):
             _vc._prune_copy_swap_tables("postgresql:///test", {1, 2}, {3})
         sqls = _executed_sql(mock_cursor)
         assert any(s == "ALTER TABLE release RENAME TO release_old" for s in sqls)
         assert any(s == "DROP TABLE release_old CASCADE" for s in sqls)
+
+
+class TestPruneCopySwapTablesCountGuard:
+    """WXYC/discogs-etl#357: _prune_copy_swap_tables aborts before the RENAME
+    swap when the mocked ``SELECT count(*) FROM new_release...`` doesn't
+    match ``len(keep_ids | review_ids)``. Mock-based sibling of the pg-marked
+    ``TestPruneCopySwapCountGuard`` in
+    tests/integration/test_copy_swap_preserves_not_null.py, which exercises
+    the same guard end-to-end against real tables."""
+
+    def test_shortfall_raises_before_any_rename(self) -> None:
+        # keep_ids | review_ids has 3 ids; the mocked count(*) reports only 2,
+        # so every SELECT count(*) call in the run -- including the guard's --
+        # returns (2,) and the shortfall must fire.
+        mock_conn, mock_cursor = _make_mock_conn(fetchone_value=(2,))
+        with patch.object(_vc.psycopg, "connect", return_value=mock_conn):
+            with pytest.raises(_vc.CopySwapShortfallError, match="copied 2 of 3"):
+                _vc._prune_copy_swap_tables("postgresql:///test", {1, 2}, {3}, suffix="ab12cd34")
+        sqls = _executed_sql(mock_cursor)
+        assert not any("RENAME TO" in s for s in sqls), (
+            "the guard must raise before _prune_copy_swap_tables opens the "
+            "swap connection and runs any RENAME statement"
+        )
+        assert not any("DROP CONSTRAINT" in s for s in sqls), (
+            "the guard must raise before the FK DROP CONSTRAINT loop, "
+            "which runs on the same connection as the RENAME swap"
+        )
+
+    def test_matching_count_does_not_raise(self) -> None:
+        mock_conn, mock_cursor = _make_mock_conn(fetchone_value=(3,))
+        with patch.object(_vc.psycopg, "connect", return_value=mock_conn):
+            _vc._prune_copy_swap_tables("postgresql:///test", {1, 2}, {3}, suffix="ab12cd34")
+        sqls = _executed_sql(mock_cursor)
+        assert any("RENAME TO" in s for s in sqls)
 
 
 class TestPruneAddBaseConstraintsAndIndexesSuffix:

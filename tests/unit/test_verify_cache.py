@@ -754,8 +754,16 @@ class TestClassifyFuzzyBatch:
 class TestPruneCopySwapSQL:
     """Test prune_releases_copy_swap generates correct SQL operations."""
 
-    def _make_mock_conn(self):
-        """Create a mock psycopg connection with proper cursor context manager."""
+    def _make_mock_conn(self, count: int = 42):
+        """Create a mock psycopg connection with proper cursor context manager.
+
+        ``count`` backs every ``fetchone()`` call across the whole mocked
+        run -- including the WXYC/discogs-etl#357 pre-swap row-count guard's
+        own ``SELECT count(*) FROM new_release`` -- so it must equal
+        ``len(keep_ids | review_ids)`` for the given test's ids, or the
+        guard raises ``CopySwapShortfallError`` before any SQL these tests
+        assert on gets generated.
+        """
         from unittest.mock import MagicMock
 
         import psycopg
@@ -763,7 +771,7 @@ class TestPruneCopySwapSQL:
         mock_conn = MagicMock()
         mock_cursor = MagicMock()
         # fetchone returns (count,) for "SELECT count(*)" queries.
-        mock_cursor.fetchone.return_value = (42,)
+        mock_cursor.fetchone.return_value = (count,)
         # copy context manager
         mock_cursor.copy.return_value.__enter__ = MagicMock()
         mock_cursor.copy.return_value.__exit__ = MagicMock(return_value=False)
@@ -778,7 +786,7 @@ class TestPruneCopySwapSQL:
 
     def test_creates_keep_ids_table(self):
         """Should create a temp table with keep + review IDs."""
-        mock_conn, mock_cursor = self._make_mock_conn()
+        mock_conn, mock_cursor = self._make_mock_conn(count=4)
 
         with patch("verify_cache.psycopg") as mock_psycopg:
             mock_psycopg.connect.return_value = mock_conn
@@ -791,7 +799,7 @@ class TestPruneCopySwapSQL:
     def test_swaps_all_release_tables(self):
         """Should swap release, release_artist, release_label, release_track,
         release_track_artist, and cache_metadata."""
-        mock_conn, mock_cursor = self._make_mock_conn()
+        mock_conn, mock_cursor = self._make_mock_conn(count=3)
 
         with patch("verify_cache.psycopg") as mock_psycopg:
             mock_psycopg.connect.return_value = mock_conn
