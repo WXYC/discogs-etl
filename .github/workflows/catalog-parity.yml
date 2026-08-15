@@ -243,15 +243,25 @@ jobs:
           if-no-files-found: warn
 
       - name: Report U+FFFD capture
-        # Its own renderer and its own re-raise. Defaults to 3 -- "no capture
-        # was taken" -- which is also what a skipped capture step leaves
-        # behind, and the honest summary for it.
+        # Its own renderer and its own re-raise.
+        #
+        # An UNSET sentinel means the capture step was gated off (the harness
+        # exited 2 or 3), which is NOT the same as a capture that ran and
+        # failed. Defaulting it to 3 would render the producer-failure block:
+        # causes that did not occur, and an instruction to recover the capture
+        # from a stdout payload that was never written. --not-run is its own
+        # state, renders as a notice, and exits 0 -- the parity verdict step
+        # below already fails the job for the actual cause.
         if: always() && inputs.capture_fffd_cta_pairs
         run: |
           set -euo pipefail
-          args=(--exit-code "${CAPTURE_EXIT_CODE:-3}")
-          if [ -n "${PARITY_DIR:-}" ]; then
-            args+=(--json "$PARITY_DIR/fffd-pairs.json")
+          if [ -z "${CAPTURE_EXIT_CODE:-}" ]; then
+            args=(--not-run)
+          else
+            args=(--exit-code "$CAPTURE_EXIT_CODE")
+            if [ -n "${PARITY_DIR:-}" ]; then
+              args+=(--json "$PARITY_DIR/fffd-pairs.json")
+            fi
           fi
           python scripts/fffd_capture_summary.py "${args[@]}" >> "$GITHUB_STEP_SUMMARY"
 

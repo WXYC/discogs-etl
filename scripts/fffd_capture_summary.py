@@ -46,17 +46,30 @@ Usage::
 from __future__ import annotations
 
 import argparse
-import json
 import sys
 from collections import Counter
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from typing import Any
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from lib.run_summary import load_payload as _load_payload  # noqa: E402
+from lib.run_summary import plain as _plain  # noqa: E402
+
+# The untrusted-report reader, shared with parity_run_summary.py so a
+# hardening fix reaches both (#384). Bound here with this tool's noun.
+load_payload = partial(_load_payload, noun="capture report")
 
 COMPLETE = 0
 BAD_ARGS = 2
 SOURCE_ERROR = 3
 INCOMPLETE = 4
+# Not a process exit status -- the capture step was skipped and never returned
+# one. Kept outside 0-255 so it can never collide with a code the harness
+# actually produced.
+NOT_RUN = -1
 
 ISSUE = "[BS#2152](https://github.com/WXYC/Backend-Service/issues/2152)"
 
@@ -147,6 +160,24 @@ _OUTCOMES: dict[int, _Outcome] = {
         ),
         capture_taken=False,
     ),
+    NOT_RUN: _Outcome(
+        heading="U+FFFD capture: not run",
+        lead=(
+            "**The capture was requested but never ran.** It is gated on the parity harness "
+            "having completed -- exits 0 and 4 -- because those are the only codes that mean "
+            "the MySQL export finished and the `library.db` it pairs against is whole. The "
+            "harness did not complete on this run, so there was nothing to pair against and "
+            "the step was skipped. **Nothing failed here**: the parity verdict reported "
+            "separately in this run carries the actual cause, and re-dispatching once that is "
+            "fixed will take the capture."
+        ),
+        annotation_title="U+FFFD capture not run",
+        annotation_body=(
+            "Skipped: the parity harness did not complete, so there was no library.db to "
+            "pair against. See the parity verdict for the cause."
+        ),
+        capture_taken=False,
+    ),
     BAD_ARGS: _Outcome(
         heading="U+FFFD capture: workflow defect",
         lead=(
@@ -186,31 +217,6 @@ def _outcome(exit_code: int) -> _Outcome:
         ),
         capture_taken=False,
     )
-
-
-def load_payload(path: str | None) -> tuple[dict[str, Any] | None, str | None]:
-    """Read the capture's ``--json`` object.
-
-    Returns ``(payload, problem)`` -- exactly one of which is None. Every
-    failure mode collapses into a human-readable ``problem`` string rather
-    than an exception, because this runs in the step that explains other
-    failures.
-    """
-    if not path:
-        return None, "no report path was given"
-    file = Path(path)
-    if not file.exists():
-        return None, f"`{file.name}` was never written"
-    raw = file.read_text().strip()
-    if not raw:
-        return None, f"`{file.name}` is empty -- the capture produced no report"
-    try:
-        parsed = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        return None, f"`{file.name}` could not be parsed as JSON ({exc})"
-    if not isinstance(parsed, dict):
-        return None, f"`{file.name}` is {type(parsed).__name__}, not a capture report object"
-    return parsed, None
 
 
 def _rows(payload: dict[str, Any] | None, key: str) -> list[dict[str, Any]]:
@@ -290,13 +296,18 @@ def render(exit_code: int, payload: dict[str, Any] | None, problem: str | None) 
         # The exit code promised a capture and the report cannot supply it.
         lines.append(f"> The `--json` report could not be read: {problem}.")
         lines.append("")
-    else:
+    elif exit_code != NOT_RUN:
+        # Why the report is missing is worth naming for every outcome where
+        # one should have existed. NOT_RUN is the exception: nothing was ever
+        # going to write it, and the lead already says why.
         lines.append(f"_No report to summarise: {problem}._")
         lines.append("")
 
+    artifact = (
+        "The full capture is attached to this run as an artifact. " if outcome.capture_taken else ""
+    )
     lines.append(
-        "The full capture is attached to this run as an artifact. Mode: "
-        "`catalog_parity_diff.py --capture-fffd-cta-pairs` "
+        f"{artifact}Mode: `catalog_parity_diff.py --capture-fffd-cta-pairs` "
         "([#382](https://github.com/WXYC/discogs-etl/issues/382)); consumer: "
         f"{ISSUE}."
     )
@@ -310,7 +321,10 @@ def annotation(exit_code: int, payload: dict[str, Any] | None) -> str:
     message silently loses everything after the first line.
     """
     outcome = _outcome(exit_code)
-    kind = "notice" if exit_code == COMPLETE else "error"
+    # NOT_RUN is a notice, not an error: the parity verdict step already fails
+    # the job for the exit 2/3 that caused the skip, and a second error
+    # annotation for one cause reads as two independent failures.
+    kind = "notice" if exit_code in (COMPLETE, NOT_RUN) else "error"
     body = outcome.annotation_body
     if exit_code == INCOMPLETE:
         # The one code whose annotation earns per-run detail: which reasons
@@ -326,14 +340,6 @@ def annotation(exit_code: int, payload: dict[str, Any] | None) -> str:
     return f"::{kind} title={outcome.annotation_title}::{_plain(body)}"
 
 
-def _plain(markdown: str) -> str:
-    """Strip the Markdown emphasis the summary registers carry.
-
-    Annotations render as plain text, where backticks and asterisks are noise.
-    """
-    return markdown.replace("`", "").replace("**", "")
-
-
 def _build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description=(
@@ -343,11 +349,22 @@ def _build_arg_parser() -> argparse.ArgumentParser:
             "stdout, one annotation on stderr; re-exits with the capture's own code."
         ),
     )
-    p.add_argument(
+    mode = p.add_mutually_exclusive_group(required=True)
+    mode.add_argument(
         "--exit-code",
         type=int,
-        required=True,
         help="The exit code the capture mode returned.",
+    )
+    mode.add_argument(
+        "--not-run",
+        action="store_true",
+        help=(
+            "The capture step was skipped -- the parity harness did not complete, so there "
+            "was no library.db to pair against. Renders as a notice and exits 0: nothing "
+            "failed here, and the parity verdict carries the real cause. Distinct from "
+            "--exit-code 3, which means a capture was attempted and its source or write "
+            "failed."
+        ),
     )
     p.add_argument(
         "--json",
@@ -363,10 +380,13 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = _build_arg_parser().parse_args(argv)
-    payload, problem = load_payload(args.json)
-    sys.stdout.write(render(args.exit_code, payload, problem))
-    sys.stderr.write(annotation(args.exit_code, payload) + "\n")
-    return args.exit_code
+    code = NOT_RUN if args.not_run else args.exit_code
+    payload, problem = load_payload(None if args.not_run else args.json)
+    sys.stdout.write(render(code, payload, problem))
+    sys.stderr.write(annotation(code, payload) + "\n")
+    # A skipped capture is not a failure of its own -- the parity verdict step
+    # fails the job for the cause. Every real code is re-raised as itself.
+    return 0 if args.not_run else args.exit_code
 
 
 if __name__ == "__main__":  # pragma: no cover
