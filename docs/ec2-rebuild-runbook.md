@@ -367,7 +367,7 @@ redeploys until someone deliberately sets it back.
 
 Re-arm the same way, with `ScheduleState=ENABLED`.
 
-> **While the schedule is disabled, the collision guards are your only
+> **While the schedule is disabled, the collision guards are your
 > protection.** The bootstrap's peer check ([#311](https://github.com/WXYC/discogs-etl/issues/311))
 > and the launcher precheck ([#304](https://github.com/WXYC/discogs-etl/issues/304))
 > both key off `Project=discogs-rebuild`-tagged instances, so a rebuild started
@@ -382,3 +382,12 @@ Re-arm the same way, with `ScheduleState=ENABLED`.
 >             Name=instance-state-name,Values=pending,running \
 >   --query 'Reservations[].Instances[].[InstanceId,LaunchTime]' --output table
 > ```
+>
+> Since [#354](https://github.com/WXYC/discogs-etl/issues/354), `run_pipeline.py`
+> also takes a session-level PostgreSQL advisory lock on the destination cache
+> DB itself before touching anything (`docs/architecture.md` "Concurrent-Rebuild
+> Guard") — that check is untagged and un-IAM'd, so it catches a hand-started
+> instance even when it skips the `Project=discogs-rebuild` tag entirely. It
+> does not replace the tag-based checks above (it runs later, after setup work
+> the EC2 guard would have skipped), so still verify with the command above
+> before assuming you're the only rebuild running.

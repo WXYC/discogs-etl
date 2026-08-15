@@ -374,9 +374,37 @@ echo "[$(date -u +%H:%M:%SZ)] start pipeline"
 # and import_masters no-ops.
 # --xml-type is intentionally absent — it forces single-file mode and would
 # skip artist processing.
+#
+# Exit-code handling (discogs-etl#354): run_pipeline.py's advisory-lock guard
+# (lib/rebuild_lock.py) acquires a session-level PG lock on the destination
+# cache DB before touching anything, and bows out with the distinct
+# REBUILD_LOCK_BOWED_OUT_EXIT_CODE below — not 0 — when a peer already holds
+# it. Implemented literally as a plain "exit 0, matching #311's semantics"
+# (the original ticket wording for this guard), that bow-out would be
+# indistinguishable from a completed rebuild: `set -e` sees no error,
+# execution falls through to the drift watchdog and posts
+# ":white_check_mark: rebuilt successfully" for a run that never touched the
+# cache — exactly the false-positive-success defect class incident #352
+# exists to eliminate. `set +e`/`set -e` bracket the call so this script,
+# not the ERR trap, is the first thing to inspect the exit code.
+set +e
 python "$REPO_DIR/scripts/run_pipeline.py" \
     --xml "$WORK_DIR" \
     --library-db "$WORK_DIR/library.db"
+PIPELINE_EXIT_CODE=$?
+set -e
+
+# Must match lib/rebuild_lock.py's REBUILD_LOCK_BOWED_OUT_EXIT_CODE exactly —
+# tests/unit/test_rebuild_cache_lock_bowout.py pins the two numbers in sync.
+REBUILD_LOCK_BOWED_OUT_EXIT_CODE=75
+
+if [ "$PIPELINE_EXIT_CODE" -eq "$REBUILD_LOCK_BOWED_OUT_EXIT_CODE" ]; then
+    echo "[$(date -u +%H:%M:%SZ)] bowed out: another rebuild already holds the discogs-cache advisory lock (key 354001); no cache write"
+    notify_slack ":no_entry:" "bowed out — another rebuild holds the discogs-cache advisory lock (key 354001); no cache write. Log: ${LOG_FILE}"
+    exit 0
+elif [ "$PIPELINE_EXIT_CODE" -ne 0 ]; then
+    on_error "$LINENO" "$PIPELINE_EXIT_CODE"
+fi
 
 # ---------------------------------------------------------------------------
 # 6. Drift watchdog — same library.db the pipeline just filtered against

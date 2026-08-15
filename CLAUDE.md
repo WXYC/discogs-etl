@@ -68,12 +68,13 @@ The `entity.*` schema in the cache database is **owned by this repo** and is cre
 
 ### Advisory lock keys (shared-PG registry)
 
-`pg_advisory_xact_lock` keys are database-global on the shared discogs-cache PG, so every repo that takes one must register it here before shipping — an accidental key collision serializes (or deadlocks) unrelated work across services with no error to debug from. Current allocations:
+`pg_advisory_xact_lock` keys are database-global on the shared discogs-cache PG, so every repo that takes one must register it here before shipping — an accidental key collision serializes (or deadlocks) unrelated work across services with no error to debug from. This registry also governs session-level `pg_advisory_lock` / `pg_try_advisory_lock` keys: Postgres shares one keyspace across both the xact-scoped and session-scoped families, so a session-level key must be registered here too, and must not collide with an xact-scoped one. Current allocations:
 
 | Key | Owner | Purpose |
 |---|---|---|
 | `842001` | library-metadata-lookup | `lml_cache.*` streaming-catalog bootstrap transaction (`entity/streaming_catalog.py`, LML#842 PR A) — serializes concurrent boots around its `CREATE OR REPLACE FUNCTION` / constraint-widen DDL |
 | `886001` | library-metadata-lookup | `lml_cache.album_streaming_url_cache` bootstrap transaction (`entity/streaming_url_cache.py`, LML#886) — serializes concurrent boots around its widen-only service-CHECK DO block |
 | `330001` | discogs-etl | `scripts/seed_cache_from_clone.py` `_seed_family` real (non-dry-run) writes — serializes concurrent `seed_releases_additive`/`seed_artists_additive` invocations against the same target so two overlapping runs can't both compute the same release/artist as "new" and double-insert the arbiter-less child rows (PR#330) |
+| `354001` | discogs-etl | `lib/rebuild_lock.py`, taken by `scripts/run_pipeline.py::main()` before any subprocess is spawned or any destructive statement runs — a **session-level** `pg_try_advisory_lock` (not xact-scoped: the rebuild spans many transactions) that backstops the #311 EC2-tag guard against IAM/stack drift by enforcing mutual exclusion on the one resource every rebuild instance actually shares, in every AWS account and region (#354, incident #352) |
 
 Convention for new keys: `<issue-number> * 1000 + sequence` in the owning repo (842001 = LML#842, first key), which keeps keys human-traceable and collision-free without central coordination beyond this table.
