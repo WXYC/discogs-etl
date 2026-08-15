@@ -98,11 +98,20 @@ class TestLibrarySelectNullableTextColumnsWrapped:
         ), "cross_reference_names subquery is not wrapped all the way to its closing paren"
 
     def test_not_null_columns_left_unwrapped(self) -> None:
-        """Columns that are always populated must NOT be wrapped -- doing so
+        """Columns that carry no SQL NULL must NOT be wrapped -- doing so
         would be unjustified scope creep on this fix. Guards against a future
-        edit accidentally over-applying IFNULL."""
+        edit accidentally over-applying IFNULL.
+
+        Two of these have measured backing as of 2026-08-14
+        (WXYC/discogs-etl#375): `TITLE IS NULL` and `PRESENTATION_NAME IS
+        NULL` both counted 0 against prod. The remaining six rest on the
+        original "always populated" reading and are unmeasured. Note TITLE is
+        not the same as *non-empty*: six rows hold a byte-exact empty-string
+        TITLE, which is expected residue handled downstream by
+        `catalog_parity_diff.py::_rule_b_missing_reason`, not a reason to
+        wrap. See scripts/sync-library.sh's SELECT comment."""
         select_text = _library_select()
-        always_populated = [
+        unwrapped = [
             "r.ID",
             "r.TITLE",
             "lc.PRESENTATION_NAME",
@@ -112,7 +121,7 @@ class TestLibrarySelectNullableTextColumnsWrapped:
             "g.REFERENCE_NAME",
             "f.REFERENCE_NAME",
         ]
-        for col in always_populated:
+        for col in unwrapped:
             assert f"IFNULL({col}" not in select_text, f"{col} should not be IFNULL-wrapped"
             assert col in select_text, f"{col} should still be selected plainly"
 
