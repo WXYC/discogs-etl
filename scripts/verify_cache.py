@@ -72,6 +72,7 @@ from lib.pg_concurrent_ddl import (
     add_constraint_safely,
     add_index_concurrently_safely,
 )
+from lib.scratch_namespace import new_scratch_suffix, scratch_name
 
 logger = logging.getLogger(__name__)
 
@@ -988,47 +989,64 @@ PRUNE_PRE_SWAP_NOT_NULL_COLUMNS: dict[str, tuple[str, ...]] = {
 }
 
 
-def _prune_copy_swap_tables(
+def _prune_build_scratch_tables(
     db_url: str,
     keep_ids: set[int],
     review_ids: set[int],
+    suffix: str = "",
 ) -> None:
-    """CTAS + DEFAULT-restore + RENAME for every table in PRUNE_COPY_TABLES.
+    """Build ``_keep_ids`` and every ``new_X`` scratch table for one prune
+    invocation inside a single transaction.
 
-    Loads `_keep_ids`, copies keepers into `new_X`, re-applies the column
-    DEFAULTs that CTAS stripped (so the swapped-in table is already DEFAULTed
-    at the moment it goes live), drops the old FK constraints, swaps the
-    tables. Idempotent. See #256.
+    Loads ``_keep_ids``, copies keepers into `new_X`, and re-applies the
+    column DEFAULTs / NOT NULLs that CTAS stripped (so the swapped-in table
+    is already correct at the moment it goes live) -- all namespaced with
+    ``suffix`` (empty string, the default, preserves today's unnamespaced
+    table names) and all inside ONE non-autocommit transaction on a
+    dedicated connection, committed only once everything has been built.
+
+    This is what satisfies "a crashed run leaves no scratch residue"
+    (WXYC/discogs-etl#356): PostgreSQL rolls back an open transaction the
+    moment it detects the client connection is gone, so a killed process
+    (or a terminated backend) at any point inside this function undoes
+    every scratch table it created up to that point. See the symmetric
+    ``dedup_releases.build_dedup_scratch_tables`` for the same shape
+    applied to the dedup step.
+
+    Idempotent (DROP IF EXISTS precedes each CREATE). See #256.
     """
     all_ids = keep_ids | review_ids
-    conn = psycopg.connect(db_url, autocommit=True)
+    keep_ids_table = scratch_name("_keep_ids", suffix)
+    conn = psycopg.connect(db_url)  # non-autocommit: this function owns the one commit
     try:
         with conn.cursor() as cur:
-            cur.execute("DROP TABLE IF EXISTS _keep_ids")
-            cur.execute("CREATE UNLOGGED TABLE _keep_ids (release_id integer PRIMARY KEY)")
-            with cur.copy("COPY _keep_ids (release_id) FROM STDIN") as copy:
+            cur.execute(f"DROP TABLE IF EXISTS {keep_ids_table}")
+            cur.execute(f"CREATE UNLOGGED TABLE {keep_ids_table} (release_id integer PRIMARY KEY)")
+            with cur.copy(f"COPY {keep_ids_table} (release_id) FROM STDIN") as copy:
                 for rid in all_ids:
                     copy.write_row((rid,))
 
         for old_table, new_table, columns, id_col in PRUNE_COPY_TABLES:
+            physical_new_table = scratch_name(new_table, suffix)
             with conn.cursor() as cur:
-                cur.execute(f"DROP TABLE IF EXISTS {new_table}")
+                cur.execute(f"DROP TABLE IF EXISTS {physical_new_table}")
                 cur.execute(f"""
-                    CREATE TABLE {new_table} AS
+                    CREATE TABLE {physical_new_table} AS
                     SELECT {columns} FROM {old_table} t
                     WHERE EXISTS (
-                        SELECT 1 FROM _keep_ids k WHERE k.release_id = t.{id_col}
+                        SELECT 1 FROM {keep_ids_table} k WHERE k.release_id = t.{id_col}
                     )
                 """)
                 for column, default_sql in PRUNE_PRE_SWAP_COLUMN_DEFAULTS.get(
                     new_table, {}
                 ).items():
                     cur.execute(
-                        f"ALTER TABLE {new_table} ALTER COLUMN {column} SET DEFAULT {default_sql}"
+                        f"ALTER TABLE {physical_new_table} ALTER COLUMN {column} "
+                        f"SET DEFAULT {default_sql}"
                     )
-                cur.execute(f"SELECT count(*) FROM {new_table}")
+                cur.execute(f"SELECT count(*) FROM {physical_new_table}")
                 count = cur.fetchone()[0]
-            logger.info(f"  Copied {old_table} -> {new_table}: {count:,} rows")
+            logger.info(f"  Copied {old_table} -> {physical_new_table}: {count:,} rows")
 
         # Pre-swap NOT NULL on PK columns, driven by PRUNE_PRE_SWAP_NOT_NULL_COLUMNS.
         # The new_X tables aren't live yet, so the implicit full-table scan that
@@ -1045,9 +1063,38 @@ def _prune_copy_swap_tables(
         # to be remembered once per script.
         with conn.cursor() as cur:
             for new_table, columns in PRUNE_PRE_SWAP_NOT_NULL_COLUMNS.items():
+                physical_new_table = scratch_name(new_table, suffix)
                 for column in columns:
-                    cur.execute(f"ALTER TABLE {new_table} ALTER COLUMN {column} SET NOT NULL")
+                    cur.execute(
+                        f"ALTER TABLE {physical_new_table} ALTER COLUMN {column} SET NOT NULL"
+                    )
 
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def _prune_copy_swap_tables(
+    db_url: str,
+    keep_ids: set[int],
+    review_ids: set[int],
+    *,
+    suffix: str = "",
+) -> None:
+    """CTAS + DEFAULT-restore + RENAME for every table in PRUNE_COPY_TABLES.
+
+    Delegates scratch-table construction to :func:`_prune_build_scratch_tables`
+    (namespaced with ``suffix``, crash-safe -- see that function's docstring
+    for WXYC/discogs-etl#356), then drops the old FK constraints and swaps
+    the tables in. Idempotent. See #256.
+    """
+    _prune_build_scratch_tables(db_url, keep_ids, review_ids, suffix=suffix)
+
+    conn = psycopg.connect(db_url, autocommit=True)
+    try:
         # DROP CONSTRAINT + RENAME deadlock surface — same lock-acquisition
         # mismatch as the FK-add path below, with the *broader* surface
         # (AccessExclusive instead of ShareRowExclusive). Conflicts with every
@@ -1097,6 +1144,7 @@ def _prune_copy_swap_tables(
             )
 
         for old_table, new_table, _, _ in PRUNE_COPY_TABLES:
+            physical_new_table = scratch_name(new_table, suffix)
             bak = f"{old_table}_old"
             # Atomic swap: the three statements (RENAME old → bak, RENAME
             # new → old, DROP bak CASCADE) run in one transaction so the
@@ -1112,27 +1160,29 @@ def _prune_copy_swap_tables(
                 conn,
                 [
                     f"ALTER TABLE {old_table} RENAME TO {bak}",
-                    f"ALTER TABLE {new_table} RENAME TO {old_table}",
+                    f"ALTER TABLE {physical_new_table} RENAME TO {old_table}",
                     f"DROP TABLE {bak} CASCADE",
                 ],
-                lock_tables=[old_table, new_table],
+                lock_tables=[old_table, physical_new_table],
                 attempts=SWAP_PATH_ATTEMPTS,
                 backoff_seconds=SWAP_PATH_BACKOFF_SECONDS,
             )
-            logger.info(f"  Swapped {new_table} -> {old_table}")
+            logger.info(f"  Swapped {physical_new_table} -> {old_table}")
     finally:
         conn.close()
 
 
-def _prune_add_base_constraints_and_indexes(db_url: str) -> None:
+def _prune_add_base_constraints_and_indexes(db_url: str, *, suffix: str = "") -> None:
     """Add PK / FK / indexes / NOT NULL on the post-swap tables.
 
     Runs orphan cleanup, FK + PK creation, FK + trigram + cache metadata
     indexes, a race-window backfill of any NULL cache_metadata.cached_at
     that slipped past PRUNE_PRE_SWAP_COLUMN_DEFAULTS, and SET NOT NULL on
-    the schema-required columns. Drops `_keep_ids` at the end.
+    the schema-required columns. Drops ``_keep_ids`` (namespaced with
+    ``suffix``, matching the value :func:`_prune_build_scratch_tables` was
+    called with in this invocation -- see WXYC/discogs-etl#356) at the end.
 
-    DEFAULT restoration happens in ``_prune_copy_swap_tables`` pre-swap
+    DEFAULT restoration happens in ``_prune_build_scratch_tables`` pre-swap
     (see PRUNE_PRE_SWAP_COLUMN_DEFAULTS); this function only handles
     constraints/indexes that have to land on the live table.
     """
@@ -1361,16 +1411,19 @@ def _prune_add_base_constraints_and_indexes(db_url: str) -> None:
         # Drop ``_keep_ids`` whether or not the constraint adds succeeded.
         # A failed prune that retries (manually or via the outer pipeline)
         # would otherwise leave the UNLOGGED keep-ids table sitting in the
-        # cache until the next ``_prune_copy_swap_tables`` call drops it.
-        # The DROP at the start of ``_prune_copy_swap_tables`` makes this
-        # belt-and-suspenders, not load-bearing — but the storage overhead
-        # is real (~24MB per ~6M-row keep set) and operator confusion when
-        # auditing the cache schema is avoidable.
+        # cache until the next invocation's ``_prune_build_scratch_tables``
+        # call drops it -- and under per-invocation suffixing (#356) a
+        # retry mints a *different* suffix, so that self-healing DROP would
+        # never find this invocation's table. This is the only cleanup it
+        # gets, so it's load-bearing here, not merely belt-and-suspenders:
+        # the storage overhead is real (~24MB per ~6M-row keep set) and an
+        # orphaned per-invocation table would sit in ``public`` forever.
+        keep_ids_table = scratch_name("_keep_ids", suffix)
         try:
             with conn.cursor() as cur:
-                cur.execute("DROP TABLE IF EXISTS _keep_ids")
+                cur.execute(f"DROP TABLE IF EXISTS {keep_ids_table}")
         except Exception:  # noqa: BLE001
-            logger.warning("Could not clean up _keep_ids on exit", exc_info=True)
+            logger.warning("Could not clean up %s on exit", keep_ids_table, exc_info=True)
         conn.close()
 
 
@@ -1378,6 +1431,8 @@ def prune_releases_copy_swap(
     db_url: str,
     keep_ids: set[int],
     review_ids: set[int],
+    *,
+    suffix: str | None = None,
 ) -> None:
     """Prune releases using copy-and-swap (faster than DELETE for large prune sets).
 
@@ -1389,11 +1444,24 @@ def prune_releases_copy_swap(
         db_url: PostgreSQL connection URL.
         keep_ids: Release IDs classified as KEEP.
         review_ids: Release IDs classified as REVIEW (also kept).
+        suffix: Per-invocation scratch-table namespacing
+            (WXYC/discogs-etl#356). Defaults to ``None``, which mints a
+            fresh suffix via :func:`lib.scratch_namespace.new_scratch_suffix`
+            -- so every real call to this function (verify_cache.py's own
+            ``--prune`` CLI path, and run_pipeline.py's subprocess launch
+            of it) is automatically collision-safe against a concurrent
+            invocation, with no call-site changes required. Pass ``""``
+            explicitly to opt out (pre-#356 unnamespaced behavior) or a
+            specific value to control/observe one invocation's tables
+            (e.g. in a concurrency or crash-residue test).
     """
     all_ids = keep_ids | review_ids
     if not all_ids:
         logger.warning("No releases to keep — skipping copy-swap prune")
         return
+
+    resolved_suffix = new_scratch_suffix() if suffix is None else suffix
+    logger.info("Scratch table suffix for this prune invocation: %s", resolved_suffix)
 
     logger.info(
         "Pruning via copy-and-swap (%s KEEP + %s REVIEW = %s total)",
@@ -1403,8 +1471,8 @@ def prune_releases_copy_swap(
     )
 
     start = time.time()
-    _prune_copy_swap_tables(db_url, keep_ids, review_ids)
-    _prune_add_base_constraints_and_indexes(db_url)
+    _prune_copy_swap_tables(db_url, keep_ids, review_ids, suffix=resolved_suffix)
+    _prune_add_base_constraints_and_indexes(db_url, suffix=resolved_suffix)
     elapsed = time.time() - start
     logger.info(f"Copy-and-swap prune completed in {elapsed:.1f}s")
 

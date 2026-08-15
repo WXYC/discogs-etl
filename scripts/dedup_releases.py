@@ -36,6 +36,7 @@ from lib.pg_concurrent_ddl import (  # noqa: E402
     add_index_concurrently_safely,
     group_concurrent_index_ddls_by_table,
 )
+from lib.scratch_namespace import new_scratch_suffix, scratch_name  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -226,18 +227,24 @@ def create_label_match_table(conn) -> int:
     return count
 
 
-def load_keep_release_ids(conn, path: Path) -> int:
+def load_keep_release_ids(conn, path: Path, *, suffix: str = "") -> int:
     """Load a newline-separated release_id allowlist into an UNLOGGED table.
 
-    Creates ``keep_release_ids (release_id integer PRIMARY KEY)``. The PK
-    constraint guarantees NOT NULL, which matters: ``NOT IN`` against a
-    subquery containing NULL evaluates to NULL for every row, silently
-    keeping 100% of duplicates. Loading zero ids is a harmless no-op filter.
+    Creates ``keep_release_ids`` (namespaced to ``keep_release_ids_<suffix>``
+    when ``suffix`` is given -- see WXYC/discogs-etl#356) with columns
+    ``(release_id integer PRIMARY KEY)``. The PK constraint guarantees NOT
+    NULL, which matters: ``NOT IN`` against a subquery containing NULL
+    evaluates to NULL for every row, silently keeping 100% of duplicates.
+    Loading zero ids is a harmless no-op filter.
 
     Args:
-        conn: psycopg connection (autocommit=True).
+        conn: psycopg connection (autocommit=True, or a connection managed
+            by an enclosing transaction -- this function never commits).
         path: Path to a newline-separated release_id allowlist file (see
             lib.keep_release_ids for the file format).
+        suffix: Per-invocation scratch-table suffix from
+            :func:`lib.scratch_namespace.new_scratch_suffix`. Empty string
+            (the default) preserves today's unnamespaced table name.
 
     Returns:
         Number of ids loaded.
@@ -245,57 +252,67 @@ def load_keep_release_ids(conn, path: Path) -> int:
     ids = parse_keep_release_ids(path)
     logger.info("Loaded %d release_id override(s) from %s", len(ids), path)
 
+    table = scratch_name("keep_release_ids", suffix)
     with conn.cursor() as cur:
-        cur.execute("DROP TABLE IF EXISTS keep_release_ids")
-        cur.execute("""
-            CREATE UNLOGGED TABLE keep_release_ids (
+        cur.execute(f"DROP TABLE IF EXISTS {table}")
+        cur.execute(f"""
+            CREATE UNLOGGED TABLE {table} (
                 release_id integer PRIMARY KEY
             )
         """)
         if ids:
-            with cur.copy("COPY keep_release_ids (release_id) FROM STDIN") as copy:
+            with cur.copy(f"COPY {table} (release_id) FROM STDIN") as copy:
                 for rid in ids:
                     copy.write_row((rid,))
 
     return len(ids)
 
 
-def ensure_dedup_ids(conn, *, keep_ids_loaded: bool = False) -> int:
+def ensure_dedup_ids(conn, *, keep_ids_loaded: bool = False, suffix: str = "") -> int:
     """Ensure dedup_delete_ids table exists. Create if needed.
 
     Uses release_track_count table for track counts if available (v2 pipeline),
     falling back to counting from release_track directly (v1 / standalone usage).
 
     Args:
-        conn: psycopg connection (autocommit=True).
+        conn: psycopg connection (autocommit=True, or a connection managed
+            by an enclosing transaction -- this function never commits).
         keep_ids_loaded: When True, a ``keep_release_ids`` table (from
-            load_keep_release_ids) is assumed to exist, and no release_id it
-            contains may land in dedup_delete_ids -- even if its ROW_NUMBER
-            rank within its (master_id, format) partition is rn > 1. Any
-            pre-existing dedup_delete_ids is force-recreated in this case, so
-            a stale table from a prior (non-exempting) run can't silently
-            skip the exemption.
+            load_keep_release_ids, namespaced with the same ``suffix``) is
+            assumed to exist, and no release_id it contains may land in
+            dedup_delete_ids -- even if its ROW_NUMBER rank within its
+            (master_id, format) partition is rn > 1. Any pre-existing
+            dedup_delete_ids is force-recreated in this case, so a stale
+            table from a prior (non-exempting) run can't silently skip the
+            exemption.
+        suffix: Per-invocation scratch-table suffix from
+            :func:`lib.scratch_namespace.new_scratch_suffix`. Empty string
+            (the default) preserves today's unnamespaced table names, both
+            for ``dedup_delete_ids`` and (when ``keep_ids_loaded``) for the
+            ``keep_release_ids`` table it reads from. See
+            WXYC/discogs-etl#356.
 
     Returns number of IDs to delete.
     """
+    dedup_table = scratch_name("dedup_delete_ids", suffix)
+    keep_table = scratch_name("keep_release_ids", suffix)
+
     if keep_ids_loaded:
         with conn.cursor() as cur:
-            cur.execute("DROP TABLE IF EXISTS dedup_delete_ids")
+            cur.execute(f"DROP TABLE IF EXISTS {dedup_table}")
 
     with conn.cursor() as cur:
-        cur.execute("""
-            SELECT EXISTS (
-                SELECT FROM information_schema.tables
-                WHERE table_name = 'dedup_delete_ids'
-            )
-        """)
+        cur.execute(
+            "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = %s)",
+            (dedup_table,),
+        )
         exists = cur.fetchone()[0]
 
     if exists:
         with conn.cursor() as cur:
-            cur.execute("SELECT count(*) FROM dedup_delete_ids")
+            cur.execute(f"SELECT count(*) FROM {dedup_table}")
             count = int(cur.fetchone()[0])
-        logger.info(f"dedup_delete_ids already exists with {count:,} IDs")
+        logger.info(f"{dedup_table} already exists with {count:,} IDs")
         return count
 
     # Choose track count source: pre-computed table or live count from release_track
@@ -342,7 +359,7 @@ def ensure_dedup_ids(conn, *, keep_ids_loaded: bool = False) -> int:
             # changes. keep_release_ids.release_id is NOT NULL (PK), so this NOT IN
             # can never be NULL-poisoned into keeping every row.
             cur.execute(f"""
-                CREATE UNLOGGED TABLE dedup_delete_ids AS
+                CREATE UNLOGGED TABLE {dedup_table} AS
                 SELECT release_id FROM (
                     SELECT id AS release_id FROM (
                         SELECT r.id, r.master_id,
@@ -357,11 +374,11 @@ def ensure_dedup_ids(conn, *, keep_ids_loaded: bool = False) -> int:
                     ) ranked
                     WHERE rn > 1
                 ) candidates
-                WHERE release_id NOT IN (SELECT release_id FROM keep_release_ids)
+                WHERE release_id NOT IN (SELECT release_id FROM {keep_table})
             """)
         else:
             cur.execute(f"""
-                CREATE UNLOGGED TABLE dedup_delete_ids AS
+                CREATE UNLOGGED TABLE {dedup_table} AS
                 SELECT id AS release_id FROM (
                     SELECT r.id, r.master_id,
                            ROW_NUMBER() OVER (
@@ -375,13 +392,12 @@ def ensure_dedup_ids(conn, *, keep_ids_loaded: bool = False) -> int:
                 ) ranked
                 WHERE rn > 1
             """)
-        cur.execute("ALTER TABLE dedup_delete_ids ADD PRIMARY KEY (release_id)")
-    conn.commit()
+        cur.execute(f"ALTER TABLE {dedup_table} ADD PRIMARY KEY (release_id)")
 
     with conn.cursor() as cur:
-        cur.execute("SELECT count(*) FROM dedup_delete_ids")
+        cur.execute(f"SELECT count(*) FROM {dedup_table}")
         count = int(cur.fetchone()[0])
-    logger.info(f"Created dedup_delete_ids with {count:,} IDs")
+    logger.info(f"Created {dedup_table} with {count:,} IDs")
     return count
 
 
@@ -460,49 +476,146 @@ PRE_SWAP_NOT_NULL_COLUMNS: dict[str, tuple[str, ...]] = {
 }
 
 
-def copy_table(conn, old_table: str, new_table: str, columns: str, id_col: str) -> int:
+def copy_table(
+    conn,
+    old_table: str,
+    new_table: str,
+    columns: str,
+    id_col: str,
+    *,
+    suffix: str = "",
+) -> int:
     """Copy rows NOT in dedup_delete_ids to a new table.
+
+    ``new_table`` names the *base* scratch table (e.g. ``"new_release"``,
+    matching the ``DEDUP_TABLES`` / ``PRE_SWAP_COLUMN_DEFAULTS`` /
+    ``PRE_SWAP_NOT_NULL_COLUMNS`` keys); the table actually created on the
+    database is ``scratch_name(new_table, suffix)``. ``suffix`` also
+    namespaces the ``dedup_delete_ids`` table this reads from, so it must
+    be the SAME suffix ``ensure_dedup_ids`` was called with in this
+    invocation (empty string -- the default -- for both preserves today's
+    unnamespaced behavior). See WXYC/discogs-etl#356.
+
+    Never commits: callers that need per-call transaction boundaries (e.g.
+    an autocommit connection) get them implicitly; callers building an
+    invocation's entire scratch-table set inside one transaction (see
+    ``build_dedup_scratch_tables``) rely on this NOT committing early, so a
+    crash before that transaction's own commit leaves nothing behind.
 
     Returns row count of new table.
     """
     start = time.time()
-    logger.info(f"Copying {old_table} -> {new_table} (keeping non-duplicate rows)...")
+    physical_new_table = scratch_name(new_table, suffix)
+    dedup_table = scratch_name("dedup_delete_ids", suffix)
+    logger.info(f"Copying {old_table} -> {physical_new_table} (keeping non-duplicate rows)...")
 
     with conn.cursor() as cur:
-        cur.execute(f"DROP TABLE IF EXISTS {new_table}")
+        cur.execute(f"DROP TABLE IF EXISTS {physical_new_table}")
         cur.execute(f"""
-            CREATE TABLE {new_table} AS
+            CREATE TABLE {physical_new_table} AS
             SELECT {columns} FROM {old_table} t
             WHERE NOT EXISTS (
-                SELECT 1 FROM dedup_delete_ids d WHERE d.release_id = t.{id_col}
+                SELECT 1 FROM {dedup_table} d WHERE d.release_id = t.{id_col}
             )
         """)
         for column, default_sql in PRE_SWAP_COLUMN_DEFAULTS.get(new_table, {}).items():
-            cur.execute(f"ALTER TABLE {new_table} ALTER COLUMN {column} SET DEFAULT {default_sql}")
+            cur.execute(
+                f"ALTER TABLE {physical_new_table} ALTER COLUMN {column} SET DEFAULT {default_sql}"
+            )
         for column in PRE_SWAP_NOT_NULL_COLUMNS.get(new_table, ()):
-            cur.execute(f"ALTER TABLE {new_table} ALTER COLUMN {column} SET NOT NULL")
-        cur.execute(f"SELECT count(*) FROM {new_table}")
+            cur.execute(f"ALTER TABLE {physical_new_table} ALTER COLUMN {column} SET NOT NULL")
+        cur.execute(f"SELECT count(*) FROM {physical_new_table}")
         count = int(cur.fetchone()[0])
-    conn.commit()
 
     elapsed = time.time() - start
-    logger.info(f"  {new_table}: {count:,} rows in {elapsed:.1f}s")
+    logger.info(f"  {physical_new_table}: {count:,} rows in {elapsed:.1f}s")
     return count
 
 
-def swap_tables(conn, old_table: str, new_table: str) -> None:
+def swap_tables(conn, old_table: str, new_table: str, *, suffix: str = "") -> None:
     """Swap old and new tables atomically.
+
+    ``new_table`` is the base scratch name copy_table() was called with;
+    the physical table renamed into place is ``scratch_name(new_table,
+    suffix)`` (empty ``suffix`` -- the default -- preserves today's
+    unnamespaced behavior). The backup name (``<old_table>_old``) is
+    deliberately NOT namespaced: it only exists for the duration of this
+    function's single transaction, guarded by PostgreSQL's own locking on
+    ``old_table`` (a second concurrent swap of the same live table would
+    block on that lock, not silently collide) -- see WXYC/discogs-etl#356
+    and the sibling advisory-lock ticket #354 for the swap-concurrency
+    story this doesn't attempt to solve.
 
     Uses CASCADE on DROP to remove FK constraints that reference the old table.
     Constraints are recreated by add_constraints_and_indexes() after all swaps.
     """
+    physical_new_table = scratch_name(new_table, suffix)
     bak = f"{old_table}_old"
     with conn.cursor() as cur:
         cur.execute(f"ALTER TABLE {old_table} RENAME TO {bak}")
-        cur.execute(f"ALTER TABLE {new_table} RENAME TO {old_table}")
+        cur.execute(f"ALTER TABLE {physical_new_table} RENAME TO {old_table}")
         cur.execute(f"DROP TABLE {bak} CASCADE")
     conn.commit()
-    logger.info(f"  Swapped {new_table} -> {old_table}")
+    logger.info(f"  Swapped {physical_new_table} -> {old_table}")
+
+
+def build_dedup_scratch_tables(
+    db_url: str,
+    suffix: str,
+    *,
+    keep_release_ids_path: Path | None = None,
+) -> tuple[int, bool]:
+    """Build every scratch table for one dedup invocation inside one transaction.
+
+    Loads the keep-ids allowlist (if given), computes ``dedup_delete_ids``,
+    and copies every ``DEDUP_TABLES`` entry into its ``new_X`` scratch
+    table -- all namespaced with ``suffix`` and all inside ONE
+    non-autocommit transaction on a dedicated connection. Nothing commits
+    until every scratch table this invocation needs has been fully built.
+
+    This is what satisfies "a crashed run leaves no scratch residue"
+    (WXYC/discogs-etl#356): PostgreSQL rolls back an open transaction the
+    moment it detects the client connection is gone, so a killed process
+    (or a terminated backend) at any point inside this function undoes
+    every scratch table it created up to that point -- there is nothing
+    left in ``public`` for a later invocation (which mints its own,
+    different ``suffix``) to trip over or need to clean up. The swap step
+    that follows (``swap_tables``, driven by ``main()`` on a separate
+    autocommit connection) is a different concern: by the time it runs,
+    this function's transaction has already committed, so it's operating
+    on durable state.
+
+    Args:
+        db_url: PostgreSQL connection URL.
+        suffix: Per-invocation scratch-table suffix from
+            :func:`lib.scratch_namespace.new_scratch_suffix`.
+        keep_release_ids_path: Optional path to a release_id allowlist
+            file. When given, loaded into a namespaced ``keep_release_ids``
+            table and used to exempt those ids from ``dedup_delete_ids``.
+
+    Returns:
+        ``(delete_count, keep_ids_loaded)`` -- the same values
+        ``main()`` needs to decide whether there's anything left to do.
+    """
+    conn = psycopg.connect(db_url)  # non-autocommit: this function owns the one commit
+    try:
+        keep_ids_loaded = False
+        if keep_release_ids_path is not None:
+            loaded = load_keep_release_ids(conn, keep_release_ids_path, suffix=suffix)
+            keep_ids_loaded = loaded > 0
+
+        delete_count = ensure_dedup_ids(conn, keep_ids_loaded=keep_ids_loaded, suffix=suffix)
+        if delete_count > 0:
+            for old, new, cols, id_col in DEDUP_TABLES:
+                copy_table(conn, old, new, cols, id_col, suffix=suffix)
+
+        conn.commit()
+        return delete_count, keep_ids_loaded
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def _exec_one(db_url: str, stmt: str) -> None:
@@ -1056,10 +1169,25 @@ def main():
 
     init_logger(repo="discogs-etl", tool="discogs-etl dedup_releases")
 
+    # Per-invocation scratch-table suffix (WXYC/discogs-etl#356): every
+    # dedup_delete_ids / keep_release_ids / new_X table this run creates is
+    # namespaced with it, so a concurrent invocation against the same
+    # database -- running its own dedup, or a prune -- can never observe or
+    # drop this run's working state, and vice versa. This is per-invocation,
+    # not per-rebuild-run: see lib.scratch_namespace's module docstring for
+    # why (dedup_releases.py and verify_cache.py are independent
+    # subprocesses with no shared run_id to thread through).
+    suffix = new_scratch_suffix()
+    logger.info("Scratch table suffix for this invocation: %s", suffix)
+
     logger.info("Connecting to %s", redact_dsn(db_url))
     conn = psycopg.connect(db_url, autocommit=True)
 
-    # Step 0 (optional): Load WXYC label preferences for label-aware ranking
+    # Step 0 (optional): Load WXYC label preferences for label-aware ranking.
+    # Out of scope for #356 -- these tables (wxyc_label_pref,
+    # release_label_match, label_hierarchy) aren't part of the copy-swap
+    # working set implicated in the 2026-08-04 incident and stay
+    # unnamespaced.
     if args.library_labels:
         if not args.library_labels.exists():
             logger.error("Library labels file not found: %s", args.library_labels)
@@ -1075,38 +1203,37 @@ def main():
 
         create_label_match_table(conn)
 
-    # Step 0.5 (optional): Load WXYC library pinned overrides exempt from dedup.
-    # Only engage the exemption path when the allowlist is non-empty: it
-    # force-recreates dedup_delete_ids (forfeiting the reuse-verbatim
-    # short-circuit), which is wasted work when there are no ids to exempt. An
-    # empty allowlist -- the only case in production until Seam A lands -- must
-    # stay byte-identical to the no-flag path.
-    keep_ids_loaded = False
-    if args.keep_release_ids:
-        if not args.keep_release_ids.exists():
-            logger.error("Keep-release-ids file not found: %s", args.keep_release_ids)
-            sys.exit(1)
-        loaded = load_keep_release_ids(conn, args.keep_release_ids)
-        keep_ids_loaded = loaded > 0
+    # Step 0.5 (optional) validation: fail fast, before opening the
+    # scratch-build transaction, if an explicitly-requested override file
+    # doesn't exist.
+    if args.keep_release_ids and not args.keep_release_ids.exists():
+        logger.error("Keep-release-ids file not found: %s", args.keep_release_ids)
+        sys.exit(1)
 
-    # Step 1: Ensure dedup IDs exist
-    delete_count = ensure_dedup_ids(conn, keep_ids_loaded=keep_ids_loaded)
+    # Steps 0.5 + 1: build every scratch table for this invocation --
+    # keep_release_ids (if requested) and dedup_delete_ids -- inside one
+    # transaction on a dedicated connection. See build_dedup_scratch_tables
+    # for why: a crashed run leaves no scratch residue because PostgreSQL
+    # rolls back that whole transaction the instant the connection drops.
+    delete_count, keep_ids_loaded = build_dedup_scratch_tables(
+        db_url, suffix, keep_release_ids_path=args.keep_release_ids
+    )
     if delete_count == 0:
         logger.info("No duplicates found, nothing to do")
         with conn.cursor() as cur:
+            cur.execute(f"DROP TABLE IF EXISTS {scratch_name('dedup_delete_ids', suffix)}")
             cur.execute("DROP TABLE IF EXISTS release_track_count")
             cur.execute("DROP TABLE IF EXISTS wxyc_label_pref")
             cur.execute("DROP TABLE IF EXISTS release_label_match")
-            cur.execute("DROP TABLE IF EXISTS keep_release_ids")
+            cur.execute(f"DROP TABLE IF EXISTS {scratch_name('keep_release_ids', suffix)}")
         conn.close()
         return
 
     total_start = time.time()
 
-    # Step 2: Copy each table (keeping only non-duplicate rows)
-    # Only base tables + cache_metadata (tracks are imported after dedup)
-    for old, new, cols, id_col in DEDUP_TABLES:
-        copy_table(conn, old, new, cols, id_col)
+    # Step 2 (copying each DEDUP_TABLES entry) already happened inside
+    # build_dedup_scratch_tables, alongside dedup_delete_ids, as part of
+    # this invocation's single crash-safe transaction.
 
     # Step 3: Drop old FK constraints before swap
     logger.info("Dropping FK constraints on old tables...")
@@ -1123,7 +1250,7 @@ def main():
     # Step 4: Swap tables
     logger.info("Swapping tables...")
     for old, new, _, _ in DEDUP_TABLES:
-        swap_tables(conn, old, new)
+        swap_tables(conn, old, new, suffix=suffix)
 
     # Step 5: Add base constraints and indexes
     add_base_constraints_and_indexes(conn, db_url=db_url)
@@ -1131,12 +1258,12 @@ def main():
     # Step 6: Cleanup
     logger.info("Cleaning up...")
     with conn.cursor() as cur:
-        cur.execute("DROP TABLE IF EXISTS dedup_delete_ids")
+        cur.execute(f"DROP TABLE IF EXISTS {scratch_name('dedup_delete_ids', suffix)}")
         cur.execute("DROP TABLE IF EXISTS release_track_count")
         cur.execute("DROP TABLE IF EXISTS wxyc_label_pref")
         cur.execute("DROP TABLE IF EXISTS release_label_match")
         cur.execute("DROP TABLE IF EXISTS label_hierarchy")
-        cur.execute("DROP TABLE IF EXISTS keep_release_ids")
+        cur.execute(f"DROP TABLE IF EXISTS {scratch_name('keep_release_ids', suffix)}")
 
     # Step 7: Report
     with conn.cursor() as cur:
