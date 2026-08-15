@@ -241,6 +241,29 @@ jobs:
           PY_RC=$?
           set -e
 
+          # Advisory-lock bow-out (discogs-etl#354): run_pipeline.py exits 75
+          # within a second or two, long before the converter ever opens the
+          # FIFO for reading. curl is still parked in open() on the write end
+          # — a FIFO open-for-write blocks until a reader arrives — and no
+          # reader is ever coming, so the `wait` below would block until this
+          # job's 350-minute timeout, burning ~5.8h of runner budget on a run
+          # that did nothing. Reap curl and propagate the code instead.
+          #
+          # Deliberately still non-zero here: unlike scripts/rebuild-cache.sh
+          # (which reports the bow-out to Slack and exits 0), this workflow has
+          # no bow-out reporting surface, and every later step is `if:
+          # success()`. Going red is the safe direction — a bow-out must never
+          # be recorded as a completed rebuild (incident #352) — at the cost of
+          # a Slack failure ping an operator has to read the log to interpret.
+          # This path is `workflow_dispatch`-only and non-canonical; the EC2
+          # script is where a bow-out is reported properly.
+          if [ "$PY_RC" -eq 75 ]; then
+            echo "::warning::bowed out — another rebuild holds the discogs-cache advisory lock (key 354001); no cache write. See discogs-etl#354."
+            kill "$CURL_PID" 2>/dev/null || true
+            wait "$CURL_PID" 2>/dev/null || true
+            exit "$PY_RC"
+          fi
+
           # Wait for curl to finish writing curl.status. `wait` returns curl's
           # own exit code; we also read the status file in case curl was killed
           # by SIGPIPE (downstream reader closed early -- python crash) which

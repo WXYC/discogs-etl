@@ -44,8 +44,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from lib.dsn import redact_dsn  # noqa: E402
 from lib.observability import init_logger  # noqa: E402
 from lib.rebuild_lock import (  # noqa: E402
-    REBUILD_LOCK_BOWED_OUT_EXIT_CODE,
     REBUILD_LOCK_KEY,
+    exit_bowed_out,
     release_rebuild_lock,
     try_acquire_rebuild_lock,
 )
@@ -1222,6 +1222,13 @@ def main() -> None:
     # docs/architecture.md "Concurrent-Rebuild Guard" and CLAUDE.md's
     # advisory-lock registry (key 354001). This is defence in depth
     # alongside, not a replacement for, the #311 EC2-level guard.
+    #
+    # Scope caveat: the lock is keyed on --database-url. On the deprecated
+    # --target-db-url path the consumer-visible writes land in the *target*
+    # instead, so two runs with different sources and the same target would
+    # not exclude each other. That flag is on its way out and the monthly
+    # rebuild never uses it; if it outlives this guard, key the lock on the
+    # consumer DB instead.
     lock_conn = try_acquire_rebuild_lock(args.database_url)
     if lock_conn is None:
         logger.warning(
@@ -1229,7 +1236,10 @@ def main() -> None:
             "(key %d); bowing out without touching the cache. See discogs-etl#354.",
             REBUILD_LOCK_KEY,
         )
-        sys.exit(REBUILD_LOCK_BOWED_OUT_EXIT_CODE)
+        # NOT sys.exit -- see exit_bowed_out's docstring (#180): a swallowed
+        # SystemExit here would exit 0 and let rebuild-cache.sh report a
+        # bow-out as a completed rebuild.
+        exit_bowed_out()
 
     try:
         python = sys.executable

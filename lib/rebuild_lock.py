@@ -46,8 +46,13 @@ deadlocks) unrelated work across services with no error to debug from.
 from __future__ import annotations
 
 import logging
+import os
+import sys
+import time
+from typing import NoReturn
 
 import psycopg
+from psycopg.conninfo import conninfo_to_dict
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +81,113 @@ REBUILD_LOCK_KEY = 354001
 # pinned in sync by tests/unit/test_rebuild_cache_lock_bowout.py.
 REBUILD_LOCK_BOWED_OUT_EXIT_CODE = 75
 
+# Client-side TCP keepalives for the dedicated lock connection.
+#
+# This connection is the one thing in the whole pipeline that issues exactly
+# two statements hours apart: `pg_try_advisory_lock` at the start and
+# `pg_advisory_unlock` at the end. In between it sits perfectly idle for the
+# 60-90+ minutes the rebuild takes, and DATABASE_URL_DISCOGS reaches Railway
+# through their public TCP proxy (`*.proxy.rlwy.net`) -- precisely the shape
+# of connection an intermediary reaps for inactivity. Without keepalives
+# nothing on the wire distinguishes "holding the lock" from "dead".
+#
+# Measured against the live discogs-cache Postgres (17.10) on 2026-08-14:
+#
+#   idle_session_timeout                = 0     (server never reaps idle sessions)
+#   idle_in_transaction_session_timeout = 0     (n/a anyway -- autocommit)
+#   statement_timeout                   = 0
+#   tcp_keepalives_idle                 = 7200s (server probes only after 2h)
+#   tcp_keepalives_interval             = 75s
+#   tcp_keepalives_count                = 9
+#
+# So the *server* will not time the session out -- good -- but its own
+# keepalive floor is 2 hours, far longer than a rebuild. That leaves the
+# proxy hop unprotected in both directions:
+#
+#   - if the proxy drops the connection silently, the backend keeps holding
+#     the advisory lock until server-side keepalives notice, ~2h+ later,
+#     which can wedge a subsequent run;
+#   - if the proxy resets it, the backend dies at once and the lock releases
+#     *mid-rebuild*, silently disarming the guard exactly the way #352's IAM
+#     gap silently disarmed the EC2 one.
+#
+# 30s idle + 10s interval x 5 probes keeps the proxy's idle timer from ever
+# firing and detects a genuinely dead peer within ~80s, while still tolerating
+# a transient blip (it takes 50s of wholly unacknowledged probes to give up).
+#
+# ``connect_timeout`` is in the same dict for the same reason. Acquiring the
+# lock is now the pipeline's *first* contact with Postgres -- earlier than
+# ``run_pipeline.wait_for_postgres``, whose whole job is to absorb a
+# not-yet-accepting server. Without an explicit timeout a blackholed host
+# leaves main() parked in libpq's default TCP connect (~130s on Linux)
+# emitting nothing at all.
+#
+# Applied only for parameters the caller's DSN does not already set, so an
+# operator can still tune or disable them per-environment from the URL.
+REBUILD_LOCK_CONNECT_PARAMS = {
+    "connect_timeout": 15,
+    "keepalives": 1,
+    "keepalives_idle": 30,
+    "keepalives_interval": 10,
+    "keepalives_count": 5,
+}
+
+# Bounded retry around the *connection*, not the lock test itself. Moving
+# first contact to the top of main() traded away the tolerance
+# ``wait_for_postgres`` used to provide, and a monthly job that aborts on one
+# transient blip against Railway's public proxy costs a month of cache
+# staleness plus an EC2 instance-hour. A refusal is never retried -- that is a
+# definitive answer, and queuing behind a multi-hour rebuild is exactly what
+# `pg_try_advisory_lock` exists to avoid.
+REBUILD_LOCK_CONNECT_ATTEMPTS = 3
+REBUILD_LOCK_CONNECT_BACKOFF_SECONDS = 2.0
+
+
+def _connection_kwargs(database_url: str) -> dict[str, int]:
+    """Params from :data:`REBUILD_LOCK_CONNECT_PARAMS` not already pinned by
+    ``database_url`` itself.
+
+    A DSN-supplied value always wins, so an operator can override or switch
+    any of them off for an environment where they are unwanted. An unparseable
+    DSN yields the full default set rather than raising here -- the caller's
+    ``psycopg.connect`` is where that malformed URL should surface, with
+    psycopg's own error message, not as a confusing failure from this helper.
+    """
+    try:
+        supplied = conninfo_to_dict(database_url)
+    except Exception:
+        return dict(REBUILD_LOCK_CONNECT_PARAMS)
+    return {k: v for k, v in REBUILD_LOCK_CONNECT_PARAMS.items() if k not in supplied}
+
+
+def _connect_with_retry(database_url: str) -> psycopg.Connection:
+    """Open the dedicated lock connection, retrying transient failures.
+
+    Retries only ``psycopg.OperationalError`` (refused/reset/timed-out
+    connections). Authentication and DSN-syntax errors are not transient and
+    propagate on the first attempt. The final attempt's exception is raised
+    unchanged so the caller sees psycopg's own message.
+    """
+    kwargs = _connection_kwargs(database_url)
+    for attempt in range(1, REBUILD_LOCK_CONNECT_ATTEMPTS + 1):
+        try:
+            return psycopg.connect(database_url, autocommit=True, **kwargs)
+        except psycopg.OperationalError as exc:
+            if attempt == REBUILD_LOCK_CONNECT_ATTEMPTS:
+                raise
+            delay = REBUILD_LOCK_CONNECT_BACKOFF_SECONDS * attempt
+            # Never log the DSN itself -- it carries the cache credentials and
+            # this warning rides the wxyc_etl/Sentry logging pipeline (#361).
+            logger.warning(
+                "Could not open the rebuild-lock connection (attempt %d/%d): %s; retrying in %.1fs",
+                attempt,
+                REBUILD_LOCK_CONNECT_ATTEMPTS,
+                exc,
+                delay,
+            )
+            time.sleep(delay)
+    raise AssertionError("unreachable")  # pragma: no cover
+
 
 def try_acquire_rebuild_lock(database_url: str) -> psycopg.Connection | None:
     """Attempt to acquire the discogs-cache rebuild's advisory lock.
@@ -87,7 +199,10 @@ def try_acquire_rebuild_lock(database_url: str) -> psycopg.Connection | None:
     as long as this connection stays open, so the caller must keep the
     returned connection alive for the pipeline's entire run and must not
     reuse it for pipeline queries (closing or losing track of it releases
-    the lock early).
+    the lock early). Because it then sits idle for the rebuild's whole
+    multi-hour run, client-side TCP keepalives are applied on top of the
+    caller's DSN -- see :data:`REBUILD_LOCK_CONNECT_PARAMS` for the
+    measured server settings that make them necessary.
 
     Non-blocking by design: ``pg_try_advisory_lock`` returns immediately
     regardless of contention. A second rebuild instance must bow out at once
@@ -105,7 +220,7 @@ def try_acquire_rebuild_lock(database_url: str) -> psycopg.Connection | None:
     doing so would let a broken connection string report itself as a
     peaceful, retry-later bow-out instead of the infra failure it is.
     """
-    conn = psycopg.connect(database_url, autocommit=True)
+    conn = _connect_with_retry(database_url)
     try:
         with conn.cursor() as cur:
             cur.execute("SELECT pg_try_advisory_lock(%s)", (REBUILD_LOCK_KEY,))
@@ -117,6 +232,38 @@ def try_acquire_rebuild_lock(database_url: str) -> psycopg.Connection | None:
         conn.close()
         return None
     return conn
+
+
+def exit_bowed_out() -> NoReturn:
+    """Terminate this process with :data:`REBUILD_LOCK_BOWED_OUT_EXIT_CODE`,
+    bypassing exception unwinding entirely.
+
+    ``os._exit`` rather than ``sys.exit`` is deliberate, and the reason is
+    recorded in this repo's own history: ``scripts/run_pipeline.py``'s
+    ``run_step`` carries the comment *"Raise rather than sys.exit so any
+    logger plugin that captures SystemExit (Sentry-enabled run #3 swallowed
+    it; #180) cannot mask the failure."* Here the consequence of a swallowed
+    ``SystemExit`` is worse than a masked failure: ``main()`` would return
+    normally, the process would exit 0, and ``scripts/rebuild-cache.sh`` would
+    fall through to the drift watchdog and post ":white_check_mark: rebuilt
+    successfully" for a run that never touched the cache -- the exact
+    false-positive-success class incident #352 exists to eliminate.
+
+    ``run_step``'s "raise instead" remedy is unavailable to us, because a
+    bow-out has to surface a *specific* exit code rather than just any
+    non-zero one, so this bypasses the interpreter's unwinding instead.
+    Logging handlers are flushed first, since ``os._exit`` skips the
+    ``atexit`` machinery that would normally do it. Nothing else needs to run
+    on this path: the lock was never acquired, no subprocess was ever
+    spawned, and no temporary directory exists yet.
+    """
+    logging.shutdown()
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.flush()
+        except Exception:  # pragma: no cover - a closed stream is not fatal here
+            pass
+    os._exit(REBUILD_LOCK_BOWED_OUT_EXIT_CODE)
 
 
 def release_rebuild_lock(conn: psycopg.Connection) -> None:

@@ -369,4 +369,11 @@ fi
 log "exec rebuild-cache.sh"
 "$REPO_DIR/scripts/rebuild-cache.sh"
 
-log "rebuild-cache.sh exited 0; trap EXIT will upload + shutdown"
+# Since discogs-etl#354 a 0 here has two meanings: the cache was rebuilt, OR
+# run_pipeline.py bowed out because a peer already held the destination DB's
+# advisory lock and rebuild-cache.sh reported that bow-out (:no_entry:) and
+# exited 0 deliberately — a bow-out is not a failure. rebuild-cache.sh posts
+# the distinguishing Slack message itself, so don't read this line as "the
+# cache was rebuilt." #267 is the standing reminder of what it costs to treat
+# a bare exit 0 from this call as a success signal.
+log "rebuild-cache.sh returned 0 (rebuilt, or bowed out on the advisory lock — see its Slack message); trap EXIT will upload + shutdown"

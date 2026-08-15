@@ -2531,3 +2531,121 @@ class TestWaitForPostgresRedaction:
         assert "svc" not in logged
         # Still useful for operators: the target host survives redaction.
         assert "cache-host:5433/discogs" in logged
+# ---------------------------------------------------------------------------
+# main() — advisory-lock guard behaviour (discogs-etl#354, incident #352)
+# ---------------------------------------------------------------------------
+
+
+class TestAdvisoryLockGuardBehaviour:
+    """Behavioural companion to tests/unit/test_run_pipeline_lock_ordering.py.
+
+    That file pins the *textual* order of the guard's call sites inside
+    ``main()``. These tests pin what that ordering is actually for, by running
+    ``main()``: a lock-loser must fork nothing at all, and a lock-winner must
+    hand the connection back on every exit path. A regression that moved the
+    acquisition below a fork -- or introduced a brand-new fork above it, which
+    the static ordering test cannot see -- fails here.
+    """
+
+    @staticmethod
+    def _xml_args(tmp_path):
+        xml_file = tmp_path / "releases.xml.gz"
+        xml_file.touch()
+        return run_pipeline.parse_args(["--xml", str(xml_file)])
+
+    def test_lock_loser_exits_75_without_forking_anything(self, tmp_path) -> None:
+        """The whole correctness argument for the guard: advisory locks are
+        cooperative, so a lock-loser is only harmless if it bows out before it
+        has spawned a single child. ``run_step`` is this module's sole
+        ``subprocess.Popen`` call site, so an untouched ``subprocess`` proves
+        no child ever ran."""
+        args = self._xml_args(tmp_path)
+
+        class _Bowed(Exception):
+            """Stands in for exit_bowed_out()'s os._exit, which would take the
+            test runner down with it. The real exit code is asserted
+            end-to-end against a live subprocess in
+            tests/integration/test_rebuild_lock.py."""
+
+        with (
+            patch.object(run_pipeline, "parse_args", return_value=args),
+            patch.object(run_pipeline, "try_acquire_rebuild_lock", return_value=None) as acquire,
+            patch.object(run_pipeline, "exit_bowed_out", side_effect=_Bowed) as bow_out,
+            patch.object(run_pipeline, "release_rebuild_lock") as release,
+            patch.object(run_pipeline, "subprocess") as mock_subprocess,
+            patch.object(run_pipeline, "convert_and_filter") as convert,
+            patch.object(run_pipeline, "generate_library_db") as generate,
+            pytest.raises(_Bowed),
+        ):
+            run_pipeline.main()
+
+        bow_out.assert_called_once_with()
+        acquire.assert_called_once_with(args.database_url)
+        mock_subprocess.Popen.assert_not_called()
+        convert.assert_not_called()
+        generate.assert_not_called()
+        release.assert_not_called()
+
+    def test_lock_is_acquired_before_pipeline_work_and_released_after(self, tmp_path) -> None:
+        args = self._xml_args(tmp_path)
+        order: list[str] = []
+        fake_conn = MagicMock(name="lock_conn")
+
+        with (
+            patch.object(run_pipeline, "parse_args", return_value=args),
+            patch.object(
+                run_pipeline,
+                "try_acquire_rebuild_lock",
+                side_effect=lambda _url: (order.append("acquire"), fake_conn)[1],
+            ),
+            patch.object(
+                run_pipeline,
+                "_run_xml_pipeline",
+                side_effect=lambda *a, **k: order.append("pipeline"),
+            ),
+            patch.object(
+                run_pipeline,
+                "release_rebuild_lock",
+                side_effect=lambda _conn: order.append("release"),
+            ),
+        ):
+            run_pipeline.main()
+
+        assert order == ["acquire", "pipeline", "release"]
+
+    def test_lock_is_released_even_when_the_pipeline_raises(self, tmp_path) -> None:
+        """The release lives in a ``finally``. A crash mid-rebuild must still
+        free the key rather than leaving it held until the backend's own
+        keepalives notice."""
+        args = self._xml_args(tmp_path)
+        fake_conn = MagicMock(name="lock_conn")
+
+        with (
+            patch.object(run_pipeline, "parse_args", return_value=args),
+            patch.object(run_pipeline, "try_acquire_rebuild_lock", return_value=fake_conn),
+            patch.object(
+                run_pipeline, "_run_xml_pipeline", side_effect=RuntimeError("pipeline exploded")
+            ),
+            patch.object(run_pipeline, "release_rebuild_lock") as release,
+            pytest.raises(RuntimeError, match="pipeline exploded"),
+        ):
+            run_pipeline.main()
+
+        release.assert_called_once_with(fake_conn)
+
+    def test_lock_is_released_when_path_validation_exits(self, tmp_path) -> None:
+        """sys.exit(1) inside the guarded block raises SystemExit, which the
+        ``finally`` must still unwind through."""
+        args = run_pipeline.parse_args(["--xml", str(tmp_path / "missing.xml.gz")])
+        fake_conn = MagicMock(name="lock_conn")
+
+        with (
+            patch.object(run_pipeline, "parse_args", return_value=args),
+            patch.object(run_pipeline, "try_acquire_rebuild_lock", return_value=fake_conn),
+            patch.object(run_pipeline, "release_rebuild_lock") as release,
+            pytest.raises(SystemExit) as excinfo,
+        ):
+            run_pipeline.main()
+
+        assert excinfo.value.code == 1
+        release.assert_called_once_with(fake_conn)
