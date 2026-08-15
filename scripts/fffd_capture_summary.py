@@ -87,10 +87,10 @@ _REASON_GLOSS: dict[str, str] = {
         "report"
     ),
     "zero_candidates": (
-        "no MySQL row on that release agrees at every non-U+FFFD position. Either the row "
-        "changed in tubafrenzy after the corruption, or the character count was not "
-        "preserved -- a truncated multi-byte sequence decodes to a single U+FFFD rather "
-        "than one per byte"
+        "no MySQL row on that release reproduces the corrupt value -- under the "
+        "length-preserving substitution rule or the forward-simulated double-encoding one "
+        "(discogs-etl#386). Either the row changed in tubafrenzy after the corruption, or "
+        "its true value is not in this MySQL snapshot at all"
     ),
 }
 
