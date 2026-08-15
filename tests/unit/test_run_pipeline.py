@@ -23,6 +23,32 @@ _spec.loader.exec_module(run_pipeline)
 run_sql_statements_parallel = run_pipeline.run_sql_statements_parallel
 
 
+@pytest.fixture(autouse=True)
+def _stub_rebuild_lock():
+    """Stub out discogs-etl#354's advisory-lock guard for every test in this
+    file.
+
+    ``main()`` now acquires a real PG advisory lock before doing anything
+    else -- including before any of the file's mocked-out subprocess/DB
+    calls run. These are unit tests, meant to run with no Postgres
+    available at all (see docs/testing.md's marker tiers), so leaving the
+    guard live here would make tests that never intended to touch a
+    database implicitly depend on one being reachable. The guard's own
+    acquire/refuse/release behavior is covered elsewhere:
+    tests/integration/test_rebuild_lock.py (pg-marked, live PG) and
+    tests/unit/test_run_pipeline_lock_ordering.py (static ordering pin).
+    Matches this file's existing pattern of mocking away other DB-touching
+    helpers (wait_for_postgres, run_sql_file, ...) that aren't the subject
+    under test.
+    """
+    fake_conn = MagicMock(name="rebuild_lock_connection")
+    with (
+        patch.object(run_pipeline, "try_acquire_rebuild_lock", return_value=fake_conn),
+        patch.object(run_pipeline, "release_rebuild_lock"),
+    ):
+        yield fake_conn
+
+
 class TestRunStepStreaming:
     """run_step() streams subprocess output line-by-line."""
 

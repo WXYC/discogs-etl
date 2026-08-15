@@ -43,6 +43,12 @@ from wxyc_etl.state import PipelineState
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from lib.dsn import redact_dsn  # noqa: E402
 from lib.observability import init_logger  # noqa: E402
+from lib.rebuild_lock import (  # noqa: E402
+    REBUILD_LOCK_BOWED_OUT_EXIT_CODE,
+    REBUILD_LOCK_KEY,
+    release_rebuild_lock,
+    try_acquire_rebuild_lock,
+)
 
 STEP_NAMES = [
     "create_schema",
@@ -1202,61 +1208,95 @@ def main() -> None:
 
     init_logger(repo="discogs-etl", tool="discogs-etl run_pipeline")
 
-    python = sys.executable
-    db_url = args.database_url
-    pipeline_start = time.monotonic()
-
-    # Generate library.db if requested
-    if args.generate_library_db:
-        generated_db = Path(tempfile.mkdtemp(prefix="discogs_library_")) / "library.db"
-        generate_library_db(generated_db, args.catalog_source, args.catalog_db_url)
-        args.library_db = generated_db
-
-    # Validate paths
-    if args.xml is not None:
-        if not args.xml.exists():
-            logger.error("XML path not found: %s", args.xml)
-            sys.exit(1)
-        if args.library_artists and not args.library_artists.exists():
-            logger.error("library_artists.txt not found: %s", args.library_artists)
-            sys.exit(1)
-    else:
-        if not args.csv_dir.exists():
-            logger.error("CSV directory not found: %s", args.csv_dir)
-            sys.exit(1)
-
-    if args.library_db and not args.library_db.exists():
-        logger.error("library.db not found: %s", args.library_db)
-        sys.exit(1)
-
-    if args.library_labels and not args.library_labels.exists():
-        logger.error("library_labels.csv not found: %s", args.library_labels)
-        sys.exit(1)
-
-    # Steps 1-3: XML conversion + filtering (only in --xml mode)
-    if args.xml is not None:
-        _run_xml_pipeline(args, python, db_url)
-    else:
-        # Database build only (--csv-dir mode)
-        state = _load_or_create_state(args)
-        _run_database_build(
-            db_url,
-            args.csv_dir,
-            args.library_db,
-            python,
-            target_db_url=args.target_db_url,
-            library_labels=args.library_labels,
-            label_hierarchy=args.label_hierarchy,
-            catalog_source=args.catalog_source,
-            catalog_db_url=args.catalog_db_url,
-            state=state,
-            state_file=args.state_file,
-            truncate_existing=args.truncate_existing,
-            fresh_rebuild=args.fresh_rebuild,
+    # Concurrent-rebuild guard (discogs-etl#354, incident #352): a session-
+    # level PG advisory lock on the destination cache DB. This MUST be the
+    # first thing main() does after logger setup -- earlier than argument
+    # path-validation, earlier than --generate-library-db's
+    # wxyc-export-to-sqlite fork, earlier than every subprocess this module
+    # spawns. run_step() forks dedup_releases.py / import_csv.py /
+    # derive_va_release.py etc. via subprocess.Popen, each opening its own
+    # fresh connection -- advisory locks are cooperative, so a session lock
+    # held by this process blocks none of those children's SQL. It only
+    # functions as a mutex if the check happens exactly once, at the
+    # earliest possible point, before the first fork. See
+    # docs/architecture.md "Concurrent-Rebuild Guard" and CLAUDE.md's
+    # advisory-lock registry (key 354001). This is defence in depth
+    # alongside, not a replacement for, the #311 EC2-level guard.
+    lock_conn = try_acquire_rebuild_lock(args.database_url)
+    if lock_conn is None:
+        logger.warning(
+            "Another rebuild already holds the discogs-cache advisory lock "
+            "(key %d); bowing out without touching the cache. See discogs-etl#354.",
+            REBUILD_LOCK_KEY,
         )
+        sys.exit(REBUILD_LOCK_BOWED_OUT_EXIT_CODE)
 
-    total = time.monotonic() - pipeline_start
-    logger.info("Pipeline complete in %.1f minutes.", total / 60)
+    try:
+        python = sys.executable
+        db_url = args.database_url
+        pipeline_start = time.monotonic()
+
+        # Generate library.db if requested
+        if args.generate_library_db:
+            generated_db = Path(tempfile.mkdtemp(prefix="discogs_library_")) / "library.db"
+            generate_library_db(generated_db, args.catalog_source, args.catalog_db_url)
+            args.library_db = generated_db
+
+        # Validate paths
+        if args.xml is not None:
+            if not args.xml.exists():
+                logger.error("XML path not found: %s", args.xml)
+                sys.exit(1)
+            if args.library_artists and not args.library_artists.exists():
+                logger.error("library_artists.txt not found: %s", args.library_artists)
+                sys.exit(1)
+        else:
+            if not args.csv_dir.exists():
+                logger.error("CSV directory not found: %s", args.csv_dir)
+                sys.exit(1)
+
+        if args.library_db and not args.library_db.exists():
+            logger.error("library.db not found: %s", args.library_db)
+            sys.exit(1)
+
+        if args.library_labels and not args.library_labels.exists():
+            logger.error("library_labels.csv not found: %s", args.library_labels)
+            sys.exit(1)
+
+        # Steps 1-3: XML conversion + filtering (only in --xml mode)
+        if args.xml is not None:
+            _run_xml_pipeline(args, python, db_url)
+        else:
+            # Database build only (--csv-dir mode)
+            state = _load_or_create_state(args)
+            _run_database_build(
+                db_url,
+                args.csv_dir,
+                args.library_db,
+                python,
+                target_db_url=args.target_db_url,
+                library_labels=args.library_labels,
+                label_hierarchy=args.label_hierarchy,
+                catalog_source=args.catalog_source,
+                catalog_db_url=args.catalog_db_url,
+                state=state,
+                state_file=args.state_file,
+                truncate_existing=args.truncate_existing,
+                fresh_rebuild=args.fresh_rebuild,
+            )
+
+        total = time.monotonic() - pipeline_start
+        logger.info("Pipeline complete in %.1f minutes.", total / 60)
+    finally:
+        # Explicit release on every path through the try block above
+        # (success, sys.exit(1) validation failures, or an uncaught
+        # exception -- finally runs before SystemExit/the exception
+        # propagates). An unclean process death (SIGKILL, instance
+        # termination) skips this, which is fine by design: PostgreSQL
+        # releases a session-level advisory lock as soon as it detects the
+        # holding backend's connection has dropped, so a crashed run can
+        # never wedge the next monthly tick.
+        release_rebuild_lock(lock_conn)
 
 
 def _run_database_build_post_import(
