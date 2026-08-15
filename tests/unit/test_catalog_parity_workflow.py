@@ -383,6 +383,16 @@ class TestFffdCaptureDispatch:
         it. It already is; this pins that the ordering stays safe."""
         assert _step(job, "parity verdict").get("if") == "always()"
 
+    def test_a_gated_off_capture_is_not_reported_as_a_failure(self, job) -> None:
+        """When the harness exits 2/3 the capture step is skipped and
+        ``CAPTURE_EXIT_CODE`` is never set. Defaulting that to an exit code
+        would render the producer-failure block -- naming causes that did not
+        occur and pointing at a stdout payload that was never written. The
+        parity verdict step already fails the job for the real cause."""
+        run = _step(job, "Report U+FFFD")["run"]
+        assert "--not-run" in run, "a skipped capture needs its own state, not a default code"
+        assert "CAPTURE_EXIT_CODE:-3" not in run
+
     def test_capture_summary_script_exists(self) -> None:
         assert (REPO_ROOT / "scripts" / "fffd_capture_summary.py").exists()
 

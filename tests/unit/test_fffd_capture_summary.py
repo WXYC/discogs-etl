@@ -90,10 +90,11 @@ def _write(tmp_path: Path, payload) -> str:
 
 
 class TestExitTaxonomy:
-    def test_exit_zero_reads_as_a_complete_capture(self, tmp_path) -> None:
+    def test_exit_zero_reads_as_a_complete_capture(self) -> None:
         out = fcs.render(0, _payload(resolved=14), None)
         assert "complete" in out.lower()
-        assert "unresolved" not in out.split("| Metric |")[0].lower() or "0" in out
+        assert "| resolved | 14 |" in out
+        assert "| unresolved | 0 |" in out
 
     def test_exit_four_is_an_incomplete_capture_not_drift(self) -> None:
         """The distinction this renderer exists for. Someone reading both
@@ -125,6 +126,66 @@ class TestExitTaxonomy:
         out = fcs.render(code, None, "no report path was given")
         assert out.startswith("## ")
         assert len(out.strip().splitlines()) >= 3
+
+
+class TestCaptureNeverRan:
+    """A capture that was gated off is not a capture that failed.
+
+    The step is skipped when the parity harness exits 2 or 3, which leaves
+    ``CAPTURE_EXIT_CODE`` unset. Defaulting that to 3 would render the
+    producer-failure block -- naming causes that did not occur (a Backend
+    sign-in, a destination path) and telling the reader to recover the capture
+    from stdout, where nothing was ever written. That is the same conflation
+    this renderer exists to prevent, one level down.
+    """
+
+    def test_not_run_is_its_own_outcome(self) -> None:
+        out = fcs.render(fcs.NOT_RUN, None, "no report path was given")
+        assert "not run" in out.lower() or "did not run" in out.lower()
+
+    def test_not_run_does_not_send_the_reader_hunting_stdout(self) -> None:
+        out = fcs.render(fcs.NOT_RUN, None, "no report path was given")
+        assert "stdout" not in out.lower()
+
+    def test_not_run_says_why_it_was_skipped(self) -> None:
+        """The reason is always the same one, and it is already on screen in
+        the parity block: the harness did not complete, so there was no
+        library.db to pair against."""
+        out = fcs.render(fcs.NOT_RUN, None, "no report path was given").lower()
+        assert "parity" in out
+
+    def test_not_run_does_not_complain_about_a_report_it_never_expected(self) -> None:
+        """The other no-payload outcomes explain *why* the report is missing,
+        because for them it should have been there. Here nothing was ever
+        going to write one, so the line is noise on top of a lead that
+        already says so."""
+        out = fcs.render(fcs.NOT_RUN, None, "no report path was given")
+        assert "No report to summarise" not in out
+
+    def test_not_run_does_not_claim_an_artifact_that_does_not_exist(self) -> None:
+        out = fcs.render(fcs.NOT_RUN, None, "no report path was given")
+        assert "attached to this run as an artifact" not in out
+
+    def test_not_run_is_a_notice_not_an_error(self) -> None:
+        """The parity verdict step already fails the job for the exit 2/3
+        that caused this. A second error annotation for one cause reads as
+        two independent failures."""
+        assert fcs.annotation(fcs.NOT_RUN, None).startswith("::notice")
+
+    def test_not_run_sentinel_cannot_collide_with_a_real_exit_status(self) -> None:
+        assert fcs.NOT_RUN not in range(256)
+
+    def test_cli_not_run_flag_exits_zero(self, capsys) -> None:
+        assert fcs.main(["--not-run"]) == 0
+        assert capsys.readouterr().out.startswith("## ")
+
+    def test_cli_rejects_both_flags_at_once(self) -> None:
+        with pytest.raises(SystemExit):
+            fcs.main(["--not-run", "--exit-code", "4"])
+
+    def test_cli_requires_one_of_them(self) -> None:
+        with pytest.raises(SystemExit):
+            fcs.main([])
 
 
 class TestCounts:

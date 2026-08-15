@@ -45,11 +45,20 @@ Usage::
 from __future__ import annotations
 
 import argparse
-import json
 import sys
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from typing import Any
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from lib.run_summary import load_payload as _load_payload  # noqa: E402
+from lib.run_summary import plain as _plain  # noqa: E402
+
+# The untrusted-report reader, shared with fffd_capture_summary.py so a
+# hardening fix reaches both (#384). Bound here with this tool's noun.
+load_payload = partial(_load_payload, noun="parity report")
 
 CLEAN = 0
 BAD_ARGS = 2
@@ -174,31 +183,6 @@ def _outcome(exit_code: int) -> _Outcome:
         ),
         verdict_computed=False,
     )
-
-
-def load_payload(path: str | None) -> tuple[dict[str, Any] | None, str | None]:
-    """Read the harness's ``--json`` object.
-
-    Returns ``(payload, problem)`` -- exactly one of which is None. Every
-    failure mode collapses into a human-readable ``problem`` string rather
-    than an exception, because this runs in the step that explains other
-    failures.
-    """
-    if not path:
-        return None, "no report path was given"
-    file = Path(path)
-    if not file.exists():
-        return None, f"`{file.name}` was never written"
-    raw = file.read_text().strip()
-    if not raw:
-        return None, f"`{file.name}` is empty -- the harness produced no verdict"
-    try:
-        parsed = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        return None, f"`{file.name}` could not be parsed as JSON ({exc})"
-    if not isinstance(parsed, dict):
-        return None, f"`{file.name}` is {type(parsed).__name__}, not a parity report object"
-    return parsed, None
 
 
 def verdict_causes(payload: dict[str, Any] | None) -> list[str]:
@@ -358,14 +342,6 @@ def annotation(exit_code: int, payload: dict[str, Any] | None) -> str:
         detail = "; ".join(_plain(c) for c in causes) if causes else "see the run summary"
         body = f"{body} {detail}."
     return f"::{kind} title={outcome.annotation_title}::{body}"
-
-
-def _plain(markdown: str) -> str:
-    """Strip the Markdown emphasis a cause carries for the step summary.
-
-    Annotations render as plain text, where backticks and asterisks are noise.
-    """
-    return markdown.replace("`", "").replace("**", "")
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
