@@ -325,23 +325,45 @@ def parse_library_tsv(tsv_path: str) -> Iterable[Sequence[object]]:
     *comparable* -- both holding true bytes -- so do not read it as
     load-bearing for this parser.
 
-    **Carriage return is outside the escape vocabulary, and this parser does
-    not handle it.** ``mysql``'s ``safe_put_field`` escapes exactly NUL, TAB,
-    NL and backslash, never CR, while this ``open()`` runs in universal-
-    newline mode -- so a raw CR in source data is read as a line terminator.
-    Mid-row it splits the line and both fragments fail the field-count check
-    (dropped, with a WARNING); in the **final** column the first fragment
-    still has the right field count and is accepted with the value silently
-    truncated at the CR. Unlike the four escapes above this class leaves no
-    trace in the built artifact -- a ``char(13)`` probe against ``library.db``
-    cannot see a row that was dropped or truncated on the way in -- so it has
-    to be measured against MySQL (``INSTR(TITLE, CHAR(13))``). Deliberately
-    left unfixed here: correcting it changes which rows are ingested, which
-    needs that measurement first. See WXYC/discogs-etl#370.
+    **Carriage return is outside the escape vocabulary, so this parser reads
+    with** ``newline="\n"`` **to keep a bare CR from acting as a line
+    terminator.** ``mysql``'s ``safe_put_field`` escapes exactly NUL, TAB, NL
+    and backslash, never CR. Left in Python's default universal-newline
+    mode, ``open()`` would treat a raw CR in source data as a line
+    terminator: mid-row it would split the line and both fragments would
+    fail the field-count check (dropped, with a WARNING); in the **final**
+    column the first fragment would still have the right field count and be
+    accepted with the value silently truncated at the CR -- no error, and a
+    served title or artist name quietly missing its tail. ``newline=""``
+    does *not* fix this: it only suppresses newline *translation*, and
+    universal-newline splitting stays on, so a bare CR still terminates a
+    line. Only ``newline="\n"`` disables that splitting, so a bare CR
+    survives as data within whichever field contains it. See
+    WXYC/discogs-etl#373.
+
+    Measured against tubafrenzy MySQL 2026-08-14, byte-exact via
+    ``LOCATE(CHAR(13), BINARY col)`` (not ``INSTR(col, CHAR(13))``, which
+    compares collation weights rather than bytes on this server and
+    spuriously matches non-ASCII/mojibake content -- see WXYC/discogs-etl#373
+    for the false-positive counts that trap produced): every free-text column
+    behind *both* parsers returns zero CR-bearing rows -- the seven in
+    ``LIBRARY_SELECT_SQL`` and, for ``parse_compilation_track_tsv``,
+    ``COMPILATION_TRACK_ARTIST.ARTIST_NAME`` and ``TRACK_TITLE``. The class is
+    real and reachable but currently latent -- this fix changes no row's
+    ingestion outcome today, for either parser. See WXYC/discogs-etl#370.
+
+    The flip side of ``newline="\n"`` is that it requires an **LF-terminated**
+    file, which is what the Linux ``mysql -B -N`` producer emits. Fed a
+    CRLF-terminated TSV, both parsers would now leave a trailing CR on each
+    row's final column rather than absorbing it, and would do so silently.
+    That is unreachable from this repo's producers, and it is not fixable in
+    the parser regardless: a CRLF terminator and a data CR at the end of the
+    last field are the same two bytes, and resolving that ambiguity in favour
+    of data is the whole point of this change.
 
     A generator, so warnings interleave with the inserts they describe.
     """
-    with open(tsv_path, encoding="utf-8") as f:
+    with open(tsv_path, encoding="utf-8", newline="\n") as f:
         for line in f:
             fields = line.rstrip("\n").split("\t")
             if len(fields) != len(LIBRARY_INSERT_COLUMNS):
@@ -371,9 +393,10 @@ def parse_compilation_track_tsv(tsv_path: str) -> Iterable[Sequence[object]]:
     sees it. Every surviving field is then unescaped back to the real
     bytes, same as ``parse_library_tsv`` -- this parser is **not** safe to
     reuse unchanged; see that function's docstring for the ``--raw``
-    fragility both parsers share.
+    fragility and the bare-CR handling (``newline="\n"``, WXYC/discogs-etl#373)
+    that both parsers share.
     """
-    with open(tsv_path, encoding="utf-8") as f:
+    with open(tsv_path, encoding="utf-8", newline="\n") as f:
         for line in f:
             fields = line.rstrip("\n").split("\t")
             if len(fields) != 3:

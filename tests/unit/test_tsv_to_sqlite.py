@@ -764,6 +764,109 @@ class TestTsvToSqlite:
         assert title == "\\N"
         assert title is not None
 
+    def test_cr_in_final_column_survives_intact(self, tmp_path: Path) -> None:
+        r"""A bare CR in the final column (cross_reference_names) must survive
+        intact rather than being read as a line terminator and silently
+        truncating the value (WXYC/discogs-etl#373).
+
+        Red before the ``newline="\n"`` fix: the default universal-newline
+        ``open()`` treats the bare CR as a line terminator, so the first
+        fragment still carries all 11 fields and is accepted with the value
+        truncated at ``Cross``, while the orphaned tail (``Ref``) is dropped
+        as malformed. The dropped tail does emit a WARNING, but it identifies
+        neither the truncated row nor the truncation -- the corrupted value
+        lands with no diagnostic attached to it, which is what makes this the
+        dangerous half of the defect.
+        """
+        tsv = (
+            "1\tAluminum Tunes\tStereolab\tST\t100\t1\tRock\tCD\t\\N\t\\N\tCross\rRef\n"
+            "2\tDOGA\tJuana Molina\tMO\t200\t2\tRock\tCD\t\\N\t\\N\t\\N\n"
+        )
+        tsv_file = tmp_path / "input.tsv"
+        tsv_file.write_text(tsv, encoding="utf-8")
+        db_path = tmp_path / "library.db"
+
+        tsv_to_sqlite(str(tsv_file), str(db_path))
+
+        conn = sqlite3.connect(str(db_path))
+        rows = conn.execute("SELECT id, cross_reference_names FROM library ORDER BY id").fetchall()
+        conn.close()
+
+        # Both rows land intact -- the CR-bearing final column is not
+        # truncated, and the row following the bare CR is not mistaken for a
+        # continuation of the first.
+        assert rows == [(1, "Cross\rRef"), (2, None)]
+
+    def test_cr_mid_row_no_longer_splits_row(self, tmp_path: Path) -> None:
+        r"""A bare CR in a non-final column no longer terminates the line.
+
+        Pre-fix this was the loud, already-handled case: both fragments fail
+        the field-count check and the row is dropped with a WARNING. Post-fix
+        the row is accepted whole, with the CR preserved inside the field
+        (WXYC/discogs-etl#373) -- this is the intended behavior change noted
+        in the ticket, not a regression.
+        """
+        tsv = "1\tAluminum Tunes\tStereo\rlab\tST\t100\t1\tRock\tCD\t\\N\t\\N\t\\N\n"
+        tsv_file = tmp_path / "input.tsv"
+        tsv_file.write_text(tsv, encoding="utf-8")
+        db_path = tmp_path / "library.db"
+
+        tsv_to_sqlite(str(tsv_file), str(db_path))
+
+        conn = sqlite3.connect(str(db_path))
+        row = conn.execute("SELECT id, artist FROM library WHERE id = 1").fetchone()
+        conn.close()
+
+        assert row == (1, "Stereo\rlab")
+
+    def test_crlf_in_field_value_round_trips(self, tmp_path: Path) -> None:
+        r"""A Windows-entered line break survives as a real CRLF *inside* the
+        field, pinning the interaction between the ``newline="\n"`` fix and
+        ``_unescape_mysql_field`` (WXYC/discogs-etl#373).
+
+        This is the likeliest real origin of a CR in this data, and on the
+        wire it is a two-part shape: ``mysql -B -N`` escapes the LF to the two
+        characters backslash-``n`` but leaves the CR as a bare byte, so the
+        field arrives as ``Cross`` + CR + ``\n`` + ``Ref``. Both halves have
+        to be handled by different mechanisms for the value to reassemble --
+        ``newline="\n"`` keeps the bare CR from ending the line, and the
+        unescape turns the two-char sequence back into a real LF. Covered
+        once here rather than twice: the unescape half lives in
+        ``_parse_nullable_field``, which both parsers share.
+        """
+        tsv = "1\tAluminum Tunes\tStereolab\tST\t100\t1\tRock\tCD\t\\N\t\\N\tCross\r\\nRef\n"
+        tsv_file = tmp_path / "input.tsv"
+        tsv_file.write_text(tsv, encoding="utf-8")
+        db_path = tmp_path / "library.db"
+
+        tsv_to_sqlite(str(tsv_file), str(db_path))
+
+        conn = sqlite3.connect(str(db_path))
+        value = conn.execute("SELECT cross_reference_names FROM library WHERE id = 1").fetchone()[0]
+        conn.close()
+
+        # A real CRLF pair, not the escaped spelling and not a truncation.
+        assert value == "Cross\r\nRef"
+
+    def test_multiple_rows_still_parse_after_newline_fix(self, tmp_path: Path) -> None:
+        r"""A normal, CR-free multi-row TSV parses unchanged under
+        ``newline="\n"`` -- regression guard for WXYC/discogs-etl#373."""
+        tsv = (
+            "1\tAluminum Tunes\tStereolab\tST\t100\t1\tRock\tCD\t\\N\t\\N\t\\N\n"
+            "2\tDOGA\tJuana Molina\tMO\t200\t2\tRock\tCD\t\\N\t\\N\t\\N\n"
+        )
+        tsv_file = tmp_path / "input.tsv"
+        tsv_file.write_text(tsv, encoding="utf-8")
+        db_path = tmp_path / "library.db"
+
+        tsv_to_sqlite(str(tsv_file), str(db_path))
+
+        conn = sqlite3.connect(str(db_path))
+        rows = conn.execute("SELECT id, title, artist FROM library ORDER BY id").fetchall()
+        conn.close()
+
+        assert rows == [(1, "Aluminum Tunes", "Stereolab"), (2, "DOGA", "Juana Molina")]
+
 
 class TestCtaEscaping:
     """Escaping tests for parse_compilation_track_tsv (WXYC/discogs-etl#370).
@@ -934,3 +1037,83 @@ class TestCtaEscaping:
         conn.close()
 
         assert track_title is None
+
+    def test_cta_cr_in_final_column_survives_intact(self, tmp_path: Path) -> None:
+        r"""A bare CR in the final column (track_title) must survive intact
+        rather than being read as a line terminator and silently truncating
+        the value (WXYC/discogs-etl#373).
+
+        Red before the ``newline="\n"`` fix: the default universal-newline
+        ``open()`` treats the bare CR as a line terminator, so the first
+        fragment is accepted with ``track_title`` truncated at ``Track`` and
+        the trailing fragment (``Title``) is dropped as malformed.
+        """
+        library_tsv = self._library_tsv(tmp_path)
+        cta_tsv = self._cta_tsv(
+            tmp_path,
+            [
+                ["1", "Stereolab", "Track\rTitle"],
+                ["1", "Juana Molina", "Other Track"],
+            ],
+        )
+        db_path = tmp_path / "library.db"
+
+        tsv_to_sqlite(str(library_tsv), str(db_path), str(cta_tsv))
+
+        conn = sqlite3.connect(str(db_path))
+        rows = conn.execute(
+            "SELECT artist_name, track_title FROM compilation_track_artist ORDER BY rowid"
+        ).fetchall()
+        conn.close()
+
+        # Both rows land intact -- the CR-bearing final column is not
+        # truncated, and the row following the bare CR is not mistaken for a
+        # continuation of the first.
+        assert rows == [("Stereolab", "Track\rTitle"), ("Juana Molina", "Other Track")]
+
+    def test_cta_cr_mid_row_no_longer_splits_row(self, tmp_path: Path) -> None:
+        r"""A bare CR in a non-final column (artist_name) no longer
+        terminates the line.
+
+        Pre-fix this was the loud, already-handled case: both fragments fail
+        the field-count check and the row is dropped with a WARNING. Post-fix
+        the row is accepted whole, with the CR preserved inside the field
+        (WXYC/discogs-etl#373) -- an intended behavior change, not a
+        regression.
+        """
+        library_tsv = self._library_tsv(tmp_path)
+        cta_tsv = self._cta_tsv(tmp_path, [["1", "Stereo\rlab", "Some Track"]])
+        db_path = tmp_path / "library.db"
+
+        tsv_to_sqlite(str(library_tsv), str(db_path), str(cta_tsv))
+
+        conn = sqlite3.connect(str(db_path))
+        row = conn.execute(
+            "SELECT library_release_id, artist_name FROM compilation_track_artist"
+        ).fetchone()
+        conn.close()
+
+        assert row == (1, "Stereo\rlab")
+
+    def test_cta_multiple_rows_still_parse_after_newline_fix(self, tmp_path: Path) -> None:
+        r"""A normal, CR-free multi-row CTA TSV parses unchanged under
+        ``newline="\n"`` -- regression guard for WXYC/discogs-etl#373."""
+        library_tsv = self._library_tsv(tmp_path)
+        cta_tsv = self._cta_tsv(
+            tmp_path,
+            [
+                ["1", "Stereolab", "Some Track"],
+                ["1", "Juana Molina", "Other Track"],
+            ],
+        )
+        db_path = tmp_path / "library.db"
+
+        tsv_to_sqlite(str(library_tsv), str(db_path), str(cta_tsv))
+
+        conn = sqlite3.connect(str(db_path))
+        rows = conn.execute(
+            "SELECT artist_name, track_title FROM compilation_track_artist ORDER BY rowid"
+        ).fetchall()
+        conn.close()
+
+        assert rows == [("Stereolab", "Some Track"), ("Juana Molina", "Other Track")]
