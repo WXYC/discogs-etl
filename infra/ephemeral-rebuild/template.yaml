@@ -94,6 +94,24 @@ Parameters:
       are NOT created by this stack — provision them out-of-band via the
       AWS console or CLI before the first run (see infra/ephemeral-rebuild/README.md).
 
+  ReleaseCountAlarmThreshold:
+    Type: Number
+    Default: 75000
+    Description: >
+      Static floor for ReleaseCountAlarm (#358): the alarm fires when
+      release_count (WXYC/DiscogsCache, published daily by sync-library.yml
+      via scripts/cache_health_metrics.py) drops below this value. Formula
+      per #358: 0.5 x the trailing-90-day minimum of release_count. The
+      account migration (#353, closed 2026-08-05) reset that series to no
+      history in the org account, so a real trailing-90-day minimum cannot
+      be computed yet — this default is a provisional stand-in, half of the
+      150,000 illustrative figure from the original ticket, chosen only
+      because it clears the three 2026 collapses the ticket cites (which
+      bottomed at 39,005 / 39,724 / 50,135) with margin. Recompute the
+      formula and override via --parameter-overrides once the org-account
+      series has ~90 days of history; do not hand-edit ReleaseCountAlarm's
+      Threshold instead.
+
 Conditions:
   HasAlertEmail: !Not [!Equals [!Ref AlertEmail, '']]
 
@@ -391,6 +409,39 @@ Resources:
       ComparisonOperator: GreaterThanOrEqualToThreshold
       TreatMissingData: notBreaching
       AlarmActions: [!Ref AlertTopic]
+
+  # #358: the 2026-06-04 / 2026-07-07 / 2026-08-04 cache collapses (#352)
+  # were all release_count cliffs that nothing alarmed on. cache_health_metrics.py
+  # (invoked daily by sync-library.yml) publishes release_count to
+  # WXYC/DiscogsCache with no Dimensions key, so the plain simple-form alarm
+  # works directly — no dimensionless companion metric needed (see the org
+  # CLAUDE.md CloudWatch conventions on when a companion is and isn't
+  # warranted). Static floor rather than ANOMALY_DETECTION_BAND: the account
+  # migration (#353) reset the org-account series to no history, so a band
+  # would be untrustworthy for its first weeks. See ReleaseCountAlarmThreshold
+  # for the floor's formula and provisional-default rationale.
+  ReleaseCountAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: discogs-rebuild-release-count-floor
+      AlarmDescription: >
+        release_count dropped below ReleaseCountAlarmThreshold — the cache
+        likely lost a large share of its rows (see #352 for the incident
+        class: a colliding rebuild truncating and only partially reloading
+        `release`). Investigate before assuming legitimate library churn:
+        compare against the prior successful run and check
+        s3://wxyc-discogs-rebuild-logs-<account>/ for the most recent
+        rebuild log.
+      Namespace: WXYC/DiscogsCache
+      MetricName: release_count
+      Statistic: Minimum
+      Period: 86400
+      EvaluationPeriods: 1
+      Threshold: !Ref ReleaseCountAlarmThreshold
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+      OKActions: [!Ref AlertTopic]
 
 Outputs:
   LauncherFunctionArn:

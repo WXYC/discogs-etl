@@ -161,3 +161,64 @@ def test_sweeper_schedule_is_not_gated(transformed_template: dict[str, Any]) -> 
     """
     hourly = _events_rule(transformed_template, "SweeperFunctionHourly")
     assert hourly.get("State", "ENABLED") == "ENABLED"
+
+
+def _cloudwatch_alarm(transformed: dict[str, Any], logical_id: str) -> dict[str, Any]:
+    resource = transformed["Resources"][logical_id]
+    assert resource["Type"] == "AWS::CloudWatch::Alarm", (
+        f"{logical_id} is {resource['Type']}, expected AWS::CloudWatch::Alarm"
+    )
+    return resource["Properties"]
+
+
+def test_release_count_alarm_threshold_is_a_revisable_parameter(
+    source_template: dict[str, Any],
+) -> None:
+    """The floor must be a template parameter, never a bare number on the resource.
+
+    #358: the number needs to be revisable via ``--parameter-overrides`` as the
+    cache grows and the org-account series (post #353 migration) accrues real
+    trailing-90-day history, without touching the alarm resource itself.
+    """
+    param = source_template["Parameters"]["ReleaseCountAlarmThreshold"]
+    assert param["Type"] == "Number"
+    assert float(param["Default"]) > 0
+
+
+def test_release_count_alarm_shape(transformed_template: dict[str, Any]) -> None:
+    """Simple-form alarm against the undimensioned ``release_count`` series.
+
+    ``scripts/cache_health_metrics.py`` publishes ``release_count`` to
+    ``WXYC/DiscogsCache`` with no ``Dimensions`` key, so the plain
+    Namespace/MetricName/Statistic form works directly — no dimensionless
+    companion metric is needed (see the org CLAUDE.md CloudWatch conventions).
+    """
+    props = _cloudwatch_alarm(transformed_template, "ReleaseCountAlarm")
+    assert props["Namespace"] == "WXYC/DiscogsCache"
+    assert props["MetricName"] == "release_count"
+    assert "Dimensions" not in props
+    assert props["Statistic"] == "Minimum"
+    assert props["ComparisonOperator"] == "LessThanThreshold"
+    assert props["Threshold"] == {"Ref": "ReleaseCountAlarmThreshold"}
+    assert props["AlarmActions"] == [{"Ref": "AlertTopic"}]
+
+
+def test_release_count_alarm_is_not_anomaly_detection(
+    source_template: dict[str, Any],
+) -> None:
+    """A static floor only — ``ANOMALY_DETECTION_BAND`` would need the org-account
+    series to re-baseline over weeks before it's trustworthy (#358), and the
+    account migration (#353) reset that history to nothing.
+    """
+    alarm = source_template["Resources"]["ReleaseCountAlarm"]["Properties"]
+    assert alarm["ComparisonOperator"] == "LessThanThreshold"
+    assert "Metrics" not in alarm
+    assert "ThresholdMetricId" not in alarm
+
+
+def test_release_count_alarm_wired_to_alert_topic(
+    source_template: dict[str, Any],
+) -> None:
+    """Alongside ``LauncherErrorAlarm`` / ``StaleInstanceAlarm``, on the same topic."""
+    alarm = source_template["Resources"]["ReleaseCountAlarm"]["Properties"]
+    assert alarm["AlarmActions"] == [{"Ref": "AlertTopic"}]
