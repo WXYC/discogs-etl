@@ -237,6 +237,35 @@ genuinely still in flight (check `ps -ef | grep run_pipeline`) or it
 crashed without releasing the lock (which `flock` cleans up on next reboot
 or by `rm`-ing the file).
 
+### `BootstrapPeerQueryFailed` — the run terminated before touching the cache
+
+The bootstrap's peer check ([#311](https://github.com/WXYC/discogs-etl/issues/311)) could not
+run: `aws ec2 describe-instances` exited non-zero. The log line carries the exit status and the
+captured stderr, and a `:rotating_light:` Slack message repeats both. Since #355 this **aborts**
+rather than proceeding — a guard that cannot run is not a guard, and the alternative is what
+destroyed ~119,432 rows on 2026-08-04 ([#352](https://github.com/WXYC/discogs-etl/issues/352)).
+Nothing relaunches automatically, so the monthly rebuild is skipped until an operator acts.
+
+Read the captured stderr first; it names the failure mode:
+
+- **`UnauthorizedOperation` / `AccessDenied`** — the instance profile lost `ec2:DescribeInstances`.
+  That grant lives in the `InstanceRole` policy in `infra/ephemeral-rebuild/template.yaml`; confirm
+  the deployed stack matches and re-`sam deploy` if it drifted. This is the exact 2026-08-04
+  condition, and it was invisible before #355.
+- **`RequestLimitExceeded` / `Throttling`** — transient. Re-launch; botocore already retried
+  internally, so a repeat means sustained API pressure in the account.
+- **`Could not connect to the endpoint URL`** — no route to the EC2 API (subnet/NAT/VPC-endpoint
+  change). Fix networking before re-launching; the pipeline needs the same egress anyway.
+
+Once the cause is fixed, re-launch per [Triggering a manual run](#triggering-a-manual-run). The log
+is already in S3 — the abort goes through `trap on_exit EXIT`, so the upload-and-shutdown chain ran
+normally.
+
+An **empty** peer result is a different, benign line (`WARN: peer check found no active rebuild
+instances (self not yet visible?); proceeding`) and does not abort: `DescribeInstances` is
+eventually consistent, the launcher precheck already ran, and the >3h sweeper is the backstop. The
+two messages are deliberately distinct so they grep apart.
+
 ### Slack alerts but no log file in `/var/log/discogs-rebuild/`
 
 The trap fires before the `tee` redirect could write anything. Run
