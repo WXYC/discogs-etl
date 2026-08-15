@@ -36,7 +36,11 @@ from lib.pg_concurrent_ddl import (  # noqa: E402
     add_index_concurrently_safely,
     group_concurrent_index_ddls_by_table,
 )
-from lib.scratch_namespace import new_scratch_suffix, scratch_name  # noqa: E402
+from lib.scratch_namespace import (  # noqa: E402
+    drop_scratch_tables,
+    new_scratch_suffix,
+    scratch_name,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -302,8 +306,14 @@ def ensure_dedup_ids(conn, *, keep_ids_loaded: bool = False, suffix: str = "") -
             cur.execute(f"DROP TABLE IF EXISTS {dedup_table}")
 
     with conn.cursor() as cur:
+        # table_schema is pinned to 'public' deliberately: an unqualified probe
+        # would also match a same-named table in ``entity`` or ``lml_cache``
+        # (neither of which this repo's rebuild may reach -- see CLAUDE.md), and
+        # a false positive here short-circuits into "reuse it verbatim" and then
+        # fails with UndefinedTable on the unqualified count below.
         cur.execute(
-            "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = %s)",
+            "SELECT EXISTS (SELECT FROM information_schema.tables"
+            " WHERE table_schema = 'public' AND table_name = %s)",
             (dedup_table,),
         )
         exists = cur.fetchone()[0]
@@ -446,6 +456,20 @@ DEDUP_TABLES: list[tuple[str, str, str, str]] = [
 ]
 
 
+# Every base scratch-table name one dedup invocation can create, for the
+# cleanup paths in main(). The `new_X` entries are normally consumed by
+# swap_tables() (RENAME leaves nothing behind), so they matter only when the
+# run dies partway through the swap loop. Deliberately excludes
+# release_track_count / wxyc_label_pref / release_label_match /
+# label_hierarchy: those are NOT namespaced (see docs/architecture.md) and
+# main() drops them by their literal names.
+DEDUP_SCRATCH_BASES: tuple[str, ...] = (
+    "dedup_delete_ids",
+    "keep_release_ids",
+    *(new for _, new, _, _ in DEDUP_TABLES),
+)
+
+
 # Column DEFAULTs to re-apply on each new_X table *before* swap_tables() makes
 # it live. CTAS strips DEFAULTs along with NOT NULL/CHECK; restoring DEFAULT
 # *before* the swap closes the race window where an LML cache-miss insert
@@ -533,18 +557,27 @@ def copy_table(
 
 
 def swap_tables(conn, old_table: str, new_table: str, *, suffix: str = "") -> None:
-    """Swap old and new tables atomically.
+    """Rename the new table over the old one.
 
     ``new_table`` is the base scratch name copy_table() was called with;
     the physical table renamed into place is ``scratch_name(new_table,
     suffix)`` (empty ``suffix`` -- the default -- preserves today's
-    unnamespaced behavior). The backup name (``<old_table>_old``) is
-    deliberately NOT namespaced: it only exists for the duration of this
-    function's single transaction, guarded by PostgreSQL's own locking on
-    ``old_table`` (a second concurrent swap of the same live table would
-    block on that lock, not silently collide) -- see WXYC/discogs-etl#356
-    and the sibling advisory-lock ticket #354 for the swap-concurrency
-    story this doesn't attempt to solve.
+    unnamespaced behavior).
+
+    The backup name (``<old_table>_old``) is NOT namespaced, and this is a
+    known gap rather than a guarantee: ``main()`` opens its connection with
+    ``autocommit=True``, so the three statements below are three separate
+    transactions, not one. AccessExclusive on ``old_table`` is released
+    after the first RENAME, there is a window in which ``old_table`` does
+    not exist at all, and the ``conn.commit()`` at the end is a no-op.
+    Scratch-table namespacing (WXYC/discogs-etl#356) does NOT make two
+    concurrent swaps of the same live table safe -- it only stops them
+    colliding on their *scratch* names beforehand. Serializing the swap
+    itself is the sibling advisory-lock ticket
+    (WXYC/discogs-etl#354); until that lands, two invocations reaching this
+    function concurrently can still interleave destructively. Compare
+    ``verify_cache.py::_prune_copy_swap_tables``, whose swap DOES run as
+    one statement-list transaction via ``add_constraint_safely``.
 
     Uses CASCADE on DROP to remove FK constraints that reference the old table.
     Constraints are recreated by add_constraints_and_indexes() after all swaps.
@@ -1215,7 +1248,7 @@ def main():
     # transaction on a dedicated connection. See build_dedup_scratch_tables
     # for why: a crashed run leaves no scratch residue because PostgreSQL
     # rolls back that whole transaction the instant the connection drops.
-    delete_count, keep_ids_loaded = build_dedup_scratch_tables(
+    delete_count, _keep_ids_loaded = build_dedup_scratch_tables(
         db_url, suffix, keep_release_ids_path=args.keep_release_ids
     )
     if delete_count == 0:
@@ -1235,25 +1268,45 @@ def main():
     # build_dedup_scratch_tables, alongside dedup_delete_ids, as part of
     # this invocation's single crash-safe transaction.
 
-    # Step 3: Drop old FK constraints before swap
-    logger.info("Dropping FK constraints on old tables...")
-    with conn.cursor() as cur:
-        for stmt in [
-            "ALTER TABLE release_artist DROP CONSTRAINT IF EXISTS fk_release_artist_release",
-            "ALTER TABLE release_label DROP CONSTRAINT IF EXISTS fk_release_label_release",
-            "ALTER TABLE release_genre DROP CONSTRAINT IF EXISTS fk_release_genre_release",
-            "ALTER TABLE release_style DROP CONSTRAINT IF EXISTS fk_release_style_release",
-            "ALTER TABLE cache_metadata DROP CONSTRAINT IF EXISTS fk_cache_metadata_release",
-        ]:
-            cur.execute(stmt)
+    # Steps 3-5 run after build_dedup_scratch_tables' COMMIT, so this
+    # invocation's scratch tables are durable from here on. PostgreSQL's
+    # rollback-on-disconnect no longer covers them, and per-invocation
+    # suffixing means no later run will ever reclaim them by name (see
+    # lib.scratch_namespace.drop_scratch_tables). Anything that escapes has
+    # to take its own tables with it, or a failed rebuild orphans a full
+    # copy of the release table in `public` permanently.
+    try:
+        # Step 3: Drop old FK constraints before swap
+        logger.info("Dropping FK constraints on old tables...")
+        with conn.cursor() as cur:
+            for stmt in [
+                "ALTER TABLE release_artist DROP CONSTRAINT IF EXISTS fk_release_artist_release",
+                "ALTER TABLE release_label DROP CONSTRAINT IF EXISTS fk_release_label_release",
+                "ALTER TABLE release_genre DROP CONSTRAINT IF EXISTS fk_release_genre_release",
+                "ALTER TABLE release_style DROP CONSTRAINT IF EXISTS fk_release_style_release",
+                "ALTER TABLE cache_metadata DROP CONSTRAINT IF EXISTS fk_cache_metadata_release",
+            ]:
+                cur.execute(stmt)
 
-    # Step 4: Swap tables
-    logger.info("Swapping tables...")
-    for old, new, _, _ in DEDUP_TABLES:
-        swap_tables(conn, old, new, suffix=suffix)
+        # Step 4: Swap tables
+        logger.info("Swapping tables...")
+        for old, new, _, _ in DEDUP_TABLES:
+            swap_tables(conn, old, new, suffix=suffix)
 
-    # Step 5: Add base constraints and indexes
-    add_base_constraints_and_indexes(conn, db_url=db_url)
+        # Step 5: Add base constraints and indexes
+        add_base_constraints_and_indexes(conn, db_url=db_url)
+    except BaseException:
+        logger.warning(
+            "Dedup failed after the scratch build committed; "
+            "dropping this invocation's scratch tables (suffix %s)",
+            suffix,
+        )
+        try:
+            with conn.cursor() as cur:
+                drop_scratch_tables(cur, DEDUP_SCRATCH_BASES, suffix)
+        except Exception:  # noqa: BLE001
+            logger.warning("Could not clean up scratch tables on exit", exc_info=True)
+        raise
 
     # Step 6: Cleanup
     logger.info("Cleaning up...")
