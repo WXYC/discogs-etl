@@ -2265,13 +2265,21 @@ class TestRunStepSafe:
 
 
 class TestArgvCredentialRedaction:
-    """Every argv call site that carries the cache database URL (#361) must
-    route through run_step_safe, so a step failure never surfaces the DSN
-    in a propagated exception. Covers all four scripts named in #361:
-    dedup_releases.py, import_csv.py, and verify_cache.py (two call sites
-    each, one per build path)."""
+    """Every argv call site that carries a credentialed database URL (#361)
+    must route through run_step_safe, so a step failure never surfaces the
+    DSN in a propagated exception.
+
+    Two credentials reach argv in this file. The cache DSN goes to
+    dedup_releases.py, import_csv.py, verify_cache.py (two call sites each,
+    one per build path) and — in --direct-pg mode — the discogs-xml-converter
+    binary's --database-url. The WXYC catalog DSN goes to the wxyc-catalog
+    CLIs (wxyc-export-to-sqlite, wxyc-extract-library-labels). Flag-vs-
+    positional makes no difference: CalledProcessError.__str__ embeds the
+    whole argv either way.
+    """
 
     DSN = "postgresql://svc:hunter2@cache-host/discogs"
+    CATALOG_DSN = "postgresql://cat:s3cr3t@catalog-host/wxyc"
 
     def _mock_conn(self):
         mock_cursor = MagicMock()
@@ -2285,7 +2293,15 @@ class TestArgvCredentialRedaction:
         mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
         return mock_conn
 
-    def _assert_dsn_redacted(self, fake_run_step, invoke) -> None:
+    def _assert_dsn_redacted(self, fake_run_step, invoke, expected_cmd) -> None:
+        """Drive a build path whose *expected_cmd* step fails, and assert the
+        escaping exception is the redacted one.
+
+        Asserting on the exception *type* and on ``.cmd`` matters: a bare
+        ``pytest.raises(Exception)`` would still pass if a drifting mock made
+        the build die with a TypeError before ever reaching the failing step,
+        leaving the guard green while testing nothing.
+        """
         with (
             patch.object(run_pipeline, "run_step", side_effect=fake_run_step),
             patch.object(run_pipeline, "wait_for_postgres"),
@@ -2302,10 +2318,14 @@ class TestArgvCredentialRedaction:
             mock_check.return_value = run_pipeline.ReloadInvariantResult(
                 ok=True, release_count=1, artist_coverage=1.0, track_coverage=1.0
             )
-            with pytest.raises(Exception) as excinfo:
+            with pytest.raises(subprocess.CalledProcessError) as excinfo:
                 invoke()
-        assert self.DSN not in str(excinfo.value)
-        assert "hunter2" not in str(excinfo.value)
+        # The redacted re-raise carries the plain step label as its cmd, which
+        # proves the run_step_safe path ran rather than some earlier failure.
+        assert excinfo.value.cmd == expected_cmd
+        rendered = str(excinfo.value)
+        for secret in (self.DSN, self.CATALOG_DSN, "hunter2", "s3cr3t"):
+            assert secret not in rendered
 
     @pytest.mark.parametrize(
         "failing_step_name",
@@ -2325,6 +2345,7 @@ class TestArgvCredentialRedaction:
                 sys.executable,
                 state=None,
             ),
+            failing_step_name,
         )
 
     def test_database_build_copy_to_step_failure_redacts_dsn(self) -> None:
@@ -2342,6 +2363,7 @@ class TestArgvCredentialRedaction:
                 target_db_url="postgresql://svc:hunter2@target-host/discogs",
                 state=None,
             ),
+            "Copy matched releases to target database",
         )
 
     @pytest.mark.parametrize(
@@ -2358,4 +2380,120 @@ class TestArgvCredentialRedaction:
             lambda: run_pipeline._run_database_build_post_import(
                 self.DSN, Path("/tmp/csv"), Path("/tmp/library.db"), sys.executable
             ),
+            failing_step_name,
         )
+
+    # -- the converter binary: same cache DSN, passed as --database-url ------
+    #
+    # #361's survey named three *scripts*, so the converter invocation was not
+    # in its table. But in --direct-pg mode convert_and_filter puts the cache
+    # DSN into argv exactly like the others, and nothing up the stack catches
+    # the CalledProcessError, so it reaches the default excepthook and the
+    # log bucket identically.
+
+    def test_converter_failure_redacts_dsn(self) -> None:
+        def fake_run_step(step_name, cmd, *args, **kwargs):
+            raise subprocess.CalledProcessError(1, cmd)
+
+        with patch.object(run_pipeline, "run_step", side_effect=fake_run_step):
+            with pytest.raises(subprocess.CalledProcessError) as excinfo:
+                run_pipeline.convert_and_filter(
+                    Path("/data/releases.xml.gz"),
+                    Path("/tmp/csv"),
+                    "discogs-xml-converter",
+                    database_url=self.DSN,
+                )
+        rendered = str(excinfo.value)
+        assert self.DSN not in rendered
+        assert "hunter2" not in rendered
+
+    def test_converter_csv_mode_still_reports_failure(self) -> None:
+        """CSV mode carries no DSN, but must still fail loudly."""
+
+        def fake_run_step(step_name, cmd, *args, **kwargs):
+            raise subprocess.CalledProcessError(3, cmd)
+
+        with patch.object(run_pipeline, "run_step", side_effect=fake_run_step):
+            with pytest.raises(subprocess.CalledProcessError) as excinfo:
+                run_pipeline.convert_and_filter(
+                    Path("/data/releases.xml.gz"), Path("/tmp/csv"), "discogs-xml-converter"
+                )
+        assert excinfo.value.returncode == 3
+
+    # -- the wxyc-catalog CLIs: a *second* credential ------------------------
+    #
+    # --catalog-db-url is the tubafrenzy MySQL or Backend-Service PostgreSQL
+    # connection string (docs/architecture.md). Different database, same argv
+    # mechanism, same log bucket.
+
+    def test_generate_library_db_failure_redacts_catalog_dsn(self) -> None:
+        def fake_run_step(step_name, cmd, *args, **kwargs):
+            raise subprocess.CalledProcessError(1, cmd)
+
+        with patch.object(run_pipeline, "run_step", side_effect=fake_run_step):
+            with pytest.raises(subprocess.CalledProcessError) as excinfo:
+                run_pipeline.generate_library_db(
+                    Path("/tmp/library.db"), "backend-service", self.CATALOG_DSN
+                )
+        rendered = str(excinfo.value)
+        assert self.CATALOG_DSN not in rendered
+        assert "s3cr3t" not in rendered
+
+    def test_database_build_label_extraction_failure_redacts_catalog_dsn(self) -> None:
+        def fake_run_step(step_name, cmd, *args, **kwargs):
+            if step_name == "Extract WXYC library labels":
+                raise subprocess.CalledProcessError(1, cmd)
+
+        self._assert_dsn_redacted(
+            fake_run_step,
+            lambda: run_pipeline._run_database_build(
+                self.DSN,
+                Path("/tmp/csv"),
+                Path("/tmp/library.db"),
+                sys.executable,
+                catalog_source="backend-service",
+                catalog_db_url=self.CATALOG_DSN,
+                state=None,
+            ),
+            "Extract WXYC library labels",
+        )
+
+    def test_post_import_label_extraction_failure_redacts_catalog_dsn(self) -> None:
+        def fake_run_step(step_name, cmd, *args, **kwargs):
+            if step_name == "Extract WXYC library labels":
+                raise subprocess.CalledProcessError(1, cmd)
+
+        self._assert_dsn_redacted(
+            fake_run_step,
+            lambda: run_pipeline._run_database_build_post_import(
+                self.DSN,
+                Path("/tmp/csv"),
+                Path("/tmp/library.db"),
+                sys.executable,
+                catalog_source="backend-service",
+                catalog_db_url=self.CATALOG_DSN,
+            ),
+            "Extract WXYC library labels",
+        )
+
+
+class TestWaitForPostgresRedaction:
+    """wait_for_postgres logs its target on *every* run, success or failure.
+
+    The argv fix (#361) only covers the failure traceback; this line put the
+    same credentialed DSN into the same teed log on the happy path, so a
+    rebuild did not need to fail to publish it. Redaction precedent:
+    resolve_collisions.py and derive_va_release.py's _describe_target.
+    """
+
+    DSN = "postgresql://svc:hunter2@cache-host:5433/discogs"
+
+    def test_logs_host_without_credentials(self, caplog) -> None:
+        with caplog.at_level(logging.INFO, logger=run_pipeline.logger.name):
+            with patch.object(run_pipeline.psycopg, "connect", return_value=MagicMock()):
+                run_pipeline.wait_for_postgres(self.DSN)
+        logged = " ".join(r.getMessage() for r in caplog.records)
+        assert "hunter2" not in logged
+        assert "svc" not in logged
+        # Still useful for operators: the target host survives redaction.
+        assert "cache-host:5433/discogs" in logged

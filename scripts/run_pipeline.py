@@ -361,9 +361,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return args
 
 
+def _redact_dsn(db_url: str) -> str:
+    """Strip userinfo from a connection string, keeping host/port/database.
+
+    Same shape as scripts/resolve_collisions.py and derive_va_release.py's
+    _describe_target. A DSN with no userinfo is returned unchanged.
+    """
+    return db_url.split("@")[-1]
+
+
 def wait_for_postgres(db_url: str) -> None:
     """Poll Postgres until a connection succeeds or timeout is reached."""
-    logger.info("Waiting for PostgreSQL at %s ...", db_url)
+    # Redacted: this logs on every run, success or failure, and
+    # rebuild-cache-bootstrap.sh tees the pipeline log to the S3 log bucket.
+    # Unredacted, it published the cache credential on the happy path (#361).
+    logger.info("Waiting for PostgreSQL at %s ...", _redact_dsn(db_url))
     deadline = time.monotonic() + PG_CONNECT_TIMEOUT
     delay = 0.5
     while True:
@@ -491,24 +503,36 @@ def run_step_safe(description: str, cmd: list[str], **kwargs) -> None:
     exception that escapes a failed step (#361).
 
     dedup_releases.py, import_csv.py, and verify_cache.py all take the
-    cache database URL positionally rather than via environment variable.
-    run_step() already logs the failure safely (exit code + elapsed time,
-    no argv) before raising subprocess.CalledProcessError, but
+    cache database URL positionally rather than via environment variable;
+    the discogs-xml-converter binary and the wxyc-catalog CLIs take theirs
+    as a flag. The distinction does not matter here, because
     CalledProcessError.__str__ embeds the *full* argv it was constructed
-    with -- credentials and all. Left uncaught, that string is exactly what
-    Python's default exception handler prints to stderr, and
-    rebuild-cache-bootstrap.sh tees stdout/stderr straight to the rebuild
-    log bucket on every step failure.
+    with -- credentials and all. run_step() already logs the failure safely
+    (exit code + elapsed time, no argv) before raising, but left uncaught
+    that string is exactly what Python's default exception handler prints
+    to stderr, and rebuild-cache-bootstrap.sh tees stdout/stderr straight
+    to the rebuild log bucket on every step failure.
 
-    Same precedent as run_derive_va_release_step (~line 514): log only the
-    exit code, never str(exc) or cmd. Unlike that soft-fail step, these
-    steps are not optional, so this re-raises rather than swallowing the
-    failure -- but the re-raised CalledProcessError carries *description*
-    (a plain label) as its ``cmd``, never the real argv, so its own
-    __str__ stays credential-free no matter how far up the call stack it
-    is eventually printed or logged. ``from None`` suppresses Python's
-    implicit exception chaining, which would otherwise still print the
-    original, argv-bearing exception as "the above exception" context.
+    Same precedent as run_derive_va_release_step below: log only the exit
+    code, never str(exc) or cmd. Unlike that soft-fail step, these steps
+    are not optional, so this re-raises rather than swallowing the failure
+    -- but the re-raised CalledProcessError carries *description* (a plain
+    label) as its ``cmd``, never the real argv, so its own __str__ stays
+    credential-free however far up the call stack it is printed or logged.
+    ``from None`` suppresses Python's implicit exception chaining, which
+    would otherwise still print the original, argv-bearing exception as
+    "the above exception" context.
+
+    Scope, so the guarantee is not overread: this closes the *traceback*
+    channel only. Two other channels still carry the DSN into the same log
+    and are deliberately out of this function's reach --
+    (1) the child scripts log their own connection string at startup, which
+    belongs to #227 and needs those files edited; and (2) Sentry's
+    excepthook integration captures frame locals by default, so the
+    argv-bearing ``cmd`` local survives in the event payload even though
+    ``from None`` correctly stops its chain walk. The durable fix for both
+    is #361's own suggestion: have those scripts read DATABASE_URL_DISCOGS
+    from a merged os.environ instead of argv.
     """
     try:
         run_step(description, cmd, **kwargs)
@@ -913,7 +937,10 @@ def convert_and_filter(
     description = (
         "Convert and import XML to PostgreSQL" if database_url else "Convert and filter XML to CSV"
     )
-    run_step(description, cmd)
+    # run_step_safe even though the converter takes --database-url as a flag
+    # rather than positionally: CalledProcessError.__str__ embeds the whole
+    # argv either way, and in --direct-pg mode that argv holds the cache DSN.
+    run_step_safe(description, cmd)
 
 
 def _infer_pipeline_state(db_url: str, csv_dir: str) -> PipelineState:
@@ -1037,8 +1064,13 @@ def generate_library_db(
     catalog_source: str,
     catalog_db_url: str,
 ) -> None:
-    """Step 0: Generate library.db from WXYC catalog via wxyc-catalog CLI."""
-    run_step(
+    """Step 0: Generate library.db from WXYC catalog via wxyc-catalog CLI.
+
+    --catalog-db-url is a *second* credential (tubafrenzy MySQL or
+    Backend-Service PostgreSQL), so this needs the same argv redaction as the
+    cache-DSN steps.
+    """
+    run_step_safe(
         "Generate library.db",
         [
             "wxyc-export-to-sqlite",
@@ -1282,7 +1314,7 @@ def _run_database_build_post_import(
     labels_csv = library_labels
     if labels_csv is None and catalog_source is not None and catalog_db_url is not None:
         labels_csv = Path(tempfile.mkdtemp(prefix="discogs_labels_")) / "library_labels.csv"
-        run_step(
+        run_step_safe(
             "Extract WXYC library labels",
             [
                 "wxyc-extract-library-labels",
@@ -1526,7 +1558,7 @@ def _run_database_build(
         labels_csv = library_labels
         if labels_csv is None and catalog_source is not None and catalog_db_url is not None:
             labels_csv = Path(tempfile.mkdtemp(prefix="discogs_labels_")) / "library_labels.csv"
-            run_step(
+            run_step_safe(
                 "Extract WXYC library labels",
                 [
                     "wxyc-extract-library-labels",
