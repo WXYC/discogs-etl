@@ -97,20 +97,33 @@ Parameters:
   ReleaseCountAlarmThreshold:
     Type: Number
     Default: 75000
+    MinValue: 1
     Description: >
       Static floor for ReleaseCountAlarm (#358): the alarm fires when
       release_count (WXYC/DiscogsCache, published daily by sync-library.yml
-      via scripts/cache_health_metrics.py) drops below this value. Formula
-      per #358: 0.5 x the trailing-90-day minimum of release_count. The
-      account migration (#353, closed 2026-08-05) reset that series to no
-      history in the org account, so a real trailing-90-day minimum cannot
-      be computed yet — this default is a provisional stand-in, half of the
-      150,000 illustrative figure from the original ticket, chosen only
-      because it clears the three 2026 collapses the ticket cites (which
-      bottomed at 39,005 / 39,724 / 50,135) with margin. Recompute the
-      formula and override via --parameter-overrides once the org-account
-      series has ~90 days of history; do not hand-edit ReleaseCountAlarm's
-      Threshold instead.
+      via scripts/cache_health_metrics.py) drops below this value.
+
+      75000 is provisional. #358 specifies 0.5 x the trailing-90-day minimum
+      of release_count, but the #353 account migration (closed 2026-08-05)
+      moved the series to the org account with no history, so that minimum
+      cannot be computed yet. The stand-in is pinned to the incident record
+      in #358 instead: it sits above all three 2026 collapses (which bottomed
+      at 39,005 / 39,724 / 50,135) and below the lowest healthy reading in
+      that same series (106,977), so it catches the incident class without
+      firing during the legitimate multi-day re-accretion that followed each
+      one.
+
+      When recomputing from real history, take the trailing-90-day minimum
+      over *healthy* days only. Applied naively the formula disarms the
+      alarm: any 90-day window containing a collapse has a minimum of ~39,005,
+      and half of that (~19,500) sits below every cliff the alarm exists to
+      catch. Exclude known-incident days — or use a low percentile of good
+      days — then override via --parameter-overrides. Do not hand-edit
+      ReleaseCountAlarm's Threshold instead.
+
+      MinValue guards the other direction: release_count is never negative, so
+      a 0 or negative override would make LessThanThreshold unsatisfiable and
+      silently disable the alarm with no deploy error and no drift signal.
 
 Conditions:
   HasAlertEmail: !Not [!Equals [!Ref AlertEmail, '']]
@@ -434,12 +447,31 @@ Resources:
         rebuild log.
       Namespace: WXYC/DiscogsCache
       MetricName: release_count
+      # Minimum, not Maximum: sync-library.yml also carries workflow_dispatch,
+      # so a day can hold more than one sample. If any sample that day saw a
+      # collapsed table, that is the reading worth paging on — a false page
+      # from a manual re-run landing mid-rebuild is a cheaper mistake than
+      # averaging a real collapse away.
       Statistic: Minimum
       Period: 86400
       EvaluationPeriods: 1
       Threshold: !Ref ReleaseCountAlarmThreshold
       ComparisonOperator: LessThanThreshold
-      TreatMissingData: notBreaching
+      # `missing`, NOT `notBreaching` — the opposite of the sibling alarms
+      # above, deliberately. Theirs count events (an absent AWS/Lambda Errors
+      # datapoint really does mean zero errors); this one is a gauge, where an
+      # absent datapoint means "we could not count the cache", not "the cache
+      # is fine". Both failure modes produce exactly that absence: the metric
+      # publisher runs `COUNT(*) FROM release`, which raises UndefinedTable
+      # when a colliding rebuild has dropped the table mid-swap, and the whole
+      # publish chain in sync-library.yml is `if: success()`, so any earlier
+      # step failing skips it. Under notBreaching each of those days scores as
+      # healthy and the alarm sits in OK straight through the incident it
+      # exists to catch — and, with OKActions attached, sends a false all-clear
+      # on the day after a real firing. `missing` holds the last known state
+      # instead, and reads INSUFFICIENT_DATA before the first publish, which is
+      # the behavior infra/bootstrap/README.md already documents for this alarm.
+      TreatMissingData: missing
       AlarmActions: [!Ref AlertTopic]
       OKActions: [!Ref AlertTopic]
 

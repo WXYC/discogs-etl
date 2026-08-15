@@ -179,10 +179,16 @@ def test_release_count_alarm_threshold_is_a_revisable_parameter(
     #358: the number needs to be revisable via ``--parameter-overrides`` as the
     cache grows and the org-account series (post #353 migration) accrues real
     trailing-90-day history, without touching the alarm resource itself.
+
+    ``MinValue`` is the counterpart to ``ScheduleState``'s ``AllowedValues``:
+    ``release_count`` is never negative, so an override of ``0`` or below makes
+    ``LessThanThreshold`` unsatisfiable and silently disables the alarm — a
+    clean deploy, no drift, no signal, no alarm.
     """
     param = source_template["Parameters"]["ReleaseCountAlarmThreshold"]
     assert param["Type"] == "Number"
     assert float(param["Default"]) > 0
+    assert float(param["MinValue"]) >= 1
 
 
 def test_release_count_alarm_shape(transformed_template: dict[str, Any]) -> None:
@@ -203,6 +209,34 @@ def test_release_count_alarm_shape(transformed_template: dict[str, Any]) -> None
     assert props["AlarmActions"] == [{"Ref": "AlertTopic"}]
 
 
+def test_release_count_alarm_treats_a_missing_datapoint_as_missing(
+    transformed_template: dict[str, Any],
+) -> None:
+    """An absent datapoint must not score as healthy.
+
+    This is the property that decides whether the alarm detects anything, and
+    the one most likely to be "fixed" back to match the sibling alarms. Those
+    two count events, where an absent datapoint genuinely means zero; this one
+    is a gauge, where absent means *the count could not be taken*. Both real
+    failure modes produce that absence rather than a low number:
+    ``cache_health_metrics.py`` runs ``COUNT(*) FROM release`` and raises
+    ``UndefinedTable`` when a colliding rebuild has dropped the table mid-swap
+    (#352), and every step of the publish chain in ``sync-library.yml`` is
+    ``if: success()``. Under ``notBreaching`` the alarm rides through the
+    incident in OK and — because ``OKActions`` is wired — sends a false
+    all-clear the day after a real firing.
+
+    ``Period`` and ``EvaluationPeriods`` are pinned alongside it: the series is
+    published once daily, so a shorter period would leave most periods empty
+    and make the missing-data policy, not the metric, decide the alarm state.
+    """
+    props = _cloudwatch_alarm(transformed_template, "ReleaseCountAlarm")
+    assert props["TreatMissingData"] == "missing"
+    assert props["Period"] == 86400
+    assert props["EvaluationPeriods"] == 1
+    assert props["OKActions"] == [{"Ref": "AlertTopic"}]
+
+
 def test_release_count_alarm_is_not_anomaly_detection(
     source_template: dict[str, Any],
 ) -> None:
@@ -216,9 +250,18 @@ def test_release_count_alarm_is_not_anomaly_detection(
     assert "ThresholdMetricId" not in alarm
 
 
-def test_release_count_alarm_wired_to_alert_topic(
-    source_template: dict[str, Any],
+@pytest.mark.parametrize(
+    "logical_id",
+    ["LauncherErrorAlarm", "StaleInstanceAlarm", "ReleaseCountAlarm"],
+)
+def test_every_alarm_fans_into_the_shared_alert_topic(
+    transformed_template: dict[str, Any], logical_id: str
 ) -> None:
-    """Alongside ``LauncherErrorAlarm`` / ``StaleInstanceAlarm``, on the same topic."""
-    alarm = source_template["Resources"]["ReleaseCountAlarm"]["Properties"]
-    assert alarm["AlarmActions"] == [{"Ref": "AlertTopic"}]
+    """``AlertTopic`` is the single fan-out point, so every alarm must reach it.
+
+    An alarm wired to no topic — or to one created outside the stack — pages
+    nobody, which is the wxyc-canary#13 failure mode restated: a resource that
+    looks deployed and alerts into a void.
+    """
+    props = _cloudwatch_alarm(transformed_template, logical_id)
+    assert props["AlarmActions"] == [{"Ref": "AlertTopic"}]
