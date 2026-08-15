@@ -486,6 +486,37 @@ def run_step(description: str, cmd: list[str], **kwargs) -> None:
     logger.info("  completed in %.1fs", elapsed)
 
 
+def run_step_safe(description: str, cmd: list[str], **kwargs) -> None:
+    """Run a step via run_step(), keeping a credentialed argv out of any
+    exception that escapes a failed step (#361).
+
+    dedup_releases.py, import_csv.py, and verify_cache.py all take the
+    cache database URL positionally rather than via environment variable.
+    run_step() already logs the failure safely (exit code + elapsed time,
+    no argv) before raising subprocess.CalledProcessError, but
+    CalledProcessError.__str__ embeds the *full* argv it was constructed
+    with -- credentials and all. Left uncaught, that string is exactly what
+    Python's default exception handler prints to stderr, and
+    rebuild-cache-bootstrap.sh tees stdout/stderr straight to the rebuild
+    log bucket on every step failure.
+
+    Same precedent as run_derive_va_release_step (~line 514): log only the
+    exit code, never str(exc) or cmd. Unlike that soft-fail step, these
+    steps are not optional, so this re-raises rather than swallowing the
+    failure -- but the re-raised CalledProcessError carries *description*
+    (a plain label) as its ``cmd``, never the real argv, so its own
+    __str__ stays credential-free no matter how far up the call stack it
+    is eventually printed or logged. ``from None`` suppresses Python's
+    implicit exception chaining, which would otherwise still print the
+    original, argv-bearing exception as "the above exception" context.
+    """
+    try:
+        run_step(description, cmd, **kwargs)
+    except subprocess.CalledProcessError as exc:
+        logger.error("%s failed (exit %d)", description, exc.returncode)
+        raise subprocess.CalledProcessError(exc.returncode, description) from None
+
+
 def run_derive_va_release_step(db_url: str, python: str) -> bool:
     """Best-effort derive_va_release step (#344), shared by both build paths.
 
@@ -1272,7 +1303,7 @@ def _run_database_build_post_import(
     dedup_cmd.extend(["--keep-release-ids", str(keep_release_ids_path)])
     dedup_cmd.append(db_url)
 
-    run_step("Deduplicate releases", dedup_cmd)
+    run_step_safe("Deduplicate releases", dedup_cmd)
 
     # -- create_track_indexes (FK constraints, FK indexes, trigram indexes)
     # Level 0: Clean orphan track rows before FK validation (parallel).
@@ -1328,7 +1359,7 @@ def _run_database_build_post_import(
 
     # -- prune (optional)
     if library_db:
-        run_step(
+        run_step_safe(
             "Prune to library matches",
             [
                 python,
@@ -1457,7 +1488,7 @@ def _run_database_build(
         if truncate_existing:
             import_cmd.append("--truncate-existing")
         import_cmd.extend([str(csv_dir), db_url])
-        run_step("Import base CSVs", import_cmd)
+        run_step_safe("Import base CSVs", import_cmd)
         if state:
             state.mark_completed("import_csv")
             _save_state()
@@ -1516,7 +1547,7 @@ def _run_database_build(
         dedup_cmd.extend(["--keep-release-ids", str(keep_release_ids_path)])
         dedup_cmd.append(db_url)
 
-        run_step("Deduplicate releases", dedup_cmd)
+        run_step_safe("Deduplicate releases", dedup_cmd)
         if state:
             state.mark_completed("dedup")
             _save_state()
@@ -1535,7 +1566,7 @@ def _run_database_build(
         # to make the no-op explicit.)
         tracks_cmd = [python, str(SCRIPT_DIR / "import_csv.py"), "--tracks-only"]
         tracks_cmd.extend([str(csv_dir), db_url])
-        run_step("Import tracks", tracks_cmd)
+        run_step_safe("Import tracks", tracks_cmd)
         if state:
             state.mark_completed("import_tracks")
             _save_state()
@@ -1594,7 +1625,7 @@ def _run_database_build(
     if state and state.is_completed("prune"):
         logger.info("Skipping prune/copy-to (already completed)")
     elif library_db and target_db_url:
-        run_step(
+        run_step_safe(
             "Copy matched releases to target database",
             [
                 python,
@@ -1612,7 +1643,7 @@ def _run_database_build(
             state.mark_completed("prune")
             _save_state()
     elif library_db:
-        run_step(
+        run_step_safe(
             "Prune to library matches",
             [
                 python,
