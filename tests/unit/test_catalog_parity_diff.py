@@ -1769,9 +1769,9 @@ class TestRuleBMissingReason:
 
     def test_null_artist_name_is_a_reason(self) -> None:
         """The NULL note: LIBRARY_SELECT_SQL has no IFNULL wrapper, so a SQL
-        NULL artist reaches library.db as NULL, not ''. The predicate must
-        catch both -- it is spelled ``_normalize(value) is None``, which
-        collapses NULL and '' identically."""
+        NULL artist (PRESENTATION_NAME) would reach library.db as Python
+        None via parse_library_tsv's `\\N` mapping, not ''. The predicate
+        catches both explicitly (`value is None or value.strip() == ""`)."""
         mod = _load_module()
         assert mod._rule_b_missing_reason(_row(artist=None)) == "empty_artist_name"
 
@@ -1780,31 +1780,58 @@ class TestRuleBMissingReason:
         assert mod._rule_b_missing_reason(_row(artist="   ")) == "empty_artist_name"
 
     @pytest.mark.parametrize("column", ["artist", "title"])
-    def test_literal_null_string_counts_as_absent_and_why(self, column: str) -> None:
-        """A recorded trade-off, not an oversight.
+    def test_literal_null_string_is_reported_as_unexplained_drift(self, column: str) -> None:
+        """Measured 2026-08-14 against prod tubafrenzy MySQL (#375): TITLE IS
+        NULL and PRESENTATION_NAME IS NULL both count 0, and neither column
+        holds the uppercase string 'NULL' either (BINARY TITLE = 'NULL' and
+        BINARY PRESENTATION_NAME = 'NULL' both count 0). There is no SQL NULL
+        arriving as the string "NULL" for these two columns to catch, so the
+        broad `_normalize(value) is None` predicate was over-matching: an
+        album or artist genuinely titled "NULL" is a legal row Backend
+        imports rather than skips, and folding it into empty_artist_name /
+        empty_album_title would silently forgive real drift instead of
+        reporting it.
 
-        `mysql -B -N` on this server renders a genuine SQL NULL as the
-        literal 4-character text "NULL" rather than the `\\N` sentinel
-        (verified in prod -- see scripts/sync-library.sh's SELECT comment,
-        which IFNULL-wrapped ALBUM_ARTIST for exactly this reason after
-        64,780 rows leaked a literal 'NULL' into library_fts).
-        `parse_library_tsv` only maps `\\N`, and TITLE / PRESENTATION_NAME
-        are the two columns LIBRARY_SELECT_SQL leaves unwrapped -- so a
-        SQL-NULL title arrives here as the string "NULL", and nothing in the
-        row can distinguish it from an album genuinely titled "NULL".
-
-        The cost of matching it: a genuinely-missing row titled "NULL" is
-        filed as expected residue. The cost of NOT matching it: the ledger's
-        six empty-TITLE ids stay unexplained forever and `clean` is
-        unreachable, which is the failure this predicate exists to prevent.
-        The second is the one that breaks the gate, so the predicate matches.
-
-        Narrowing this to `.strip() == ""` is safe only AFTER TITLE and
-        PRESENTATION_NAME get the same IFNULL treatment in both SELECTs.
+        This is the behaviour change from #375: before the narrowing this
+        asserted "empty_artist_name" / "empty_album_title"; now it asserts
+        None (unexplained -- no row-derivable reason), because the predicate
+        is spelled as an explicit empty check instead of reusing
+        `_normalize`'s NULL-string collapse. It is inert on today's data --
+        no row is titled uppercase "NULL" -- and only starts mattering if one
+        ever appears, at which point it is correctly reported as drift.
         """
         mod = _load_module()
-        expected = {"artist": "empty_artist_name", "title": "empty_album_title"}[column]
-        assert mod._rule_b_missing_reason(_row(**{column: "NULL"})) == expected
+        assert mod._rule_b_missing_reason(_row(**{column: "NULL"})) is None
+
+    def test_mixed_case_null_string_title_is_also_unexplained_drift(self) -> None:
+        """Guards the case-sensitivity boundary against the two rows that
+        actually exist: LIBRARY_RELEASE ids 18930 and 55924 hold the title
+        "Null" (mixed case, not "NULL"). `_normalize` compares
+        case-sensitively (see TestNormalize.test_case_is_not_folded), so
+        neither the pre-#375 predicate nor the narrowed one ever matched
+        these two ids -- this pins that "Null" reads as unexplained drift
+        both before and after the narrowing, i.e. #375 does not change their
+        classification.
+        """
+        mod = _load_module()
+        assert mod._rule_b_missing_reason(_row(title="Null")) is None
+
+    @pytest.mark.parametrize("ledger_id", [21107, 39290, 51871, 52374, 65301, 66329])
+    def test_ledger_empty_title_ids_still_resolve_to_empty_album_title(
+        self, ledger_id: int
+    ) -> None:
+        """The six ledger ids (`residue-ledger.md` Set 2) are byte-exact
+        empty strings in prod, not SQL NULLs and not whitespace-only
+        (measured 2026-08-14: `LENGTH(TITLE) = 0` for all six) -- so the
+        narrowed `value is None or value.strip() == ""` check still catches
+        every one of them, same as the broad `_normalize` check did.
+        """
+        mod = _load_module()
+        assert mod._rule_b_missing_reason(_row(id=ledger_id, title="")) == "empty_album_title"
+
+    def test_whitespace_only_title_is_the_same_reason_as_empty(self) -> None:
+        mod = _load_module()
+        assert mod._rule_b_missing_reason(_row(title="   ")) == "empty_album_title"
 
     def test_cta_drop_rule_does_not_share_the_null_string_leniency(self, tmp_path: Path) -> None:
         """The CTA counterpart is deliberately narrower, and that asymmetry

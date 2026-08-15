@@ -409,46 +409,53 @@ def _rule_b_missing_reason(mysql_row: Mapping[str, object]) -> str | None:
     mysql-sourced library.db row alone, so they correctly fall through as
     unexplained rather than being guessed at.
 
-    **The artist and title checks are spelled ``_normalize(value) is None``,
-    and the reason is the producer's wire format -- not a preference for
-    reusing the comparator.** ``_normalize`` also collapses the literal
-    4-character string ``"NULL"``, which looks like over-matching (an album
-    genuinely titled ``NULL`` is a legal row Backend imports rather than
-    skips, so forgiving its absence would file real drift as expected). It is
-    nonetheless the only correct predicate here, because for *these two
-    columns* the wire cannot tell the two apart:
+    **The artist and title checks are spelled as an explicit empty check
+    (``value is None or value.strip() == ""``), not ``_normalize(value) is
+    None``.** Measured 2026-08-14 against prod tubafrenzy MySQL (#375):
+    ``TITLE IS NULL`` and ``PRESENTATION_NAME IS NULL`` both count 0, and
+    neither column holds the uppercase string ``"NULL"`` either (``BINARY
+    TITLE = 'NULL'`` / ``BINARY PRESENTATION_NAME = 'NULL'`` both count 0).
+    There is no SQL NULL arriving as the literal text ``"NULL"`` for these
+    two columns to catch -- the premise the broad ``_normalize`` reuse was
+    written against does not hold, so routing through ``_normalize`` was
+    over-matching: an album or artist genuinely titled ``"NULL"`` is a legal
+    row Backend imports rather than skips, and folding it into
+    ``empty_artist_name`` / ``empty_album_title`` would silently forgive
+    real drift instead of reporting it.
 
-    - ``mysql -B -N`` **on this server prints a genuine SQL NULL as the
-      literal text ``"NULL"``**, not as the ``\\N`` sentinel -- verified in
-      prod and documented at ``scripts/sync-library.sh``'s SELECT comment,
-      which fixed exactly this for ``ALBUM_ARTIST`` (64,780 rows had leaked a
-      literal ``'NULL'`` into ``library_fts``).
-    - ``parse_library_tsv`` maps only ``\\N`` to ``None``. It has no handling
-      for the literal string, so that mapping never fires for these columns.
-    - ``TITLE`` and ``PRESENTATION_NAME`` are the two columns
-      ``LIBRARY_SELECT_SQL`` leaves **unwrapped** by ``IFNULL`` (unlike
-      ``ALTERNATE_ARTIST_NAME`` / ``ALBUM_ARTIST`` / the crossref subquery).
+    The six ledger ids (``residue-ledger.md`` Set 2 -- ``21107, 39290,
+    51871, 52374, 65301, 66329``) are byte-exact empty strings in prod
+    (``LENGTH(TITLE) = 0``), not SQL NULLs and not whitespace, so the
+    narrower ``.strip() == ""`` check still catches all six -- nothing is
+    lost by dropping the ``_normalize`` reuse. Two rows (ids 18930, 55924)
+    hold the mixed-case string ``"Null"``; ``_normalize`` compares
+    case-sensitively (``stripped == "NULL"``, not case-folded), so neither
+    the old predicate nor this one ever matched them -- their classification
+    is unchanged by this narrowing.
 
-    So a SQL-NULL title arrives here as the string ``"NULL"``, and
-    ``value is None or value.strip() == ""`` would miss it -- leaving the
-    ledger's six empty-``TITLE`` ids (``residue-ledger.md`` Set 2)
-    permanently unexplained and ``clean`` permanently unreachable, which is
-    the failure this whole predicate exists to prevent.
+    This narrowing is **inert on current production data**: zero rows in
+    either column hold the uppercase string ``"NULL"``, so zero
+    classifications change today. What it buys is forward-looking -- if a
+    SQL NULL ever does appear in these columns, ``mysql -B -N`` on this
+    server prints it as the literal text ``"NULL"`` (verified in prod,
+    documented at ``scripts/sync-library.sh``'s SELECT comment, which
+    ``IFNULL``-wrapped ``ALBUM_ARTIST`` for exactly this reason after 64,780
+    rows leaked a literal ``'NULL'`` into ``library_fts``), and
+    ``parse_library_tsv`` has no handling for that literal (it only maps
+    ``\\N``). After this narrowing such a row is reported as unexplained
+    drift -- loud, and correct -- rather than silently forgiven as expected
+    residue, which is the point at which an ``IFNULL`` wrap on ``TITLE`` /
+    ``PRESENTATION_NAME`` in ``LIBRARY_SELECT_SQL`` and
+    ``scripts/sync-library.sh``'s SELECT would become worth landing. Neither
+    pinned SELECT is touched here.
 
-    ``_load_cta_counts`` uses the narrower ``str.strip() == ""`` for what
-    reads like the same rule, and the two are **correctly** different rather
-    than an inconsistency: ``COMPILATION_TRACK_ARTIST.ARTIST_NAME`` is
-    documented ``NOT NULL`` and also unwrapped, so a ``"NULL"`` there can
-    only ever be a genuine artist name -- never a SQL NULL. The predicate
-    tracks each column's nullability, not one house style.
-
-    The real fix is at the SQL layer, where ``sync-library.sh`` already put
-    it for the other columns: ``IFNULL``-wrap ``TITLE`` and
-    ``PRESENTATION_NAME`` in both SELECTs so a SQL NULL arrives as ``''`` and
-    this can narrow to ``.strip() == ""``. That changes the pinned
-    production SELECTs, so it is a follow-up rather than part of #370, and
-    plan step 8's prod run settles which representation the six ids actually
-    take with a single query.
+    ``_load_cta_counts`` already uses this same narrower ``str.strip() ==
+    ""`` check, and the two predicates are consistent for the same
+    underlying reason now confirmed for both: ``COMPILATION_TRACK_ARTIST.
+    ARTIST_NAME`` is documented ``NOT NULL``, and ``TITLE`` /
+    ``PRESENTATION_NAME`` are measured to hold zero SQL NULLs -- in both
+    cases a ``"NULL"`` in the column can only be a genuine name/title, never
+    a SQL NULL wearing a disguise.
     """
     genre = mysql_row.get("genre")
     if is_db_only_genre(genre if isinstance(genre, str) else None):
@@ -456,9 +463,11 @@ def _rule_b_missing_reason(mysql_row: Mapping[str, object]) -> str | None:
     fmt = mysql_row.get("format")
     if parse_format_and_discs(fmt if isinstance(fmt, str) else "") is None:
         return "unparseable_format"
-    if _normalize(mysql_row.get("artist")) is None:
+    artist = mysql_row.get("artist")
+    if artist is None or (isinstance(artist, str) and artist.strip() == ""):
         return "empty_artist_name"
-    if _normalize(mysql_row.get("title")) is None:
+    title = mysql_row.get("title")
+    if title is None or (isinstance(title, str) and title.strip() == ""):
         return "empty_album_title"
     return None
 
