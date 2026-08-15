@@ -76,6 +76,28 @@ def last_line_index(lines: list[str], needle: str) -> int:
     return found
 
 
+def function_body(lines: list[str], func_name: str) -> str:
+    """Return the source text of a top-level ``func_name() {`` ... ``}`` block.
+
+    The bootstrap's functions are all top-level: the opening line is
+    unindented and the matching closing brace is a bare ``}`` at column 0
+    (no nested top-level functions in this script). Slicing on those two
+    anchors isolates one function's body for fragment/ordering assertions
+    without dragging in sibling functions that happen to share substrings.
+    """
+    start = None
+    for i, line in enumerate(lines):
+        if line.startswith(f"{func_name}() {{"):
+            start = i
+            break
+    if start is None:
+        raise AssertionError(f"function {func_name!r} not found in {SCRIPT_PATH}")
+    for j in range(start + 1, len(lines)):
+        if lines[j] == "}":
+            return "\n".join(lines[start : j + 1])
+    raise AssertionError(f"closing brace for {func_name!r} not found in {SCRIPT_PATH}")
+
+
 def test_trap_on_exit_registered_before_imds_calls(script_lines: list[str]) -> None:
     """#173: trap must be live before the script can early-exit on IMDSv2.
 
@@ -220,4 +242,160 @@ def test_collision_guard_uses_same_tag_and_state_filter(script_lines: list[str])
     assert "instance-state-name,Values=pending,running" in src, (
         "bootstrap peer check must filter on pending/running instance state, matching "
         "list_active_rebuild_instances in the launcher/sweeper. See #311."
+    )
+
+
+def test_peer_query_does_not_discard_stderr(script_lines: list[str]) -> None:
+    """#355: the peer query must capture stderr, not swallow it.
+
+    The pre-#355 shape was
+    ``... --output text 2>/dev/null)" || instances=""`` — a failed query
+    (e.g. AccessDenied) discards its error text and collapses into the same
+    empty ``instances`` value a legitimately-empty result produces. On
+    2026-08-04 that hid an AccessDenied peer-check failure inside a
+    345 KB bootstrap log with zero trace of the authorization error. The
+    query must instead redirect stderr somewhere it can be logged.
+    """
+    body = function_body(script_lines, "abort_if_not_winning_rebuild")
+    assert "describe-instances" in body, (
+        "abort_if_not_winning_rebuild() must still call `aws ec2 describe-instances`."
+    )
+    assert "2>/dev/null" not in body, (
+        "the peer query must not discard stderr with `2>/dev/null` -- a failed query "
+        "(AccessDenied, throttling, etc.) must leave a trace to log and alert on. See #355 "
+        "and the 2026-08-04 incident (#352) it fixes."
+    )
+
+
+def test_peer_query_failure_and_empty_result_are_distinguishable_branches(
+    script_lines: list[str],
+) -> None:
+    """#355: a failed peer query must take a different branch than a
+    legitimately empty one, with a different, greppable log-message prefix.
+
+    Before this fix, ``2>/dev/null || instances=""`` meant "the query errored"
+    and "the query succeeded with zero rows" were literally the same code
+    path, both landing on the WARN "found no active rebuild instances"
+    message. That message blames eventual consistency, which is a true
+    explanation for the empty-result case and a false one for the errored
+    case. The two must now be distinguishable both in control flow and in
+    the text an operator (or an alert) would grep for.
+    """
+    body = function_body(script_lines, "abort_if_not_winning_rebuild")
+    lines = body.splitlines()
+
+    empty_result_line = first_line_index(lines, "no active rebuild instances")
+    failure_line = first_line_index(lines, "BootstrapPeerQueryFailed")
+    assert empty_result_line != failure_line, (
+        "the empty-result WARN and the query-failure log line must be distinct lines "
+        "with distinct messages, not a single shared fail-open path. See #355."
+    )
+
+    # The two messages must not share a common "found no active rebuild
+    # instances" framing -- that framing is specifically what mis-described
+    # the 2026-08-04 AccessDenied failure as a benign empty result.
+    assert "no active rebuild instances" not in lines[failure_line], (
+        "the query-failure log line must not reuse the empty-result phrasing "
+        "('found no active rebuild instances') -- that phrasing is what made an "
+        "AccessDenied failure look like a benign eventual-consistency gap on "
+        "2026-08-04. See #355."
+    )
+
+
+def test_peer_query_failure_captures_and_logs_stderr(script_lines: list[str]) -> None:
+    """#355: the captured stderr from a failed query must appear in the log."""
+    body = function_body(script_lines, "abort_if_not_winning_rebuild")
+    lines = body.splitlines()
+
+    # The query must be captured under a name we can find again in the ERROR
+    # log line and the Slack notification -- pin that a stderr variable is
+    # both assigned and later referenced, rather than merely captured and
+    # discarded.
+    assert "stderr" in body, (
+        "abort_if_not_winning_rebuild() must capture the peer query's stderr into a "
+        "variable (not `2>/dev/null`) so a failure has forensic content. See #355."
+    )
+    failure_line = first_line_index(lines, "BootstrapPeerQueryFailed")
+    # The captured-stderr variable name must be referenced on (or immediately
+    # after) the ERROR line that reports the failure, so the log actually
+    # contains the captured text rather than just announcing the failure.
+    window = "\n".join(lines[failure_line : failure_line + 3])
+    assert "stderr" in window, (
+        "the ERROR log line for a failed peer query must include the captured stderr "
+        "text, not just announce that the query failed. See #355 acceptance criteria: "
+        "'Captured stderr from a failed query appears in the log.'"
+    )
+
+
+def test_peer_query_failure_aborts_rather_than_returns(script_lines: list[str]) -> None:
+    """#355: a failed peer query must abort, not fail open.
+
+    The empty-result and self-not-visible branches both ``return 0`` so the
+    bootstrap proceeds -- that fail-open is intentional and kept (see the
+    module-level docstring / #311's eventual-consistency rationale). A
+    *failed* query is a different condition: the guard could not run at all,
+    so "proceed anyway" is exactly the 2026-08-04 incident. This must be an
+    ``exit`` (which the top-level ``trap on_exit EXIT`` turns into an
+    upload-and-shutdown, per #352's post-mortem), not a ``return 0``.
+    """
+    body = function_body(script_lines, "abort_if_not_winning_rebuild")
+    lines = body.splitlines()
+    failure_line = first_line_index(lines, "BootstrapPeerQueryFailed")
+
+    # Walk forward from the failure log line to the next `fi` that closes its
+    # `if` block, and assert the block aborts via `exit` with a non-zero
+    # status rather than returning 0 (the fail-open shape used by the other
+    # two branches).
+    block = None
+    for end in range(failure_line, len(lines)):
+        if lines[end].strip() == "fi":
+            block = "\n".join(lines[failure_line : end + 1])
+            break
+    assert block is not None, "could not find the closing `fi` for the query-failure branch"
+    assert "exit 0" not in block, (
+        "a failed peer query must not fail open via `return 0` / `exit 0` -- that is "
+        "the exact 2026-08-04 incident this ticket closes. See #355."
+    )
+    assert "return 0" not in block, (
+        "a failed peer query must not fail open via `return 0` -- that is the exact "
+        "2026-08-04 incident this ticket closes. See #355."
+    )
+    assert "exit " in block, (
+        "a failed peer query must abort via `exit <nonzero>` so the top-level "
+        "`trap on_exit EXIT` uploads the log and shuts the instance down. See #355."
+    )
+
+
+def test_peer_query_failure_notifies_slack(script_lines: list[str]) -> None:
+    """#355: a failed peer query must page out via Slack, not just log quietly.
+
+    345 KB of bootstrap log with no authorization error anywhere is exactly
+    what happened on 2026-08-04 -- nobody was reading that log. The failure
+    must reach ``notify_slack`` so it surfaces without anyone tailing logs.
+    """
+    body = function_body(script_lines, "abort_if_not_winning_rebuild")
+    lines = body.splitlines()
+    failure_line = first_line_index(lines, "BootstrapPeerQueryFailed")
+    tail = "\n".join(lines[failure_line : failure_line + 6])
+    assert "notify_slack" in tail, (
+        "the query-failure branch must call notify_slack so the failure surfaces "
+        "without anyone reading logs. See #355."
+    )
+
+
+def test_empty_result_fail_open_message_unchanged(script_lines: list[str]) -> None:
+    """#355 must not touch the genuinely-empty-result fail-open kept from #311.
+
+    ``DescribeInstances`` really is eventually consistent, the launcher
+    precheck already ran, and the >3h sweeper is a backstop -- a *successful*
+    query that legitimately finds zero peers must still proceed with its
+    original message unchanged.
+    """
+    body = function_body(script_lines, "abort_if_not_winning_rebuild")
+    assert (
+        "WARN: peer check found no active rebuild instances "
+        "(self not yet visible?); proceeding" in body
+    ), "the empty-result fail-open message from #311 must be preserved verbatim. See #355."
+    assert "return 0" in body, (
+        "the empty-result branch must still fail open via `return 0`. See #355."
     )

@@ -115,18 +115,40 @@ notify_slack() {
 # and proceeds; every later instance sees an earlier peer and bows out. No
 # mutual-suicide path.
 #
-# Fail-open: if the query errors or self isn't yet visible (DescribeInstances
-# is eventually consistent), proceed rather than block the rebuild — the
-# launcher precheck already ran and the >3h sweeper is the backstop. TOCTOU
-# note: DescribeInstances isn't atomic, but this is the *late* authoritative
-# check, a much narrower window than the launcher's.
+# Fail-open only covers a *successful* query that legitimately finds zero
+# peers, or one that hasn't yet caught up to self (DescribeInstances is
+# eventually consistent) — the launcher precheck already ran and the >3h
+# sweeper is the backstop. TOCTOU note: DescribeInstances isn't atomic, but
+# this is the *late* authoritative check, a much narrower window than the
+# launcher's.
+#
+# A *failed* query (non-zero `aws` exit — AccessDenied, throttling, network)
+# is a different condition and does NOT fail open: it aborts. On 2026-08-04
+# an org-account instance whose InstanceRole lacked ec2:DescribeInstances hit
+# this path; `2>/dev/null || instances=""` discarded the AccessDenied error
+# and collapsed it into the same empty string a legitimately-empty result
+# produces, so the guard logged a benign-looking WARN and proceeded to
+# destroy ~119,432 rows (#352). A guard that cannot run is not a guard — see
+# #355.
 abort_if_not_winning_rebuild() {
-    local instances winner
+    local instances winner stderr_file query_exit=0 query_stderr
+    stderr_file="$(mktemp)"
     instances="$(aws ec2 describe-instances \
         --filters 'Name=tag:Project,Values=discogs-rebuild' \
                   'Name=instance-state-name,Values=pending,running' \
         --query 'Reservations[].Instances[].[LaunchTime,InstanceId]' \
-        --output text 2>/dev/null)" || instances=""
+        --output text 2>"$stderr_file")" || query_exit=$?
+    query_stderr="$(tr '\n' ' ' < "$stderr_file")"
+    rm -f "$stderr_file"
+
+    if [ "$query_exit" -ne 0 ]; then
+        log "ERROR: BootstrapPeerQueryFailed: aws ec2 describe-instances exited ${query_exit}; cannot verify no peer rebuild is running -- stderr: ${query_stderr}"
+        notify_slack ":rotating_light:" "peer query failed (exit ${query_exit}) on ${INSTANCE_ID} -- aborting rather than risk writing the shared cache alongside an unranked peer. stderr: ${query_stderr}"
+        # A failed guard is not a guard. This aborts (nonzero exit) rather
+        # than falling through to the fail-open branches below — trap
+        # on_exit EXIT still uploads the log and runs shutdown -h now.
+        exit 1
+    fi
 
     if [ -z "$instances" ]; then
         log "WARN: peer check found no active rebuild instances (self not yet visible?); proceeding"
