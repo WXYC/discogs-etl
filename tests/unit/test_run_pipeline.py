@@ -2213,3 +2213,149 @@ class TestDeriveVaReleaseStep:
         )
         self._invoke_database_build(fail_derive=True, state=state)
         assert not state.is_completed("derive_va_release")
+
+
+class TestRunStepSafe:
+    """run_step_safe() wraps run_step(), keeping a credentialed argv out of
+    any exception that escapes a failed step (#361).
+
+    dedup_releases.py, import_csv.py, and verify_cache.py all receive the
+    cache database URL positionally. run_step() raises
+    subprocess.CalledProcessError on a nonzero exit, and
+    CalledProcessError.__str__ embeds the full argv it was built with --
+    credentials included. Left uncaught, that string is what a default
+    exception traceback prints, and rebuild-cache-bootstrap.sh tees
+    stdout/stderr straight to the rebuild log bucket on every step failure.
+    """
+
+    DSN = "postgresql://svc:hunter2@cache-host/discogs"
+
+    def test_success_delegates_to_run_step(self, caplog) -> None:
+        with caplog.at_level(logging.INFO, logger=run_pipeline.logger.name):
+            run_pipeline.run_step_safe("echo test", [sys.executable, "-c", "print('hi')"])
+        logged = [r.message for r in caplog.records]
+        assert any("hi" in msg for msg in logged)
+
+    def test_failure_still_raises(self) -> None:
+        with pytest.raises(subprocess.CalledProcessError) as excinfo:
+            run_pipeline.run_step_safe(
+                "fail test", [sys.executable, "-c", "import sys; sys.exit(7)"]
+            )
+        assert excinfo.value.returncode == 7
+
+    def test_failure_does_not_embed_credentialed_argv(self) -> None:
+        with pytest.raises(subprocess.CalledProcessError) as excinfo:
+            run_pipeline.run_step_safe(
+                "Deduplicate releases",
+                [sys.executable, "-c", "import sys; sys.exit(1)", self.DSN],
+            )
+        assert self.DSN not in str(excinfo.value)
+        assert "hunter2" not in str(excinfo.value)
+
+    def test_failure_logs_only_exit_code(self, caplog) -> None:
+        with caplog.at_level(logging.ERROR, logger=run_pipeline.logger.name):
+            with pytest.raises(subprocess.CalledProcessError):
+                run_pipeline.run_step_safe(
+                    "Deduplicate releases",
+                    [sys.executable, "-c", "import sys; sys.exit(1)", self.DSN],
+                )
+        logged = [r.getMessage() for r in caplog.records]
+        assert any("Deduplicate releases" in msg for msg in logged)
+        assert all(self.DSN not in msg and "hunter2" not in msg for msg in logged)
+
+
+class TestArgvCredentialRedaction:
+    """Every argv call site that carries the cache database URL (#361) must
+    route through run_step_safe, so a step failure never surfaces the DSN
+    in a propagated exception. Covers all four scripts named in #361:
+    dedup_releases.py, import_csv.py, and verify_cache.py (two call sites
+    each, one per build path)."""
+
+    DSN = "postgresql://svc:hunter2@cache-host/discogs"
+
+    def _mock_conn(self):
+        mock_cursor = MagicMock()
+        mock_cursor.fetchone.return_value = [True]
+        mock_cursor.fetchall.return_value = [
+            ("idx_release_artist_name_trgm",),
+            ("idx_release_title_trgm",),
+        ]
+        mock_conn = MagicMock()
+        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
+        mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+        return mock_conn
+
+    def _assert_dsn_redacted(self, fake_run_step, invoke) -> None:
+        with (
+            patch.object(run_pipeline, "run_step", side_effect=fake_run_step),
+            patch.object(run_pipeline, "wait_for_postgres"),
+            patch.object(run_pipeline, "run_sql_file"),
+            patch.object(run_pipeline, "run_sql_statements_parallel"),
+            patch.object(run_pipeline, "set_tables_unlogged"),
+            patch.object(run_pipeline, "set_tables_logged"),
+            patch.object(run_pipeline, "run_vacuum"),
+            patch.object(run_pipeline, "report_sizes"),
+            patch.object(run_pipeline, "check_reload_invariant") as mock_check,
+            patch.object(run_pipeline, "write_keep_release_ids", return_value=0),
+            patch.object(run_pipeline.psycopg, "connect", return_value=self._mock_conn()),
+        ):
+            mock_check.return_value = run_pipeline.ReloadInvariantResult(
+                ok=True, release_count=1, artist_coverage=1.0, track_coverage=1.0
+            )
+            with pytest.raises(Exception) as excinfo:
+                invoke()
+        assert self.DSN not in str(excinfo.value)
+        assert "hunter2" not in str(excinfo.value)
+
+    @pytest.mark.parametrize(
+        "failing_step_name",
+        ["Import base CSVs", "Deduplicate releases", "Import tracks", "Prune to library matches"],
+    )
+    def test_database_build_step_failure_redacts_dsn(self, failing_step_name) -> None:
+        def fake_run_step(step_name, cmd, *args, **kwargs):
+            if step_name == failing_step_name:
+                raise subprocess.CalledProcessError(1, cmd)
+
+        self._assert_dsn_redacted(
+            fake_run_step,
+            lambda: run_pipeline._run_database_build(
+                self.DSN,
+                Path("/tmp/csv"),
+                Path("/tmp/library.db"),
+                sys.executable,
+                state=None,
+            ),
+        )
+
+    def test_database_build_copy_to_step_failure_redacts_dsn(self) -> None:
+        def fake_run_step(step_name, cmd, *args, **kwargs):
+            if step_name == "Copy matched releases to target database":
+                raise subprocess.CalledProcessError(1, cmd)
+
+        self._assert_dsn_redacted(
+            fake_run_step,
+            lambda: run_pipeline._run_database_build(
+                self.DSN,
+                Path("/tmp/csv"),
+                Path("/tmp/library.db"),
+                sys.executable,
+                target_db_url="postgresql://svc:hunter2@target-host/discogs",
+                state=None,
+            ),
+        )
+
+    @pytest.mark.parametrize(
+        "failing_step_name",
+        ["Deduplicate releases", "Prune to library matches"],
+    )
+    def test_post_import_step_failure_redacts_dsn(self, failing_step_name) -> None:
+        def fake_run_step(step_name, cmd, *args, **kwargs):
+            if step_name == failing_step_name:
+                raise subprocess.CalledProcessError(1, cmd)
+
+        self._assert_dsn_redacted(
+            fake_run_step,
+            lambda: run_pipeline._run_database_build_post_import(
+                self.DSN, Path("/tmp/csv"), Path("/tmp/library.db"), sys.executable
+            ),
+        )
