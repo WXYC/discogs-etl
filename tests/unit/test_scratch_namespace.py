@@ -70,3 +70,57 @@ class TestNewScratchSuffix:
         name), but guard against anything that would ever need quoting."""
         suffix = new_scratch_suffix()
         assert re.fullmatch(r"[a-z0-9]+", suffix)
+
+    def test_longest_base_name_stays_under_postgres_identifier_limit(self) -> None:
+        """PostgreSQL silently TRUNCATES identifiers past 63 bytes (NAMEDATALEN-1).
+
+        A truncated suffix would re-collide -- two invocations whose names
+        got cut back to the same 63 bytes would share a table again, which
+        is precisely the failure #356 exists to prevent. The longest base
+        name in either script is ``new_release_track_artist`` (24 chars);
+        with ``_`` + an 8-char hex suffix that is 33.
+        """
+        longest_base = "new_release_track_artist"
+        name = scratch_name(longest_base, new_scratch_suffix())
+        assert len(name.encode()) == 33
+        assert len(name.encode()) < 63
+
+
+class TestDropScratchTables:
+    """#356: suffixing removed the old self-healing DROP, so each invocation
+    must drop its own tables. This helper is that shared step."""
+
+    def test_drops_every_base_with_the_suffix_applied(self) -> None:
+        from unittest.mock import MagicMock
+
+        from lib.scratch_namespace import drop_scratch_tables
+
+        cur = MagicMock()
+        drop_scratch_tables(cur, ["dedup_delete_ids", "new_release"], "ab12cd34")
+
+        executed = [call.args[0] for call in cur.execute.call_args_list]
+        assert executed == [
+            "DROP TABLE IF EXISTS dedup_delete_ids_ab12cd34",
+            "DROP TABLE IF EXISTS new_release_ab12cd34",
+        ]
+
+    def test_uses_if_exists_so_it_is_idempotent(self) -> None:
+        """The success path already consumed the ``new_X`` tables via the
+        swap's RENAME, so cleanup routinely runs against tables that are
+        already gone and must not raise."""
+        from unittest.mock import MagicMock
+
+        from lib.scratch_namespace import drop_scratch_tables
+
+        cur = MagicMock()
+        drop_scratch_tables(cur, ["new_release"], "ab12cd34")
+        assert "IF EXISTS" in cur.execute.call_args_list[0].args[0]
+
+    def test_empty_suffix_drops_the_unnamespaced_names(self) -> None:
+        from unittest.mock import MagicMock
+
+        from lib.scratch_namespace import drop_scratch_tables
+
+        cur = MagicMock()
+        drop_scratch_tables(cur, ["_keep_ids"], "")
+        assert cur.execute.call_args_list[0].args[0] == "DROP TABLE IF EXISTS _keep_ids"

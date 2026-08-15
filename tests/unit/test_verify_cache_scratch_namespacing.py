@@ -175,3 +175,87 @@ class TestPruneReleasesCopySwapAutoSuffix:
             )
 
         assert seen_suffixes == [""]
+
+
+class TestPruneFailurePathCleansUpItsOwnScratchTables:
+    """#356 regression guard: once ``_prune_build_scratch_tables`` commits,
+    PostgreSQL's rollback-on-disconnect no longer covers the scratch
+    tables, and per-invocation suffixing means no later run reclaims them
+    by name. ``_prune_add_base_constraints_and_indexes`` is the only thing
+    that drops ``_keep_ids`` -- and it never runs if the swap raises first
+    (``add_constraint_safely`` re-raises once SWAP_PATH_ATTEMPTS is
+    exhausted). Without an explicit handler that orphans ``_keep_ids`` plus
+    every not-yet-swapped ``new_X`` permanently.
+    """
+
+    def test_swap_failure_drops_this_invocations_scratch_tables(self) -> None:
+        dropped: list[tuple[str, str]] = []
+
+        def _boom(db_url, keep_ids, review_ids, *, suffix=""):
+            raise RuntimeError("lock timeout during swap")
+
+        def _fake_drop(db_url, suffix):
+            dropped.append((db_url, suffix))
+
+        with (
+            patch.object(_vc, "_prune_copy_swap_tables", side_effect=_boom),
+            patch.object(_vc, "_prune_add_base_constraints_and_indexes"),
+            patch.object(_vc, "_drop_prune_scratch_tables", side_effect=_fake_drop),
+            pytest.raises(RuntimeError, match="lock timeout"),
+        ):
+            _vc.prune_releases_copy_swap("postgresql:///test", keep_ids={1}, review_ids=set())
+
+        assert len(dropped) == 1, "a failed prune must clean up its own scratch tables"
+        assert dropped[0][1] != "", "cleanup must target the suffix this invocation minted"
+
+    def test_constraint_phase_failure_also_cleans_up(self) -> None:
+        dropped: list[str] = []
+
+        with (
+            patch.object(_vc, "_prune_copy_swap_tables"),
+            patch.object(
+                _vc,
+                "_prune_add_base_constraints_and_indexes",
+                side_effect=RuntimeError("constraint add failed"),
+            ),
+            patch.object(
+                _vc,
+                "_drop_prune_scratch_tables",
+                side_effect=lambda db_url, suffix: dropped.append(suffix),
+            ),
+            pytest.raises(RuntimeError, match="constraint add failed"),
+        ):
+            _vc.prune_releases_copy_swap("postgresql:///test", keep_ids={1}, review_ids=set())
+
+        assert len(dropped) == 1
+
+    def test_success_path_does_not_invoke_the_failure_cleanup(self) -> None:
+        with (
+            patch.object(_vc, "_prune_copy_swap_tables"),
+            patch.object(_vc, "_prune_add_base_constraints_and_indexes"),
+            patch.object(_vc, "_drop_prune_scratch_tables") as mock_drop,
+        ):
+            _vc.prune_releases_copy_swap("postgresql:///test", keep_ids={1}, review_ids=set())
+
+        mock_drop.assert_not_called()
+
+    def test_scratch_bases_cover_keep_ids_and_every_copy_table(self) -> None:
+        """The cleanup list has to stay in lockstep with PRUNE_COPY_TABLES;
+        a table added there but missed here leaks silently."""
+        assert "_keep_ids" in _vc.PRUNE_SCRATCH_BASES
+        for _, new_table, _, _ in _vc.PRUNE_COPY_TABLES:
+            assert new_table in _vc.PRUNE_SCRATCH_BASES
+
+    def test_cleanup_never_masks_the_original_error(self) -> None:
+        """A cleanup that itself fails must not replace the exception that
+        triggered it -- the original failure is the diagnostic signal."""
+        with (
+            patch.object(
+                _vc, "_prune_copy_swap_tables", side_effect=RuntimeError("original failure")
+            ),
+            patch.object(_vc, "_prune_add_base_constraints_and_indexes"),
+            patch.object(_vc, "psycopg") as mock_psycopg,
+        ):
+            mock_psycopg.connect.side_effect = OSError("db unreachable")
+            with pytest.raises(RuntimeError, match="original failure"):
+                _vc.prune_releases_copy_swap("postgresql:///test", keep_ids={1}, review_ids=set())

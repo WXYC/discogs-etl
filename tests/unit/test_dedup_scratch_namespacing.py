@@ -209,3 +209,31 @@ class TestBuildDedupScratchTablesTransactionSafety:
             assert any(f"CREATE TABLE {new}_ab12cd34 AS" in s for s in sqls), (
                 f"expected a suffixed CREATE TABLE for {new}"
             )
+
+
+class TestDedupScratchBases:
+    """#356 regression guard: the failure-path cleanup list must cover every
+    scratch table an invocation can create. A table added to DEDUP_TABLES
+    but missed here leaks a full copy of a live table permanently, because
+    per-invocation suffixing means no later run reclaims it by name.
+    """
+
+    def test_covers_the_id_tables_and_every_dedup_copy_target(self) -> None:
+        assert "dedup_delete_ids" in _dr.DEDUP_SCRATCH_BASES
+        assert "keep_release_ids" in _dr.DEDUP_SCRATCH_BASES
+        for _old, new, _cols, _id_col in _dr.DEDUP_TABLES:
+            assert new in _dr.DEDUP_SCRATCH_BASES
+
+    def test_excludes_the_deliberately_unnamespaced_tables(self) -> None:
+        """release_track_count / wxyc_label_pref / release_label_match /
+        label_hierarchy are cross-subprocess or flag-gated tables that are
+        NOT suffixed (see docs/architecture.md); main() drops them by their
+        literal names, so suffixing them here would emit DROPs for tables
+        that never existed and, worse, imply they were namespaced."""
+        for unnamespaced in (
+            "release_track_count",
+            "wxyc_label_pref",
+            "release_label_match",
+            "label_hierarchy",
+        ):
+            assert unnamespaced not in _dr.DEDUP_SCRATCH_BASES

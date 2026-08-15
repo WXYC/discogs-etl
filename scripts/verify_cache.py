@@ -72,7 +72,7 @@ from lib.pg_concurrent_ddl import (
     add_constraint_safely,
     add_index_concurrently_safely,
 )
-from lib.scratch_namespace import new_scratch_suffix, scratch_name
+from lib.scratch_namespace import drop_scratch_tables, new_scratch_suffix, scratch_name
 
 logger = logging.getLogger(__name__)
 
@@ -1471,8 +1471,26 @@ def prune_releases_copy_swap(
     )
 
     start = time.time()
-    _prune_copy_swap_tables(db_url, keep_ids, review_ids, suffix=resolved_suffix)
-    _prune_add_base_constraints_and_indexes(db_url, suffix=resolved_suffix)
+    # Once _prune_build_scratch_tables commits, this invocation's scratch
+    # tables are durable and no longer covered by PostgreSQL's
+    # rollback-on-disconnect -- and per-invocation suffixing means no later
+    # run reclaims them by name. _prune_add_base_constraints_and_indexes
+    # drops _keep_ids in its own finally, but it never runs at all if
+    # _prune_copy_swap_tables raises (add_constraint_safely re-raises once
+    # SWAP_PATH_ATTEMPTS is exhausted, e.g. when a live LML lock outlasts
+    # the retry budget). Without this handler that failure orphans
+    # _keep_ids_<suffix> plus every not-yet-swapped new_X_<suffix> -- a
+    # multi-GB permanent leak in `public`.
+    try:
+        _prune_copy_swap_tables(db_url, keep_ids, review_ids, suffix=resolved_suffix)
+        _prune_add_base_constraints_and_indexes(db_url, suffix=resolved_suffix)
+    except BaseException:
+        logger.warning(
+            "Copy-and-swap prune failed; dropping this invocation's scratch tables (suffix %s)",
+            resolved_suffix,
+        )
+        _drop_prune_scratch_tables(db_url, resolved_suffix)
+        raise
     elapsed = time.time() - start
     logger.info(f"Copy-and-swap prune completed in {elapsed:.1f}s")
 
@@ -1541,6 +1559,38 @@ PRUNE_COPY_TABLES = [
         "release_id",
     ),
 ]
+
+
+# Every base scratch-table name one prune invocation can create, for the
+# failure-path cleanup in prune_releases_copy_swap(). The `new_X` entries are
+# normally consumed by the swap's RENAME, so they only survive when the run
+# dies partway through the swap loop.
+PRUNE_SCRATCH_BASES: tuple[str, ...] = (
+    "_keep_ids",
+    *(new for _, new, _, _ in PRUNE_COPY_TABLES),
+)
+
+
+def _drop_prune_scratch_tables(db_url: str, suffix: str) -> None:
+    """Drop every scratch table one prune invocation created. Idempotent.
+
+    Best-effort: a failure to clean up must never mask the original error
+    that triggered the cleanup, so this swallows and logs its own
+    exceptions rather than raising.
+    """
+    try:
+        conn = psycopg.connect(db_url, autocommit=True)
+    except Exception:  # noqa: BLE001
+        logger.warning("Could not connect to clean up prune scratch tables", exc_info=True)
+        return
+    try:
+        with conn.cursor() as cur:
+            drop_scratch_tables(cur, PRUNE_SCRATCH_BASES, suffix)
+    except Exception:  # noqa: BLE001
+        logger.warning("Could not clean up prune scratch tables", exc_info=True)
+    finally:
+        conn.close()
+
 
 # Used by --copy-to (deprecated alongside --target-db-url, but still functional).
 # Each entry: (table_name, filter_column, columns_list).

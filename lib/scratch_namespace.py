@@ -28,6 +28,7 @@ manually re-run dedup after a crash) no longer share one debuggable
 from __future__ import annotations
 
 import secrets
+from collections.abc import Iterable
 
 
 def new_scratch_suffix() -> str:
@@ -62,3 +63,30 @@ def scratch_name(base: str, suffix: str) -> str:
     :func:`new_scratch_suffix`.
     """
     return f"{base}_{suffix}" if suffix else base
+
+
+def drop_scratch_tables(cur, bases: Iterable[str], suffix: str) -> None:
+    """``DROP TABLE IF EXISTS`` every namespaced scratch table for one invocation.
+
+    Per-invocation suffixing removes the self-healing property the
+    unsuffixed names used to have: pre-#356, a run that died after its
+    scratch tables were committed left tables the *next* invocation
+    reclaimed, because that invocation created the same literal names and
+    every create was preceded by ``DROP TABLE IF EXISTS``. Under suffixing
+    no future invocation ever mints the same suffix, so nothing reclaims
+    them -- an orphaned ``new_release_<suffix>`` is a full copy of the
+    release table sitting in ``public`` forever.
+
+    Callers therefore have to clean up after themselves on every exit path
+    that follows the scratch build's COMMIT. This helper is the shared
+    "drop this invocation's tables" step for those paths; it is idempotent
+    and safe to call when the tables are already gone (the normal
+    success-path case, where the swap consumed the ``new_X`` tables).
+
+    Args:
+        cur: An open psycopg cursor.
+        bases: Base (unsuffixed) scratch table names.
+        suffix: The suffix this invocation minted.
+    """
+    for base in bases:
+        cur.execute(f"DROP TABLE IF EXISTS {scratch_name(base, suffix)}")
