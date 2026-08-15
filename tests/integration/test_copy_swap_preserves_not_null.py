@@ -613,6 +613,73 @@ class TestPruneCopySwapToleratesRaceWindowInsert:
         )
 
 
+class TestPruneCopySwapCountGuard:
+    """prune_releases_copy_swap aborts before the swap when the release copy
+    undershoots the KEEP/REVIEW set (WXYC/discogs-etl#357).
+
+    The 2026-08-04 incident (#352) swapped a 44,531-row ``new_release`` into
+    place when 71,694 ids had been classified KEEP/REVIEW — 27,163 of them
+    had no source row to copy, and nothing compared the two counts before
+    the swap. This pins the fix: ``count(*) FROM new_release`` must equal
+    ``|keep_ids ∪ review_ids|`` before the swap loop runs. Scoped to the
+    release/new_release pair only — the other seven PRUNE_COPY_TABLES have
+    a variable rows-per-release ratio and must not be compared against the
+    same total (that would abort on every legitimate prune).
+    """
+
+    @pytest.fixture(autouse=True)
+    def _seed(self, db_url):
+        self.db_url = db_url
+        _seed_minimal_fixture(db_url)
+
+    def _table_ids(self, table: str) -> list[int]:
+        conn = psycopg.connect(self.db_url, autocommit=True)
+        try:
+            with conn.cursor() as cur:
+                id_col = "release_id" if table != "release" else "id"
+                cur.execute(f"SELECT {id_col} FROM {table} ORDER BY {id_col}")
+                return [row[0] for row in cur.fetchall()]
+        finally:
+            conn.close()
+
+    def test_matching_keep_review_set_completes_the_swap(self):
+        """copied_rows == |KEEP ∪ REVIEW| is a no-op guard on a normal prune."""
+        _vc.prune_releases_copy_swap(self.db_url, keep_ids={1, 2}, review_ids=set())
+        assert self._table_ids("release") == [1, 2], (
+            "A matching KEEP/REVIEW set must not be blocked by the new count "
+            "guard — the swap should complete and prune release 3 as usual."
+        )
+
+    def test_shortfall_against_release_aborts_before_swap(self):
+        """A KEEP id absent from `release` raises and leaves the old tables intact."""
+        release_before = self._table_ids("release")
+        release_artist_before = self._table_ids("release_artist")
+
+        with pytest.raises(_vc.CopySwapShortfallError) as exc_info:
+            # 999 does not exist in `release` -- induces a 2-copied-vs-3-expected
+            # shortfall (releases 1 and 2 copy; 999 has no source row).
+            _vc.prune_releases_copy_swap(self.db_url, keep_ids={1, 2, 999}, review_ids=set())
+
+        message = str(exc_info.value)
+        assert "copied 2 of 3" in message, (
+            f"failure message must state both the copied count and the "
+            f"expected KEEP/REVIEW count, got: {message!r}"
+        )
+        assert "999" in message, (
+            f"failure message must include a sample of the missing ids, got: {message!r}"
+        )
+
+        assert self._table_ids("release") == release_before == [1, 2, 3], (
+            "Shortfall must abort before the swap -- the old `release` table "
+            "(and its 3 seeded rows) must be untouched."
+        )
+        assert self._table_ids("release_artist") == release_artist_before, (
+            "The guard must fire before any table (including release's "
+            "children) is touched, since it gates entry to the whole "
+            "swap sequence, not just the release rename."
+        )
+
+
 class TestNotNullPinExpectationsMatchSchema:
     """Catch drift between _EXPECTED_NOT_NULL and schema/create_database.sql.
 

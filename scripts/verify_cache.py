@@ -60,6 +60,8 @@ except ImportError:
 from rapidfuzz import fuzz, process
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
+sys.path.insert(0, str(Path(__file__).parent))
+from check_cache_drift import post_slack_alert
 from wxyc_etl.text import is_compilation_artist, split_artist_name_contextual
 
 from lib.dsn import redact_dsn
@@ -1077,6 +1079,85 @@ def _prune_build_scratch_tables(
         conn.close()
 
 
+class CopySwapShortfallError(RuntimeError):
+    """Raised when the copy-and-swap prune copied fewer ``release`` rows than
+    the KEEP/REVIEW set called for.
+
+    WXYC/discogs-etl#357: on 2026-08-04 a prune logged ``69,768 KEEP + 2,507
+    REVIEW = 71,694 total`` immediately followed by ``Copied release ->
+    new_release: 44,531 rows`` -- 27,163 ids marked keep had no source row
+    to copy (a concurrent peer had already swapped the source table out
+    from under this invocation). Nothing compared the two counts, so the
+    truncated table swapped into place anyway and the loss wasn't found
+    until the next day. See :func:`_assert_release_copy_count`.
+    """
+
+
+def _assert_release_copy_count(
+    db_url: str,
+    keep_ids: set[int],
+    review_ids: set[int],
+    *,
+    suffix: str,
+) -> None:
+    """Abort before the swap if ``new_release`` didn't get every KEEP/REVIEW id.
+
+    Compares ``count(*) FROM new_release`` (namespaced with ``suffix``) to
+    ``|keep_ids ∪ review_ids|``. Scoped to the release/new_release pair
+    only: ``keep_ids``/``review_ids`` are release ids, and ``release`` is
+    the only 1:1-keyed table in PRUNE_COPY_TABLES. The other seven child
+    tables have a variable rows-per-release ratio and must never be
+    compared against this same total -- that would abort every legitimate
+    prune, not just a genuine shortfall.
+
+    A match is a no-op. A shortfall logs both counts, the delta, and a
+    sample of the missing ids, posts a best-effort Slack alert (a no-op
+    when ``SLACK_MONITORING_WEBHOOK`` is unset), and raises
+    :class:`CopySwapShortfallError` -- called from
+    :func:`_prune_copy_swap_tables` before it opens the connection that
+    drops FK constraints and runs the RENAME swap, so a shortfall never
+    touches the live tables. See WXYC/discogs-etl#357.
+    """
+    all_ids = keep_ids | review_ids
+    expected = len(all_ids)
+
+    keep_ids_table = scratch_name("_keep_ids", suffix)
+    physical_new_release = scratch_name("new_release", suffix)
+
+    conn = psycopg.connect(db_url, autocommit=True)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(f"SELECT count(*) FROM {physical_new_release}")
+            copied = cur.fetchone()[0]
+
+            if copied == expected:
+                return
+
+            cur.execute(f"""
+                SELECT k.release_id FROM {keep_ids_table} k
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM {physical_new_release} n WHERE n.id = k.release_id
+                )
+                ORDER BY k.release_id
+                LIMIT 20
+            """)
+            missing_sample = [row[0] for row in cur.fetchall()]
+    finally:
+        conn.close()
+
+    message = (
+        f"Copy-and-swap prune shortfall on release -> {physical_new_release}: "
+        f"copied {copied:,} of {expected:,} expected rows (KEEP ∪ REVIEW), "
+        f"delta {expected - copied:,}. Missing ids (sample, max 20): {missing_sample}"
+    )
+    logger.error(message)
+    post_slack_alert(
+        webhook_url=os.environ.get("SLACK_MONITORING_WEBHOOK"),
+        message=message,
+    )
+    raise CopySwapShortfallError(message)
+
+
 def _prune_copy_swap_tables(
     db_url: str,
     keep_ids: set[int],
@@ -1088,10 +1169,13 @@ def _prune_copy_swap_tables(
 
     Delegates scratch-table construction to :func:`_prune_build_scratch_tables`
     (namespaced with ``suffix``, crash-safe -- see that function's docstring
-    for WXYC/discogs-etl#356), then drops the old FK constraints and swaps
-    the tables in. Idempotent. See #256.
+    for WXYC/discogs-etl#356), asserts the release copy matches the
+    KEEP/REVIEW set before any live table is touched (WXYC/discogs-etl#357,
+    see :func:`_assert_release_copy_count`), then drops the old FK
+    constraints and swaps the tables in. Idempotent. See #256.
     """
     _prune_build_scratch_tables(db_url, keep_ids, review_ids, suffix=suffix)
+    _assert_release_copy_count(db_url, keep_ids, review_ids, suffix=suffix)
 
     conn = psycopg.connect(db_url, autocommit=True)
     try:
