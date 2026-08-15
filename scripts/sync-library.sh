@@ -142,7 +142,15 @@ MYSQL_PORT="${DB_PORT:-3306}"
 # Python string-sniffing in tsv_to_sqlite.py, which would risk corrupting
 # that row instead. The other columns in this SELECT (ID, TITLE,
 # PRESENTATION_NAME, CALL_LETTERS, both CALL_NUMBERS, and both REFERENCE_NAME
-# columns) are always populated and are left unwrapped.
+# columns) are left unwrapped deliberately, not on assumption: measured
+# 2026-08-14 against prod (WXYC/discogs-etl#375), `TITLE IS NULL` and
+# `PRESENTATION_NAME IS NULL` both count 0 -- zero SQL NULLs in either
+# column. TITLE is not fully clean, though -- six rows carry a byte-exact
+# empty-string TITLE (ids 21107, 39290, 51871, 52374, 65301, 66329;
+# `LENGTH(TITLE) = 0`, not NULL and not whitespace), which downstream
+# consumers (catalog_parity_diff.py's `_rule_b_missing_reason`) already
+# handle as expected residue via a plain `.strip() == ""` check, so no
+# IFNULL is needed here for that either.
 ETL_OUTPUT=$(mktemp)
 CSV_FILE=$(mktemp)
 if ! MYSQL_PWD="$LIBRARY_DB_PASSWORD" mysql -h "$MYSQL_HOST" -P "$MYSQL_PORT" -u "$LIBRARY_DB_USER" \
