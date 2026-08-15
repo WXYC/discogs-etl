@@ -66,6 +66,18 @@ notify_slack() {
 # (the cleanup would otherwise clobber it) and pass it as $2. See #269 —
 # the failure mode this guards against is a silent exit-0 report when a
 # preceding successful `rm -rf` (or similar) hides a real failure.
+#
+# The disable below is function-scoped on purpose, and must stay ABOVE the
+# opening brace: tests/unit/test_rebuild_cache_err_trap_exit_code.py pins
+# `local exit_code=${2:-$?}` as the literal first statement of the body (a
+# preceding statement would clobber $? before the fallback could read it), so
+# a directive inside the body breaks that #269 guard. SC2319 fires only
+# because discogs-etl#354 added a call from inside an `elif` body, where a
+# bare $? would refer to the `[ ]` test rather than to a command — and that
+# call site passes the exit code explicitly as $2, so the fallback is never
+# evaluated there. On the ERR-trap path there is no enclosing condition and $?
+# is the failing command's status, as intended.
+# shellcheck disable=SC2319
 on_error() {
     local exit_code=${2:-$?}
     local line=$1
@@ -385,14 +397,27 @@ echo "[$(date -u +%H:%M:%SZ)] start pipeline"
 # execution falls through to the drift watchdog and posts
 # ":white_check_mark: rebuilt successfully" for a run that never touched the
 # cache — exactly the false-positive-success defect class incident #352
-# exists to eliminate. `set +e`/`set -e` bracket the call so this script,
-# not the ERR trap, is the first thing to inspect the exit code.
-set +e
+# exists to eliminate.
+#
+# `|| PIPELINE_EXIT_CODE=$?` — NOT `set +e` — is what lets this script, rather
+# than the ERR trap, be the first thing to inspect the exit code. `set +e`
+# suppresses only errexit, never the ERR trap: bash fires a trap on ERR for
+# any failing simple command regardless of errexit state. Bracketing the call
+# in `set +e`/`set -e` therefore leaves the trap armed, so a bow-out would
+# fire `on_error` at the invocation line, post ":warning: failed at line N
+# (exit 75)", and exit 75 — with every line below here dead code. Verified
+# against bash 3.2.57 and 5.2.37. A command on the left of `||` is one of the
+# documented cases where the ERR trap is suppressed (same list errexit obeys),
+# which is why this shape works and the bracketed one does not.
+# tests/unit/test_rebuild_cache_lock_bowout.py executes this region for real
+# rather than only reading it, so the distinction cannot silently regress.
+#
+# Seeded to 0 first: on success the `||` right-hand side never runs, and
+# `set -u` would abort on the unset variable below.
+PIPELINE_EXIT_CODE=0
 python "$REPO_DIR/scripts/run_pipeline.py" \
     --xml "$WORK_DIR" \
-    --library-db "$WORK_DIR/library.db"
-PIPELINE_EXIT_CODE=$?
-set -e
+    --library-db "$WORK_DIR/library.db" || PIPELINE_EXIT_CODE=$?
 
 # Must match lib/rebuild_lock.py's REBUILD_LOCK_BOWED_OUT_EXIT_CODE exactly —
 # tests/unit/test_rebuild_cache_lock_bowout.py pins the two numbers in sync.

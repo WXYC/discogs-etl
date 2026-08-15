@@ -29,9 +29,11 @@ from pathlib import Path
 
 import psycopg
 import pytest
+from psycopg.conninfo import conninfo_to_dict
 
 from lib.rebuild_lock import (
     REBUILD_LOCK_BOWED_OUT_EXIT_CODE,
+    REBUILD_LOCK_CONNECT_PARAMS,
     REBUILD_LOCK_KEY,
     release_rebuild_lock,
     try_acquire_rebuild_lock,
@@ -49,6 +51,24 @@ class TestTryAcquireRebuildLock:
         try:
             assert conn is not None
             assert not conn.closed
+        finally:
+            if conn is not None:
+                release_rebuild_lock(conn)
+
+    def test_the_held_connection_really_has_keepalives_enabled(self, fresh_db_url: str) -> None:
+        """The lock connection is idle for the rebuild's entire multi-hour run
+        and reaches Railway through a public TCP proxy, so the keepalives are
+        load-bearing rather than decorative. Asserted against a live
+        connection's negotiated conninfo, not just the kwargs we passed."""
+        conn = try_acquire_rebuild_lock(fresh_db_url)
+        try:
+            assert conn is not None
+            live = conninfo_to_dict(conn.info.dsn)
+            for param, value in REBUILD_LOCK_CONNECT_PARAMS.items():
+                assert live.get(param) == str(value), (
+                    f"{param} did not survive onto the live lock connection: "
+                    f"got {live.get(param)!r}, expected {str(value)!r}"
+                )
         finally:
             if conn is not None:
                 release_rebuild_lock(conn)
@@ -89,35 +109,51 @@ class TestTryAcquireRebuildLock:
     def test_second_caller_does_not_leak_a_connection_on_refusal(self, fresh_db_url: str) -> None:
         """A refused acquisition must close its own connection rather than
         leaving an idle backend behind -- otherwise every bowed-out instance
-        accumulates a stray connection against the shared cache DB."""
+        accumulates a stray connection against the shared cache DB.
+
+        Polled rather than sampled once: ``conn.close()`` returns as soon as
+        the client has closed its socket, but the server-side backend exits
+        asynchronously, so an immediate second count races that teardown. A
+        single sample failed ~1 run in 25 locally; waiting for the count to
+        come back to baseline tests the same property (no *leaked* backend)
+        without depending on how promptly the postmaster reaps.
+        """
         holder = psycopg.connect(fresh_db_url, autocommit=True)
         with holder.cursor() as cur:
             cur.execute("SELECT pg_try_advisory_lock(%s)", (REBUILD_LOCK_KEY,))
 
         admin = psycopg.connect(fresh_db_url, autocommit=True)
-        with admin.cursor() as cur:
-            cur.execute(
-                "SELECT count(*) FROM pg_stat_activity "
-                "WHERE datname = current_database() AND pid <> pg_backend_pid()"
+
+        def backend_count() -> int:
+            with admin.cursor() as cur:
+                cur.execute(
+                    "SELECT count(*) FROM pg_stat_activity "
+                    "WHERE datname = current_database() AND pid <> pg_backend_pid()"
+                )
+                (count,) = cur.fetchone()
+            return count
+
+        try:
+            before = backend_count()
+
+            refused = try_acquire_rebuild_lock(fresh_db_url)
+            assert refused is None
+
+            deadline = time.monotonic() + 10.0
+            after = backend_count()
+            while after != before and time.monotonic() < deadline:
+                time.sleep(0.05)
+                after = backend_count()
+
+            assert after == before, (
+                f"a refused acquisition must not leak an open connection "
+                f"({before} backends before, still {after} after 10s)"
             )
-            (before,) = cur.fetchone()
-
-        refused = try_acquire_rebuild_lock(fresh_db_url)
-        assert refused is None
-
-        with admin.cursor() as cur:
-            cur.execute(
-                "SELECT count(*) FROM pg_stat_activity "
-                "WHERE datname = current_database() AND pid <> pg_backend_pid()"
-            )
-            (after,) = cur.fetchone()
-
-        with holder.cursor() as cur:
-            cur.execute("SELECT pg_advisory_unlock(%s)", (REBUILD_LOCK_KEY,))
-        holder.close()
-        admin.close()
-
-        assert after == before, "a refused acquisition must not leak an open connection"
+        finally:
+            with holder.cursor() as cur:
+                cur.execute("SELECT pg_advisory_unlock(%s)", (REBUILD_LOCK_KEY,))
+            holder.close()
+            admin.close()
 
     def test_acquires_once_a_prior_holder_releases(self, fresh_db_url: str) -> None:
         holder = psycopg.connect(fresh_db_url, autocommit=True)

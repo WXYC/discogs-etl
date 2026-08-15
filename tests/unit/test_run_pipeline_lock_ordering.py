@@ -13,8 +13,15 @@ a window where a losing peer's earlier forks have already run.
 These are static-structural tests -- they parse ``scripts/run_pipeline.py``
 and assert the relevant fragments exist in the required order, the same
 convention ``tests/unit/test_rebuild_cache_alembic_upgrade.py`` uses for
-``scripts/rebuild-cache.sh``. The live acquire/refuse/release behavior is
-covered by ``tests/integration/test_rebuild_lock.py`` (pg-marked).
+``scripts/rebuild-cache.sh``.
+
+They have a known blind spot, and it is deliberate that they are not the only
+coverage: comparing the order of *known* call sites cannot see a brand-new
+fork introduced above the acquisition. ``TestAdvisoryLockGuardBehaviour`` in
+``tests/unit/test_run_pipeline.py`` closes that by running ``main()`` with a
+refused lock and asserting ``subprocess`` is never touched at all. The live
+acquire/refuse/release behavior is covered by
+``tests/integration/test_rebuild_lock.py`` (pg-marked).
 """
 
 from __future__ import annotations
@@ -98,25 +105,35 @@ class TestAdvisoryLockAcquiredFirst:
             f"_run_database_build() dispatch (line {dispatch_idx + 1})."
         )
 
-    def test_bow_out_uses_the_distinct_exit_code(self, script_lines: list[str]) -> None:
+    def test_bow_out_uses_the_distinct_exit_helper(self, script_lines: list[str]) -> None:
         start, end = _main_body_bounds(script_lines)
         lock_idx = _first_index_in_range(script_lines, "try_acquire_rebuild_lock(", start, end)
-        exit_idx = _first_index_in_range(
-            script_lines, "REBUILD_LOCK_BOWED_OUT_EXIT_CODE", start, end
-        )
+        exit_idx = _first_index_in_range(script_lines, "exit_bowed_out()", start, end)
         assert lock_idx < exit_idx, (
-            "the bow-out branch (sys.exit(REBUILD_LOCK_BOWED_OUT_EXIT_CODE)) "
-            "must appear after the acquisition attempt in main()."
+            "the bow-out branch (exit_bowed_out()) must appear after the "
+            "acquisition attempt in main()."
         )
-        # Must not be a bare sys.exit(0) or sys.exit(1) standing in for it --
-        # that is exactly the #352 false-positive-success trap the ticket
-        # warns about (see scripts/rebuild-cache.sh's own test file).
-        bow_out_line = script_lines[exit_idx]
-        assert "sys.exit(" in "\n".join(script_lines[exit_idx : exit_idx + 3]), (
-            "REBUILD_LOCK_BOWED_OUT_EXIT_CODE must be passed straight to "
-            f"sys.exit(...) near line {exit_idx + 1}."
+
+    def test_bow_out_does_not_use_a_bare_sys_exit(self, script_lines: list[str]) -> None:
+        """A bare ``sys.exit(0)``/``sys.exit(1)`` standing in for the bow-out is
+        exactly the #352 false-positive-success trap: 0 is indistinguishable
+        from a completed rebuild to ``scripts/rebuild-cache.sh``, and 1 is
+        indistinguishable from a crash. ``exit_bowed_out()`` additionally
+        sidesteps the SystemExit-swallowing failure this repo hit in #180.
+
+        Scoped to the guard's own block -- the lines between the acquisition
+        attempt and the ``try:`` that opens the guarded body -- so main()'s
+        legitimate ``sys.exit(1)`` path-validation calls further down are not
+        swept up.
+        """
+        start, end = _main_body_bounds(script_lines)
+        lock_idx = _first_index_in_range(script_lines, "try_acquire_rebuild_lock(", start, end)
+        try_idx = _first_index_in_range(script_lines, "    try:", lock_idx, end)
+        guard_block = script_lines[lock_idx:try_idx]
+        offenders = [line for line in guard_block if "sys.exit(" in line]
+        assert not offenders, (
+            f"the bow-out must go through exit_bowed_out(), not sys.exit(...): found {offenders!r}"
         )
-        assert bow_out_line.strip() != "sys.exit(0)"
 
     def test_lock_released_in_main(self, script_lines: list[str]) -> None:
         start, end = _main_body_bounds(script_lines)
