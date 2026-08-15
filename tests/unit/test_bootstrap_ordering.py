@@ -29,12 +29,18 @@ script — that surface is covered by manual end-to-end retest after the next
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT_PATH = REPO_ROOT / "scripts" / "rebuild-cache-bootstrap.sh"
+
+# The greppable marker the peer-query-failure branch logs (#355). It is a
+# contract with operators and with the runbook's troubleshooting entry, not
+# an implementation detail -- renaming it means updating both.
+FAILURE_MARKER = "BootstrapPeerQueryFailed"
 
 
 @pytest.fixture(scope="module")
@@ -76,26 +82,66 @@ def last_line_index(lines: list[str], needle: str) -> int:
     return found
 
 
-def function_body(lines: list[str], func_name: str) -> str:
-    """Return the source text of a top-level ``func_name() {`` ... ``}`` block.
+def non_comment_lines(lines: list[str]) -> list[str]:
+    """Drop whole-line comments, matching ``test_rebuild_cache_curl_resilience``.
+
+    Every assertion about what the *code* does must run against this, not
+    the raw text. Otherwise an explanatory comment that quotes the shape it
+    is warning against -- and the comments in this script do exactly that,
+    e.g. the ``2>/dev/null || instances=""`` post-mortem note above
+    ``abort_if_not_winning_rebuild`` -- fails a test that is looking for
+    that shape in the code.
+    """
+    return [line for line in lines if not line.lstrip().startswith("#")]
+
+
+FUNC_DEF_RE = re.compile(r"^(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*\(\)\s*\{")
+
+
+def function_body(lines: list[str], func_name: str) -> list[str]:
+    """Return the lines of a top-level ``func_name() {`` ... ``}`` block.
 
     The bootstrap's functions are all top-level: the opening line is
-    unindented and the matching closing brace is a bare ``}`` at column 0
-    (no nested top-level functions in this script). Slicing on those two
-    anchors isolates one function's body for fragment/ordering assertions
-    without dragging in sibling functions that happen to share substrings.
+    unindented and the matching closing brace is a bare ``}`` at column 0.
+    Slicing on those two anchors isolates one function's body for
+    fragment/ordering assertions without dragging in sibling functions that
+    happen to share substrings.
+
+    Anchor-matching is not brace-counting, so it would silently over-capture
+    if the closing anchor were ever missed -- a heredoc or string holding a
+    bare ``}`` at column 0 would end the slice early, and a reindented
+    closing brace would run the slice on into the next function. Both
+    failure modes are caught here rather than surfacing as a confusing
+    assertion further downstream: encountering another top-level function
+    definition before the closing brace is an error, and so is running off
+    the end of the file.
     """
     start = None
     for i, line in enumerate(lines):
-        if line.startswith(f"{func_name}() {{"):
+        match = FUNC_DEF_RE.match(line)
+        if match and match.group("name") == func_name:
             start = i
             break
     if start is None:
         raise AssertionError(f"function {func_name!r} not found in {SCRIPT_PATH}")
     for j in range(start + 1, len(lines)):
         if lines[j] == "}":
-            return "\n".join(lines[start : j + 1])
+            return lines[start : j + 1]
+        if FUNC_DEF_RE.match(lines[j]):
+            raise AssertionError(
+                f"while slicing {func_name!r} in {SCRIPT_PATH}, hit the definition of "
+                f"{lines[j]!r} at line {j + 1} before a closing bare `}}` at column 0. "
+                f"Either {func_name!r}'s closing brace is indented, or a heredoc/string "
+                f"inside it holds a bare `}}` at column 0 -- this helper anchors on text, "
+                f"not brace depth, so it cannot slice that shape. Restore the convention "
+                f"or teach this helper to count braces."
+            )
     raise AssertionError(f"closing brace for {func_name!r} not found in {SCRIPT_PATH}")
+
+
+def guard_body(lines: list[str]) -> list[str]:
+    """The code lines (comments stripped) of ``abort_if_not_winning_rebuild``."""
+    return non_comment_lines(function_body(lines, "abort_if_not_winning_rebuild"))
 
 
 def test_trap_on_exit_registered_before_imds_calls(script_lines: list[str]) -> None:
@@ -249,19 +295,22 @@ def test_peer_query_does_not_discard_stderr(script_lines: list[str]) -> None:
     """#355: the peer query must capture stderr, not swallow it.
 
     The pre-#355 shape was
-    ``... --output text 2>/dev/null)" || instances=""`` — a failed query
+    ``... --output text 2>/dev/null)" || instances=""`` -- a failed query
     (e.g. AccessDenied) discards its error text and collapses into the same
     empty ``instances`` value a legitimately-empty result produces. On
     2026-08-04 that hid an AccessDenied peer-check failure inside a
     345 KB bootstrap log with zero trace of the authorization error. The
     query must instead redirect stderr somewhere it can be logged.
     """
-    body = function_body(script_lines, "abort_if_not_winning_rebuild")
-    assert "describe-instances" in body, (
+    body = guard_body(script_lines)
+    code = "\n".join(body)
+    assert "describe-instances" in code, (
         "abort_if_not_winning_rebuild() must still call `aws ec2 describe-instances`."
     )
-    assert "2>/dev/null" not in body, (
-        "the peer query must not discard stderr with `2>/dev/null` -- a failed query "
+    # Match any spacing -- `2>/dev/null`, `2> /dev/null`, `2>>/dev/null` all
+    # discard the same forensic content.
+    assert not re.search(r"2>>?\s*/dev/null", code), (
+        "the peer query must not discard stderr into /dev/null -- a failed query "
         "(AccessDenied, throttling, etc.) must leave a trace to log and alert on. See #355 "
         "and the 2026-08-04 incident (#352) it fixes."
     )
@@ -281,11 +330,10 @@ def test_peer_query_failure_and_empty_result_are_distinguishable_branches(
     case. The two must now be distinguishable both in control flow and in
     the text an operator (or an alert) would grep for.
     """
-    body = function_body(script_lines, "abort_if_not_winning_rebuild")
-    lines = body.splitlines()
+    body = guard_body(script_lines)
 
-    empty_result_line = first_line_index(lines, "no active rebuild instances")
-    failure_line = first_line_index(lines, "BootstrapPeerQueryFailed")
+    empty_result_line = first_line_index(body, "no active rebuild instances")
+    failure_line = first_line_index(body, FAILURE_MARKER)
     assert empty_result_line != failure_line, (
         "the empty-result WARN and the query-failure log line must be distinct lines "
         "with distinct messages, not a single shared fail-open path. See #355."
@@ -294,36 +342,112 @@ def test_peer_query_failure_and_empty_result_are_distinguishable_branches(
     # The two messages must not share a common "found no active rebuild
     # instances" framing -- that framing is specifically what mis-described
     # the 2026-08-04 AccessDenied failure as a benign empty result.
-    assert "no active rebuild instances" not in lines[failure_line], (
+    assert "no active rebuild instances" not in body[failure_line], (
         "the query-failure log line must not reuse the empty-result phrasing "
         "('found no active rebuild instances') -- that phrasing is what made an "
         "AccessDenied failure look like a benign eventual-consistency gap on "
         "2026-08-04. See #355."
     )
 
+    # ...and the branches must be selected by the query's *exit status*, not
+    # by re-inspecting the (identically empty) result. Testing `$instances`
+    # for emptiness is precisely the conflation #355 exists to undo.
+    guard = first_line_index(body, FAILURE_MARKER)
+    predicate = "\n".join(body[max(0, guard - 3) : guard])
+    assert re.search(r"\$\{?query_exit\}?", predicate), (
+        "the query-failure branch must be selected by the captured `aws` exit status "
+        "(`query_exit`), not by re-testing whether `$instances` is empty -- that test "
+        "cannot tell AccessDenied from zero rows, which is the #352 mechanism. See #355."
+    )
+
 
 def test_peer_query_failure_captures_and_logs_stderr(script_lines: list[str]) -> None:
-    """#355: the captured stderr from a failed query must appear in the log."""
-    body = function_body(script_lines, "abort_if_not_winning_rebuild")
-    lines = body.splitlines()
+    """#355: the captured stderr from a failed query must appear in the log.
 
-    # The query must be captured under a name we can find again in the ERROR
-    # log line and the Slack notification -- pin that a stderr variable is
-    # both assigned and later referenced, rather than merely captured and
-    # discarded.
-    assert "stderr" in body, (
-        "abort_if_not_winning_rebuild() must capture the peer query's stderr into a "
-        "variable (not `2>/dev/null`) so a failure has forensic content. See #355."
+    Asserting on the *expansion* (``${query_stderr}``) rather than the word
+    "stderr" is deliberate: the log line contains the literal text
+    ``-- stderr:`` as a label, so a substring check for "stderr" would still
+    pass if someone dropped the variable expansion and left the label behind
+    -- exactly the regression this test exists to catch.
+    """
+    body = guard_body(script_lines)
+    code = "\n".join(body)
+
+    # The variable must actually be fed from the redirected stderr file, not
+    # merely declared.
+    assert re.search(r"query_stderr=.*\$\{?stderr_file\}?", code), (
+        "abort_if_not_winning_rebuild() must assign `query_stderr` from the file the "
+        "peer query's stderr was redirected into, so a failure has forensic content. "
+        "See #355."
     )
-    failure_line = first_line_index(lines, "BootstrapPeerQueryFailed")
-    # The captured-stderr variable name must be referenced on (or immediately
-    # after) the ERROR line that reports the failure, so the log actually
-    # contains the captured text rather than just announcing the failure.
-    window = "\n".join(lines[failure_line : failure_line + 3])
-    assert "stderr" in window, (
-        "the ERROR log line for a failed peer query must include the captured stderr "
-        "text, not just announce that the query failed. See #355 acceptance criteria: "
+    assert re.search(r"2>\s*\"?\$\{?stderr_file\}?", code), (
+        "the peer query must redirect stderr into `$stderr_file`. See #355."
+    )
+
+    failure_line = first_line_index(body, FAILURE_MARKER)
+    # The captured-stderr expansion must appear on (or immediately after) the
+    # ERROR line that reports the failure, so the log actually contains the
+    # captured text rather than just announcing that a failure happened.
+    window = "\n".join(body[failure_line : failure_line + 3])
+    assert "${query_stderr}" in window, (
+        "the ERROR log line for a failed peer query must interpolate the captured "
+        "stderr, not just announce that the query failed. See #355 acceptance criteria: "
         "'Captured stderr from a failed query appears in the log.'"
+    )
+
+
+def test_peer_query_stderr_is_sanitized_before_interpolation(script_lines: list[str]) -> None:
+    """#355: captured stderr must be made safe for notify_slack's JSON body.
+
+    ``notify_slack`` hand-builds ``{"text":"..."}`` with no escaping, and
+    every caller before this one passed static text. botocore's
+    network-failure message embeds literal double quotes -- ``Could not
+    connect to the endpoint URL: "https://ec2.us-east-1.amazonaws.com/"`` --
+    which produces an invalid payload that Slack rejects, and
+    ``curl ... || true`` swallows the rejection. The alert this branch
+    exists to send would be silently dropped in one of the three failure
+    modes it names. It must also be bounded: Slack's ``text`` limit is
+    4000 chars and a botocore traceback runs well past it.
+    """
+    body = guard_body(script_lines)
+    code = "\n".join(body)
+
+    # The capture must run through a `tr -c` whitelist, not a blacklist: a
+    # blacklist only excludes the characters we thought of, and the failure
+    # mode is silent.
+    capture = next(
+        (line for line in body if re.match(r'\s*query_stderr="?\$\(', line)),
+        None,
+    )
+    assert capture is not None, (
+        "`query_stderr` must be assigned from a command substitution that sanitizes "
+        "the captured stderr. See #355."
+    )
+    assert "tr -c " in capture, (
+        "the captured stderr must be sanitized through a `tr -c <whitelist>` so "
+        "characters we did not anticipate cannot reach notify_slack's hand-built JSON "
+        "payload. See #355."
+    )
+
+    whitelist = next(
+        (line for line in body if "printable_safe=" in line),
+        None,
+    )
+    assert whitelist is not None, (
+        "the `tr -c` whitelist must be a named set (`printable_safe`) so its contents "
+        "are reviewable. See #355."
+    )
+    assert '"' not in whitelist and "\\" not in whitelist, (
+        'the sanitizing whitelist must exclude `"` and `\\` -- notify_slack builds '
+        '`{"text":"..."}` by hand with no escaping, and botocore\'s network-failure '
+        "message embeds literal double quotes. An unescaped quote makes Slack reject "
+        "the payload and `curl ... || true` swallows the rejection. See #355."
+    )
+
+    assert re.search(r"query_stderr=\"\$\{query_stderr:\d+:\d+\}\"", code), (
+        "the captured stderr must be length-capped before interpolation -- an "
+        "unbounded botocore traceback exceeds Slack's 4000-char `text` limit and "
+        "would drop the alert. See #355."
     )
 
 
@@ -335,32 +459,33 @@ def test_peer_query_failure_aborts_rather_than_returns(script_lines: list[str]) 
     module-level docstring / #311's eventual-consistency rationale). A
     *failed* query is a different condition: the guard could not run at all,
     so "proceed anyway" is exactly the 2026-08-04 incident. This must be an
-    ``exit`` (which the top-level ``trap on_exit EXIT`` turns into an
-    upload-and-shutdown, per #352's post-mortem), not a ``return 0``.
+    ``exit`` with a non-zero status (which the top-level ``trap on_exit
+    EXIT`` turns into an upload-and-shutdown, per #352's post-mortem), not a
+    ``return 0``.
     """
-    body = function_body(script_lines, "abort_if_not_winning_rebuild")
-    lines = body.splitlines()
-    failure_line = first_line_index(lines, "BootstrapPeerQueryFailed")
+    body = guard_body(script_lines)
+    failure_line = first_line_index(body, FAILURE_MARKER)
 
     # Walk forward from the failure log line to the next `fi` that closes its
-    # `if` block, and assert the block aborts via `exit` with a non-zero
-    # status rather than returning 0 (the fail-open shape used by the other
-    # two branches).
+    # `if` block. `body` is already comment-stripped, so a future explanatory
+    # comment mentioning `return 0` cannot fail this.
     block = None
-    for end in range(failure_line, len(lines)):
-        if lines[end].strip() == "fi":
-            block = "\n".join(lines[failure_line : end + 1])
+    for end in range(failure_line, len(body)):
+        if body[end].strip() == "fi":
+            block = body[failure_line : end + 1]
             break
     assert block is not None, "could not find the closing `fi` for the query-failure branch"
-    assert "exit 0" not in block, (
+
+    statements = [line.strip() for line in block]
+    assert not any(re.fullmatch(r"(exit|return)\s+0", stmt) for stmt in statements), (
         "a failed peer query must not fail open via `return 0` / `exit 0` -- that is "
         "the exact 2026-08-04 incident this ticket closes. See #355."
     )
-    assert "return 0" not in block, (
-        "a failed peer query must not fail open via `return 0` -- that is the exact "
-        "2026-08-04 incident this ticket closes. See #355."
+    assert not any(re.fullmatch(r"return\b.*", stmt) for stmt in statements), (
+        "a failed peer query must `exit`, not `return` -- a bare `return` would hand "
+        "control back to the caller and proceed to the cache write. See #355."
     )
-    assert "exit " in block, (
+    assert any(re.fullmatch(r"exit\s+[1-9][0-9]*", stmt) for stmt in statements), (
         "a failed peer query must abort via `exit <nonzero>` so the top-level "
         "`trap on_exit EXIT` uploads the log and shuts the instance down. See #355."
     )
@@ -373,13 +498,31 @@ def test_peer_query_failure_notifies_slack(script_lines: list[str]) -> None:
     what happened on 2026-08-04 -- nobody was reading that log. The failure
     must reach ``notify_slack`` so it surfaces without anyone tailing logs.
     """
-    body = function_body(script_lines, "abort_if_not_winning_rebuild")
-    lines = body.splitlines()
-    failure_line = first_line_index(lines, "BootstrapPeerQueryFailed")
-    tail = "\n".join(lines[failure_line : failure_line + 6])
+    body = guard_body(script_lines)
+    failure_line = first_line_index(body, FAILURE_MARKER)
+    tail = "\n".join(body[failure_line : failure_line + 6])
     assert "notify_slack" in tail, (
         "the query-failure branch must call notify_slack so the failure surfaces "
         "without anyone reading logs. See #355."
+    )
+
+
+def test_peer_query_runs_after_slack_webhook_is_sourced(script_lines: list[str]) -> None:
+    """#355: the guard's Slack alert is only real if the webhook is already set.
+
+    ``notify_slack`` no-ops when ``SLACK_MONITORING_WEBHOOK`` is empty. The
+    guard is called late (step 6, right before the first cache write) and the
+    SSM fetch happens at step 5, so today the alert does fire -- but nothing
+    else pins that ordering, and moving the guard earlier "to fail faster"
+    would silently reduce it back to a log-only failure.
+    """
+    code = non_comment_lines(script_lines)
+    webhook_assigned = first_line_index(code, 'SLACK_MONITORING_WEBHOOK="$(ssm_param')
+    guard_called = last_line_index(code, "abort_if_not_winning_rebuild")
+    assert webhook_assigned < guard_called, (
+        "abort_if_not_winning_rebuild must run after SLACK_MONITORING_WEBHOOK is read "
+        "from SSM, or its :rotating_light: alert silently no-ops and the failure is "
+        "log-only again. See #355."
     )
 
 
@@ -391,11 +534,59 @@ def test_empty_result_fail_open_message_unchanged(script_lines: list[str]) -> No
     query that legitimately finds zero peers must still proceed with its
     original message unchanged.
     """
-    body = function_body(script_lines, "abort_if_not_winning_rebuild")
+    body = guard_body(script_lines)
+    code = "\n".join(body)
     assert (
         "WARN: peer check found no active rebuild instances "
-        "(self not yet visible?); proceeding" in body
+        "(self not yet visible?); proceeding" in code
     ), "the empty-result fail-open message from #311 must be preserved verbatim. See #355."
-    assert "return 0" in body, (
-        "the empty-result branch must still fail open via `return 0`. See #355."
+
+    empty_result_line = first_line_index(body, "no active rebuild instances")
+    assert any(
+        line.strip() == "return 0" for line in body[empty_result_line : empty_result_line + 2]
+    ), "the empty-result branch must still fail open via `return 0`. See #355."
+
+
+def test_tie_break_and_no_mutual_suicide_preserved(script_lines: list[str]) -> None:
+    """#355 must leave #311's tie-break semantics exactly as they were.
+
+    The total order is "earliest LaunchTime, ties broken by lexicographically
+    smaller InstanceId", realised as a plain ``sort | head -n1`` over
+    ``<LaunchTime>\\t<InstanceId>`` lines. The no-mutual-suicide property
+    depends on all three of: the self-not-yet-listed branch proceeding rather
+    than aborting, the winner being compared against self, and the loser
+    exiting **0** (a bow-out is not a failure). A regression in any of them
+    is either two concurrent writers or zero.
+    """
+    body = guard_body(script_lines)
+    code = "\n".join(body)
+
+    assert "LaunchTime,InstanceId" in code, (
+        "the peer query must select [LaunchTime, InstanceId] in that order -- the "
+        "tie-break is a lexicographic sort over those two columns. See #311."
+    )
+    assert re.search(r"sort\s*\|\s*head -n1", code), (
+        "the winner must still be `sort | head -n1` over `<LaunchTime>\\t<InstanceId>`. See #311."
+    )
+    assert 'if [ "$winner" != "$INSTANCE_ID" ]; then' in code, (
+        "the loser branch must still compare the computed winner against self. See #311."
+    )
+
+    # Self not yet listed -> proceed (fail-open), NOT abort. If this became an
+    # abort, every instance in a same-second pair could bow out and no rebuild
+    # would run at all.
+    self_missing_line = first_line_index(body, "does not yet list self")
+    assert any(
+        line.strip() == "return 0" for line in body[self_missing_line : self_missing_line + 2]
+    ), (
+        "the self-not-yet-listed branch must still fail open via `return 0`; turning it "
+        "into an abort risks all instances bowing out. See #311."
+    )
+
+    # The loser bows out with exit 0 -- a deliberate no-op, not a failure.
+    loser_line = first_line_index(body, "BootstrapCollisionAborted")
+    loser_block = [line.strip() for line in body[loser_line : loser_line + 4]]
+    assert "exit 0" in loser_block, (
+        "the outranked instance must still bow out with `exit 0` -- a non-zero exit "
+        "would page as a failure for what is correct, intended behaviour. See #311."
     )

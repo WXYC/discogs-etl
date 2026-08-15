@@ -131,6 +131,18 @@ notify_slack() {
 # destroy ~119,432 rows (#352). A guard that cannot run is not a guard — see
 # #355.
 abort_if_not_winning_rebuild() {
+    # Whitelist of characters the captured stderr may contribute to a log
+    # line or a Slack payload: alphanumerics, space, and the punctuation
+    # that carries the forensic content (`:` `/` `-` keep ARNs and URLs
+    # intact). Deliberately excludes `"` and `\` — notify_slack hand-builds
+    # `{"text":"..."}` with no escaping, and botocore's network-failure
+    # message embeds literal double quotes (`Could not connect to the
+    # endpoint URL: "https://ec2..."`). An unescaped quote makes Slack
+    # reject the payload, and `curl ... || true` swallows the rejection —
+    # silently dropping the very alert this branch exists to send. A
+    # whitelist rather than a blacklist so a control character or an
+    # encoding we didn't anticipate can't reintroduce the problem.
+    local printable_safe='a-zA-Z0-9 !#$%&()*+,./:;<=>?@^_|~-'
     local instances winner stderr_file query_exit=0 query_stderr
     stderr_file="$(mktemp)"
     instances="$(aws ec2 describe-instances \
@@ -138,7 +150,15 @@ abort_if_not_winning_rebuild() {
                   'Name=instance-state-name,Values=pending,running' \
         --query 'Reservations[].Instances[].[LaunchTime,InstanceId]' \
         --output text 2>"$stderr_file")" || query_exit=$?
-    query_stderr="$(tr '\n' ' ' < "$stderr_file")"
+    # `tr -c` maps everything outside the whitelist to a space, which also
+    # flattens the newlines into one greppable line. Then cap the length:
+    # a botocore traceback (a broken CLI install is plausible — this script
+    # installs the CLI itself) runs to multiple KB, past Slack's 4000-char
+    # `text` limit. 500 chars comfortably holds an AccessDenied message
+    # including the full assumed-role ARN, which is the diagnostic that
+    # matters here.
+    query_stderr="$(tr -c "$printable_safe" ' ' < "$stderr_file")"
+    query_stderr="${query_stderr:0:500}"
     rm -f "$stderr_file"
 
     if [ "$query_exit" -ne 0 ]; then
