@@ -1,4 +1,4 @@
-"""Unit tests for ``lib/run_summary.py`` -- the plumbing both run-summary
+"""Unit tests for ``lib/run_summary.py`` -- the plumbing the run-summary
 renderers share (discogs-etl#384).
 
 ``parity_run_summary.py`` (#378) and ``fffd_capture_summary.py`` (#382) render
@@ -10,9 +10,15 @@ runs, so both face the same degraded inputs -- zero-byte on exits 2 and 3,
 truncated on a crash mid-write -- and both run in the step whose job is to
 explain other failures, so neither may traceback.
 
-Kept in two copies, a hardening fix to one would silently not reach the other.
-These tests pin the shared loader's contract and that both renderers actually
-route through it.
+``sam_deploy_summary.py`` (#396) is the third, and the one that split the
+reader in two: its producer is ``sam deploy`` and its output is a captured
+console log, so it binds :func:`load_text` where the other two bind
+:func:`load_payload`. The degraded population is identical, which is why the
+JSON path now sits on top of the text path rather than beside it.
+
+Kept in separate copies, a hardening fix to one would silently not reach the
+others. These tests pin the shared loader's contract and that the renderers
+actually route through it.
 """
 
 from __future__ import annotations
@@ -26,7 +32,7 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
 
-from lib.run_summary import load_payload, plain  # noqa: E402
+from lib.run_summary import load_payload, load_text, plain  # noqa: E402
 
 
 def _load(name: str):
@@ -49,7 +55,7 @@ class TestLoadPayload:
     def test_no_path_is_a_problem_not_an_exception(self) -> None:
         payload, problem = load_payload(None, noun="parity report")
         assert payload is None
-        assert problem == "no report path was given"
+        assert problem == "no parity report path was given"
 
     def test_absent_file(self, tmp_path) -> None:
         payload, problem = load_payload(str(tmp_path / "gone.json"), noun="capture report")
@@ -94,6 +100,54 @@ class TestLoadPayload:
         payload, problem = load_payload(str(path), noun="capture report")
         assert payload is None
         assert problem
+
+
+class TestLoadText:
+    """``load_payload``'s reader, reachable on its own for the producer whose
+    output is a console log rather than JSON (#396's ``sam deploy`` capture)."""
+
+    def test_contents_come_back_stripped(self, tmp_path) -> None:
+        path = tmp_path / "sam-deploy.log"
+        path.write_text("\nNo changes to deploy. Stack wxyc-discogs-rebuild is up to date\n\n")
+        text, problem = load_text(str(path), noun="deploy log")
+        assert text == "No changes to deploy. Stack wxyc-discogs-rebuild is up to date"
+        assert problem is None
+
+    def test_no_path_names_the_noun(self, tmp_path) -> None:
+        _, problem = load_text(None, noun="deploy log")
+        assert problem == "no deploy log path was given"
+
+    @pytest.mark.parametrize(
+        ("write", "expected"),
+        [
+            (None, "never written"),
+            ("", "empty"),
+            ("   \n\t\n", "empty"),
+        ],
+    )
+    def test_degraded_files_are_problems_not_exceptions(self, tmp_path, write, expected) -> None:
+        path = tmp_path / "sam-deploy.log"
+        if write is not None:
+            path.write_text(write)
+        text, problem = load_text(str(path), noun="deploy log")
+        assert text is None
+        assert problem and expected in problem
+
+    def test_undecodable_bytes_do_not_traceback(self, tmp_path) -> None:
+        path = tmp_path / "sam-deploy.log"
+        path.write_bytes(b"Successfully created/updated stack - Csillagrabl\xc3")
+        text, problem = load_text(str(path), noun="deploy log")
+        assert text is None
+        assert problem and "UTF-8" in problem
+
+    def test_load_payload_reports_the_same_problems(self, tmp_path) -> None:
+        """The refactor's contract: JSON parsing sits on top of this, it does
+        not re-implement the read."""
+        absent = str(tmp_path / "gone.json")
+        assert (
+            load_payload(absent, noun="parity report")[1]
+            == (load_text(absent, noun="parity report")[1])
+        )
 
 
 class TestPlain:
