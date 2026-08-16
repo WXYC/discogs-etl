@@ -166,8 +166,27 @@ Resources:
                   ]
                 Resource: !Sub arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:launch-template/*
               - Sid: Ec2Describe # ec2:Describe* has no resource-level scoping
+                # DescribeImages is required by the AmiId parameter, not by any
+                # resource in the template. AmiId is typed
+                # AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>, so after
+                # resolving the SSM parameter (see AmiSsmParameter above)
+                # CloudFormation validates that the resolved value is a real AMI
+                # — an ec2:DescribeImages call made with the *deploying
+                # principal's* credentials. That validation runs on every
+                # changeset, so without this the stack cannot be updated at all,
+                # even by a changeset that only adds an unrelated CloudWatch
+                # alarm. That is exactly how #396 surfaced: #358's alarm was the
+                # first real changeset since the org-account migration, and it
+                # failed with "AccessDenied … ec2:DescribeImages" and rolled
+                # back. Every deploy in between reported success only because
+                # --no-fail-on-empty-changeset makes a no-op exit 0.
                 Effect: Allow
-                Action: [ec2:DescribeLaunchTemplates, ec2:DescribeLaunchTemplateVersions]
+                Action:
+                  [
+                    ec2:DescribeLaunchTemplates,
+                    ec2:DescribeLaunchTemplateVersions,
+                    ec2:DescribeImages,
+                  ]
                 Resource: '*'
               - Sid: Lambda
                 Effect: Allow

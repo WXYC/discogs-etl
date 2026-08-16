@@ -33,6 +33,8 @@ import pytest
 import yaml
 from samtranslator.translator.transform import transform
 
+from tests.cfn_yaml import CfnLoader
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 TEMPLATE_PATH = REPO_ROOT / "infra" / "ephemeral-rebuild" / "template.yaml"
 
@@ -51,35 +53,15 @@ _TRANSFORM_REGION = "us-east-1"
 _PLACEHOLDER_CODE_URI = "s3://placeholder-bucket/placeholder.zip"
 
 
-class _CfnLoader(yaml.SafeLoader):
-    """SafeLoader that understands CloudFormation's short-form intrinsic tags.
-
-    ``yaml.safe_load`` raises ConstructorError on ``!Ref`` / ``!Sub`` / ``!GetAtt``
-    / ``!If`` / ``!Not`` / ``!Equals``, all of which this template uses.
-    """
-
-
-def _construct_cfn_tag(loader: yaml.Loader, tag_suffix: str, node: yaml.Node) -> Any:
-    key = "Ref" if tag_suffix == "Ref" else f"Fn::{tag_suffix}"
-    if isinstance(node, yaml.ScalarNode):
-        value: Any = loader.construct_scalar(node)
-        if key == "Fn::GetAtt":
-            value = value.split(".")
-    elif isinstance(node, yaml.SequenceNode):
-        value = loader.construct_sequence(node, deep=True)
-    else:
-        value = loader.construct_mapping(node, deep=True)
-    return {key: value}
-
-
-_CfnLoader.add_multi_constructor("!", _construct_cfn_tag)
+# CloudFormation's short-form intrinsic tags are handled by the shared loader
+# in tests/cfn_yaml.py -- see #396 for why it is shared rather than copied.
 
 
 @pytest.fixture(scope="module")
 def source_template() -> dict[str, Any]:
     """The template as written, intrinsics preserved as ``{"Ref": ...}`` dicts."""
     with TEMPLATE_PATH.open(encoding="utf-8") as fh:
-        return yaml.load(fh, Loader=_CfnLoader)  # noqa: S506 — _CfnLoader subclasses SafeLoader
+        return yaml.load(fh, Loader=CfnLoader)  # noqa: S506 — CfnLoader subclasses SafeLoader
 
 
 @pytest.fixture(scope="module")
