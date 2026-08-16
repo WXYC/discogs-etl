@@ -2531,6 +2531,8 @@ class TestWaitForPostgresRedaction:
         assert "svc" not in logged
         # Still useful for operators: the target host survives redaction.
         assert "cache-host:5433/discogs" in logged
+
+
 # ---------------------------------------------------------------------------
 # main() — advisory-lock guard behaviour (discogs-etl#354, incident #352)
 # ---------------------------------------------------------------------------
