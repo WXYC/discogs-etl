@@ -1145,7 +1145,7 @@ def _prune_copy_swap_tables(
 
         for old_table, new_table, _, _ in PRUNE_COPY_TABLES:
             physical_new_table = scratch_name(new_table, suffix)
-            bak = f"{old_table}_old"
+            bak = scratch_name(f"{old_table}_old", suffix)
             # Atomic swap: the three statements (RENAME old → bak, RENAME
             # new → old, DROP bak CASCADE) run in one transaction so the
             # table name ``old_table`` is never momentarily unbound (which

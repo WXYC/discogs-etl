@@ -85,6 +85,18 @@ class TestNewScratchSuffix:
         assert len(name.encode()) == 33
         assert len(name.encode()) < 63
 
+    def test_longest_copy_swap_backup_name_stays_under_the_same_limit(self) -> None:
+        """The copy-swap backup name (``<old_table>_old``) is namespaced too.
+
+        Its longest base is the longest *live* table either swap renames,
+        ``release_track_artist``, plus ``_old`` -- 24 chars, the same as
+        ``new_release_track_artist``, so 33 bytes with the suffix.
+        """
+        longest_backup_base = "release_track_artist_old"
+        name = scratch_name(longest_backup_base, new_scratch_suffix())
+        assert len(name.encode()) == 33
+        assert len(name.encode()) < 63
+
 
 class TestDropScratchTables:
     """#356: suffixing removed the old self-healing DROP, so each invocation

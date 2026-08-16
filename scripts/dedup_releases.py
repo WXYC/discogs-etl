@@ -561,29 +561,40 @@ def swap_tables(conn, old_table: str, new_table: str, *, suffix: str = "") -> No
 
     ``new_table`` is the base scratch name copy_table() was called with;
     the physical table renamed into place is ``scratch_name(new_table,
-    suffix)`` (empty ``suffix`` -- the default -- preserves today's
-    unnamespaced behavior).
+    suffix)``, and the backup the live table is parked under is
+    ``scratch_name(f"{old_table}_old", suffix)``. An empty ``suffix`` --
+    the default -- preserves the pre-#356 unnamespaced behavior for both.
 
-    The backup name (``<old_table>_old``) is NOT namespaced, and this is a
-    known gap rather than a guarantee: ``main()`` opens its connection with
-    ``autocommit=True``, so the three statements below are three separate
-    transactions, not one. AccessExclusive on ``old_table`` is released
-    after the first RENAME, there is a window in which ``old_table`` does
-    not exist at all, and the ``conn.commit()`` at the end is a no-op.
-    Scratch-table namespacing (WXYC/discogs-etl#356) does NOT make two
-    concurrent swaps of the same live table safe -- it only stops them
-    colliding on their *scratch* names beforehand. Serializing the swap
-    itself is the sibling advisory-lock ticket
-    (WXYC/discogs-etl#354); until that lands, two invocations reaching this
-    function concurrently can still interleave destructively. Compare
-    ``verify_cache.py::_prune_copy_swap_tables``, whose swap DOES run as
-    one statement-list transaction via ``add_constraint_safely``.
+    The backup is namespaced for the same reason every other scratch table
+    is (WXYC/discogs-etl#356), and the reasoning is easy to invert: before
+    #356 two concurrent invocations collided on their *scratch* names long
+    before either got this far, and that early collision incidentally kept
+    them from ever contending here. Removing it means both now arrive at
+    the swap cleanly, so ``<old_table>_old`` -- which briefly holds the
+    only copy of the live table's rows -- must not be a shared name.
+    ``run_pipeline.py`` holds a session-level advisory lock that stops two
+    *pipelines* reaching this point at all (see ``docs/architecture.md``,
+    "Concurrent-Rebuild Guard (Advisory Lock)"), but this script has its
+    own ``__main__`` entrypoint that operators are directed to run against
+    prod (``docs/lml-override-backfill-runbook.md``), and that path takes
+    no lock.
+
+    Namespacing does not make two concurrent swaps of the same *live*
+    table safe -- nothing in this function can. ``main()`` opens its
+    connection with ``autocommit=True``, so the three statements below are
+    three separate transactions, not one: AccessExclusive on ``old_table``
+    is released after the first RENAME, there is a window in which
+    ``old_table`` does not exist at all, and the ``conn.commit()`` at the
+    end is a no-op. Compare ``verify_cache.py::_prune_copy_swap_tables``,
+    whose swap DOES run as one statement-list transaction via
+    ``add_constraint_safely``. Serializing the swap itself is the advisory
+    lock's job.
 
     Uses CASCADE on DROP to remove FK constraints that reference the old table.
     Constraints are recreated by add_constraints_and_indexes() after all swaps.
     """
     physical_new_table = scratch_name(new_table, suffix)
-    bak = f"{old_table}_old"
+    bak = scratch_name(f"{old_table}_old", suffix)
     with conn.cursor() as cur:
         cur.execute(f"ALTER TABLE {old_table} RENAME TO {bak}")
         cur.execute(f"ALTER TABLE {physical_new_table} RENAME TO {old_table}")
