@@ -53,7 +53,9 @@ jobs:
           pip install -e ".[dev]"
           pytest tests/unit/test_ephemeral_rebuild_launcher.py \
                  tests/unit/test_ephemeral_rebuild_sweeper.py \
-                 tests/unit/test_ephemeral_rebuild_template.py -v
+                 tests/unit/test_ephemeral_rebuild_template.py \
+                 tests/unit/test_sam_deploy_summary.py \
+                 tests/unit/test_deploy_ephemeral_rebuild_workflow.py -v
 
   deploy:
     runs-on: ubuntu-latest
@@ -99,11 +101,30 @@ jobs:
         # --parameter-overrides, so a deliberate `ScheduleState=DISABLED` set
         # out-of-band survives redeploys instead of being silently re-armed —
         # which is the entire point of #353 having parameterized it.
+        #
+        # --no-fail-on-empty-changeset stays, and it is why the next step
+        # exists. It makes SAM exit 0 both when it applies a changeset and when
+        # it has nothing to apply, and those two were indistinguishable in this
+        # workflow's output for months while the deploy role could not apply
+        # anything at all (#396). Reddening the empty case is not the fix:
+        # three of the four triggers legitimately produce no template diff, so
+        # that would put a permanent failing check on `main`. The outcome gets
+        # *stated* instead — see "Report deploy outcome" below.
         run: |
           OPTIONAL_ARGS=()
           if [ -n "$REBUILD_ALERT_EMAIL" ]; then
             OPTIONAL_ARGS+=("AlertEmail=$REBUILD_ALERT_EMAIL")
           fi
+
+          # Absolute, and outside the working-directory: the report step runs
+          # from the repo root.
+          SAM_DEPLOY_LOG="${RUNNER_TEMP}/sam-deploy.log"
+          echo "SAM_DEPLOY_LOG=$SAM_DEPLOY_LOG" >> "$GITHUB_ENV"
+
+          # Capture SAM's status instead of failing on it, so the report step
+          # below still runs and renders the failure. Same treatment, for the
+          # same reason, as catalog-parity.yml's harness step.
+          set +e
           sam deploy \
             --no-confirm-changeset \
             --no-fail-on-empty-changeset \
@@ -112,4 +133,36 @@ jobs:
             --s3-bucket "${SAM_S3_BUCKET:-aws-sam-cli-managed-default-samclisourcebucket-v0kc5deo10yi}" \
             --parameter-overrides \
               RepoBranch=main \
-              "${OPTIONAL_ARGS[@]}"
+              "${OPTIONAL_ARGS[@]}" 2>&1 | tee "$SAM_DEPLOY_LOG"
+          # ${PIPESTATUS[0]} and NOT $?. Behind the `| tee`, `$?` is tee's
+          # status — 0 unless the disk fills — so reading it would report every
+          # failed deploy as a success, which is a strictly worse version of
+          # the bug this step is being changed to fix.
+          rc=${PIPESTATUS[0]}
+          set -e
+
+          echo "SAM_DEPLOY_EXIT_CODE=$rc" >> "$GITHUB_ENV"
+          echo "sam deploy exited $rc"
+
+      - name: Report deploy outcome
+        # !cancelled() rather than always(): this must survive the deploy step
+        # failing (that is the run whose summary matters most) and must also
+        # run when the deploy step never happened at all — but a cancelled job
+        # deployed nothing for a reason that needs no explaining.
+        if: ${{ !cancelled() }}
+        # Renders the applied / nothing-deployed / failed / unclassifiable
+        # taxonomy into the step summary and re-raises the code, so THIS is the
+        # step that fails the job. A no-op stays green and annotates as a
+        # warning; an exit-0 deploy whose output matches neither marker fails
+        # closed (exit 65). See scripts/sam_deploy_summary.py (#396).
+        run: |
+          set -euo pipefail
+          if [ -z "${SAM_DEPLOY_EXIT_CODE:-}" ]; then
+            args=(--not-run)
+          else
+            args=(--exit-code "$SAM_DEPLOY_EXIT_CODE")
+            if [ -n "${SAM_DEPLOY_LOG:-}" ]; then
+              args+=(--log "$SAM_DEPLOY_LOG")
+            fi
+          fi
+          python scripts/sam_deploy_summary.py "${args[@]}" >> "$GITHUB_STEP_SUMMARY"

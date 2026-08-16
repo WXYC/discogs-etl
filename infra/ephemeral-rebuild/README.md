@@ -69,6 +69,26 @@ The first guided deploy writes its choices to `samconfig.toml`; subsequent deplo
 
 `samconfig.toml` names the SAM artifact bucket explicitly (`s3_bucket = …`) rather than setting `resolve_s3`. `resolve_s3` reconciles the `aws-sam-cli-managed-default` CloudFormation stack, which the least-privilege CI deploy role is not authorized to touch. Note that the two are mutually exclusive — SAM rejects `--s3-bucket` and `--resolve-s3` together, and a `samconfig.toml` default counts as "provided", so re-adding `resolve_s3` there breaks the CI deploy even though nothing on the command line changed.
 
+#### Reading a CI deploy run ([#396](https://github.com/WXYC/discogs-etl/issues/396))
+
+**A green run of this workflow does not by itself mean the stack was deployed.** It runs `sam deploy --no-fail-on-empty-changeset`, so SAM exits 0 both when it applies a changeset and when it has nothing to apply. Between the [#353](https://github.com/WXYC/discogs-etl/issues/353) account cutover and 2026-08-16 the deploy role lacked `ec2:DescribeImages` and could not have applied *anything*; the workflow was green throughout, and the condition surfaced only when [#358](https://github.com/WXYC/discogs-etl/issues/358)'s `ReleaseCountAlarm` happened to be the first real changeset in that window and failed loudly.
+
+The flag stays — three of the four triggers legitimately produce no template diff, and reddening those would put a permanent failing check on `main`. Instead every run now ends with a **Report deploy outcome** step (`scripts/sam_deploy_summary.py`) that renders which of these it was into the run summary and one annotation:
+
+| Outcome | Step exit | Annotation | Meaning |
+|---|---|---|---|
+| Changeset applied | `0` | `notice` | The stack now matches `template.yaml` at this commit |
+| **Nothing was deployed** | `0` | **`warning`** | SAM had nothing to apply. Nothing reached AWS |
+| Failed | SAM's own code | `error` | CloudFormation rolled back; the stack is behind `main` |
+| Outcome could not be determined | `65` | `error` | Exit 0, output matched neither marker — fails closed |
+| Never ran | `65` | `error` | An earlier step failed; `sam deploy` was not reached |
+
+A **nothing was deployed** warning is expected when the trigger was a change to `scripts/rebuild-cache-bootstrap.sh` (the instance fetches that from the repo at run time; it is not part of the rendered template), a change to the workflow file, or a bare `workflow_dispatch` on an already-deployed `main`. It is **suspicious** when the push changed `template.yaml` or a Lambda handler in this directory — that means a template change did not reach the stack.
+
+**Outcome could not be determined** means a SAM CLI upgrade reworded one of the two lines the renderer matches (`Successfully created/updated stack` / `No changes to deploy`). Read the deploy step's log, confirm what actually happened, then update `scripts/sam_deploy_summary.py` and the verbatim log fixtures in `tests/unit/test_sam_deploy_summary.py` — replacing those fixtures is how the new wording gets pinned. Failing closed is deliberate: an exit-0 deploy whose output cannot be read might have deployed nothing, and treating that as success is exactly what #396 was.
+
+On an `AccessDenied` failure the summary names the denied IAM actions and points at [`infra/bootstrap/`](../bootstrap/README.md) — the grant belongs on the **deploy role**, not the `InstanceRole` this stack's rebuild assumes at run time.
+
 ### 3. Confirm the schedule
 
 ```bash

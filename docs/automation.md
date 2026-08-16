@@ -10,6 +10,8 @@ This pipeline runs monthly (or when Discogs publishes new data dumps). It has a 
 
 Two workflows assume the same role, `AWS_ROLE_TO_ASSUME`: `deploy-ephemeral-rebuild.yml` deploys the stack with it, and `sync-library.yml` uses it to publish daily cache-health metrics. Re-pointing that variable moves both.
 
+**A green `deploy-ephemeral-rebuild.yml` run is not, on its own, evidence that anything was deployed** — it runs `sam deploy --no-fail-on-empty-changeset`, and for months every run was a no-op while the deploy role could not apply a changeset at all ([#396](https://github.com/WXYC/discogs-etl/issues/396)). Each run now states which it was; the outcome table is in [`infra/ephemeral-rebuild/README.md` → Reading a CI deploy run](../infra/ephemeral-rebuild/README.md#reading-a-ci-deploy-run-396).
+
 **An absent stack means the migration happened.** From 2026-05-30 until the [#353](https://github.com/WXYC/discogs-etl/issues/353) cutover the rebuild stack existed in *two* accounts at once, both armed with `cron(0 6 4 * ? *)` against the same Railway database, and the resulting double-run destroyed 27,163 cache rows on 2026-08-04 ([#352](https://github.com/WXYC/discogs-etl/issues/352)). The duplicate was not carelessness: a correct migration in May 2026 deleted the old stack, and [#248](https://github.com/WXYC/discogs-etl/issues/248) — fixing a genuinely broken CI deploy a week later — observed that account was empty of the stack and concluded it had never deployed. Both readings fit the evidence. Writing the directive down is what makes the intended one recoverable, which is why this paragraph exists rather than just the rule above it.
 
 Before concluding infrastructure is missing, check the other account.
