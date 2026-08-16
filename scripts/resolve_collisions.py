@@ -28,6 +28,7 @@ from pathlib import Path
 import psycopg
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from lib.dsn import redact_dsn  # noqa: E402
 from lib.observability import init_logger  # noqa: E402
 
 logger = logging.getLogger(__name__)
@@ -533,7 +534,7 @@ def main(argv: list[str] | None = None) -> None:
     load_wxyc_titles(args.library_db, artists)
 
     # Connect to Discogs cache
-    logger.info("Connecting to Discogs cache: %s", args.database_url.split("@")[-1])
+    logger.info("Connecting to Discogs cache: %s", redact_dsn(args.database_url))
     conn = psycopg.connect(args.database_url)
 
     # Batch-lookup wrong artist IDs (uses B-tree index, fast)

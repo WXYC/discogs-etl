@@ -62,6 +62,7 @@ from rapidfuzz import fuzz, process
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from wxyc_etl.text import is_compilation_artist, split_artist_name_contextual
 
+from lib.dsn import redact_dsn
 from lib.format_normalization import format_matches, normalize_library_format
 from lib.keep_release_ids import parse_keep_release_ids
 from lib.observability import init_logger
@@ -2336,7 +2337,7 @@ async def async_main():
     index = LibraryIndex.from_sqlite(args.library_db)
 
     # Step 3: Connect to Discogs cache and load releases
-    logger.info(f"Connecting to {args.database_url}")
+    logger.info("Connecting to %s", redact_dsn(args.database_url))
     conn = await asyncpg.connect(args.database_url)
 
     try:
