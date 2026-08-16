@@ -74,6 +74,25 @@ def _step(job: str, name: str) -> dict[str, Any]:
 
 DEPLOY_STEP_NAME = "SAM deploy"
 REPORT_STEP_NAME = "Report deploy outcome"
+RENDERER = "sam_deploy_summary.py"
+
+
+def _effective_workdir(step_name: str, job: str = "deploy") -> str:
+    """Where a step's ``run:`` actually executes, relative to the repo root.
+
+    GitHub resolves ``working-directory`` step-first, then the job's
+    ``defaults.run``, then the workflow's. Checking only the step's own key
+    would miss a job-level default entirely -- which is the realistic way this
+    breaks, since the repetition across three steps invites hoisting.
+    """
+    for source in (
+        _step(job, step_name),
+        WORKFLOW["jobs"][job].get("defaults", {}).get("run", {}),
+        WORKFLOW.get("defaults", {}).get("run", {}),
+    ):
+        if source.get("working-directory"):
+            return source["working-directory"]
+    return "."
 
 
 class TestTheDeployStepCapturesItsOutcome:
@@ -167,10 +186,19 @@ class TestTheReportStep:
     def test_the_renderer_path_resolves_from_the_steps_working_directory(self) -> None:
         """``SAM deploy`` runs in ``infra/ephemeral-rebuild``. If the report
         step inherited that, the relative script path would not resolve and the
-        summary would be a ``can't open file`` traceback."""
-        step = _step("deploy", REPORT_STEP_NAME)
-        cwd = REPO_ROOT / step.get("working-directory", ".")
-        assert (cwd / "scripts" / "sam_deploy_summary.py").is_file()
+        summary would be a ``can't open file`` traceback.
+
+        Resolved through the full precedence chain, not just the step's own
+        key: three of the four ``deploy`` steps repeat that
+        ``working-directory``, so hoisting it to ``jobs.deploy.defaults.run``
+        is an obvious tidy-up -- and one that would break this step while a
+        step-level-only check kept passing."""
+        assert (REPO_ROOT / _effective_workdir(REPORT_STEP_NAME) / "scripts" / RENDERER).is_file()
+
+    def test_the_deploy_step_still_runs_where_sam_expects(self) -> None:
+        """The other half of that precedence chain: ``sam build`` and
+        ``sam deploy`` need ``template.yaml``'s directory."""
+        assert (REPO_ROOT / _effective_workdir(DEPLOY_STEP_NAME) / "template.yaml").is_file()
 
 
 class TestTheRendererNeedsNoInstall:
