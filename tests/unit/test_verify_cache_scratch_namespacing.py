@@ -312,6 +312,83 @@ class TestPruneFailurePathCleansUpItsOwnScratchTables:
         for _, new_table, _, _ in _vc.PRUNE_COPY_TABLES:
             assert new_table in _vc.PRUNE_SCRATCH_BASES
 
+    def test_shortfall_abort_retains_keep_ids_but_drops_the_new_table_copies(self) -> None:
+        """WXYC/discogs-etl#357 forensics exemption.
+
+        #356's blanket cleanup and #357's guard compose badly on their own:
+        the abort drops the very ``_keep_ids_<suffix>`` table the alert's
+        missing-id diff has to be re-run against, so the ids beyond the
+        20-id sample become unrecoverable. The exemption keeps that one
+        narrow id table and still drops the multi-GB ``new_X`` copies the
+        #356 cleanup exists to prevent leaking.
+        """
+        with (
+            patch.object(
+                _vc,
+                "_prune_copy_swap_tables",
+                side_effect=_vc.CopySwapShortfallError("copied 2 of 3"),
+            ),
+            patch.object(_vc, "_prune_add_base_constraints_and_indexes"),
+            patch.object(_vc, "_drop_prune_scratch_tables") as mock_drop,
+            pytest.raises(_vc.CopySwapShortfallError),
+        ):
+            _vc.prune_releases_copy_swap("postgresql:///test", keep_ids={1}, review_ids=set())
+
+        mock_drop.assert_called_once()
+        bases = mock_drop.call_args.kwargs.get("bases", _vc.PRUNE_SCRATCH_BASES)
+        assert "_keep_ids" not in bases, (
+            "a shortfall abort must retain _keep_ids_<suffix> so an operator "
+            "can re-run the missing-id diff past the 20-id alert sample"
+        )
+        assert set(bases) == {new for _, new, _, _ in _vc.PRUNE_COPY_TABLES}, (
+            "the exemption is narrow: every new_X copy is still dropped, only _keep_ids is spared"
+        )
+
+    def test_shortfall_abort_logs_the_retained_table_name_at_error(self, caplog) -> None:
+        """The retained table is only useful if the operator is told its name."""
+        with (
+            patch.object(
+                _vc,
+                "_prune_copy_swap_tables",
+                side_effect=_vc.CopySwapShortfallError("copied 2 of 3"),
+            ),
+            patch.object(_vc, "_prune_add_base_constraints_and_indexes"),
+            patch.object(_vc, "_drop_prune_scratch_tables"),
+            caplog.at_level("ERROR", logger=_vc.logger.name),
+            pytest.raises(_vc.CopySwapShortfallError),
+        ):
+            _vc.prune_releases_copy_swap(
+                "postgresql:///test", keep_ids={1}, review_ids=set(), suffix="fx357abc"
+            )
+
+        errors = [r.getMessage() for r in caplog.records if r.levelname == "ERROR"]
+        assert any("_keep_ids_fx357abc" in m for m in errors), (
+            f"the abort must name the retained table at ERROR, got: {errors!r}"
+        )
+
+    def test_non_shortfall_failure_still_drops_keep_ids_too(self) -> None:
+        """The exemption is keyed to CopySwapShortfallError alone.
+
+        Every other failure keeps #356's behavior: drop this invocation's
+        entire scratch set, ``_keep_ids`` included. Nothing is retained,
+        because nothing about a lock timeout or a constraint failure needs
+        the keep-ids table to diagnose.
+        """
+        with (
+            patch.object(
+                _vc, "_prune_copy_swap_tables", side_effect=RuntimeError("lock timeout during swap")
+            ),
+            patch.object(_vc, "_prune_add_base_constraints_and_indexes"),
+            patch.object(_vc, "_drop_prune_scratch_tables") as mock_drop,
+            pytest.raises(RuntimeError, match="lock timeout"),
+        ):
+            _vc.prune_releases_copy_swap("postgresql:///test", keep_ids={1}, review_ids=set())
+
+        mock_drop.assert_called_once()
+        bases = mock_drop.call_args.kwargs.get("bases", _vc.PRUNE_SCRATCH_BASES)
+        assert set(bases) == set(_vc.PRUNE_SCRATCH_BASES)
+        assert "_keep_ids" in bases
+
     def test_cleanup_never_masks_the_original_error(self) -> None:
         """A cleanup that itself fails must not replace the exception that
         triggered it -- the original failure is the diagnostic signal."""

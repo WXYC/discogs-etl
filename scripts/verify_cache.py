@@ -42,7 +42,7 @@ import sqlite3
 import sys
 import time
 import unicodedata
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
@@ -1090,6 +1090,12 @@ class CopySwapShortfallError(RuntimeError):
     from under this invocation). Nothing compared the two counts, so the
     truncated table swapped into place anyway and the loss wasn't found
     until the next day. See :func:`_assert_release_copy_count`.
+
+    This is the one exception type :func:`prune_releases_copy_swap` treats
+    specially on its cleanup path: a shortfall abort retains
+    ``_keep_ids_<suffix>`` for forensics. Anything raised as a plain
+    ``RuntimeError`` gets the blanket cleanup instead, so don't widen this
+    class to cover unrelated prune failures.
     """
 
 
@@ -1117,6 +1123,13 @@ def _assert_release_copy_count(
     :func:`_prune_copy_swap_tables` before it opens the connection that
     drops FK constraints and runs the RENAME swap, so a shortfall never
     touches the live tables. See WXYC/discogs-etl#357.
+
+    The missing-id sample is capped at 20, so the alert alone can't
+    close an investigation on a 27,163-id shortfall. The uncapped diff is
+    re-runnable afterwards only because :func:`prune_releases_copy_swap`'s
+    abort path retains ``_keep_ids_<suffix>``; the message says so, and
+    that retention is what makes this sample a pointer rather than the
+    whole record.
     """
     all_ids = keep_ids | review_ids
     expected = len(all_ids)
@@ -1148,7 +1161,11 @@ def _assert_release_copy_count(
     message = (
         f"Copy-and-swap prune shortfall on release -> {physical_new_release}: "
         f"copied {copied:,} of {expected:,} expected rows (KEEP ∪ REVIEW), "
-        f"delta {expected - copied:,}. Missing ids (sample, max 20): {missing_sample}"
+        f"delta {expected - copied:,}. Missing ids (sample, max 20): {missing_sample}. "
+        f"The live tables are untouched. The abort drops this invocation's new_* table "
+        f"copies but RETAINS {keep_ids_table} for forensics -- re-run the NOT EXISTS diff "
+        f"against it for the full missing-id set, then DROP TABLE {keep_ids_table} when "
+        f"done, since per-invocation suffixing means no later run reclaims it."
     )
     logger.error(message)
     post_slack_alert(
@@ -1568,6 +1585,35 @@ def prune_releases_copy_swap(
     try:
         _prune_copy_swap_tables(db_url, keep_ids, review_ids, suffix=resolved_suffix)
         _prune_add_base_constraints_and_indexes(db_url, suffix=resolved_suffix)
+    except CopySwapShortfallError:
+        # Forensics exemption (WXYC/discogs-etl#357). The blanket cleanup
+        # below is correct for every failure whose diagnosis lives in the
+        # traceback -- but a shortfall's diagnosis lives in the *data*.
+        # The alert names at most 20 missing ids, sampled by a NOT EXISTS
+        # diff of _keep_ids against new_release; dropping _keep_ids makes
+        # that query unrunnable and the remaining ids unrecoverable, since
+        # the classification that produced them is not persisted anywhere
+        # else and re-deriving it means re-running the whole fuzzy-match
+        # phase against a cache that has since moved.
+        #
+        # So: retain _keep_ids_<suffix> (one integer column -- ~24MB at the
+        # ~6M-row worst case, cheap to leave behind) and still drop every
+        # new_X_<suffix> copy (full table copies, the multi-GB leak the
+        # cleanup exists to prevent). The cost is a real one and is stated
+        # in docs/architecture.md: this table is now the operator's to drop
+        # once the investigation closes, because per-invocation suffixing
+        # means no later run will ever reclaim its name.
+        retained = scratch_name("_keep_ids", resolved_suffix)
+        logger.error(
+            "Copy-and-swap prune aborted on a row-count shortfall (suffix %s); dropping this "
+            "invocation's new_* table copies but RETAINING %s so the missing-id diff stays "
+            "re-runnable. Investigate, then DROP TABLE %s -- nothing else will.",
+            resolved_suffix,
+            retained,
+            retained,
+        )
+        _drop_prune_scratch_tables(db_url, resolved_suffix, bases=PRUNE_NEW_TABLE_SCRATCH_BASES)
+        raise
     except BaseException:
         logger.warning(
             "Copy-and-swap prune failed; dropping this invocation's scratch tables (suffix %s)",
@@ -1645,22 +1691,39 @@ PRUNE_COPY_TABLES = [
 ]
 
 
+# The `new_X` table copies alone. These are full copies of the live tables
+# (multi-GB on the real cache), normally consumed by the swap's RENAME, so
+# they only survive when the run dies before or partway through the swap
+# loop. Every failure path drops these -- there is no case in which keeping
+# one is worth the storage.
+PRUNE_NEW_TABLE_SCRATCH_BASES: tuple[str, ...] = tuple(new for _, new, _, _ in PRUNE_COPY_TABLES)
+
 # Every base scratch-table name one prune invocation can create, for the
-# failure-path cleanup in prune_releases_copy_swap(). The `new_X` entries are
-# normally consumed by the swap's RENAME, so they only survive when the run
-# dies partway through the swap loop.
-PRUNE_SCRATCH_BASES: tuple[str, ...] = (
-    "_keep_ids",
-    *(new for _, new, _, _ in PRUNE_COPY_TABLES),
-)
+# failure-path cleanup in prune_releases_copy_swap(). ``_keep_ids`` is the
+# narrow (one integer column) id table; it is the one base that a
+# CopySwapShortfallError abort deliberately retains -- see
+# :func:`prune_releases_copy_swap`.
+PRUNE_SCRATCH_BASES: tuple[str, ...] = ("_keep_ids", *PRUNE_NEW_TABLE_SCRATCH_BASES)
 
 
-def _drop_prune_scratch_tables(db_url: str, suffix: str) -> None:
-    """Drop every scratch table one prune invocation created. Idempotent.
+def _drop_prune_scratch_tables(
+    db_url: str,
+    suffix: str,
+    bases: Iterable[str] = PRUNE_SCRATCH_BASES,
+) -> None:
+    """Drop this prune invocation's scratch tables. Idempotent.
 
     Best-effort: a failure to clean up must never mask the original error
     that triggered the cleanup, so this swallows and logs its own
     exceptions rather than raising.
+
+    Args:
+        db_url: PostgreSQL connection URL.
+        suffix: The suffix this invocation minted.
+        bases: Which base names to drop. Defaults to the full set. The
+            shortfall-abort path in :func:`prune_releases_copy_swap` passes
+            :data:`PRUNE_NEW_TABLE_SCRATCH_BASES` instead, to retain
+            ``_keep_ids`` for forensics (WXYC/discogs-etl#357).
     """
     try:
         conn = psycopg.connect(db_url, autocommit=True)
@@ -1669,7 +1732,7 @@ def _drop_prune_scratch_tables(db_url: str, suffix: str) -> None:
         return
     try:
         with conn.cursor() as cur:
-            drop_scratch_tables(cur, PRUNE_SCRATCH_BASES, suffix)
+            drop_scratch_tables(cur, bases, suffix)
     except Exception:  # noqa: BLE001
         logger.warning("Could not clean up prune scratch tables", exc_info=True)
     finally:
