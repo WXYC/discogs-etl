@@ -39,16 +39,6 @@ TS="$(date -u +%Y-%m-%dT%H%MZ)"
 LOG_FILE="$LOG_DIR/$TS.log"
 exec > >(tee -a "$LOG_FILE") 2>&1
 
-# Single-instance lock. Two cron ticks landing on a still-running rebuild
-# would clobber each other's COPY work.
-LOCK_FD=200
-LOCK_FILE="${LOCK_FILE:-$LOG_DIR/discogs-rebuild.lock}"
-exec 200>"$LOCK_FILE"
-if ! flock -n "$LOCK_FD"; then
-    echo "[$(date -u +%H:%M:%SZ)] another rebuild is already running; exiting"
-    exit 0
-fi
-
 notify_slack() {
     local emoji="$1" message="$2"
     if [ -z "${SLACK_MONITORING_WEBHOOK:-}" ]; then
@@ -93,6 +83,30 @@ fail() {
     notify_slack ":warning:" "$1. Log: ${LOG_FILE}"
     exit 1
 }
+
+# Single-instance lock. Two cron ticks landing on a still-running rebuild
+# would clobber each other's COPY work. Placed below notify_slack()'s
+# definition -- an earlier revision had this block above it, so its
+# bow-out branch could only echo and exit 0, with no way to tell Slack
+# apart from a completed rebuild. That is the same false-positive-success
+# defect class incident #352 exists to eliminate; #267 is the standing
+# reminder of what it costs.
+#
+# LOCK_FILE defaults under $LOG_DIR, which on the ephemeral EC2 model is
+# per-instance, so this guard only ever sees a concurrent run on the *same
+# host*. It cannot see -- and its Slack message below must not claim to
+# guard against -- a peer rebuild on a different host or AWS account. That
+# cross-host case is what the destination-database advisory lock further
+# down (REBUILD_LOCK_BOWED_OUT_EXIT_CODE) and the bootstrap's EC2-tag
+# guard (#311) are for; this flock is a cheaper, same-host-only backstop.
+LOCK_FD=200
+LOCK_FILE="${LOCK_FILE:-$LOG_DIR/discogs-rebuild.lock}"
+exec 200>"$LOCK_FILE"
+if ! flock -n "$LOCK_FD"; then
+    echo "[$(date -u +%H:%M:%SZ)] another rebuild is already running on this host; exiting"
+    notify_slack ":lock:" "bowed out — another rebuild is already running on this host (flock); no cache write. Log: ${LOG_FILE}"
+    exit 0
+fi
 
 echo "[$(date -u +%H:%M:%SZ)] starting rebuild — log: $LOG_FILE"
 

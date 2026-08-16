@@ -212,7 +212,9 @@ sudo -u ec2-user bash -c '
 ```
 
 The script's `flock` will refuse to start if another rebuild is already
-running (zero-exit no-op).
+running on the same host: it posts a `:lock:` Slack message distinguishing
+this same-host bow-out from the destination-database advisory-lock bow-out
+(`:no_entry:`), then exits 0 (not a failure).
 
 ### Smoke mode
 
