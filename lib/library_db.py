@@ -33,6 +33,21 @@ alternate_artist_name, album_artist, label, cross_reference_names``.
 ``label`` is never inserted -- it exists in the schema but is always NULL in
 production, because the MySQL SELECT that feeds the daily build has no label
 column.
+
+**Charset-torture corpus scope.** The shared corpus this repo pins
+(``tests/fixtures/charset-torture.json``, guarded by
+``.github/workflows/charset-corpus-drift.yml``) also defines
+``expected_storage`` and ``expected_match_form`` -- the WX-2 Normalizer
+Charter's ``to_storage_form``/``to_match_form`` outputs. discogs-etl
+implements neither: ``to_storage_form`` has zero call sites in this repo,
+and both round-trip detectors (``tests/unit/test_charset_torture_sqlite_build.py``,
+``tests/integration/test_charset_torture_pg_cache.py``) assert only that
+``entry["input"]`` survives byte-for-byte -- ``library.db`` is
+byte-preserving by design. The drift guard is a whole-file SHA-256 check, so
+it will not catch a future test here written against ``expected_storage`` or
+``expected_match_form``; don't add one. That canonicalization contract
+belongs to whichever service actually normalizes metadata (e.g. LML's
+identity layer), not to this byte-preserving cache.
 """
 
 from __future__ import annotations
