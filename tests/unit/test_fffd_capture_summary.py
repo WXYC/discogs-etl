@@ -123,7 +123,7 @@ class TestExitTaxonomy:
 
     @pytest.mark.parametrize("code", [0, 2, 3, 4, 137])
     def test_every_code_renders_a_heading_and_a_lead(self, code) -> None:
-        out = fcs.render(code, None, "no report path was given")
+        out = fcs.render(code, None, "no capture report path was given")
         assert out.startswith("## ")
         assert len(out.strip().splitlines()) >= 3
 
@@ -140,18 +140,18 @@ class TestCaptureNeverRan:
     """
 
     def test_not_run_is_its_own_outcome(self) -> None:
-        out = fcs.render(fcs.NOT_RUN, None, "no report path was given")
+        out = fcs.render(fcs.NOT_RUN, None, "no capture report path was given")
         assert "not run" in out.lower() or "did not run" in out.lower()
 
     def test_not_run_does_not_send_the_reader_hunting_stdout(self) -> None:
-        out = fcs.render(fcs.NOT_RUN, None, "no report path was given")
+        out = fcs.render(fcs.NOT_RUN, None, "no capture report path was given")
         assert "stdout" not in out.lower()
 
     def test_not_run_says_why_it_was_skipped(self) -> None:
         """The reason is always the same one, and it is already on screen in
         the parity block: the harness did not complete, so there was no
         library.db to pair against."""
-        out = fcs.render(fcs.NOT_RUN, None, "no report path was given").lower()
+        out = fcs.render(fcs.NOT_RUN, None, "no capture report path was given").lower()
         assert "parity" in out
 
     def test_not_run_does_not_complain_about_a_report_it_never_expected(self) -> None:
@@ -159,11 +159,11 @@ class TestCaptureNeverRan:
         because for them it should have been there. Here nothing was ever
         going to write one, so the line is noise on top of a lead that
         already says so."""
-        out = fcs.render(fcs.NOT_RUN, None, "no report path was given")
+        out = fcs.render(fcs.NOT_RUN, None, "no capture report path was given")
         assert "No report to summarise" not in out
 
     def test_not_run_does_not_claim_an_artifact_that_does_not_exist(self) -> None:
-        out = fcs.render(fcs.NOT_RUN, None, "no report path was given")
+        out = fcs.render(fcs.NOT_RUN, None, "no capture report path was given")
         assert "attached to this run as an artifact" not in out
 
     def test_not_run_is_a_notice_not_an_error(self) -> None:

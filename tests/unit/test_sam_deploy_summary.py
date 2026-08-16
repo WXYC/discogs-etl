@@ -165,7 +165,10 @@ class TestClassify:
     def test_exit_zero_with_neither_marker_is_unclassifiable(self) -> None:
         """Fail closed. If SAM's wording changes, the run must go red rather
         than quietly inheriting the 'looks fine' reading that #396 was."""
-        assert sds.classify(0, "Deploying with following values\nRegion: us-east-1\n")
+        assert (
+            sds.classify(0, "Deploying with following values\nRegion: us-east-1\n")
+            == sds.UNCLASSIFIABLE
+        )
         assert sds.classify(0, "Deploying with following values\n") == sds.UNCLASSIFIABLE
 
     def test_exit_zero_with_both_markers_is_unclassifiable(self) -> None:
@@ -298,6 +301,57 @@ class TestTheNoOpIsUnmistakable:
         assert "\n" not in line
 
 
+class TestNoStatusRecorded:
+    """``not_run`` may only claim what it observed.
+
+    The deploy step writes ``SAM_DEPLOY_LOG`` to ``$GITHUB_ENV`` *before*
+    invoking SAM, so a log can exist for a run that recorded no exit code --
+    the step killed between SAM finishing and the status being written. A
+    narrow window, but "nothing was deployed" is an inference from "no status
+    was recorded", and asserting the inference as fact is the shape of the
+    error this whole file exists to prevent.
+    """
+
+    def test_the_outcome_is_still_not_run(self) -> None:
+        """The bucket is right; only what it is allowed to say changed."""
+        assert sds.classify(None, APPLIED_LOG) == sds.NOT_RUN
+        assert sds.classify(None, None) == sds.NOT_RUN
+
+    def test_with_no_log_it_still_says_nothing_was_deployed(self) -> None:
+        out = sds.render(sds.NOT_RUN, None, None, "no deploy log path was given")
+        assert "nothing was deployed" in out.lower()
+
+    def test_a_log_carrying_the_applied_marker_withdraws_that_claim(self) -> None:
+        out = sds.render(sds.NOT_RUN, None, APPLIED_LOG, None)
+        assert sds.APPLIED_MARKER in out
+        assert "cannot tell you whether the deploy completed" in out
+
+    def test_it_tells_the_reader_to_check_the_stack(self) -> None:
+        out = sds.render(sds.NOT_RUN, None, APPLIED_LOG, None)
+        assert "infra/ephemeral-rebuild/template.yaml" in out
+
+    def test_a_log_carrying_the_no_changes_marker_is_treated_the_same(self) -> None:
+        """SAM ran either way; which line it printed does not restore the
+        missing status."""
+        out = sds.render(sds.NOT_RUN, None, NO_CHANGES_LOG, None)
+        assert sds.NO_CHANGES_MARKER in out
+        assert "cannot tell you whether the deploy completed" in out
+
+    def test_a_log_with_neither_marker_corroborates_the_usual_reading(self) -> None:
+        out = sds.render(sds.NOT_RUN, None, "Deploying with following values\n", None)
+        assert "never having been reached" in out
+        assert "cannot tell you whether the deploy completed" not in out
+
+    def test_it_stays_red_either_way(self, tmp_path) -> None:
+        for log in (None, APPLIED_LOG):
+            argv = ["--not-run"]
+            if log is not None:
+                path = tmp_path / "sam-deploy.log"
+                path.write_text(log)
+                argv += ["--log", str(path)]
+            assert sds.main(argv) == sds.UNCLASSIFIABLE_EXIT
+
+
 class TestFailureDiagnosis:
     """#396 took hours to root-cause. The next one should take one look."""
 
@@ -333,7 +387,25 @@ class TestFailureDiagnosis:
         assert sds.denied_actions(ROLLBACK_LOG) == ["ec2:DescribeImages"]
 
     def test_denied_actions_ignores_arns_and_resource_types(self) -> None:
+        """The decoys have to sit in a log that reaches the regex at all --
+        ``denied_actions`` short-circuits on a log with no ``AccessDenied``, so
+        asserting ``[] `` against a clean log passes whatever the regex does."""
+        decoys = (
+            "AccessDenied. User\n"
+            "arn:aws:cloudformation:us-east-1:203767826763:changeSet/samcli-deploy1786912571\n"
+            "AWS::CloudWatch::Alarm   AWS::CloudFormation::Stack   AWS::Serverless::Function\n"
+            "https://github.com/WXYC/discogs-etl   s3://aws-sam-cli-managed-default\n"
+            'For expression "Stacks[].StackStatus" we matched expected path\n'
+            "permission to call ec2:DescribeImages\n"
+        )
+        assert sds.denied_actions(decoys) == ["ec2:DescribeImages"]
+
+    def test_a_log_with_no_access_denied_names_no_actions(self) -> None:
+        """A failure with an unrelated cause must not be reported as a
+        permissions problem, however many colons its output contains."""
         assert sds.denied_actions(APPLIED_LOG) == []
+        assert sds.denied_actions("Error: Failed to create/update the stack: x") == []
+        assert sds.denied_actions(None) == []
 
 
 class TestDegradedInput:

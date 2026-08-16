@@ -28,7 +28,7 @@ Outcomes, and the exit code each produces::
     no_changes      SAM had nothing to apply -- NOTHING REACHED AWS       0  (::warning)
     failed          SAM exited non-zero                        SAM's own code
     unclassifiable  exit 0, but the output says neither                  65
-    not_run         the deploy step never produced a status              65
+    not_run         no exit status was recorded                          65
 
 **The exit code alone decides failure; prose never overrides it.** For exit 0
 there are exactly two accepted top-level SAM strings, and anything else --
@@ -182,18 +182,24 @@ _OUTCOMES: dict[str, _Outcome] = {
         ),
     ),
     NOT_RUN: _Outcome(
-        heading="Ephemeral-rebuild deploy: never ran",
+        heading="Ephemeral-rebuild deploy: no exit status was recorded",
         lead=(
-            "**The deploy step produced no exit status, so `sam deploy` was never reached.** "
-            "An earlier step in this job failed -- the SAM build, the OIDC credential "
-            "assumption, or the checkout. Nothing was deployed; the failure is in the step "
-            "above this one."
+            "**The deploy step recorded no exit status for `sam deploy`.** Almost always this "
+            "means an earlier step in the job failed -- the SAM build, the OIDC credential "
+            "assumption, or the checkout -- and SAM was never reached, so nothing was "
+            "deployed and the failure is in the step above this one.\n\n"
+            'Stated that way on purpose: "no status was recorded" is what was *observed*, '
+            'and "nothing was deployed" is an inference from it. The two come apart if the '
+            "step is killed (a step timeout, the runner going away) between SAM finishing and "
+            "the status being written -- a narrow window, but this file exists because a "
+            "confident wrong reading of a deploy cost months. Where the captured log can "
+            "settle it, it is quoted below."
         ),
         annotation_kind="error",
-        annotation_title="Ephemeral-rebuild deploy never ran",
+        annotation_title="Ephemeral-rebuild deploy status missing",
         annotation_body=(
-            "sam deploy was never reached (an earlier step in the deploy job failed). "
-            "Nothing was deployed."
+            "No exit status was recorded for sam deploy -- almost certainly an earlier step "
+            "in the deploy job failed and SAM was never reached."
         ),
     ),
 }
@@ -303,6 +309,29 @@ def render(outcome: str, exit_code: int | None, log_text: str | None, problem: s
                 "",
             ]
         )
+
+    if outcome == NOT_RUN:
+        # The deploy step exports SAM_DEPLOY_LOG *before* invoking SAM, so a log
+        # can exist even when no status was recorded. If it carries a terminal
+        # SAM line, "nothing was deployed" is not something this may assert.
+        evidence = [m for m in (APPLIED_MARKER, NO_CHANGES_MARKER) if m in (log_text or "")]
+        if evidence:
+            lines.extend(
+                [
+                    f"> **The captured log does carry `{evidence[0]}`.** SAM therefore ran and "
+                    "the step died before its status could be written, rather than SAM never "
+                    "having been reached. **Check the deployed stack against "
+                    "`infra/ephemeral-rebuild/template.yaml` before assuming either way** -- "
+                    "this run cannot tell you whether the deploy completed.",
+                    "",
+                ]
+            )
+        elif log_text:
+            lines.append(
+                "The captured log carries neither terminal SAM line, which is consistent with "
+                "SAM never having been reached."
+            )
+            lines.append("")
 
     if outcome == FAILED:
         detail = _failure_detail(log_text)
