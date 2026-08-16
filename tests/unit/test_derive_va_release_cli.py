@@ -9,6 +9,7 @@ any of them only surfaces in a prod daily-run log otherwise.
 from __future__ import annotations
 
 import importlib.util
+import logging
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -129,31 +130,28 @@ class TestFloorResolution:
 
 
 class TestTargetDescription:
-    def test_describe_target_never_includes_credentials(self, clean_env) -> None:
-        described = derive_module._describe_target(
-            "postgresql://user:hunter2@db.example.com:5433/discogs"
-        )
-        assert "hunter2" not in described
-        assert "user" not in described
-        assert described == "db.example.com:5433/discogs"
+    """The "Deriving va_release on ..." line is routed through the shared
+    redactor in lib/dsn.py; the parser's own edge cases (both DSN forms, bad
+    port, unparseable input) are pinned in tests/unit/test_dsn.py. What is
+    load-bearing *here* is that this call site still goes through it — the
+    daily sync tees this log, so an unredacted target publishes the cache
+    credential on the happy path.
+    """
 
-    def test_describe_target_conninfo_form_never_leaks_password(self, clean_env) -> None:
-        """psycopg accepts key/value DSNs too; a naive urlparse puts the whole
-        conninfo — password included — into .path and would log it."""
-        described = derive_module._describe_target(
-            "host=prod.example.com port=5433 dbname=discogs user=etl password=hunter2"
-        )
-        assert "hunter2" not in described
-        assert "password" not in described
-        assert described == "prod.example.com:5433/discogs"
-
-    def test_describe_target_bad_port_neither_crashes_nor_leaks(self, clean_env) -> None:
-        """urlparse's .port would raise on a non-numeric port before psycopg
-        could produce its clearer connect error; conninfo parsing just passes
-        it through — the log line must simply never crash or leak."""
-        described = derive_module._describe_target("postgresql://etluser:hunter2@host:notaport/db")
-        assert "hunter2" not in described
-        assert "etluser" not in described
-
-    def test_describe_target_degrades_on_unparseable_input(self, clean_env) -> None:
-        assert derive_module._describe_target("%%not-a-dsn%%") == "<unparseable target>"
+    @pytest.mark.parametrize(
+        "dsn",
+        [
+            "postgresql://etl:hunter2@db.example.com:5433/discogs",
+            "host=db.example.com port=5433 dbname=discogs user=etl password=hunter2",
+        ],
+        ids=["url", "conninfo"],
+    )
+    def test_target_line_redacts_dsn(self, clean_env, caplog, dsn: str) -> None:
+        with caplog.at_level(logging.INFO, logger=derive_module.logger.name):
+            code, _, _ = _run_main(["--database-url", dsn])
+        assert code == 0
+        logged = " ".join(record.getMessage() for record in caplog.records)
+        assert "hunter2" not in logged
+        assert "password" not in logged
+        # Still useful to an operator: the target survives redaction.
+        assert "db.example.com:5433/discogs" in logged

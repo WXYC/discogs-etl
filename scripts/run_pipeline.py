@@ -41,6 +41,7 @@ import psycopg
 from wxyc_etl.state import PipelineState
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from lib.dsn import redact_dsn  # noqa: E402
 from lib.observability import init_logger  # noqa: E402
 
 STEP_NAMES = [
@@ -361,21 +362,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return args
 
 
-def _redact_dsn(db_url: str) -> str:
-    """Strip userinfo from a connection string, keeping host/port/database.
-
-    Same shape as scripts/resolve_collisions.py and derive_va_release.py's
-    _describe_target. A DSN with no userinfo is returned unchanged.
-    """
-    return db_url.split("@")[-1]
-
-
 def wait_for_postgres(db_url: str) -> None:
     """Poll Postgres until a connection succeeds or timeout is reached."""
     # Redacted: this logs on every run, success or failure, and
     # rebuild-cache-bootstrap.sh tees the pipeline log to the S3 log bucket.
     # Unredacted, it published the cache credential on the happy path (#361).
-    logger.info("Waiting for PostgreSQL at %s ...", _redact_dsn(db_url))
+    logger.info("Waiting for PostgreSQL at %s ...", redact_dsn(db_url))
     deadline = time.monotonic() + PG_CONNECT_TIMEOUT
     delay = 0.5
     while True:
@@ -524,15 +516,14 @@ def run_step_safe(description: str, cmd: list[str], **kwargs) -> None:
     "the above exception" context.
 
     Scope, so the guarantee is not overread: this closes the *traceback*
-    channel only. Two other channels still carry the DSN into the same log
-    and are deliberately out of this function's reach --
-    (1) the child scripts log their own connection string at startup, which
-    belongs to #227 and needs those files edited; and (2) Sentry's
-    excepthook integration captures frame locals by default, so the
+    channel only. The startup line each child script logs was the second
+    channel into the same log; those now route through lib/dsn.py's
+    redact_dsn, so the only channel still carrying the DSN is Sentry's
+    excepthook integration, which captures frame locals by default -- the
     argv-bearing ``cmd`` local survives in the event payload even though
-    ``from None`` correctly stops its chain walk. The durable fix for both
-    is #361's own suggestion: have those scripts read DATABASE_URL_DISCOGS
-    from a merged os.environ instead of argv.
+    ``from None`` correctly stops its chain walk. The durable fix for that
+    last one is #361's own suggestion: have these scripts read
+    DATABASE_URL_DISCOGS from a merged os.environ instead of argv.
     """
     try:
         run_step(description, cmd, **kwargs)

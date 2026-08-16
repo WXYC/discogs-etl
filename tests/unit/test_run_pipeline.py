@@ -2482,18 +2482,26 @@ class TestWaitForPostgresRedaction:
 
     The argv fix (#361) only covers the failure traceback; this line put the
     same credentialed DSN into the same teed log on the happy path, so a
-    rebuild did not need to fail to publish it. Redaction precedent:
-    resolve_collisions.py and derive_va_release.py's _describe_target.
+    rebuild did not need to fail to publish it. Redaction runs through the
+    shared lib/dsn.py redactor, whose own edge cases are pinned in
+    tests/unit/test_dsn.py.
     """
 
     DSN = "postgresql://svc:hunter2@cache-host:5433/discogs"
+    CONNINFO_DSN = "host=cache-host port=5433 dbname=discogs user=svc password=hunter2"
 
-    def test_logs_host_without_credentials(self, caplog) -> None:
+    @pytest.mark.parametrize("attr", ["DSN", "CONNINFO_DSN"], ids=["url", "conninfo"])
+    def test_logs_host_without_credentials(self, caplog, attr: str) -> None:
+        """Both DSN forms, because psycopg.connect() takes either and the
+        keyword/value form contains no '@' at all -- the earlier
+        split("@")[-1] redactor returned it verbatim, password included.
+        """
         with caplog.at_level(logging.INFO, logger=run_pipeline.logger.name):
             with patch.object(run_pipeline.psycopg, "connect", return_value=MagicMock()):
-                run_pipeline.wait_for_postgres(self.DSN)
+                run_pipeline.wait_for_postgres(getattr(self, attr))
         logged = " ".join(r.getMessage() for r in caplog.records)
         assert "hunter2" not in logged
+        assert "password" not in logged
         assert "svc" not in logged
         # Still useful for operators: the target host survives redaction.
         assert "cache-host:5433/discogs" in logged

@@ -28,6 +28,7 @@ except ImportError:
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from wxyc_etl.pg import to_pg_text_form  # noqa: E402
 
+from lib.dsn import redact_dsn  # noqa: E402
 from lib.format_normalization import normalize_format  # noqa: E402
 from lib.observability import init_logger  # noqa: E402
 
@@ -1313,7 +1314,7 @@ def main():
         logger.error(f"CSV directory not found: {csv_dir}")
         sys.exit(1)
 
-    logger.info(f"Connecting to {db_url}")
+    logger.info("Connecting to %s", redact_dsn(db_url))
     conn = psycopg.connect(db_url)
 
     # --masters-only self-truncates its two tables inside import_masters, so it

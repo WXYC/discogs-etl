@@ -28,6 +28,7 @@ from pathlib import Path
 import psycopg
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from lib.dsn import redact_dsn  # noqa: E402
 from lib.keep_release_ids import parse_keep_release_ids  # noqa: E402
 from lib.observability import init_logger  # noqa: E402
 from lib.pg_concurrent_ddl import (  # noqa: E402
@@ -1055,7 +1056,7 @@ def main():
 
     init_logger(repo="discogs-etl", tool="discogs-etl dedup_releases")
 
-    logger.info(f"Connecting to {db_url}")
+    logger.info("Connecting to %s", redact_dsn(db_url))
     conn = psycopg.connect(db_url, autocommit=True)
 
     # Step 0 (optional): Load WXYC label preferences for label-aware ranking

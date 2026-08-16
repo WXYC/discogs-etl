@@ -68,6 +68,7 @@ from pathlib import Path
 import psycopg
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from lib.dsn import redact_dsn  # noqa: E402
 from lib.observability import init_logger  # noqa: E402
 
 logger = logging.getLogger(__name__)
@@ -188,25 +189,6 @@ def resolve_floor(cli_value: int | None) -> int:
         raise SystemExit(f"error: VA_RELEASE_FLOOR must be an integer, got {raw!r}") from None
 
 
-def _describe_target(database_url: str) -> str:
-    """Loggable host/database of the target DSN, never including credentials.
-
-    Uses psycopg's conninfo parser so key/value DSNs (``host=... password=...``)
-    are handled — a naive urlparse would put the whole conninfo, password
-    included, into ``.path``. Any parse failure degrades to a placeholder
-    rather than risking echoing the raw (credentialed) string or crashing
-    before psycopg.connect can produce its clearer error.
-    """
-    try:
-        info = psycopg.conninfo.conninfo_to_dict(database_url)
-        host = info.get("host") or "<local socket>"
-        port = f":{info['port']}" if info.get("port") else ""
-        dbname = info.get("dbname") or "<default db>"
-        return f"{host}{port}/{dbname}"
-    except Exception:
-        return "<unparseable target>"
-
-
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=(__doc__ or "").split("\n", 1)[0])
     parser.add_argument(
@@ -248,7 +230,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
 
-    logger.info("Deriving va_release on %s", _describe_target(database_url))
+    logger.info("Deriving va_release on %s", redact_dsn(database_url))
     try:
         with psycopg.connect(database_url) as conn:
             derive_va_release(conn, floor=floor)
