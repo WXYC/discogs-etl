@@ -83,6 +83,17 @@ check allowed s3:PutObject \
     "arn:aws:s3:::wxyc-discogs-rebuild-logs-${ACCOUNT}/i-0123456789abcdef0/rebuild.log"
 check allowed ec2:CreateLaunchTemplate \
     "arn:aws:ec2:${REGION}:${ACCOUNT}:launch-template/lt-0123456789abcdef0"
+# ec2:Describe* takes '*' deliberately -- it has no resource-level scoping, so
+# unlike every other check here the bare resource is the correct question, not
+# the wrong one. These are reads CloudFormation makes while building a
+# changeset, and their absence is invisible until a changeset is actually
+# applied: this suite passed all 22 of its prior expectations while
+# ec2:DescribeImages was missing and the stack could not be updated at all
+# (#396). AmiId is typed AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>, so
+# resolving it is an ssm:GetParameters call (checked above) *and* an
+# ec2:DescribeImages validation, and only the first was covered.
+check allowed ec2:DescribeImages '*'
+check allowed ec2:DescribeLaunchTemplates '*'
 check allowed iam:CreateRole \
     "arn:aws:iam::${ACCOUNT}:role/wxyc-discogs-rebuild-InstanceRole-ABC123"
 check allowed iam:CreateInstanceProfile \

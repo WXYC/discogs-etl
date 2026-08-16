@@ -53,13 +53,17 @@ The GitHub OIDC provider itself is **not** declared here. It is account-global, 
 
 ## Verifying the policy
 
-A bootstrap IAM template has no behaviour a unit test can assert before it is deployed, so its test is executed operationally:
+Two layers, because neither catches what the other does.
+
+**Statically**, `tests/unit/test_deploy_role_policy.py` pins the actions this deploy path is known to require, so a tightening that drops one fails at merge rather than at the next changeset. It asserts specific experimentally-established requirements, not minimality — that judgment stays with a human reading the template.
+
+**Operationally**, against the real deployed role:
 
 ```bash
 ./infra/bootstrap/simulate-deploy-role.sh
 ```
 
-22 expectations, exit non-zero if any fails. Run it after every deploy of this stack and after any policy edit. It covers the deploy actions, the `sync-library.yml` metrics grant, four negative controls (so a policy that got too permissive fails too, not just one that got too narrow), and two expected simulator artifacts.
+25 expectations, exit non-zero if any fails. Run it after every deploy of this stack and after any policy edit. It covers the deploy actions, the `sync-library.yml` metrics grant, four negative controls (so a policy that got too permissive fails too, not just one that got too narrow), and two expected simulator artifacts.
 
 **Do not simulate without `--resource-arns`.** Every statement here is resource-scoped, so a bare `simulate-principal-policy --action-names ...` evaluates against `*`, matches nothing, and returns `implicitDeny` for all of them — which reads as a completely broken role. It is the wrong question, not a finding.
 
