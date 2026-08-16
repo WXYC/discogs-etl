@@ -100,6 +100,31 @@ class TestPruneCopySwapTablesSuffix:
         sqls = _executed_sql(mock_cursor)
         assert any("ALTER TABLE new_release_ab12cd34 RENAME TO release" in s for s in sqls)
 
+    def test_backup_name_is_namespaced_too(self) -> None:
+        """Mirrors dedup_releases.swap_tables: the ``<old_table>_old``
+        backup was the last globally-named scratch table, and two
+        invocations that both reach the swap would contend on it. See
+        WXYC/discogs-etl#356.
+        """
+        mock_conn, mock_cursor = _make_mock_conn(fetchone_value=(5,))
+        with patch.object(_vc.psycopg, "connect", return_value=mock_conn):
+            _vc._prune_copy_swap_tables("postgresql:///test", {1, 2}, {3}, suffix="ab12cd34")
+        sqls = _executed_sql(mock_cursor)
+        for old_table, _new, _cols, _id_col in _vc.PRUNE_COPY_TABLES:
+            assert any(
+                f"ALTER TABLE {old_table} RENAME TO {old_table}_old_ab12cd34" in s for s in sqls
+            ), f"expected a namespaced backup rename for {old_table}"
+            assert any(f"DROP TABLE {old_table}_old_ab12cd34 CASCADE" in s for s in sqls)
+            assert not any(s == f"ALTER TABLE {old_table} RENAME TO {old_table}_old" for s in sqls)
+
+    def test_default_suffix_preserves_unsuffixed_backup_name(self) -> None:
+        mock_conn, mock_cursor = _make_mock_conn(fetchone_value=(5,))
+        with patch.object(_vc.psycopg, "connect", return_value=mock_conn):
+            _vc._prune_copy_swap_tables("postgresql:///test", {1, 2}, {3})
+        sqls = _executed_sql(mock_cursor)
+        assert any(s == "ALTER TABLE release RENAME TO release_old" for s in sqls)
+        assert any(s == "DROP TABLE release_old CASCADE" for s in sqls)
+
 
 class TestPruneAddBaseConstraintsAndIndexesSuffix:
     def test_drops_suffixed_keep_ids_table_on_exit(self) -> None:

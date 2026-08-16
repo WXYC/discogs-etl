@@ -103,8 +103,44 @@ class TestSwapTablesSuffix:
         _dr.swap_tables(mock_conn, "release", "new_release", suffix="ab12cd34")
         sqls = _executed_sql(mock_cursor)
         assert "ALTER TABLE new_release_ab12cd34 RENAME TO release" in sqls
+
+    def test_backup_name_is_namespaced_too(self) -> None:
+        """The copy-swap backup is a scratch table like any other.
+
+        Left global, ``release_old`` is the one name two concurrent
+        invocations still share after WXYC/discogs-etl#356 namespaced
+        everything else -- and it is the most destructive one to share,
+        because it briefly holds the *only* copy of the live table's rows.
+        Before #356 the two runs collided on their ``dedup_delete_ids`` /
+        ``new_X`` names long before either reached the swap, which
+        incidentally kept them apart here; removing that early collision
+        means both now arrive at the swap cleanly.
+        """
+        mock_conn, mock_cursor = _make_mock_conn()
+        _dr.swap_tables(mock_conn, "release", "new_release", suffix="ab12cd34")
+        sqls = _executed_sql(mock_cursor)
+        assert "ALTER TABLE release RENAME TO release_old_ab12cd34" in sqls
+        assert "DROP TABLE release_old_ab12cd34 CASCADE" in sqls
+        assert "ALTER TABLE release RENAME TO release_old" not in sqls
+        assert "DROP TABLE release_old CASCADE" not in sqls
+
+    def test_default_suffix_preserves_unsuffixed_backup_name(self) -> None:
+        mock_conn, mock_cursor = _make_mock_conn()
+        _dr.swap_tables(mock_conn, "release", "new_release")
+        sqls = _executed_sql(mock_cursor)
         assert "ALTER TABLE release RENAME TO release_old" in sqls
         assert "DROP TABLE release_old CASCADE" in sqls
+
+    def test_two_invocations_never_share_a_backup_name(self) -> None:
+        """The property the fix exists for, asserted directly."""
+        sqls: list[list[str]] = []
+        for suffix in ("ab12cd34", "99887766"):
+            mock_conn, mock_cursor = _make_mock_conn()
+            _dr.swap_tables(mock_conn, "release", "new_release", suffix=suffix)
+            sqls.append(_executed_sql(mock_cursor))
+        backups = [{s for s in run if "_old" in s} for run in sqls]
+        assert backups[0] and backups[1]
+        assert not backups[0] & backups[1]
 
 
 class TestEnsureDedupIdsSuffix:
