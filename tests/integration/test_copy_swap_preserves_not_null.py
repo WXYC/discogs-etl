@@ -20,6 +20,7 @@ from __future__ import annotations
 import importlib.util
 import sys
 from pathlib import Path
+from unittest.mock import patch
 
 import psycopg
 import pytest
@@ -678,6 +679,111 @@ class TestPruneCopySwapCountGuard:
             "children) is touched, since it gates entry to the whole "
             "swap sequence, not just the release rename."
         )
+
+
+class TestShortfallAbortRetainsKeepIdsForForensics:
+    """The abort keeps ``_keep_ids_<suffix>`` and drops the ``new_X`` copies
+    (WXYC/discogs-etl#357, composed with #356's failure-path cleanup).
+
+    #356's ``except BaseException: _drop_prune_scratch_tables(...)`` drops
+    this invocation's whole scratch set, and #357's guard raises inside
+    that ``try`` — so on their own the two changes destroy the exact
+    artifacts a shortfall investigation needs. The Slack alert samples at
+    most 20 missing ids from a ``NOT EXISTS`` against ``_keep_ids``; once
+    that table is gone the query cannot be re-run and the remaining ids
+    are unrecoverable. The exemption retains that one narrow id table and
+    still drops the multi-GB ``new_X`` copies.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _seed(self, db_url):
+        self.db_url = db_url
+        _seed_minimal_fixture(db_url)
+
+    def _relation_exists(self, name: str) -> bool:
+        conn = psycopg.connect(self.db_url, autocommit=True)
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT to_regclass(%s) IS NOT NULL", (f"public.{name}",))
+                return cur.fetchone()[0]
+        finally:
+            conn.close()
+
+    def _drop(self, name: str) -> None:
+        conn = psycopg.connect(self.db_url, autocommit=True)
+        try:
+            with conn.cursor() as cur:
+                cur.execute(f"DROP TABLE IF EXISTS {name} CASCADE")
+        finally:
+            conn.close()
+
+    def test_shortfall_keeps_keep_ids_and_drops_every_new_table(self):
+        suffix = "fx357aa1"
+        try:
+            with pytest.raises(_vc.CopySwapShortfallError):
+                # 999 has no source row in `release`: 2 copied vs 3 expected.
+                _vc.prune_releases_copy_swap(
+                    self.db_url, keep_ids={1, 2, 999}, review_ids=set(), suffix=suffix
+                )
+
+            assert self._relation_exists(f"_keep_ids_{suffix}"), (
+                "the shortfall abort must retain _keep_ids_<suffix> -- it is the "
+                "only way to recover the missing ids beyond the alert's 20-id sample"
+            )
+            for _old, new_table, _cols, _id_col in _vc.PRUNE_COPY_TABLES:
+                assert not self._relation_exists(f"{new_table}_{suffix}"), (
+                    f"{new_table}_{suffix} is a full table copy and must still be "
+                    f"dropped -- the forensics exemption covers _keep_ids only"
+                )
+        finally:
+            self._drop(f"_keep_ids_{suffix}")
+
+    def test_retained_keep_ids_can_still_answer_the_missing_id_diff(self):
+        """The point of retaining it: the alert's ``NOT EXISTS`` diff — capped
+        at 20 ids in the message — stays re-runnable, uncapped, afterwards."""
+        suffix = "fx357aa2"
+        try:
+            with pytest.raises(_vc.CopySwapShortfallError):
+                _vc.prune_releases_copy_swap(
+                    self.db_url, keep_ids={1, 2, 999}, review_ids=set(), suffix=suffix
+                )
+
+            conn = psycopg.connect(self.db_url, autocommit=True)
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(f"""
+                        SELECT k.release_id FROM _keep_ids_{suffix} k
+                        WHERE NOT EXISTS (SELECT 1 FROM release n WHERE n.id = k.release_id)
+                        ORDER BY k.release_id
+                    """)
+                    assert [row[0] for row in cur.fetchall()] == [999]
+            finally:
+                conn.close()
+        finally:
+            self._drop(f"_keep_ids_{suffix}")
+
+    def test_non_shortfall_failure_drops_keep_ids_as_well(self):
+        """A failure that isn't a shortfall keeps #356's blanket cleanup."""
+        suffix = "fx357aa3"
+        try:
+            with (
+                patch.object(
+                    _vc,
+                    "_prune_add_base_constraints_and_indexes",
+                    side_effect=RuntimeError("constraint add failed"),
+                ),
+                pytest.raises(RuntimeError, match="constraint add failed"),
+            ):
+                _vc.prune_releases_copy_swap(
+                    self.db_url, keep_ids={1, 2}, review_ids=set(), suffix=suffix
+                )
+
+            assert not self._relation_exists(f"_keep_ids_{suffix}"), (
+                "only CopySwapShortfallError earns the forensics exemption; every "
+                "other failure must drop the whole scratch set as #356 intended"
+            )
+        finally:
+            self._drop(f"_keep_ids_{suffix}")
 
 
 class TestNotNullPinExpectationsMatchSchema:
