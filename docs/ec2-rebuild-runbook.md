@@ -243,7 +243,7 @@ The bootstrap's peer check ([#311](https://github.com/WXYC/discogs-etl/issues/31
 run: `aws ec2 describe-instances` exited non-zero. The log line carries the exit status and the
 captured stderr, and a `:rotating_light:` Slack message repeats both. Since #355 this **aborts**
 rather than proceeding — a guard that cannot run is not a guard, and the alternative is what
-destroyed ~119,432 rows on 2026-08-04 ([#352](https://github.com/WXYC/discogs-etl/issues/352)).
+destroyed 27,163 rows on 2026-08-04 ([#352](https://github.com/WXYC/discogs-etl/issues/352)).
 Nothing relaunches automatically, so the monthly rebuild is skipped until an operator acts.
 
 Read the captured stderr first; it names the failure mode:
