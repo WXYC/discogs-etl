@@ -128,7 +128,7 @@ notify_slack() {
 # this path; `2>/dev/null || instances=""` discarded the AccessDenied error
 # and collapsed it into the same empty string a legitimately-empty result
 # produces, so the guard logged a benign-looking WARN and proceeded to
-# destroy ~119,432 rows (#352). A guard that cannot run is not a guard — see
+# destroy 27,163 rows (#352). A guard that cannot run is not a guard — see
 # #355.
 abort_if_not_winning_rebuild() {
     # Whitelist of characters the captured stderr may contribute to a log
