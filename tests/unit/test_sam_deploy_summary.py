@@ -1,36 +1,27 @@
 """Unit tests for ``scripts/sam_deploy_summary.py`` (discogs-etl#396).
 
-``deploy-ephemeral-rebuild.yml`` runs ``sam deploy --no-fail-on-empty-changeset``.
-That flag is correct and has to stay -- three of the workflow's four triggers
-produce no template diff at all (``scripts/rebuild-cache-bootstrap.sh`` is
-curled by the instance at runtime and is not part of the rendered template;
-the workflow file itself is not either; a ``workflow_dispatch`` re-run of an
-already-deployed ``main`` is a no-op by construction) -- but it means SAM exits
-0 whether it applied a changeset or found nothing to do. **Those two outcomes
-were indistinguishable in the run's output**, and for months the workflow's
-green history was the second one while the deploy role silently lacked
-``ec2:DescribeImages`` and could not have applied anything:
+Why this renderer exists at all -- the months of green no-op deploys, and why
+``--no-fail-on-empty-changeset`` stays -- is in that script's module docstring
+and in ``infra/ephemeral-rebuild/README.md``. Not restated here: it was already
+drifting across four copies at authoring time, and none of them fails when they
+disagree.
 
-    run 31970903384   "No changes to deploy. Stack ... is up to date"   exit 0  green
-    run 31970987037   AccessDenied ec2:DescribeImages, UPDATE_ROLLBACK  exit 1  red
+What these tests pin is the classification contract:
 
-Two minutes apart. Only the second one carried information, and only because
-#358 happened to be the first real changeset in months. This renderer is the
-fix for the first line, not the second: a no-op must announce itself.
+**The exit code alone decides failure** -- never prose. For exit 0 there are
+exactly two accepted top-level SAM strings, one per outcome, and *anything
+else is a failure to classify*, which is red. That direction is the whole
+point: the defect being fixed is a silent fall-through to "looks fine", so the
+ambiguous case must be loud.
 
-The classification is deliberately narrow. **The exit code alone decides
-failure** -- never prose. For exit 0 there are exactly two accepted top-level
-SAM strings, one per outcome, and *anything else is a failure to classify*,
-which is red. That direction is the whole point: the defect being fixed is a
-silent fall-through to "looks fine", so the ambiguous case must be loud.
-
-Nothing here parses SAM's CloudFormation events table. Its columns are
-fixed-width and wrap mid-token -- the real rollback log above contains
+**Nothing parses SAM's CloudFormation events table.** Its columns are
+fixed-width and wrap mid-token -- the rollback fixture below contains
 ``UPDATE_ROLLBACK_COMPLE`` / ``TE`` on two lines, and the successful one
 contains ``UPDATE_COMPLETE_CLEANU`` -- so substring matches against resource
-statuses are a coin flip on column width. The fixtures below keep that
-wrapping verbatim so a future "just also check for UPDATE_COMPLETE" has a test
-that shows why not.
+statuses are a coin flip on column width. The fixtures are verbatim captures
+and keep that wrapping, so a future "just also check for UPDATE_COMPLETE" has
+a test that shows why not. They are also why the SAM CLI version is pinned in
+the workflow: refreshing them is part of a bump.
 """
 
 from __future__ import annotations
@@ -207,7 +198,7 @@ class TestClassify:
 class TestExitCodes:
     """What the report step returns, and therefore what the job's status is."""
 
-    def _run(self, tmp_path, code, log_text, extra=()):
+    def _run(self, tmp_path, code, log_text):
         argv = []
         if code is not None:
             argv += ["--exit-code", str(code)]
@@ -217,7 +208,7 @@ class TestExitCodes:
             path = tmp_path / "sam-deploy.log"
             path.write_text(log_text)
             argv += ["--log", str(path)]
-        return sds.main([*argv, *extra])
+        return sds.main(argv)
 
     def test_applied_is_green(self, tmp_path) -> None:
         assert self._run(tmp_path, 0, APPLIED_LOG) == 0
@@ -233,11 +224,11 @@ class TestExitCodes:
         assert self._run(tmp_path, 137, ROLLBACK_LOG) == 137
 
     def test_unclassifiable_is_red_with_its_own_code(self, tmp_path) -> None:
-        code = self._run(tmp_path, 0, "Deploying with following values\n")
-        assert code == sds.UNCLASSIFIABLE_EXIT
-        assert code != 0
+        assert self._run(tmp_path, 0, "Deploying with following values\n") == (
+            sds.UNCLASSIFIABLE_EXIT
+        )
 
-    def test_the_unclassifiable_code_cannot_be_confused_with_sams(self, tmp_path) -> None:
+    def test_the_unclassifiable_code_cannot_be_confused_with_sams(self) -> None:
         """SAM exits 1 (and the runner 137/143 on a kill). 65 is EX_DATAERR and
         is not in either population, so the bare number is diagnostic."""
         assert sds.UNCLASSIFIABLE_EXIT == 65
@@ -264,15 +255,14 @@ class TestTheNoOpIsUnmistakable:
     def test_the_no_op_annotation_is_a_warning_not_a_notice(self) -> None:
         """Green-with-a-warning is the shape this outcome needs: it must not
         fail the job, and it must not be as quiet as the success case."""
-        assert sds.annotation(sds.NO_CHANGES, 0, NO_CHANGES_LOG).startswith("::warning ")
+        assert sds.annotation(sds.NO_CHANGES, NO_CHANGES_LOG).startswith("::warning ")
 
     def test_the_applied_annotation_is_a_notice(self) -> None:
-        assert sds.annotation(sds.APPLIED, 0, APPLIED_LOG).startswith("::notice ")
+        assert sds.annotation(sds.APPLIED, APPLIED_LOG).startswith("::notice ")
 
-    @pytest.mark.parametrize("outcome", ["FAILED", "UNCLASSIFIABLE", "NOT_RUN"])
+    @pytest.mark.parametrize("outcome", [sds.FAILED, sds.UNCLASSIFIABLE, sds.NOT_RUN])
     def test_the_red_outcomes_annotate_as_errors(self, outcome: str) -> None:
-        value = getattr(sds, outcome)
-        assert sds.annotation(value, 1, ROLLBACK_LOG).startswith("::error ")
+        assert sds.annotation(outcome, ROLLBACK_LOG).startswith("::error ")
 
     def test_the_two_green_outcomes_do_not_share_a_heading(self) -> None:
         applied = sds.render(sds.APPLIED, 0, APPLIED_LOG, None).splitlines()[0]
@@ -293,12 +283,11 @@ class TestTheNoOpIsUnmistakable:
 
     @pytest.mark.parametrize(
         "outcome",
-        ["APPLIED", "NO_CHANGES", "FAILED", "UNCLASSIFIABLE", "NOT_RUN"],
+        [sds.APPLIED, sds.NO_CHANGES, sds.FAILED, sds.UNCLASSIFIABLE, sds.NOT_RUN],
     )
     def test_every_annotation_is_exactly_one_line(self, outcome: str) -> None:
         """GitHub truncates an annotation at its first newline."""
-        line = sds.annotation(getattr(sds, outcome), 1, ROLLBACK_LOG)
-        assert "\n" not in line
+        assert "\n" not in sds.annotation(outcome, ROLLBACK_LOG)
 
 
 class TestNoStatusRecorded:
@@ -412,23 +401,23 @@ class TestDegradedInput:
     """This renderer runs in the step whose job is to explain other failures.
     A traceback here turns one legible failure into two."""
 
-    def test_an_absent_log_does_not_traceback(self, tmp_path) -> None:
-        assert sds.main(["--exit-code", "0", "--log", str(tmp_path / "gone.log")]) != 0
-
-    def test_an_empty_log_does_not_traceback(self, tmp_path) -> None:
+    @pytest.mark.parametrize("degradation", ["absent", "empty", "undecodable"])
+    def test_a_degraded_log_at_exit_zero_fails_closed(self, tmp_path, degradation) -> None:
+        """One assertion strength for one behaviour. Whichever way the log is
+        unreadable, an exit-0 deploy it cannot vouch for is unclassifiable --
+        the three read paths themselves are pinned in
+        ``tests/unit/test_run_summary_shared.py``."""
         path = tmp_path / "sam-deploy.log"
-        path.write_text("")
+        if degradation == "empty":
+            path.write_text("")
+        elif degradation == "undecodable":
+            path.write_bytes(b"No changes to deploy. Stack Csillagrabl\xc3")
         assert sds.main(["--exit-code", "0", "--log", str(path)]) == sds.UNCLASSIFIABLE_EXIT
 
     def test_an_empty_log_on_a_failing_exit_still_reports_the_failure(self, tmp_path) -> None:
         path = tmp_path / "sam-deploy.log"
         path.write_text("")
         assert sds.main(["--exit-code", "1", "--log", str(path)]) == 1
-
-    def test_undecodable_bytes_do_not_traceback(self, tmp_path) -> None:
-        path = tmp_path / "sam-deploy.log"
-        path.write_bytes(b"No changes to deploy. Stack Csillagrabl\xc3")
-        assert sds.main(["--exit-code", "0", "--log", str(path)]) != 0
 
     def test_no_log_argument_at_all_does_not_traceback(self) -> None:
         assert sds.main(["--exit-code", "1"]) == 1
@@ -446,19 +435,3 @@ class TestDegradedInput:
         assert captured.out.startswith("#")
         assert captured.err.strip().startswith("::warning ")
         assert len(captured.err.strip().splitlines()) == 1
-
-
-class TestSharedLoader:
-    """The untrusted-file read is `lib/run_summary.py`'s, not a third copy."""
-
-    def test_it_routes_through_the_shared_loader(self) -> None:
-        sys.path.insert(0, str(REPO_ROOT))
-        from lib.run_summary import load_text
-
-        assert sds.load_log.func is load_text  # functools.partial over the shared one
-
-    def test_annotations_are_plain_text(self) -> None:
-        sys.path.insert(0, str(REPO_ROOT))
-        from lib.run_summary import plain
-
-        assert sds._plain is plain

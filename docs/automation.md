@@ -16,6 +16,24 @@ Two workflows assume the same role, `AWS_ROLE_TO_ASSUME`: `deploy-ephemeral-rebu
 
 Before concluding infrastructure is missing, check the other account.
 
+## Run-outcome reporting
+
+Three workflows now share one shape, and it is worth naming so the fourth is a decision rather than a rediscovery. The problem it solves is **a zero exit that is not a health signal** — a step that completed without doing the thing anyone cares about:
+
+1. The step captures its producer's own status rather than failing on it (`rc=$?`, or `${PIPESTATUS[0]}` behind a `| tee`), and exports it via `$GITHUB_ENV`. Failing in place would make GitHub skip every later step, discarding the summary that explains the failure.
+2. A later step, gated on `always()` / `!cancelled()`, runs a small stdlib-only Python renderer that classifies the outcome, writes Markdown to `$GITHUB_STEP_SUMMARY`, writes exactly **one** annotation to stderr (GitHub truncates an annotation at its first newline), and re-exits with a meaningful code. That step, not the producer's, is what fails the job.
+3. The renderer treats the producer's output as untrusted — absent, zero-byte, truncated, or undecodable must degrade the summary rather than traceback. That reading is shared in `lib/run_summary.py` (`load_text` / `load_payload` / `plain` / `annotation_line`).
+
+| Renderer | Producer | The outcome that needed saying |
+|---|---|---|
+| `scripts/parity_run_summary.py` ([#378](https://github.com/WXYC/discogs-etl/issues/378)) | `catalog_parity_diff.py --fail-on-drift` | Exit 4 is a drift **verdict**, not a broken soak |
+| `scripts/fffd_capture_summary.py` ([#382](https://github.com/WXYC/discogs-etl/issues/382)) | `catalog_parity_diff.py --capture-fffd-cta-pairs` | Its exit 4 means the opposite of parity's |
+| `scripts/sam_deploy_summary.py` ([#396](https://github.com/WXYC/discogs-etl/issues/396)) | `sam deploy --no-fail-on-empty-changeset` | Exit 0 that deployed **nothing** |
+
+The taxonomies are deliberately **not** shared — parity's exit 4 and the capture's exit 4 mean opposite things, and collapsing them is what `lib/run_summary.py`'s docstring exists to prevent. Only the plumbing is shared.
+
+Known gap: `scripts/sync-library.sh` has four soft-fail paths that log `WARNING:` and continue without touching `EXIT_CODE`, so a green `sync-library.yml` run means "library.db uploaded", not "the sync was healthy" — and it runs daily. Tracked in [#406](https://github.com/WXYC/discogs-etl/issues/406).
+
 ## Monthly Cache Rebuild (`rebuild-cache.yml`)
 
 **Status (2026-05-07)**: the GH Actions cron is disabled. The rebuild now runs on a one-shot ephemeral EC2 spawned monthly by the `wxyc-discogs-rebuild` SAM stack (`infra/ephemeral-rebuild/`). Setup + recurring-ops instructions in [`infra/ephemeral-rebuild/README.md`](../infra/ephemeral-rebuild/README.md). The Backend-Service EC2 cron is the legacy fallback; once two ephemeral runs land successfully, it is removed per the procedure in [`docs/ec2-rebuild-runbook.md`](ec2-rebuild-runbook.md). The GH workflow file stays in the repo as a `workflow_dispatch`-only manual escape hatch (no scheduled trigger).

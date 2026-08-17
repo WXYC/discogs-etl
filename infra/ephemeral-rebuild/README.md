@@ -81,7 +81,7 @@ The flag stays — three of the four triggers legitimately produce no template d
 | **Nothing was deployed** | `0` | **`warning`** | SAM had nothing to apply. Nothing reached AWS |
 | Failed | SAM's own code | `error` | CloudFormation rolled back; the stack is behind `main` |
 | Outcome could not be determined | `65` | `error` | Exit 0, output matched neither marker — fails closed |
-| Never ran | `65` | `error` | An earlier step failed; `sam deploy` was not reached |
+| No exit status was recorded | `65` | `error` | Almost always: an earlier step failed and `sam deploy` was not reached |
 
 A **nothing was deployed** warning is expected when the trigger was a change to `scripts/rebuild-cache-bootstrap.sh` (the instance fetches that from the repo at run time; it is not part of the rendered template), a change to the workflow file, or a bare `workflow_dispatch` on an already-deployed `main`. It is **suspicious** when the push changed `template.yaml` or a Lambda handler in this directory — that means a template change did not reach the stack.
 

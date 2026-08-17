@@ -66,8 +66,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from lib.run_summary import annotation_line as _annotation_line  # noqa: E402
 from lib.run_summary import load_text as _load_text  # noqa: E402
-from lib.run_summary import plain as _plain  # noqa: E402
 
 # The untrusted-output reader, shared with the two --json renderers so a
 # hardening fix reaches all three (#384). Bound here with this tool's noun.
@@ -138,7 +138,17 @@ _OUTCOMES: dict[str, _Outcome] = {
             "this workflow used to mean either this or a real deploy, and between the #353 "
             "account cutover and 2026-08-16 it always meant this -- the deploy role lacked "
             "`ec2:DescribeImages` and could not have applied anything ("
-            "[#396](https://github.com/WXYC/discogs-etl/issues/396))."
+            "[#396](https://github.com/WXYC/discogs-etl/issues/396)).\n\n"
+            "**When this is expected.** Only `infra/ephemeral-rebuild/**` feeds the rendered "
+            "template. The workflow also fires on `scripts/rebuild-cache-bootstrap.sh` -- "
+            "which the instance fetches from the repo at run time and is not part of the "
+            "template -- on changes to the workflow file itself, and on any "
+            "`workflow_dispatch`. A no-op is the correct outcome for all three.\n\n"
+            "**When it is not.** If this push changed "
+            "`infra/ephemeral-rebuild/template.yaml` or a Lambda handler under "
+            "`infra/ephemeral-rebuild/`, then a template change did not reach the stack and "
+            "something is wrong. Compare the deployed stack against the template before "
+            "assuming a declared resource exists."
         ),
         annotation_kind="warning",
         annotation_title="Ephemeral-rebuild stack unchanged",
@@ -291,25 +301,6 @@ def render(outcome: str, exit_code: int | None, log_text: str | None, problem: s
     record = _OUTCOMES[outcome]
     lines = [f"## {record.heading}", "", record.lead, ""]
 
-    if outcome == NO_CHANGES:
-        lines.extend(
-            [
-                "**When this is expected.** Only `infra/ephemeral-rebuild/**` feeds the "
-                "rendered template. The workflow also fires on "
-                "`scripts/rebuild-cache-bootstrap.sh` -- which the instance fetches from the "
-                "repo at run time and is not part of the template -- on changes to the "
-                "workflow file itself, and on any `workflow_dispatch`. A no-op is the "
-                "correct outcome for all three.",
-                "",
-                "**When it is not.** If this push changed "
-                "`infra/ephemeral-rebuild/template.yaml` or a Lambda handler under "
-                "`infra/ephemeral-rebuild/`, then a template change did not reach the "
-                "stack and something is wrong. Compare the deployed stack against the "
-                "template before assuming a declared resource exists.",
-                "",
-            ]
-        )
-
     if outcome == NOT_RUN:
         # The deploy step exports SAM_DEPLOY_LOG *before* invoking SAM, so a log
         # can exist even when no status was recorded. If it carries a terminal
@@ -358,11 +349,18 @@ def render(outcome: str, exit_code: int | None, log_text: str | None, problem: s
     return "\n".join(lines) + "\n"
 
 
-def annotation(outcome: str, exit_code: int | None, log_text: str | None) -> str:
+def annotation(outcome: str, log_text: str | None) -> str:
     """One GitHub workflow command, on one line.
 
-    GitHub truncates an annotation at its first newline, so a multi-line
-    message silently loses everything after the first line.
+    Formatting -- the one-line and plain-text invariants -- belongs to
+    ``lib.run_summary.annotation_line``; this decides only the body. The level
+    is the record's, not computed here: an outcome's severity and its exit
+    status have to agree, and the two siblings that compute it in an ad-hoc
+    ternary outside the record are the shape to move away from.
+
+    No ``exit_code`` parameter: ``outcome`` already carries everything the
+    annotation varies on. Taking one would invite call sites that read as if
+    NOT_RUN-with-exit-1 were a real combination.
     """
     record = _OUTCOMES[outcome]
     body = record.annotation_body
@@ -370,7 +368,7 @@ def annotation(outcome: str, exit_code: int | None, log_text: str | None) -> str
         actions = denied_actions(log_text)
         if actions:
             body = f"{body} Denied IAM action(s): {', '.join(actions)} -- see the run summary."
-    return f"::{record.annotation_kind} title={record.annotation_title}::{_plain(body)}"
+    return _annotation_line(record.annotation_kind, title=record.annotation_title, body=body)
 
 
 def exit_status(outcome: str, exit_code: int | None) -> int:
@@ -420,7 +418,7 @@ def main(argv: list[str] | None = None) -> int:
     log_text, problem = load_log(args.log)
     outcome = classify(exit_code, log_text)
     sys.stdout.write(render(outcome, exit_code, log_text, problem))
-    sys.stderr.write(annotation(outcome, exit_code, log_text) + "\n")
+    sys.stderr.write(annotation(outcome, log_text) + "\n")
     return exit_status(outcome, exit_code)
 
 

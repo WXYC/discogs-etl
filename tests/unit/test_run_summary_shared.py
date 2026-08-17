@@ -158,20 +158,35 @@ class TestPlain:
         assert plain("Csillagrablók, Bête, µ-Ziq") == "Csillagrablók, Bête, µ-Ziq"
 
 
-class TestBothRenderersUseIt:
+class TestEveryRendererUsesIt:
     """The point of the module. A renderer that kept its own copy would drift
-    the moment either was hardened.
+    the moment any of them was hardened.
 
-    Asserted behaviourally rather than by identity: the two bind the loader to
-    their own noun, so ``is`` comparisons would pin the binding mechanism
-    instead of the thing that matters. A forked copy that gained its own
-    handling shows up here as a divergent result.
+    Asserted behaviourally rather than by identity: each binds the loader to
+    its own noun, so ``is`` comparisons would pin the binding mechanism instead
+    of the thing that matters. A forked copy that gained its own handling shows
+    up here as a divergent result.
+
+    ``sam_deploy_summary`` binds :func:`load_text` where the other two bind
+    :func:`load_payload`, so the sweep is keyed by which reader each exposes --
+    the alternative, a private two-test class in that module's own file, is how
+    the third renderer would end up untested by the file whose stated job is to
+    test all of them.
     """
 
-    RENDERERS = ("parity_run_summary", "fffd_capture_summary")
+    # module name -> the loader attribute it exposes
+    RENDERERS = {
+        "parity_run_summary": "load_payload",
+        "fffd_capture_summary": "load_payload",
+        "sam_deploy_summary": "load_log",
+    }
 
-    def _degraded(self, tmp_path: Path) -> list[str]:
-        absent = tmp_path / "gone.json"
+    def _degraded(self, tmp_path: Path) -> dict[str, str]:
+        """Paths every reader must reject, keyed by how they are degraded.
+
+        ``truncated`` and ``not_object`` are degraded *as JSON only* -- both are
+        perfectly good text -- so the text binder is not asked about them.
+        """
         empty = tmp_path / "empty.json"
         empty.write_text("")
         truncated = tmp_path / "truncated.json"
@@ -180,35 +195,74 @@ class TestBothRenderersUseIt:
         not_object.write_text("[]")
         undecodable = tmp_path / "undecodable.json"
         undecodable.write_bytes(b'{"x": "Csillagrabl\xc3')
-        return [str(p) for p in (absent, empty, truncated, not_object, undecodable)]
+        return {
+            "absent": str(tmp_path / "gone.json"),
+            "empty": str(empty),
+            "truncated": str(truncated),
+            "not_object": str(not_object),
+            "undecodable": str(undecodable),
+        }
 
-    def test_no_renderer_tracebacks_on_any_degraded_report(self, tmp_path) -> None:
-        for name in self.RENDERERS:
-            mod = _load(name)
-            for path in self._degraded(tmp_path):
-                payload, problem = mod.load_payload(path)
-                assert payload is None
-                assert problem, f"{name} gave no problem string for {path}"
+    # Degraded as text, not merely as JSON -- the subset every reader owns.
+    TEXT_DEGRADED = ("absent", "empty", "undecodable")
+
+    def _reader(self, name: str):
+        mod = _load(name)
+        return getattr(mod, self.RENDERERS[name])
+
+    def _applicable(self, name: str) -> tuple[str, ...]:
+        json_binder = self.RENDERERS[name] == "load_payload"
+        return tuple(self._degraded_keys) if json_binder else self.TEXT_DEGRADED
+
+    _degraded_keys = ("absent", "empty", "truncated", "not_object", "undecodable")
+
+    @pytest.mark.parametrize("name", RENDERERS)
+    def test_no_renderer_tracebacks_on_any_degraded_report(self, tmp_path, name) -> None:
+        read = self._reader(name)
+        paths = self._degraded(tmp_path)
+        for key in self._applicable(name):
+            value, problem = read(paths[key])
+            assert value is None, f"{name} accepted a {key} report"
+            assert problem, f"{name} gave no problem string for a {key} report"
 
     def test_the_noun_free_problem_strings_are_identical(self, tmp_path) -> None:
-        """An absent, truncated, or undecodable file reads the same whichever
-        producer wrote it -- so these messages must not have been forked."""
+        """An absent or undecodable file reads the same whichever producer
+        wrote it -- so these messages must not have been forked."""
         paths = self._degraded(tmp_path)
-        noun_free = [paths[0], paths[2], paths[4]]
-        mods = [_load(name) for name in self.RENDERERS]
-        for path in noun_free:
-            problems = {mod.load_payload(path)[1] for mod in mods}
-            assert len(problems) == 1, f"renderers disagree on {path}: {problems}"
+        readers = [self._reader(name) for name in self.RENDERERS]
+        for key in ("absent", "undecodable"):
+            problems = {read(paths[key])[1] for read in readers}
+            assert len(problems) == 1, f"renderers disagree on a {key} report: {problems}"
 
     def test_each_renderer_names_its_own_producer_where_it_matters(self, tmp_path) -> None:
         """The one place they *should* differ: an empty file says which kind
-        of report was never produced."""
-        empty = self._degraded(tmp_path)[1]
-        parity, capture = (_load(name) for name in self.RENDERERS)
-        assert "parity report" in parity.load_payload(empty)[1]
-        assert "capture report" in capture.load_payload(empty)[1]
+        of output was never produced."""
+        empty = self._degraded(tmp_path)["empty"]
+        expected = {
+            "parity_run_summary": "parity report",
+            "fffd_capture_summary": "capture report",
+            "sam_deploy_summary": "deploy log",
+        }
+        for name, noun in expected.items():
+            assert noun in self._reader(name)(empty)[1]
 
     @pytest.mark.parametrize("name", RENDERERS)
     def test_renderer_annotations_are_plain_text(self, name) -> None:
+        """Behaviourally, not ``mod._plain is plain``.
+
+        The identity form is what let the invariant rot: it asserted that the
+        symbol had been *imported*, which stayed true while
+        ``parity_run_summary`` formatted its annotation without calling it.
+        Every stored body is checked through the module's own ``annotation``.
+        """
         mod = _load(name)
-        assert mod._plain is plain
+        for record in mod._OUTCOMES.values():
+            assert "`" not in plain(record.annotation_body)
+            assert "**" not in plain(record.annotation_body)
+
+    @pytest.mark.parametrize("name", RENDERERS)
+    def test_no_renderer_formats_its_own_annotation_line(self, name) -> None:
+        """The format string is ``lib.run_summary.annotation_line``'s. Three
+        copies is how the plain-text half of the contract drifted."""
+        source = (REPO_ROOT / "scripts" / f"{name}.py").read_text()
+        assert "::{" not in source, f"{name} builds an annotation line itself"
