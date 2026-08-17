@@ -55,8 +55,8 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from lib.run_summary import annotation_line as _annotation_line  # noqa: E402
 from lib.run_summary import load_payload as _load_payload  # noqa: E402
-from lib.run_summary import plain as _plain  # noqa: E402
 
 # The untrusted-report reader, shared with parity_run_summary.py so a
 # hardening fix reaches both (#384). Bound here with this tool's noun.
@@ -317,8 +317,9 @@ def render(exit_code: int, payload: dict[str, Any] | None, problem: str | None) 
 def annotation(exit_code: int, payload: dict[str, Any] | None) -> str:
     """One GitHub workflow command, on one line.
 
-    GitHub truncates an annotation at its first newline, so a multi-line
-    message silently loses everything after the first line.
+    Formatting -- the one-line and plain-text invariants -- belongs to
+    ``lib.run_summary.annotation_line``; this decides only the level and the
+    body.
     """
     outcome = _outcome(exit_code)
     # NOT_RUN is a notice, not an error: the parity verdict step already fails
@@ -337,7 +338,7 @@ def annotation(exit_code: int, payload: dict[str, Any] | None) -> str:
             else "see the run summary"
         )
         body = f"{body} Reasons: {detail}."
-    return f"::{kind} title={outcome.annotation_title}::{_plain(body)}"
+    return _annotation_line(kind, title=outcome.annotation_title, body=body)
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:

@@ -1,21 +1,9 @@
 """Wiring tests for ``.github/workflows/deploy-ephemeral-rebuild.yml`` (#396).
 
-This workflow's green history is not, on its own, evidence that the deploy
-path works. It runs ``sam deploy --no-fail-on-empty-changeset``, so SAM exits 0
-both when it applies a changeset and when it finds nothing to do -- and for
-months every run was the second while the deploy role lacked
-``ec2:DescribeImages`` and could not have applied anything. The condition was
-only discovered because #358's ``ReleaseCountAlarm`` happened to be the first
-real changeset in that window, and it failed loudly.
-
-The flag has to stay: three of the four triggers legitimately produce no
-template diff (``scripts/rebuild-cache-bootstrap.sh`` is fetched by the
-instance at runtime and is not in the rendered template, the workflow file is
-not either, and a ``workflow_dispatch`` on an already-deployed ``main`` is a
-no-op by construction). What changes is that the outcome is now *stated*.
-
-What this file pins is the plumbing that makes the statement possible, all of
-which is silently breakable:
+Why the workflow reports its deploy outcome, and why
+``--no-fail-on-empty-changeset`` stays, is in ``scripts/sam_deploy_summary.py``'s
+module docstring. This file pins only the plumbing that makes the report
+possible, all of which is silently breakable:
 
 1. **SAM's own exit status must survive the pipe.** ``sam deploy | tee`` makes
    ``$?`` ``tee``'s status, which is 0 essentially always. Reading ``$?`` here
@@ -24,9 +12,10 @@ which is silently breakable:
 2. **A failing deploy must not abort the job at that step.** GitHub skips every
    later step once one fails, so failing in place would discard the summary
    that explains what happened. The report step re-raises the code.
-3. **The report step must run when the deploy step did not.** An earlier
-   failure (SAM build, credentials) leaves no exit code behind, and "nothing
-   was deployed" is still the honest summary for that.
+3. **The report step must run, and be answerable, when the deploy step did
+   not.** An earlier failure leaves no exit code behind -- and the captured log
+   still has to reach the renderer, or the one case that can distinguish "SAM
+   never ran" from "SAM ran and the status was lost" becomes unreachable.
 4. **The renderer must be importable without a ``pip install``.** The deploy
    job installs nothing; a renderer that imported a third-party package would
    traceback in the step whose job is to explain other failures.
@@ -47,52 +36,33 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO_ROOT))
+
+from tests.workflow_yaml import load_workflow, step_named, steps, working_directory  # noqa: E402
+
 WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "deploy-ephemeral-rebuild.yml"
-RENDERER_PATH = REPO_ROOT / "scripts" / "sam_deploy_summary.py"
+RENDERER = "sam_deploy_summary.py"
+RENDERER_PATH = REPO_ROOT / "scripts" / RENDERER
 
+WORKFLOW = load_workflow(WORKFLOW_PATH)
 
-def _load() -> dict[str, Any]:
-    return yaml.safe_load(WORKFLOW_PATH.read_text())
-
-
-WORKFLOW = _load()
+DEPLOY_JOB = "deploy"
+DEPLOY_STEP_NAME = "SAM deploy"
+REPORT_STEP_NAME = "Report deploy outcome"
 
 
 def _steps(job: str) -> list[dict[str, Any]]:
-    return WORKFLOW["jobs"][job]["steps"]
+    return steps(WORKFLOW, job)
 
 
 def _step(job: str, name: str) -> dict[str, Any]:
-    for step in _steps(job):
-        if step.get("name") == name:
-            return step
-    raise AssertionError(f"no step named {name!r} in job {job!r}")
+    return step_named(WORKFLOW, job, name)
 
 
-DEPLOY_STEP_NAME = "SAM deploy"
-REPORT_STEP_NAME = "Report deploy outcome"
-RENDERER = "sam_deploy_summary.py"
-
-
-def _effective_workdir(step_name: str, job: str = "deploy") -> str:
-    """Where a step's ``run:`` actually executes, relative to the repo root.
-
-    GitHub resolves ``working-directory`` step-first, then the job's
-    ``defaults.run``, then the workflow's. Checking only the step's own key
-    would miss a job-level default entirely -- which is the realistic way this
-    breaks, since the repetition across three steps invites hoisting.
-    """
-    for source in (
-        _step(job, step_name),
-        WORKFLOW["jobs"][job].get("defaults", {}).get("run", {}),
-        WORKFLOW.get("defaults", {}).get("run", {}),
-    ):
-        if source.get("working-directory"):
-            return source["working-directory"]
-    return "."
+def _effective_workdir(step_name: str) -> str:
+    return working_directory(WORKFLOW, DEPLOY_JOB, step_name)
 
 
 class TestTheDeployStepCapturesItsOutcome:
@@ -156,9 +126,6 @@ class TestTheReportStep:
         run = _step("deploy", REPORT_STEP_NAME)["run"]
         assert "scripts/sam_deploy_summary.py" in run
 
-    def test_the_renderer_it_names_exists(self) -> None:
-        assert RENDERER_PATH.is_file()
-
     def test_it_appends_to_the_step_summary(self) -> None:
         assert '>> "$GITHUB_STEP_SUMMARY"' in _step("deploy", REPORT_STEP_NAME)["run"]
 
@@ -178,6 +145,26 @@ class TestTheReportStep:
         run = _step("deploy", REPORT_STEP_NAME)["run"]
         assert "--not-run" in run
         assert "SAM_DEPLOY_EXIT_CODE:-" in run
+
+    def test_the_log_is_passed_on_the_not_run_branch_too(self) -> None:
+        """``--log`` must not be nested under the exit-code-known branch.
+
+        The deploy step exports ``SAM_DEPLOY_LOG`` *before* it runs SAM, so a
+        log exists for a run killed between SAM finishing and the status being
+        written -- the one case where ``--not-run`` can be told whether SAM
+        actually ran. Nested, the renderer's entire evidence path becomes
+        unreachable from its only caller while every unit test still passes,
+        because the tests call ``main()`` directly.
+        """
+        lines = _step("deploy", REPORT_STEP_NAME)["run"].splitlines()
+        not_run = next(i for i, ln in enumerate(lines) if "--not-run" in ln)
+        log = next(i for i, ln in enumerate(lines) if "--log" in ln)
+        assert log > not_run, "--log is appended before the --not-run branch is chosen"
+        # The append sits at the same indentation as the `if` that chose the
+        # mode, not deeper -- i.e. after the branch closed, not inside it.
+        indent = len(lines[log]) - len(lines[log].lstrip())
+        branch_indent = len(lines[not_run]) - len(lines[not_run].lstrip())
+        assert indent <= branch_indent, "--log is nested inside a branch"
 
     def test_it_comes_after_the_deploy_step(self) -> None:
         names = [s.get("name") for s in _steps("deploy")]

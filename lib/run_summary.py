@@ -85,7 +85,12 @@ def load_payload(path: str | None, *, noun: str) -> tuple[dict[str, Any] | None,
     raw, problem = load_text(path, noun=noun)
     if raw is None:
         return None, problem
-    file = Path(path or "")
+    # `path` is necessarily truthy here -- load_text returns text only for a
+    # path it could open. Not defended with `or ""`: that would turn a future
+    # contract change into messages naming an empty file, and quietly-wrong
+    # output about a producer's run is the failure mode this module exists to
+    # avoid. A TypeError is the better answer.
+    file = Path(path)  # type: ignore[arg-type]
     try:
         parsed = json.loads(raw)
     except json.JSONDecodeError as exc:
@@ -102,3 +107,33 @@ def plain(markdown: str) -> str:
     noise rather than formatting.
     """
     return markdown.replace("`", "").replace("**", "")
+
+
+def annotation_line(kind: str, *, title: str, body: str) -> str:
+    """One GitHub workflow command, on one line.
+
+    Two invariants that are easy to state and easy to lose, which is why the
+    three renderers call this rather than each formatting the string:
+
+    * **One line.** GitHub truncates an annotation at its first newline, so a
+      multi-line body silently loses everything after the first.
+    * **Plain text.** Annotations are not rendered as Markdown, so the
+      backticks and asterisks a summary line carries show up as literal
+      punctuation. Every body goes through :func:`plain`.
+
+    The second one had already drifted while this lived in three places:
+    ``parity_run_summary.py`` stripped its appended causes but not its stored
+    ``annotation_body``, and nothing caught it because the test asserted that
+    the module had *imported* ``plain``, not that its output was stripped. It
+    was latent only because parity's bodies happened to carry no backticks.
+
+    Args:
+        kind: The workflow-command level -- ``notice``, ``warning``, ``error``.
+        title: The annotation title, shown in bold in the run UI.
+        body: The message, in the summary's Markdown register; stripped here.
+
+    Returns:
+        The complete ``::kind title=...::body`` line, without a trailing
+        newline.
+    """
+    return f"::{kind} title={title}::{plain(body)}"
