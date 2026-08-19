@@ -70,6 +70,17 @@ CREATE TABLE IF NOT EXISTS release (
 -- Mirrored in alembic/versions/0008_release_artwork_checked_at.py; the
 -- dual-write convention keeps the fresh-rebuild and alembic-upgrade paths
 -- in parity.
+--
+-- Those are not the only two paths. The copy-swap rebuild is a third, and it
+-- was in parity with neither until 2026-08-19: CREATE TABLE new_release AS
+-- SELECT carries no indexes, so the swap drops this one and only the indexes
+-- each rebuild script explicitly rebuilds come back. This index was in
+-- neither list, so prod ran without it despite being stamped well past 0008
+-- -- silently, since a missing index degrades plans rather than raising.
+-- Recreation now lives in scripts/verify_cache.py and
+-- scripts/dedup_releases.py, pinned by
+-- tests/integration/test_copy_swap_index_parity.py; drifted databases are
+-- repaired by alembic/versions/0014_repair_artwork_null_idx.py.
 CREATE INDEX IF NOT EXISTS release_artwork_null_idx
     ON release (id)
     WHERE artwork_url IS NULL AND artwork_checked_at IS NULL;

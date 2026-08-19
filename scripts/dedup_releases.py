@@ -1010,6 +1010,11 @@ def add_base_constraints_and_indexes(conn, db_url: str | None = None) -> None:
             "ON cache_metadata(cached_at)",
             "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_cache_metadata_source "
             "ON cache_metadata(source)",
+            # WXYC/discogs-etl#239. Partial index backing topup_artwork.py's
+            # never-asked drain. The copy-swap's CTAS carries no indexes, so it
+            # has to be rebuilt here alongside the trigram set.
+            "CREATE INDEX CONCURRENTLY IF NOT EXISTS release_artwork_null_idx "
+            "ON release (id) WHERE artwork_url IS NULL AND artwork_checked_at IS NULL",
         ],
         "Level 3: GIN trigram + metadata indexes (CONCURRENTLY)",
     )
