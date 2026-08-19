@@ -1439,6 +1439,14 @@ def _prune_add_base_constraints_and_indexes(db_url: str, *, suffix: str = "") ->
             "ON cache_metadata(cached_at)",
             "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_cache_metadata_source "
             "ON cache_metadata(source)",
+            # WXYC/discogs-etl#239. Partial index backing topup_artwork.py's
+            # never-asked drain; its candidate query is this predicate verbatim.
+            # Declared in schema/create_database.sql and created by alembic 0008,
+            # but the copy-swap's CTAS carries no indexes -- omitting it here is
+            # why prod was found without it on 2026-08-19 despite running past
+            # 0008. Pinned by tests/integration/test_copy_swap_index_parity.py.
+            "CREATE INDEX CONCURRENTLY IF NOT EXISTS release_artwork_null_idx "
+            "ON release (id) WHERE artwork_url IS NULL AND artwork_checked_at IS NULL",
         ):
             add_index_concurrently_safely(conn, index_ddl)
 
