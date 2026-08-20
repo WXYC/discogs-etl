@@ -68,6 +68,8 @@ The dedup `CREATE TABLE new_release AS SELECT ... FROM release` SELECT list at `
 
 The `country` column behaves the same way — listed in the dedup SELECT and therefore permanent.
 
+The partial index `idx_release_master_id` (`ON release(master_id) WHERE master_id IS NOT NULL`, declared in `schema/create_database.sql`) is a separate concern from the column: CTAS carries column types forward but never indexes, so both copy-swap sites — `dedup_releases.add_base_constraints_and_indexes` and `verify_cache._prune_add_base_constraints_and_indexes` (the prune step runs its own independent CTAS of `release` after dedup, on every rebuild that supplies library.db) — have to recreate it explicitly, matching the schema's predicate verbatim, or a `master_id` filter degrades to a full scan post-rebuild with no error to trace it back to (WXYC/discogs-etl#412). Pinned by `tests/integration/test_copy_swap_preserves_master_id_index.py`; the general "every declared index survives every rebuild path" audit lives in `tests/integration/test_copy_swap_index_parity.py`.
+
 ## artwork_checked_at Column Lifecycle
 
 The `release` table includes an `artwork_checked_at timestamptz` column (nullable, no default) added by alembic [0008](https://github.com/WXYC/discogs-etl/issues/239). It distinguishes the two states `artwork_url IS NULL` can mean:

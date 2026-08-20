@@ -917,6 +917,10 @@ class TestAddConstraintsAndIndexes:
             "idx_release_label_release_id",
             "idx_release_track_release_id",
             "idx_release_track_artist_release_id",
+            # WXYC/discogs-etl#412: dropped by setup above (see the
+            # "idx_release_master_id" entry a few lines up) and previously
+            # never recreated by add_constraints_and_indexes.
+            "idx_release_master_id",
         }
         assert expected_indexes.issubset(indexes)
 
