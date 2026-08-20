@@ -284,12 +284,30 @@ CREATE INDEX IF NOT EXISTS idx_artist_name_variation_artist_id ON artist_name_va
 CREATE INDEX IF NOT EXISTS idx_artist_member_artist_id ON artist_member(artist_id);
 CREATE INDEX IF NOT EXISTS idx_artist_url_artist_id ON artist_url(artist_id);
 
--- Partial index on master_id: speeds the dedup partition scan.
--- The INDEX is transient — the copy-swap rebuilds `release` via CTAS (CREATE
--- TABLE new_release AS SELECT ...), which carries no indexes, and
--- add_base_constraints_and_indexes does not recreate it, so it is gone
--- post-swap. The master_id COLUMN itself persists (it is in DEDUP_TABLES; see
--- L64 and scripts/dedup_releases.py) — the swap does not exclude it.
+-- Partial index on master_id: speeds the dedup partition scan AND, since
+-- WXYC/discogs-etl#412, LML's post-rebuild master_id sibling lookups
+-- (library-metadata-lookup#1241, the artwork-miss fanout).
+--
+-- Previously documented here as deliberately transient ("the copy-swap
+-- rebuilds `release` via CTAS ... and add_base_constraints_and_indexes does
+-- not recreate it, so it is gone post-swap"). That framing traces to #320,
+-- which only ever fixed a *different* stale claim (that the master_id
+-- COLUMN was dropped) and, in passing, described the index's absence as
+-- intentional without anyone having evaluated whether it should persist.
+-- #412 found a real prod consumer that needs it after a rebuild: a
+-- `master_id` filter was a 192ms/133,637-buffer full scan of `release`
+-- with the index absent. The index now persists across both copy-swap
+-- rebuild sites — scripts/dedup_releases.py's
+-- add_base_constraints_and_indexes and scripts/verify_cache.py's
+-- _prune_add_base_constraints_and_indexes (the prune step runs after dedup
+-- on every rebuild that supplies library.db and does its own independent
+-- CTAS of `release`, so both sites have to recreate it or the second one
+-- silently undoes the first) — pinned by
+-- tests/integration/test_copy_swap_preserves_master_id_index.py and audited
+-- against every other declared index by
+-- tests/integration/test_copy_swap_index_parity.py. The master_id COLUMN
+-- itself was never at risk (it is in DEDUP_TABLES / PRUNE_COPY_TABLES; see
+-- L64 and scripts/dedup_releases.py) — only this index was gone post-swap.
 CREATE INDEX IF NOT EXISTS idx_release_master_id ON release(master_id) WHERE master_id IS NOT NULL;
 
 -- Master indexes

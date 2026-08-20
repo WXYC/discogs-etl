@@ -129,15 +129,16 @@ _REBUILD_SCRIPTS = (_PRUNE, _DEDUP)
 # do NOT recreate. Every entry needs a reason. An entry here is a decision on
 # record, not a TODO -- if the decision is revisited, delete the entry and add
 # the DDL to both scripts instead.
-_EXEMPT_FROM_RECREATION: dict[str, str] = {
-    "idx_release_master_id": (
-        "Deliberate and documented in schema/create_database.sql: the swap's "
-        "CTAS carries no indexes and add_base_constraints_and_indexes does not "
-        "recreate this one, so it is gone post-swap by design. The master_id "
-        "COLUMN itself persists (it is in dedup_releases.DEDUP_TABLES). See "
-        "WXYC/discogs-etl#320 for the contract history."
-    ),
-}
+# Empty by design. The sole former entry, ``idx_release_master_id``, was exempted
+# on the premise that its absence post-swap was deliberate (WXYC/discogs-etl#320).
+# WXYC/discogs-etl#412 overturned that with a prod measurement -- a master_id
+# filter on `release` was a 192ms / 133,637-buffer full scan of all 148,491 rows
+# with the index absent, and 0.069ms / 5 buffers against the same predicate once
+# it existed -- and this file's own rule for a revisited decision is to delete the
+# entry and add the DDL to both scripts, which #412 did. Keeping the roster (and
+# TestExemptionRosterIsCurrent) in place: it is the seam a future deliberate
+# omission needs, and its guards are correct when empty.
+_EXEMPT_FROM_RECREATION: dict[str, str] = {}
 
 _DECLARED_INDEX_RE = re.compile(
     r"CREATE\s+(?:UNIQUE\s+)?INDEX\s+(?:CONCURRENTLY\s+)?(?:IF\s+NOT\s+EXISTS\s+)?"
@@ -262,6 +263,29 @@ class TestCopySwapRecreatesDeclaredIndexes:
                 f"release_artwork_null_idx is not recreated on {script.label}'s "
                 f"post-swap path -- topup_artwork.py will seq-scan the full release "
                 f"table. See WXYC/discogs-etl#239."
+            )
+
+    def test_idx_release_master_id_is_recreated(self) -> None:
+        """Regression pin: the index prod was found missing on 2026-08-20.
+
+        Same class as release_artwork_null_idx above, found one day later by a
+        different consumer -- WXYC/library-metadata-lookup#1241's sibling-pressing
+        artwork lookup, which filters `release` by master_id on the artwork-miss
+        path. Both rebuild paths CTAS `release` on the monthly rebuild's default
+        route (dedup first, then verify_cache --prune), so recreating it on only
+        one site does not survive a full rebuild: the later CTAS silently undoes
+        the earlier recreation.
+
+        See WXYC/discogs-etl#412, and
+        tests/integration/test_copy_swap_preserves_master_id_index.py for the
+        behavioral (live-Postgres) pin that the index lands with this exact
+        partial predicate -- which a source-text parser cannot verify.
+        """
+        for script in _REBUILD_SCRIPTS:
+            assert "idx_release_master_id" in _parse_recreated_indexes(script), (
+                f"idx_release_master_id is not recreated on {script.label}'s post-swap "
+                f"path -- a master_id filter on `release` will full-scan the table. "
+                f"See WXYC/discogs-etl#412."
             )
 
 

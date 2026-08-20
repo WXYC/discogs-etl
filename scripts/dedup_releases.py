@@ -1015,6 +1015,15 @@ def add_base_constraints_and_indexes(conn, db_url: str | None = None) -> None:
             # has to be rebuilt here alongside the trigram set.
             "CREATE INDEX CONCURRENTLY IF NOT EXISTS release_artwork_null_idx "
             "ON release (id) WHERE artwork_url IS NULL AND artwork_checked_at IS NULL",
+            # WXYC/discogs-etl#412. Partial index on master_id -- speeds both
+            # the dedup partition scan (pre-swap) and LML's post-rebuild
+            # master_id sibling lookups. Must match the partial predicate in
+            # schema/create_database.sql exactly, or the two definitions
+            # diverge. This was omitted here (and from verify_cache.py's
+            # equivalent list) which is why prod ran without it; see
+            # tests/integration/test_copy_swap_preserves_master_id_index.py.
+            "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_release_master_id "
+            "ON release(master_id) WHERE master_id IS NOT NULL",
         ],
         "Level 3: GIN trigram + metadata indexes (CONCURRENTLY)",
     )

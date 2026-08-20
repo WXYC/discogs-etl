@@ -1447,6 +1447,16 @@ def _prune_add_base_constraints_and_indexes(db_url: str, *, suffix: str = "") ->
             # 0008. Pinned by tests/integration/test_copy_swap_index_parity.py.
             "CREATE INDEX CONCURRENTLY IF NOT EXISTS release_artwork_null_idx "
             "ON release (id) WHERE artwork_url IS NULL AND artwork_checked_at IS NULL",
+            # WXYC/discogs-etl#412. Partial index on master_id, declared in
+            # schema/create_database.sql and mirrored verbatim (predicate
+            # included) in scripts/dedup_releases.py's equivalent list. This
+            # prune step runs its own independent CTAS of `release` after
+            # dedup on every rebuild that supplies library.db, so omitting
+            # it here silently undoes dedup's recreation of the same index --
+            # which is exactly what happened on prod. Pinned by
+            # tests/integration/test_copy_swap_preserves_master_id_index.py.
+            "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_release_master_id "
+            "ON release(master_id) WHERE master_id IS NOT NULL",
         ):
             add_index_concurrently_safely(conn, index_ddl)
 
