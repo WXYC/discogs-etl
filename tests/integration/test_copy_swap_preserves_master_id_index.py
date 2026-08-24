@@ -74,14 +74,56 @@ else:
 
 _INDEX_NAME = "idx_release_master_id"
 _EXPECTED_PREDICATE = "master_id IS NOT NULL"
+# pg_indexes renders the definition normalized, so this is the exact substring
+# a btree on the master_id column produces -- see _assert_index_shape.
+_EXPECTED_INDEX_TARGET = "USING btree (master_id)"
+
+
+def _assert_index_shape(indexdef: str | None, *, recreated_by: str) -> None:
+    """Assert the index is a btree on `master_id` AND carries the partial predicate.
+
+    Both halves matter and neither implies the other. Asserting only the
+    predicate -- as this file first did -- lets an index on the wrong column
+    through: ``ON release(id) WHERE master_id IS NOT NULL`` satisfies a
+    substring check on the predicate while being useless to a ``master_id``
+    filter, which is precisely the silent-degradation class this file exists to
+    catch. Asserting only the column would likewise admit a full (non-partial)
+    index, a different object from the one create_database.sql declares.
+    """
+    assert indexdef is not None, (
+        f"{_INDEX_NAME} is missing from `release` after the copy-swap. "
+        f"CTAS carries no indexes; {recreated_by}'s post-swap DDL must recreate it."
+    )
+    assert _EXPECTED_INDEX_TARGET in indexdef, (
+        f"{_INDEX_NAME} exists but is not a btree on master_id ({indexdef!r}). "
+        f"The post-swap recreation DDL in {recreated_by} must index the same "
+        f"column as schema/create_database.sql, or a master_id filter still "
+        f"full-scans despite the index being present."
+    )
+    assert _EXPECTED_PREDICATE in indexdef, (
+        f"{_INDEX_NAME} exists but its predicate ({indexdef!r}) does not match "
+        f"schema/create_database.sql's `WHERE {_EXPECTED_PREDICATE}`. The "
+        f"post-swap recreation DDL in {recreated_by} must match the schema "
+        f"declaration verbatim."
+    )
 
 
 def _drop_all_tables(conn) -> None:
     """Clear pipeline tables and any leftover ``new_`` copy-swap artifacts."""
+    # Every table with a `REFERENCES release(id)` FK, plus release itself.
+    # Completeness is load-bearing: `db_url` is module-scoped, so the second
+    # test class re-seeds a database the first already populated. Any dependent
+    # left out of this roster survives `DROP TABLE release CASCADE` as a table
+    # but loses its FK to the CASCADE, and `_seed_minimal_fixture`'s
+    # `CREATE TABLE IF NOT EXISTS` then short-circuits rather than restoring it
+    # -- so the second class would run against a schema quietly different from
+    # the one it believes it applied. Harmless for today's two assertions;
+    # a false-green waiting for whatever gets added to this file next.
     base = (
         "cache_metadata",
         "release_track_artist",
         "release_track",
+        "release_video",
         "release_style",
         "release_genre",
         "release_label",
@@ -210,13 +252,7 @@ class TestDedupCopySwapPreservesMasterIdIndex:
             indexdef = _index_def(conn, "release", _INDEX_NAME)
         finally:
             conn.close()
-        assert indexdef is not None
-        assert _EXPECTED_PREDICATE in indexdef, (
-            f"{_INDEX_NAME} exists but its predicate ({indexdef!r}) does not match "
-            f"schema/create_database.sql's `WHERE {_EXPECTED_PREDICATE}`. The "
-            f"post-swap recreation DDL in dedup_releases.py must match the schema "
-            f"declaration verbatim."
-        )
+        _assert_index_shape(indexdef, recreated_by="dedup_releases.py")
 
 
 class TestPruneCopySwapPreservesMasterIdIndex:
@@ -258,10 +294,4 @@ class TestPruneCopySwapPreservesMasterIdIndex:
             indexdef = _index_def(conn, "release", _INDEX_NAME)
         finally:
             conn.close()
-        assert indexdef is not None
-        assert _EXPECTED_PREDICATE in indexdef, (
-            f"{_INDEX_NAME} exists but its predicate ({indexdef!r}) does not match "
-            f"schema/create_database.sql's `WHERE {_EXPECTED_PREDICATE}`. The "
-            f"post-swap recreation DDL in verify_cache.py must match the schema "
-            f"declaration verbatim."
-        )
+        _assert_index_shape(indexdef, recreated_by="verify_cache.py")
