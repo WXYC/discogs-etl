@@ -48,6 +48,11 @@ def test_migration_uses_concurrently_and_if_not_exists() -> None:
     database that still has the index (one built from create_database.sql and
     never pruned), which is what lets it ship to every environment rather than
     only the drifted ones.
+
+    IF NOT EXISTS is necessary but not sufficient: it also no-ops against an
+    INVALID index left by an interrupted build, which is why the DDL goes
+    through lib/pg_concurrent_ddl. See
+    test_upgrade_replaces_an_invalid_leftover_index.
     """
     body = MIGRATION_PATH.read_text()
     assert "CREATE INDEX CONCURRENTLY IF NOT EXISTS release_artwork_null_idx" in body, (
@@ -147,4 +152,80 @@ def test_downgrade_keeps_the_index(run_alembic, drifted_db_url: str) -> None:
     assert _index_predicate(drifted_db_url) is not None, (
         "downgrade dropped release_artwork_null_idx — 0014's downgrade must be a "
         "no-op, since 0008 (still applied at this point) specifies the index exists"
+    )
+
+
+def _index_is_valid(db_url: str) -> bool | None:
+    """Return ``pg_index.indisvalid`` for release_artwork_null_idx, or None if absent.
+
+    ``pg_indexes`` (used by :func:`_index_predicate`) lists INVALID indexes
+    exactly like valid ones, so predicate-shape assertions cannot tell the two
+    apart. This reads the flag that decides whether the planner will actually
+    use the index.
+    """
+    with psycopg.connect(db_url) as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT i.indisvalid FROM pg_index i "
+            "JOIN pg_class c ON c.oid = i.indexrelid "
+            "WHERE c.relname = %s",
+            (_INDEX_NAME,),
+        )
+        row = cur.fetchone()
+    return row[0] if row else None
+
+
+@pytest.fixture()
+def invalid_index_db_url(fresh_db_url: str) -> str:
+    """A DB carrying an INVALID ``release_artwork_null_idx``.
+
+    This is the state PostgreSQL leaves behind when a ``CREATE INDEX
+    CONCURRENTLY`` build is interrupted — SIGTERM on the rebuild EC2 instance,
+    a job timeout, a cancelled statement: the index row stays in ``pg_class``
+    with ``pg_index.indisvalid = false`` and the planner ignores it.
+
+    Flipping the catalog flag by hand reproduces that without having to race a
+    real CONCURRENTLY build, and is the standard way to exercise the recovery
+    path. Requires superuser, which both the local docker PG and the CI
+    ``wxyc-postgres`` service provide.
+    """
+    with psycopg.connect(fresh_db_url, autocommit=True) as conn, conn.cursor() as cur:
+        cur.execute(SCHEMA_DIR.joinpath("create_database.sql").read_text())
+        cur.execute(
+            "UPDATE pg_index SET indisvalid = false WHERE indexrelid = %s::regclass",
+            (_INDEX_NAME,),
+        )
+    return fresh_db_url
+
+
+@pytest.mark.pg
+def test_invalid_index_fixture_really_is_invalid(invalid_index_db_url: str) -> None:
+    """Vacuity guard: if the catalog UPDATE didn't take, the test below proves nothing."""
+    assert _index_is_valid(invalid_index_db_url) is False, (
+        "invalid_index_db_url fixture did not mark release_artwork_null_idx INVALID "
+        "(catalog UPDATE needs superuser) — the repair test below would pass without "
+        "0014 doing anything"
+    )
+
+
+@pytest.mark.pg
+def test_upgrade_replaces_an_invalid_leftover_index(run_alembic, invalid_index_db_url: str) -> None:
+    """The re-run case: an interrupted CONCURRENTLY build must not poison the retry.
+
+    ``CREATE INDEX CONCURRENTLY IF NOT EXISTS`` alone is not enough here.
+    PostgreSQL counts an INVALID index as existing, so ``IF NOT EXISTS``
+    no-ops, alembic stamps 0014, and the operator is left with an index the
+    planner will never use — the exact silent state this revision exists to
+    repair. 0014 must drop the invalid leftover first.
+    """
+    stamp = run_alembic(["stamp", _PRIOR_REVISION], invalid_index_db_url)
+    assert stamp.returncode == 0, f"stamp failed:\n{stamp.stdout}\n{stamp.stderr}"
+
+    result = run_alembic(["upgrade", _REVISION], invalid_index_db_url)
+    assert result.returncode == 0, f"upgrade failed:\n{result.stdout}\n{result.stderr}"
+
+    assert _index_is_valid(invalid_index_db_url) is True, (
+        "release_artwork_null_idx is still INVALID after upgrading to "
+        f"{_REVISION}. A re-run following an interrupted CONCURRENTLY build must "
+        "drop the invalid leftover before recreating; IF NOT EXISTS treats it as "
+        "present and silently no-ops."
     )
