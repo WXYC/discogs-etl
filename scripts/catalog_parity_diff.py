@@ -2,7 +2,7 @@
 
 discogs-etl builds the production ``library.db`` nightly from tubafrenzy's
 MySQL database (``scripts/sync-library.sh``). To retire that MySQL
-dependency ahead of the 2026-08-31 tubafrenzy turndown, the daily build must
+dependency ahead of the 2026-09-07 tubafrenzy turndown, the daily build must
 move to Backend-Service as its catalog source -- but only once a
 Backend-sourced ``library.db`` is proven equivalent to the MySQL-sourced one.
 
