@@ -3,7 +3,7 @@
 The scheduled soak is the consumer that gives ``catalog_parity_diff.py
 --fail-on-drift``'s exit 4 a meaning, and it is the mechanism behind
 [wiki#89](https://github.com/WXYC/wiki/issues/89) AC#4 -- seven consecutive
-clean parity days before the 2026-08-31 tubafrenzy turndown. Nobody watches a
+clean parity days before the 2026-09-07 tubafrenzy turndown. Nobody watches a
 workflow that runs at 09:37 UTC daily, so the ways it can rot silently are
 what this file pins:
 

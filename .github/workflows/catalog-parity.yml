@@ -2,7 +2,7 @@ name: Catalog Parity Soak
 
 # Diffs the MySQL-sourced (tubafrenzy) and Backend-sourced catalogs daily and
 # gates on the verdict, so wiki#89 AC#4 -- seven consecutive clean parity days
-# before the 2026-08-31 tubafrenzy turndown -- is a property of this run
+# before the 2026-09-07 tubafrenzy turndown -- is a property of this run
 # history rather than of whoever last ran the harness on a laptop.
 #
 # discogs-etl#378. The harness itself is scripts/catalog_parity_diff.py (#370),
