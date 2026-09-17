@@ -24,19 +24,13 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install MariaDB client
-        run: sudo apt-get install -y mariadb-client
-
-      - uses: webfactory/ssh-agent@v0.9.0
-        with:
-          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
-
-      - name: Add Kattare host key
-        run: |
-          mkdir -p ~/.ssh
-          ssh-keyscan -H "$LIBRARY_SSH_HOST" >> ~/.ssh/known_hosts
-        env:
-          LIBRARY_SSH_HOST: ${{ secrets.LIBRARY_SSH_HOST }}
+      # WXYC/discogs-etl#346 removed three steps from here: a MariaDB client
+      # install, webfactory/ssh-agent, and an ssh-keyscan of the Kattare host.
+      # All three existed only to reach tubafrenzy's MySQL, which this job no
+      # longer reads -- the catalog now comes from Backend-Service over HTTP
+      # (see the "Run library sync" step's BACKEND_CATALOG_* env). They are
+      # still present in catalog-parity.yml, which is the one remaining MySQL
+      # reader and retires with the Kattare host on 2026-09-22.
 
       - name: Set up streaming links enrichment
         run: |
@@ -120,17 +114,24 @@ jobs:
         env:
           LML_REPO_DIR: /tmp/library-metadata-lookup
           LIBRARY_DB_OUTPUT: /tmp/library.db
-          LIBRARY_SSH_HOST: ${{ secrets.LIBRARY_SSH_HOST }}
-          LIBRARY_SSH_USER: ${{ secrets.LIBRARY_SSH_USER }}
-          LIBRARY_DB_HOST: ${{ secrets.LIBRARY_DB_HOST }}
-          LIBRARY_DB_USER: ${{ secrets.LIBRARY_DB_USER }}
-          LIBRARY_DB_PASSWORD: ${{ secrets.LIBRARY_DB_PASSWORD }}
-          LIBRARY_DB_NAME: ${{ secrets.LIBRARY_DB_NAME }}
+          # The catalog source (#346). Deliberately the same three names, the
+          # same secrets and the same default that catalog-parity.yml uses:
+          # one service account (catalog-parity@wxyc.invalid, #365) reads the
+          # Backend catalog export for both the soak and this build, and a
+          # tests/unit/test_sync_library_backend_source.py guard holds the two
+          # workflows in lockstep so a rotation cannot land on only one of
+          # them. Public hostname, so a variable with a default rather than a
+          # secret -- overridable to point a dispatch at staging.
+          BACKEND_CATALOG_URL: ${{ vars.BACKEND_CATALOG_URL || 'https://api.wxyc.org' }}
+          # The service account's password, not a token: the JWT Backend
+          # accepts expires in 15 minutes, so the build signs in per run.
+          BACKEND_CATALOG_EMAIL: ${{ secrets.BACKEND_CATALOG_EMAIL }}
+          BACKEND_CATALOG_PASSWORD: ${{ secrets.BACKEND_CATALOG_PASSWORD }}
           ADMIN_TOKEN: ${{ secrets.ADMIN_TOKEN }}
           STAGING_URL: ${{ secrets.STAGING_URL }}
           PRODUCTION_URL: ${{ secrets.PRODUCTION_URL }}
-          # Optional: when SENTRY_DSN is set, scripts/tsv_to_sqlite.py and the
-          # other Python entrypoints invoked by sync-library.sh hand exception
+          # Optional: when SENTRY_DSN is set, scripts/build_library_db.py and
+          # the other Python entrypoints invoked by sync-library.sh hand exception
           # events to Sentry via wxyc_etl.logger. Unset → Sentry stays inactive,
           # JSON logging still emits to stderr.
           SENTRY_DSN: ${{ secrets.SENTRY_DSN }}

@@ -1217,7 +1217,8 @@ def _load_cta_counts(conn: sqlite3.Connection) -> Counter[tuple[object, ...]]:
     - the TAB/NL substitution Backend's own extraction SQL applies to
       ``ARTIST_NAME`` / ``TRACK_TITLE`` at import time (``job.ts:727-729``);
       the harness's own ``COMPILATION_TRACK_SELECT_SQL`` has no such wrapper
-      (and stays that way -- see ``test_select_statements_match_sync_library_sh``).
+      (and stays that way -- the mysql side is deliberately frozen mid-soak;
+      see that constant's comment).
     - the row-drop for an empty ``artist_name``, mirroring
       ``parseLegacyCompilationTrackRows`` (``job.ts:710-711``) -- Backend's
       importer never writes such a row, so a mysql-side one is
@@ -1442,14 +1443,21 @@ def run_diff(mysql_db: str, backend_db: str, ledger: ResidueLedger | None = None
 MYSQL_PASSWORD_ENV = "LIBRARY_DB_PASSWORD"
 
 
-# The library SELECT production runs every day, copied verbatim from
-# scripts/sync-library.sh. tests/unit/test_catalog_parity_diff.py lifts every
-# `-e "SELECT ..."` out of that script and asserts (whitespace-insensitively)
-# that the set is exactly these two -- equality, not containment, so neither
-# an appended `ORDER BY`/`LIMIT` on the shell side nor a third divergent
-# query can slip past. A baseline built from a *different* query would make
-# the parity diff measure the harness rather than the migration. Change one,
-# change both.
+# The library SELECT that production ran every day until WXYC/discogs-etl#346
+# moved scripts/sync-library.sh onto the Backend producer. This is now the
+# *only* copy: the shell script runs no SELECTs, so the drift guard that held
+# the two in lockstep (test_select_statements_match_sync_library_sh) retired
+# with the second copy it existed to compare against.
+#
+# That makes this text the sole definition of what the MySQL side of a parity
+# run measures, so the reasons behind its shape are worth restating: the
+# IFNULL wraps exist because `mysql -B -N` prints a real SQL NULL as the
+# literal 4-character text "NULL" on this server, which reaches the diff as a
+# spurious field value (tests/unit/test_mysql_select_null_handling.py pins
+# each wrap, and the e2e pair executes them against SQLite). The query stays
+# frozen otherwise: the harness's whole claim is that the Backend build
+# reproduces what tubafrenzy holds, and re-shaping the mysql side mid-soak
+# would silently change what "clean" means.
 LIBRARY_SELECT_SQL = (
     "SELECT r.ID, r.TITLE, lc.PRESENTATION_NAME, lc.CALL_LETTERS, lc.CALL_NUMBERS,"
     " r.CALL_NUMBERS, g.REFERENCE_NAME, f.REFERENCE_NAME,"

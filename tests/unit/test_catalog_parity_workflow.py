@@ -16,11 +16,15 @@ what this file pins:
    at the first failing step, so the harness step has to capture its own
    status rather than fail on it -- otherwise the taxonomy in
    ``parity_run_summary.py`` never runs and exit 4 renders as a bare red X.
-3. **The run must not collide with ``sync-library.yml``.** Both scan the same
-   Kattare MySQL, whose HikariCP pool maxes at 5 connections; overlapping
-   full-catalog scans are how that host wedges (2026-05-24). The margin is
-   checked against this workflow's own ``timeout-minutes``, so raising the
-   timeout past the gap fails here instead of in production.
+3. **The run must finish before ``sync-library.yml`` starts.** The margin
+   dates from when both jobs scanned the same Kattare MySQL, whose HikariCP
+   pool maxes at 5 connections; overlapping full-catalog scans are how that
+   host wedges (2026-05-24). #346 moved the daily sync onto Backend-Service,
+   so this job is now the only Kattare reader and the margin is scheduler
+   separation rather than pool protection -- still worth holding, since this
+   is the job that cannot afford to be late. It is checked against this
+   workflow's own ``timeout-minutes``, so raising the timeout past the gap
+   fails here instead of in production.
 4. **The MySQL password must never enter the DSN.** The DSN reaches the
    harness on argv, visible to ``ps`` for the whole run and echoed by any
    ``set -x``. ``$LIBRARY_DB_PASSWORD`` -> ``MYSQL_PWD`` is the only path.
@@ -125,7 +129,7 @@ class TestTriggers:
         gap = (sync - parity) % (24 * 60)
         assert gap > timeout, (
             f"the parity soak starts {gap} min before sync-library but may run for "
-            f"{timeout} min; overlapping full-catalog scans wedge Kattare's 5-connection pool"
+            f"{timeout} min; the soak must land its verdict before the day's sync begins"
         )
 
     def test_job_is_time_bounded(self, job) -> None:

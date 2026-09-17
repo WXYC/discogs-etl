@@ -94,144 +94,61 @@ fi
 
 log "Starting library sync"
 
-# Build MySQL connection URL from individual env vars
-if [[ -z "$LIBRARY_DB_HOST" || -z "$LIBRARY_DB_USER" || -z "$LIBRARY_DB_PASSWORD" || -z "$LIBRARY_DB_NAME" ]]; then
-    notify_error "Missing required LIBRARY_DB_* environment variables"
+# Catalog source: Backend-Service's HTTP export, not tubafrenzy's MySQL
+# (WXYC/discogs-etl#346). This block used to tunnel into Kattare and run two
+# `mysql -B -N` SELECTs against `wxycmusic`; Kattare hosting ends 2026-09-22
+# and the catalog's write authority moved to Backend-Service ahead of it, so
+# the MySQL read path had nothing left to read. The SELECTs themselves are not
+# gone -- `scripts/catalog_parity_diff.py` keeps its own MySQL producer, which
+# is what certifies the two sides agree -- they are just no longer on the
+# daily path, and they retire with the host rather than with this script.
+#
+# Everything from the streaming-links enrichment down is deliberately
+# untouched by that swap: those steps consume the built SQLite, never the
+# source, so the cutover is invisible to them.
+#
+# BACKEND_CATALOG_URL is a knob rather than a constant so that a one-off can
+# aim at staging, exactly as catalog-parity.yml allows; unset means prod.
+BACKEND_CATALOG_URL="${BACKEND_CATALOG_URL:-https://api.wxyc.org}"
+
+# Credentials reach the builder through the environment and never through
+# argv, which is readable by any `ps` and is echoed by `set -x` and by GitHub
+# Actions command traces. Two accepted shapes: a pre-minted service-account
+# JWT for an operator running this by hand, or the service account's
+# email/password for an unattended run -- a better-auth JWT lives 15 minutes,
+# far short of a daily schedule, so CI signs in per run instead of storing a
+# token. Checked here rather than left to the builder because an
+# unauthenticated run otherwise surfaces several HTTP round-trips later, as a
+# producer failure whose real cause is one missing secret.
+if [[ -z "$BACKEND_CATALOG_TOKEN" && ( -z "$BACKEND_CATALOG_EMAIL" || -z "$BACKEND_CATALOG_PASSWORD" ) ]]; then
+    notify_error "Missing Backend catalog credentials: set BACKEND_CATALOG_TOKEN, or both BACKEND_CATALOG_EMAIL and BACKEND_CATALOG_PASSWORD"
     exit 1
 fi
-# Set up SSH tunnel to Kattare if LIBRARY_SSH_HOST is configured
-if [[ -n "$LIBRARY_SSH_HOST" && -n "$LIBRARY_SSH_USER" ]]; then
-    LOCAL_DB_PORT=13306
-    log "Opening SSH tunnel to $LIBRARY_SSH_HOST..."
-    ssh -f -N -L "${LOCAL_DB_PORT}:${LIBRARY_DB_HOST}:3306" \
-        "${LIBRARY_SSH_USER}@${LIBRARY_SSH_HOST}" \
-        -o StrictHostKeyChecking=no -o ConnectTimeout=10
-    DB_HOST="127.0.0.1"
-    DB_PORT="$LOCAL_DB_PORT"
-    log "SSH tunnel established on port $LOCAL_DB_PORT"
-else
-    DB_HOST="$LIBRARY_DB_HOST"
-    DB_PORT="3306"
-fi
 
-# Run ETL: query MySQL via CLI (bypasses Python driver auth issues with MySQL 4.1)
+# `mktemp -d` creates only the directory, so library.db does not exist yet --
+# which is what build_library_db.py requires. It refuses a pre-existing
+# --output, builds beside the target and renames on success, so a failed run
+# leaves nothing half-written behind for the next one to trip over.
 DB_PATH=$(mktemp -d)/library.db
-MYSQL_HOST="${DB_HOST:-$LIBRARY_DB_HOST}"
-MYSQL_PORT="${DB_PORT:-3306}"
 
-# The 11th SELECT column is CROSS_REFERENCE_NAMES: a correlated subquery over
-# LIBRARY_CODE_CROSS_REFERENCE that pipe-joins (" | ") the PRESENTATION_NAMEs
-# of any LIBRARY_CODEs cataloger-cross-referenced to this row's own code, in
-# either FK direction (CROSS_REFERENCING_ARTIST_ID / CROSS_REFERENCED_LIBRARY_
-# CODE_ID both -> LIBRARY_CODE.ID), excluding the row's own name. This is the
-# same alias link wxyc-catalog's TubafrenzySource.fetch_cross_referenced_artists
-# reads for the XML-converter artist filter -- here it rides along on every
-# library.db row instead of only feeding that allowlist. See
-# WXYC/discogs-etl#334.
-#
-# ALTERNATE_ARTIST_NAME, ALBUM_ARTIST, and the CROSS_REFERENCE_NAMES subquery
-# are wrapped in IFNULL(<expr>, '') because `mysql -B -N` on this server
-# prints a genuine SQL NULL as the literal 4-character text "NULL", not the
-# "\N" sentinel tsv_to_sqlite.py's parser expects -- and since ALBUM_ARTIST
-# feeds the library_fts index, an unwrapped NULL became a literal 'NULL'
-# string that a typed search for "null" then matched against the whole
-# catalog (verified in prod: 64,780 album_artist / 63,904
-# cross_reference_names rows). IFNULL only ever substitutes for a *real* SQL
-# NULL, so an artist or cross-reference genuinely named the text "NULL"
-# still passes through untouched -- this is deliberately a SQL-layer fix, not
-# Python string-sniffing in tsv_to_sqlite.py, which would risk corrupting
-# that row instead. The other columns in this SELECT (ID, TITLE,
-# PRESENTATION_NAME, CALL_LETTERS, both CALL_NUMBERS, and both REFERENCE_NAME
-# columns) are left unwrapped.
-#
-# Two of those eight now have measured backing rather than an assumption:
-# on 2026-08-14 (WXYC/discogs-etl#375) `TITLE IS NULL` and
-# `PRESENTATION_NAME IS NULL` both counted 0 against prod. The other six
-# remain unmeasured and rest on the original "always populated" reading.
-# TITLE is not fully clean even so -- six rows carry a byte-exact
-# empty-string TITLE (ids 21107, 39290, 51871, 52374, 65301, 66329;
-# `LENGTH(TITLE) = 0`, not NULL and not whitespace), which downstream
-# consumers (catalog_parity_diff.py's `_rule_b_missing_reason`) already
-# handle as expected residue via a plain `.strip() == ""` check, so that is
-# not a reason to wrap either.
-#
-# Note what a count does and does not establish: it is a point-in-time
-# reading of a mutable prod table, not a NOT NULL constraint. The tubafrenzy
-# MySQL user cannot read information_schema, so whether either column is
-# schema-nullable is unverified -- if a cataloger ever does insert a NULL,
-# `mysql -B -N` renders it as the literal text `NULL` and reproduces the
-# ALBUM_ARTIST failure above. That case is caught loudly rather than
-# silently now: `_rule_b_missing_reason` no longer forgives a literal
-# "NULL" as expected residue, so it surfaces as unexplained parity drift,
-# and THAT is the signal to come back here and add the IFNULL wrap.
-ETL_OUTPUT=$(mktemp)
-CSV_FILE=$(mktemp)
-if ! MYSQL_PWD="$LIBRARY_DB_PASSWORD" mysql -h "$MYSQL_HOST" -P "$MYSQL_PORT" -u "$LIBRARY_DB_USER" \
-    --default-character-set=utf8 -B -N "$LIBRARY_DB_NAME" \
-    -e "SELECT r.ID, r.TITLE, lc.PRESENTATION_NAME, lc.CALL_LETTERS, lc.CALL_NUMBERS, r.CALL_NUMBERS, g.REFERENCE_NAME, f.REFERENCE_NAME, IFNULL(r.ALTERNATE_ARTIST_NAME, ''), IFNULL(r.ALBUM_ARTIST, ''), IFNULL((SELECT GROUP_CONCAT(DISTINCT xlc.PRESENTATION_NAME SEPARATOR ' | ') FROM LIBRARY_CODE_CROSS_REFERENCE xcr, LIBRARY_CODE xlc WHERE xlc.ID = CASE WHEN xcr.CROSS_REFERENCING_ARTIST_ID = lc.ID THEN xcr.CROSS_REFERENCED_LIBRARY_CODE_ID WHEN xcr.CROSS_REFERENCED_LIBRARY_CODE_ID = lc.ID THEN xcr.CROSS_REFERENCING_ARTIST_ID ELSE NULL END AND (xcr.CROSS_REFERENCING_ARTIST_ID = lc.ID OR xcr.CROSS_REFERENCED_LIBRARY_CODE_ID = lc.ID) AND xlc.ID != lc.ID), '') FROM LIBRARY_RELEASE r JOIN LIBRARY_CODE lc ON r.LIBRARY_CODE_ID = lc.ID JOIN FORMAT f ON r.FORMAT_ID = f.ID JOIN GENRE g ON lc.GENRE_ID = g.ID" \
-    > "$CSV_FILE" 2> "$ETL_OUTPUT"; then
-    ERROR_DETAILS=$(cat "$ETL_OUTPUT" | tail -1 | sed 's/"/\\"/g')
-    cat "$ETL_OUTPUT" >> "$LOG_FILE"
-    rm -f "$ETL_OUTPUT" "$CSV_FILE" "$DB_PATH"
-    notify_error "MySQL query failed: $ERROR_DETAILS"
+log "Building library.db from $BACKEND_CATALOG_URL..."
+if ! $PYTHON scripts/build_library_db.py \
+    --source "$BACKEND_CATALOG_URL" \
+    --output "$DB_PATH" 2>&1 | tee -a "$LOG_FILE"; then
+    rm -f "$DB_PATH"
+    rmdir "$(dirname "$DB_PATH")" 2>/dev/null || true
+    notify_error "library.db build from $BACKEND_CATALOG_URL failed"
     exit 1
 fi
-cat "$ETL_OUTPUT" >> "$LOG_FILE"
-rm -f "$ETL_OUTPUT"
 
-ROW_COUNT=$(wc -l < "$CSV_FILE" | tr -d ' ')
-log "Fetched $ROW_COUNT rows from MySQL"
-
-# Fetch compilation track artists (supplementary to LIBRARY_RELEASE; restores the
-# export dropped in the #65 slim-down -- WXYC/discogs-etl#332). Reuses the same
-# MySQL auth as the query above. artist_name/track_title are free text but mysql
-# -B -N already escapes embedded tab/newline/backslash bytes in field values, so
-# the tab/newline-based split in lib/library_db.py (shared with the
-# LIBRARY_RELEASE export above) is safe to reuse unchanged -- but the escaped
-# bytes it splits on are then unescaped back to real backslash/tab/newline/NUL
-# bytes (WXYC/discogs-etl#370), not passed through as the two-char sequences.
-# Degrades gracefully: pre-V008 fixtures / the Backend-Service catalog source have
-# no COMPILATION_TRACK_ARTIST table, so a "doesn't exist" failure here is expected
-# and must not fail the overall library sync (or any other CTA-fetch error, since
-# CTA is supplementary -- LIBRARY_RELEASE must never be blocked by it).
-#
-# TRACK_TITLE is wrapped in IFNULL(TRACK_TITLE, '') for the same reason as
-# ALBUM_ARTIST/ALTERNATE_ARTIST_NAME above: this is the same `mysql -B -N`
-# invocation style, so a genuine SQL NULL here renders as the literal text
-# "NULL" too. LIBRARY_RELEASE_ID and ARTIST_NAME are documented NOT NULL
-# (see create_compilation_track_artists in lib/library_db.py for the column
-# definitions, and parse_compilation_track_tsv beside it for the skip-with-a-
-# warning that enforces them) and stay unwrapped.
-CTA_CSV_FILE=$(mktemp)
-CTA_ETL_OUTPUT=$(mktemp)
-CTA_TSV_ARGS=()
-if MYSQL_PWD="$LIBRARY_DB_PASSWORD" mysql -h "$MYSQL_HOST" -P "$MYSQL_PORT" -u "$LIBRARY_DB_USER" \
-    --default-character-set=utf8 -B -N "$LIBRARY_DB_NAME" \
-    -e "SELECT LIBRARY_RELEASE_ID, ARTIST_NAME, IFNULL(TRACK_TITLE, '') FROM COMPILATION_TRACK_ARTIST ORDER BY LIBRARY_RELEASE_ID" \
-    > "$CTA_CSV_FILE" 2> "$CTA_ETL_OUTPUT"; then
-    CTA_ROW_COUNT=$(wc -l < "$CTA_CSV_FILE" | tr -d ' ')
-    log "Fetched $CTA_ROW_COUNT compilation track artist rows from MySQL"
-    if [[ "$CTA_ROW_COUNT" -gt 0 ]]; then
-        CTA_TSV_ARGS=(--cta-tsv "$CTA_CSV_FILE")
-    fi
-else
-    CTA_STDERR=$(cat "$CTA_ETL_OUTPUT")
-    if echo "$CTA_STDERR" | grep -qi "doesn't exist"; then
-        log "COMPILATION_TRACK_ARTIST table not found, skipping compilation track artist export"
-    else
-        log "WARNING: compilation track artist query failed, continuing without it: $(echo "$CTA_STDERR" | tail -1)"
-    fi
-fi
-cat "$CTA_ETL_OUTPUT" >> "$LOG_FILE"
-rm -f "$CTA_ETL_OUTPUT"
-
-# Build SQLite database from TSV output (plus compilation_track_artist, if fetched)
-if ! $PYTHON scripts/tsv_to_sqlite.py "$CSV_FILE" "$DB_PATH" "${CTA_TSV_ARGS[@]}" 2>&1 | tee -a "$LOG_FILE"; then
-    rm -f "$CSV_FILE" "$CTA_CSV_FILE" "$DB_PATH"
-    notify_error "SQLite export failed"
-    exit 1
-fi
-rm -f "$CSV_FILE" "$CTA_CSV_FILE"
+# A record, not a guard: the builder already refuses an empty catalog, and the
+# streaming floor below catches a thin one. What this line buys is a per-day
+# number in the log, because the upload replaces production's library.db
+# wholesale and "how many rows went out that day" is what a later incident
+# reads backwards from. The retired MySQL block logged the same thing off its
+# TSV line count.
+ROW_COUNT=$($PYTHON -c "import sqlite3,sys; print(sqlite3.connect(sys.argv[1]).execute('SELECT COUNT(*) FROM library').fetchone()[0])" "$DB_PATH" 2>>"$LOG_FILE") || ROW_COUNT="<error>"
+log "Built library.db with $ROW_COUNT rows"
 
 # Enrich with streaming links (optional — skipped if streaming_availability.db unavailable)
 LML_DIR="${LML_REPO_DIR:-$(dirname "$REPO_DIR")/library-metadata-lookup}"

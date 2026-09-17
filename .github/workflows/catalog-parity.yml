@@ -21,12 +21,16 @@ on:
   schedule:
     # 09:37 UTC daily = 5:37 AM EDT / 4:37 AM EST, 2:37 AM PDT. Three
     # deliberate choices:
-    #   * ~2h20m ahead of sync-library.yml's 12:00 UTC slot. Both scan the
-    #     same Kattare MySQL, whose HikariCP pool maxes at 5 connections, and
-    #     overlapping full-catalog scans are how that host wedges (2026-05-24).
-    #     tests/unit/test_catalog_parity_workflow.py checks that margin
-    #     against this job's timeout-minutes, so raising the timeout past the
-    #     gap fails in CI rather than in production.
+    #   * ~2h20m ahead of sync-library.yml's 12:00 UTC slot. This margin was
+    #     chosen when both jobs scanned the same Kattare MySQL, whose HikariCP
+    #     pool maxes at 5 connections -- overlapping full-catalog scans are how
+    #     that host wedges (2026-05-24). Since #346 moved the daily sync onto
+    #     Backend-Service this job is the only Kattare reader left, so the
+    #     margin now buys separation on GitHub's scheduler rather than on that
+    #     pool. Kept: it costs nothing, and the soak is still the job that must
+    #     not be late. tests/unit/test_catalog_parity_workflow.py checks the
+    #     margin against this job's timeout-minutes, so raising the timeout
+    #     past the gap fails in CI rather than in production.
     #   * Off the top of the hour: GitHub queues scheduled workflows hardest
     #     at :00, and a delayed run is a day the streak can silently lose.
     #   * Quiet for catalogers. The two sides are snapshotted minutes apart,

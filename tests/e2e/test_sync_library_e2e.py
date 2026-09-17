@@ -248,50 +248,47 @@ class TestCompilationTrackLocationInvocation:
 
 # --- literal-NULL-string bugfix (verified in prod 2026-08-02) --------------
 #
-# ``mysql -B -N`` (the CLI mode sync-library.sh uses) prints a genuine SQL
-# NULL on this server as the literal 4-character text "NULL", not the "\N"
-# sentinel tsv_to_sqlite.py's parser expects. Left unwrapped, that literal
-# text lands in SQLite as the *string* 'NULL' -- and since album_artist feeds
+# ``mysql -B -N`` (the CLI mode the tubafrenzy producer uses) prints a genuine
+# SQL NULL on this server as the literal 4-character text "NULL", not the "\N"
+# sentinel ``parse_library_tsv`` expects. Left unwrapped, that literal text
+# lands in SQLite as the *string* 'NULL' -- and since album_artist feeds
 # library_fts, a typed search for "null" matched the whole catalog.
 #
-# The fix is in the SQL text (IFNULL(<col>, '')), not in tsv_to_sqlite.py's
-# Python: an artist genuinely named "NULL" must survive, so string-sniffing
-# for the text 'NULL' would silently corrupt that row instead. There is no
-# MySQL server available in this environment, so these tests execute the
-# *actual* wrapped column expressions -- extracted live from
-# scripts/sync-library.sh -- against SQLite, which implements IFNULL
-# identically to MySQL for a plain column reference. This is a stronger,
-# self-updating proof than a hand-duplicated SQL string: if the wrap is
-# missing or malformed, the test fails for the right reason (the bare column
-# selects real NULL/None instead of '').
-_SYNC_SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "sync-library.sh"
+# The fix is in the SQL text (IFNULL(<col>, '')), not in the parser's Python:
+# an artist genuinely named "NULL" must survive, so string-sniffing for the
+# text 'NULL' would silently corrupt that row instead. There is no MySQL
+# server available in this environment, so these tests execute the *actual*
+# wrapped column expressions -- lifted live from the SQL the producer runs --
+# against SQLite, which implements IFNULL identically to MySQL for a plain
+# column reference. This is a stronger, self-updating proof than a
+# hand-duplicated SQL string: if the wrap is missing or malformed, the test
+# fails for the right reason (the bare column selects real NULL/None
+# instead of '').
+#
+# The SQL now lives in ``scripts/catalog_parity_diff.py`` rather than in
+# ``scripts/sync-library.sh``: WXYC/discogs-etl#346 moved the daily sync onto
+# the Backend producer, leaving the parity harness as the last MySQL reader
+# (and the last copy of these queries). These tests followed the SQL, together
+# with the wiring assertions in
+# ``tests/unit/test_mysql_select_null_handling.py``.
+_PARITY_SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "catalog_parity_diff.py"
 
-# Anchor on the actual `-e "SELECT ..."` mysql invocations, not the whole file
-# -- the file's own explanatory comments (necessarily) mention these same
-# column names in prose, and a naive whole-file search could match a comment
-# instead of the live SQL.
-_LIBRARY_SELECT_RE = re.compile(
-    r"-e \"(SELECT r\.ID.*?"
-    r"FROM LIBRARY_RELEASE r JOIN LIBRARY_CODE lc ON r\.LIBRARY_CODE_ID = lc\.ID "
-    r"JOIN FORMAT f ON r\.FORMAT_ID = f\.ID JOIN GENRE g ON lc\.GENRE_ID = g\.ID)\"",
-    re.DOTALL,
-)
-_CTA_SELECT_RE = re.compile(
-    r"-e \"(SELECT LIBRARY_RELEASE_ID.*?FROM COMPILATION_TRACK_ARTIST ORDER BY LIBRARY_RELEASE_ID)\"",
-    re.DOTALL,
-)
+
+def _parity_module():
+    spec = importlib.util.spec_from_file_location("catalog_parity_diff", _PARITY_SCRIPT)
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["catalog_parity_diff"] = mod
+    spec.loader.exec_module(mod)
+    return mod
 
 
 def _library_select_text() -> str:
-    match = _LIBRARY_SELECT_RE.search(_SYNC_SCRIPT.read_text())
-    assert match, f"could not locate the LIBRARY_RELEASE SELECT in {_SYNC_SCRIPT.name}"
-    return match.group(1)
+    return _parity_module().LIBRARY_SELECT_SQL
 
 
 def _cta_select_text() -> str:
-    match = _CTA_SELECT_RE.search(_SYNC_SCRIPT.read_text())
-    assert match, f"could not locate the COMPILATION_TRACK_ARTIST SELECT in {_SYNC_SCRIPT.name}"
-    return match.group(1)
+    return _parity_module().COMPILATION_TRACK_SELECT_SQL
 
 
 def _extract_column_expr(select_text: str, table_alias: str, column: str) -> str:
@@ -362,7 +359,7 @@ class TestLibrarySelectRealNullVsLiteralNullText:
         that subquery -- IFNULL wrapped around an expression that yields SQL
         NULL when no cross-reference exists (the common case: 63,904 NULL
         rows in prod) -- converts that NULL to ''. The wiring test in
-        tests/unit/test_sync_library_null_handling.py separately pins that
+        tests/unit/test_mysql_select_null_handling.py separately pins that
         the actual subquery in sync-library.sh is wrapped this way.
         """
         conn = sqlite3.connect(":memory:")
