@@ -38,6 +38,7 @@ from lib.backend_library_source import (  # noqa: E402
     SourceError,
     build_library_db_from_backend,
 )
+from lib.observability import init_logger  # noqa: E402
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
@@ -63,6 +64,10 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = _build_arg_parser().parse_args(argv)
+    # Before the build, not after: a run that fails to produce a library.db is
+    # exactly the one whose logs are worth having, and the producer logs its
+    # row count and its empty-CTA warning through the root logger.
+    init_logger(repo="discogs-etl", tool="discogs-etl build_library_db")
     try:
         build_library_db_from_backend(args.source, args.output)
     except SourceError as exc:

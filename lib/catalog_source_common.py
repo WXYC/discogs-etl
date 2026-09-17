@@ -21,8 +21,7 @@ from collections.abc import Iterable, Iterator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from lib.library_db import build_library_db  # noqa: E402
+from lib.library_db import build_library_db
 
 
 class SourceError(RuntimeError):
@@ -54,8 +53,8 @@ def _require_absent(output_path: str, label: str) -> None:
     if Path(output_path).exists():
         raise SourceError(
             f"refusing to build the {label} library.db at {output_path}: the path "
-            f"already exists. This harness only ever writes fresh scratch copies -- "
-            f"point --{label}-db at a new path (or delete that one deliberately)."
+            f"already exists. Producers only ever write to a fresh path -- point the "
+            f"output at a new one (or delete that one deliberately)."
         )
     parent = Path(output_path).parent
     if not parent.is_dir():
