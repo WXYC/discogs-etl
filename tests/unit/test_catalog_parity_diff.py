@@ -134,18 +134,9 @@ _LM_A = "Sat, 09 Aug 2026 12:00:00 GMT"
 _LM_B = "Sat, 09 Aug 2026 12:30:00 GMT"
 
 
-def _squash(text: str) -> str:
-    """Collapse all whitespace runs to single spaces, for SQL source comparison."""
-    return re.sub(r"\s+", " ", text).strip()
-
-
-def _sync_library_selects(script: str) -> set[str]:
-    """Every SELECT ``sync-library.sh`` hands to the ``mysql`` CLI, squashed.
-
-    The script passes each query as a double-quoted ``-e`` argument and none
-    of them contain a double quote, so this lifts them out exactly.
-    """
-    return {_squash(sql) for sql in re.findall(r'-e "(SELECT [^"]*)"', script)}
+# ``_squash`` and ``_sync_library_selects`` lived here, feeding
+# ``test_select_statements_match_sync_library_sh``. Both retired with that
+# test -- see ``TestMysqlProducer`` below for why.
 
 
 def _catalog_row(**overrides: Any) -> dict[str, Any]:
@@ -1180,8 +1171,10 @@ class TestClassifyField:
 
 
 class TestColumnModelsDriftGuard:
-    """Mirrors ``test_select_statements_match_sync_library_sh``'s style: set
-    equality, not containment, so an added OR removed diffed column fails."""
+    """Set equality, not containment, so an added OR removed diffed column
+    fails. (This was modelled on the retired
+    ``test_select_statements_match_sync_library_sh``, whose set-equality
+    reasoning is quoted where it used to live, in ``TestMysqlProducer``.)"""
 
     def test_column_models_keys_match_diff_columns_exactly(self) -> None:
         mod = _load_module()
@@ -4188,25 +4181,27 @@ class TestMysqlProducer:
             mod._build_library_db_from_mysql("mysql://u:p@h/db", str(existing))
         assert existing.read_bytes() == b"precious"
 
-    def test_select_statements_match_sync_library_sh(self) -> None:
-        """Drift guard: the baseline must be the *same* query prod runs daily.
-
-        A producer that quietly diverges from ``scripts/sync-library.sh``
-        would diff the Backend build against something production never
-        builds -- parity would then measure the harness, not the migration.
-
-        Asserted as set equality over every ``-e "SELECT ..."`` the script
-        runs, not as substring containment: containment is one-directional,
-        so appending ``ORDER BY``/``LIMIT`` to the shell's copy -- or adding a
-        third, divergent SELECT -- would leave the guard green while the two
-        producers ran different queries.
-        """
-        mod = _load_module()
-        script = (REPO_ROOT / "scripts" / "sync-library.sh").read_text(encoding="utf-8")
-        assert _sync_library_selects(script) == {
-            _squash(mod.LIBRARY_SELECT_SQL),
-            _squash(mod.COMPILATION_TRACK_SELECT_SQL),
-        }
+    # ``test_select_statements_match_sync_library_sh`` stood here. It lifted
+    # every ``-e "SELECT ..."`` out of ``scripts/sync-library.sh`` and
+    # asserted set equality against ``LIBRARY_SELECT_SQL`` /
+    # ``COMPILATION_TRACK_SELECT_SQL``, because the same two queries had been
+    # copied into two files and a silent divergence would have made the
+    # parity diff measure the harness rather than the migration.
+    #
+    # WXYC/discogs-etl#346 moved the daily sync onto
+    # ``scripts/build_library_db.py``, so the script runs no SELECTs at all
+    # and there is exactly one copy of each query left -- the one in this
+    # module. The guard's premise was "two copies must agree"; with one copy
+    # it asserts that a set of queries equals the empty set, which is a test
+    # that can only fail for the wrong reason. Retired deliberately rather
+    # than re-pointed: there is nothing left to point it at.
+    #
+    # What DID need carrying forward is the reason the SQL is shaped the way
+    # it is -- the ``IFNULL(<col>, '')`` wraps, whose absence put the literal
+    # string 'NULL' into 64,780 prod rows. Those assertions moved onto this
+    # module's constants and now live in
+    # ``tests/unit/test_mysql_select_null_handling.py`` and the SQLite-executed
+    # pair in ``tests/e2e/test_sync_library_e2e.py``.
 
     def test_password_comes_from_the_environment_not_the_dsn(self, monkeypatch) -> None:
         """A DSN password sits in *this* process's argv, visible to `ps`."""

@@ -7,9 +7,9 @@ catch a password leaked into ``ps`` output, and no second chance to un-email
 an account-setup token. So the properties that make the procedure safe are
 asserted here against the script's text rather than its behavior.
 
-This mirrors the drift guard on ``sync-library.sh`` in
-``test_catalog_parity_diff.py``: the shell is the artifact an operator runs,
-so the shell is what gets checked.
+It takes the same approach as the wiring tests on ``sync-library.sh`` in
+``test_sync_library_backend_source.py``: the shell is the artifact an operator
+runs, so the shell is what gets checked.
 """
 
 from __future__ import annotations
