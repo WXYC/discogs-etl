@@ -843,6 +843,7 @@ def _fetch_consistent_snapshot(
     token_source: _TokenSource,
     *,
     catalog_mapper: Callable[[dict[str, Any]], _Row] = _catalog_row_to_library_row,
+    compilation_tracks_required: bool = True,
 ) -> tuple[list[_Row], list[_Row]]:
     """Fetch both exports, retrying until they describe the same catalog snapshot.
 
@@ -860,6 +861,17 @@ def _fetch_consistent_snapshot(
     and the dangling-id cross-check are unaffected either way, since element
     0 of both catalog-row shapes is ``legacy_release_id``.
 
+    ``compilation_tracks_required=False`` makes a *failed* CTA fetch degrade
+    to an empty CTA side instead of propagating. The daily build passes it;
+    every other caller leaves it True. The asymmetry is deliberate and it is
+    the one the retired MySQL read path had: the catalog export IS the build,
+    while compilation tracks are supplementary, so a broken supplementary
+    export must not cost production a day of catalog freshness. Note this
+    tolerates the *fetch* failing, not a fetched row being malformed --
+    ``_catalog_cta_row_to_library_row``'s contract violations still raise,
+    because those mean Backend is serving something the schema forbids rather
+    than not serving at all.
+
     Note that ``Last-Modified`` is an HTTP-date, i.e. whole seconds: two
     distinct watermarks inside the same second compare equal, so a write
     landing between the two GETs in that window slips through. The
@@ -873,9 +885,28 @@ def _fetch_consistent_snapshot(
         catalog_rows, catalog_watermark = _fetch_ndjson(
             base_url + _CATALOG_PATH, token_source, catalog_mapper
         )
-        cta_rows, cta_watermark = _fetch_ndjson(
-            base_url + _COMPILATION_TRACKS_PATH, token_source, _catalog_cta_row_to_library_row
-        )
+        try:
+            cta_rows, cta_watermark = _fetch_ndjson(
+                base_url + _COMPILATION_TRACKS_PATH, token_source, _catalog_cta_row_to_library_row
+            )
+        except SourceError as exc:
+            if compilation_tracks_required:
+                raise
+            # Return rather than continue: the retry loop above exists to
+            # resolve a *torn* pair, and an export that will not answer is not
+            # a tear -- there is no second side left to disagree with the
+            # catalog. Looping would cost Backend two more full catalog
+            # exports to arrive at exactly this answer.
+            logger.warning(
+                "the compilation-track export could not be fetched; "
+                "building without the compilation_track_artist table",
+                extra={"step": "backend_producer", "source": base_url, "error": str(exc)},
+            )
+            _report(
+                f"WARNING: {base_url}{_COMPILATION_TRACKS_PATH} could not be fetched "
+                f"({exc}); building without a compilation_track_artist table"
+            )
+            return catalog_rows, []
 
         if catalog_watermark != cta_watermark:
             reason = (
@@ -925,8 +956,11 @@ def _build_library_db_from_backend(source: str, output_path: str) -> None:
             cross-origin redirect, missing credentials (neither
             ``$BACKEND_CATALOG_TOKEN`` nor the ``$BACKEND_CATALOG_EMAIL`` /
             ``$BACKEND_CATALOG_PASSWORD`` pair), a sign-in or token-exchange
-            failure, a fetch or decode failure, a torn snapshot, an empty
-            catalog, or a catalog row that violates the api.yaml contract.
+            failure, a catalog fetch or decode failure, a torn snapshot, an
+            empty catalog, or a row that violates the api.yaml contract. A
+            failed *compilation-track* fetch is the one exception: it degrades
+            to a build without that table, because the daily sync must not
+            lose a day of catalog freshness to a broken supplementary export.
     """
     _require_absent(output_path, "backend")
     base_url = _resolve_backend_base_url(source)
@@ -943,7 +977,9 @@ def _build_from_backend_snapshot(
     base_url: str, output_path: str, token_source: _TokenSource
 ) -> None:
     """Fetch a consistent snapshot and write it, with the token source live."""
-    library_rows, compilation_rows = _fetch_consistent_snapshot(base_url, token_source)
+    library_rows, compilation_rows = _fetch_consistent_snapshot(
+        base_url, token_source, compilation_tracks_required=False
+    )
     if not library_rows:
         # A broken export query, an over-narrow token scope, or a truncated
         # cached buffer all surface as a 200 with no rows. Building from it
@@ -960,12 +996,17 @@ def _build_from_backend_snapshot(
         # rather than a failure, matching the MySQL side's graceful
         # degradation. Loud, because in prod it is ~144k rows and its absence
         # would otherwise land in the report as cta_missing.
+        #
+        # Reached by two different routes now: an export that answered with no
+        # rows, and one that could not be fetched at all (which logs its own
+        # HTTP detail above, since only that site knows the difference). The
+        # wording below covers both rather than asserting which one happened.
         logger.warning(
-            "the compilation-track export returned no rows; building without the table",
+            "no compilation-track rows; building without the table",
             extra={"step": "backend_producer", "source": base_url},
         )
         _report(
-            f"WARNING: {base_url}{_COMPILATION_TRACKS_PATH} returned no rows; "
+            f"WARNING: no rows from {base_url}{_COMPILATION_TRACKS_PATH}; "
             "building without a compilation_track_artist table"
         )
 

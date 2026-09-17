@@ -131,24 +131,79 @@ fi
 # leaves nothing half-written behind for the next one to trip over.
 DB_PATH=$(mktemp -d)/library.db
 
+# Captured as well as logged, so the builder's own `error: ...` line reaches
+# notify_error's message rather than only the run log. "the build failed" on
+# its own sends whoever reads it hunting for the one fact that mattered. The
+# retired MySQL block did the same with its $ERROR_DETAILS tail.
+#
+# Note the Slack half of notify_error is inert today: this script only posts
+# when invoked with --notify, and sync-library.yml passes no flags and carries
+# no SLACK_MONITORING_WEBHOOK (docs/automation.md claims otherwise and is
+# wrong about it -- pre-existing, not introduced here). The detail still lands
+# in the ETL log and the run output, and is already correct for the day that
+# wiring gets fixed.
+BUILD_OUTPUT=$(mktemp)
 log "Building library.db from $BACKEND_CATALOG_URL..."
 if ! $PYTHON scripts/build_library_db.py \
     --source "$BACKEND_CATALOG_URL" \
-    --output "$DB_PATH" 2>&1 | tee -a "$LOG_FILE"; then
-    rm -f "$DB_PATH"
+    --output "$DB_PATH" 2>&1 | tee -a "$LOG_FILE" "$BUILD_OUTPUT"; then
+    # Prefer the builder's own `error: ` line over the last line of output:
+    # the producer prints its diagnosis there, and a trailing warning (an
+    # unfetchable compilation-track export, say) would otherwise displace it.
+    ERROR_DETAILS=$(sed -n 's/^error: //p' "$BUILD_OUTPUT" | tail -1 || true)
+    if [[ -z "$ERROR_DETAILS" ]]; then
+        ERROR_DETAILS=$(tail -1 "$BUILD_OUTPUT" || true)
+    fi
+    ERROR_DETAILS=$(printf '%s' "$ERROR_DETAILS" | sed 's/"/\\"/g')
+    rm -f "$DB_PATH" "$BUILD_OUTPUT"
     rmdir "$(dirname "$DB_PATH")" 2>/dev/null || true
-    notify_error "library.db build from $BACKEND_CATALOG_URL failed"
+    notify_error "library.db build from $BACKEND_CATALOG_URL failed: $ERROR_DETAILS"
     exit 1
 fi
+rm -f "$BUILD_OUTPUT"
 
-# A record, not a guard: the builder already refuses an empty catalog, and the
-# streaming floor below catches a thin one. What this line buys is a per-day
-# number in the log, because the upload replaces production's library.db
-# wholesale and "how many rows went out that day" is what a later incident
-# reads backwards from. The retired MySQL block logged the same thing off its
-# TSV line count.
-ROW_COUNT=$($PYTHON -c "import sqlite3,sys; print(sqlite3.connect(sys.argv[1]).execute('SELECT COUNT(*) FROM library').fetchone()[0])" "$DB_PATH" 2>>"$LOG_FILE") || ROW_COUNT="<error>"
-log "Built library.db with $ROW_COUNT rows"
+# The per-day row count, which is both a log record and the input to the floor
+# below. The retired MySQL block logged the same thing off its TSV line count.
+ROW_COUNT=$($PYTHON -c "import sqlite3,sys; print(sqlite3.connect(sys.argv[1]).execute('SELECT COUNT(*) FROM library').fetchone()[0])" "$DB_PATH" 2>>"$LOG_FILE") || ROW_COUNT=""
+log "Built library.db with ${ROW_COUNT:-<error>} rows (floor ${LIBRARY_ROW_FLOOR:-60000})"
+
+# Absolute row floor, checked before enrichment and before either upload.
+#
+# The two guards that already existed leave a wide gap between them. The
+# producer refuses a catalog export of *exactly* zero rows, and
+# STREAMING_APPLE_FLOOR asks for 100 apple_music_url links against a ~64,000-row
+# catalog. A partial export -- an over-narrow token scope, a server-side query
+# regression returning a slice, a truncated cached buffer -- lands squarely
+# between the two and publishes a gutted library.db, which the upload then
+# swaps in for production's wholesale. Nothing downstream would object, and
+# after the Kattare host goes away there is no second catalog left to notice.
+#
+# 60,000 is chosen against measured counts, not rounded down from a guess. The
+# last MySQL-sourced sync uploaded 64,766 rows (2026-09-16); the Backend side
+# of the parity run taken the same day holds 64,359 (matched 64,156 +
+# extra_in_backend 203). The floor sits ~6.8% -- about 4,350 rows -- below
+# that, which is orders of magnitude more headroom than the catalog has ever
+# moved in a day: normal movement is net growth plus the occasional librarian
+# delete, and the largest one-off shrink anyone has proposed is the 119-row
+# unpropagated-delete cohort (0.18%).
+#
+# Deliberately a catastrophe guard and not a drift detector. It catches losing
+# thousands of rows; it will not notice losing fifty, and tightening it until
+# it would is how a floor starts failing honest days -- and a failed sync is
+# its own outage, since production then keeps serving a staler catalog. Small
+# drift is what the parity harness measures while tubafrenzy still answers;
+# after that, nothing does, which is an argument for a trend check on the
+# uploaded row count rather than for a brittle floor here.
+#
+# Set LIBRARY_ROW_FLOOR=0 to opt out -- the same escape hatch
+# STREAMING_APPLE_FLOOR offers, for a local run against a fixture.
+LIBRARY_ROW_FLOOR="${LIBRARY_ROW_FLOOR:-60000}"
+if [[ "$LIBRARY_ROW_FLOOR" -gt 0 ]] && [[ -z "$ROW_COUNT" || "$ROW_COUNT" -lt "$LIBRARY_ROW_FLOOR" ]]; then
+    rm -f "$DB_PATH"
+    rmdir "$(dirname "$DB_PATH")" 2>/dev/null || true
+    notify_error "library.db build produced ${ROW_COUNT:-0} rows (< floor $LIBRARY_ROW_FLOOR); aborting before upload rather than replacing production with a truncated catalog"
+    exit 1
+fi
 
 # Enrich with streaming links (optional — skipped if streaming_availability.db unavailable)
 LML_DIR="${LML_REPO_DIR:-$(dirname "$REPO_DIR")/library-metadata-lookup}"

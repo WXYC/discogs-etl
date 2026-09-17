@@ -84,8 +84,16 @@ def _step(path: Path, needle: str) -> dict[str, Any]:
     )
 
 
-def _backend_catalog_env(step: dict[str, Any]) -> dict[str, str]:
-    return {k: v for k, v in (step.get("env") or {}).items() if k.startswith("BACKEND_CATALOG_")}
+def _backend_env(step: dict[str, Any]) -> dict[str, str]:
+    """Every ``BACKEND_`` name a step passes the producer.
+
+    The prefix is ``BACKEND_`` and not ``BACKEND_CATALOG_`` deliberately: the
+    producer also reads ``BACKEND_AUTH_URL`` and ``BACKEND_AUTH_ORIGIN``
+    (overrides for the better-auth base URL and the CSRF Origin header), and a
+    guard that filtered them out would let exactly the drift it exists to
+    catch -- one workflow pointed at a different auth origin than the other --
+    pass unnoticed."""
+    return {k: v for k, v in (step.get("env") or {}).items() if k.startswith("BACKEND_")}
 
 
 # The live build invocation, matched rather than string-searched: the script's
@@ -167,9 +175,14 @@ class TestDownstreamStepsAreUnchanged:
     """The cutover replaces the producer and nothing else."""
 
     def test_every_post_build_step_still_runs_in_order(self, script: str) -> None:
+        # Anchored on each step's own executable line, not on its name: the
+        # script explains these steps in prose as well as running them (the
+        # row floor's comment names STREAMING_APPLE_FLOOR to contrast the two
+        # guards), and a bare name search would order the comments instead.
         order = [
+            'LIBRARY_ROW_FLOOR="${LIBRARY_ROW_FLOOR:-',
             "export_streaming_links.py",
-            "STREAMING_APPLE_FLOOR",
+            'STREAMING_APPLE_FLOOR="${STREAMING_APPLE_FLOOR:-',
             'upload_library_db "$STAGING_URL"',
             'upload_library_db "$PRODUCTION_URL"',
             "scripts/derive_va_release.py",
@@ -186,20 +199,22 @@ class TestDownstreamStepsAreUnchanged:
 
 class TestSyncWorkflowBackendCredentials:
     def test_backend_credentials_reach_the_sync_step(self) -> None:
-        env = _backend_catalog_env(_step(SYNC_WORKFLOW, "Run library sync"))
+        env = _backend_env(_step(SYNC_WORKFLOW, "Run library sync"))
         assert set(env) == {
             "BACKEND_CATALOG_URL",
             "BACKEND_CATALOG_EMAIL",
             "BACKEND_CATALOG_PASSWORD",
-        }
+        }, (
+            "the auth-override names are absent on both workflows; adding one here needs the other too"
+        )
 
     def test_backend_wiring_matches_the_parity_soak(self) -> None:
         """Both workflows sign in as ``catalog-parity@wxyc.invalid`` (#365).
         Same secret names, same URL variable, same default -- including the
         ``vars.BACKEND_CATALOG_URL`` override that lets a dispatch point at
         staging, which is worth just as much here as it is there."""
-        assert _backend_catalog_env(_step(SYNC_WORKFLOW, "Run library sync")) == (
-            _backend_catalog_env(_step(PARITY_WORKFLOW, "Run catalog parity diff"))
+        assert _backend_env(_step(SYNC_WORKFLOW, "Run library sync")) == (
+            _backend_env(_step(PARITY_WORKFLOW, "Run catalog parity diff"))
         )
 
     def test_mysql_toolchain_steps_are_gone(self) -> None:
