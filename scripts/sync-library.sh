@@ -169,14 +169,22 @@ log "Built library.db with ${ROW_COUNT:-<error>} rows (floor ${LIBRARY_ROW_FLOOR
 
 # Absolute row floor, checked before enrichment and before either upload.
 #
-# The two guards that already existed leave a wide gap between them. The
-# producer refuses a catalog export of *exactly* zero rows, and
-# STREAMING_APPLE_FLOOR asks for 100 apple_music_url links against a ~64,000-row
-# catalog. A partial export -- an over-narrow token scope, a server-side query
-# regression returning a slice, a truncated cached buffer -- lands squarely
-# between the two and publishes a gutted library.db, which the upload then
-# swaps in for production's wholesale. Nothing downstream would object, and
-# after the Kattare host goes away there is no second catalog left to notice.
+# Before this, exactly one guard stood between a partial export and
+# production: the producer's refusal of a catalog export of *exactly* zero
+# rows. A partial export -- an over-narrow token scope, a server-side query
+# regression returning a slice, a truncated cached buffer -- publishes a
+# gutted library.db, which the upload then swaps in for production's
+# wholesale. Nothing downstream objects, and after the Kattare host goes away
+# there is no second catalog left to notice.
+#
+# STREAMING_APPLE_FLOOR below does NOT close that gap, and it is worth being
+# precise about why, because its name makes it look like it might.
+# export_streaming_links.py builds the streaming_links table out of
+# streaming_availability.db's albums.library_ids and never reads the library
+# table at all, so COUNT(apple_music_url) is invariant in catalog size: a
+# 3-row library.db carrying 5,000 streaming links passes a floor of 100 and
+# uploads clean. The two floors measure different things that happen to live
+# in the same file, and only this one bounds the catalog.
 #
 # 60,000 is chosen against measured counts, not rounded down from a guess. The
 # last MySQL-sourced sync uploaded 64,766 rows (2026-09-16); the Backend side
@@ -190,10 +198,17 @@ log "Built library.db with ${ROW_COUNT:-<error>} rows (floor ${LIBRARY_ROW_FLOOR
 # Deliberately a catastrophe guard and not a drift detector. It catches losing
 # thousands of rows; it will not notice losing fifty, and tightening it until
 # it would is how a floor starts failing honest days -- and a failed sync is
-# its own outage, since production then keeps serving a staler catalog. Small
-# drift is what the parity harness measures while tubafrenzy still answers;
-# after that, nothing does, which is an argument for a trend check on the
-# uploaded row count rather than for a brittle floor here.
+# its own outage, since production then keeps serving a staler catalog.
+#
+# The stronger check is relative -- today's count against yesterday's -- which
+# would catch a 40% loss this floor sleeps through. It is not here because
+# this script holds no state between runs and has nowhere honest to read
+# yesterday's count from: the only durable copies of it are the uploaded
+# library.db itself and LML's own row count, both of which are the thing being
+# validated. Inventing a state store for it belongs in a change of its own,
+# alongside the LML-side row-count floor and the freshness canary, not
+# smuggled into this one. Small drift is what the parity harness measures
+# while tubafrenzy still answers; after that, nothing does.
 #
 # Set LIBRARY_ROW_FLOOR=0 to opt out -- the same escape hatch
 # STREAMING_APPLE_FLOOR offers, for a local run against a fixture.
@@ -223,10 +238,17 @@ else
 fi
 
 # Post-enrichment floor assertion (LML#672, belt-and-suspenders). A zero/low
-# apple_music_url count means enrichment silently produced a thin library.db
-# (download flake, missing streaming db, export bug); fail BEFORE upload rather
-# than strip prod's streaming links. STREAMING_APPLE_FLOOR is an absolute floor
-# at the consumption layer, complementary to LML's relative upload-coverage guard.
+# apple_music_url count means the *enrichment* went wrong -- a download flake,
+# a missing streaming db, an export bug -- so fail BEFORE upload rather than
+# strip prod's streaming links. STREAMING_APPLE_FLOOR is an absolute floor at
+# the consumption layer, complementary to LML's relative upload-coverage guard.
+#
+# It says nothing whatsoever about the catalog. export_streaming_links.py
+# reads streaming_availability.db's albums.library_ids, never the library
+# table, so this count does not move when the catalog does; LIBRARY_ROW_FLOOR
+# above is what bounds that, and neither substitutes for the other. (This
+# comment used to imply the two were related -- they are not, and a truncated
+# catalog sailed straight through here.)
 # Set STREAMING_APPLE_FLOOR=0 to opt out (e.g. a local run with no streaming db).
 STREAMING_APPLE_FLOOR="${STREAMING_APPLE_FLOOR:-100}"
 APPLE_COUNT=$($PYTHON -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); t=c.execute(\"SELECT name FROM sqlite_master WHERE type='table' AND name='streaming_links'\").fetchone(); print(c.execute('SELECT COUNT(apple_music_url) FROM streaming_links').fetchone()[0] if t else 0)" "$DB_PATH" 2>>"$LOG_FILE") || APPLE_COUNT=""

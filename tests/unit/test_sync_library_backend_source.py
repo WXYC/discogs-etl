@@ -181,7 +181,7 @@ class TestDownstreamStepsAreUnchanged:
         # guards), and a bare name search would order the comments instead.
         order = [
             'LIBRARY_ROW_FLOOR="${LIBRARY_ROW_FLOOR:-',
-            "export_streaming_links.py",
+            '"$LML_DIR/scripts/export_streaming_links.py"',
             'STREAMING_APPLE_FLOOR="${STREAMING_APPLE_FLOOR:-',
             'upload_library_db "$STAGING_URL"',
             'upload_library_db "$PRODUCTION_URL"',
@@ -208,14 +208,91 @@ class TestSyncWorkflowBackendCredentials:
             "the auth-override names are absent on both workflows; adding one here needs the other too"
         )
 
-    def test_backend_wiring_matches_the_parity_soak(self) -> None:
-        """Both workflows sign in as ``catalog-parity@wxyc.invalid`` (#365).
-        Same secret names, same URL variable, same default -- including the
-        ``vars.BACKEND_CATALOG_URL`` override that lets a dispatch point at
-        staging, which is worth just as much here as it is there."""
-        assert _backend_env(_step(SYNC_WORKFLOW, "Run library sync")) == (
-            _backend_env(_step(PARITY_WORKFLOW, "Run catalog parity diff"))
+    def test_the_service_account_secrets_match_the_parity_soak(self) -> None:
+        """Both workflows sign in as ``catalog-parity@wxyc.invalid`` (#365), so
+        a rotation must not be able to land on only one of them."""
+        sync = _backend_env(_step(SYNC_WORKFLOW, "Run library sync"))
+        parity = _backend_env(_step(PARITY_WORKFLOW, "Run catalog parity diff"))
+        credential_names = {"BACKEND_CATALOG_EMAIL", "BACKEND_CATALOG_PASSWORD"}
+        assert {k: v for k, v in sync.items() if k in credential_names} == {
+            k: v for k, v in parity.items() if k in credential_names
+        }
+
+    def test_the_catalog_url_deliberately_does_not_match_the_parity_soak(self) -> None:
+        """The URL is the one name that must NOT be shared, and this asserts the
+        divergence rather than tolerating it.
+
+        The soak reads a repo-level ``vars.BACKEND_CATALOG_URL`` so an operator
+        can aim a dispatch at staging. Sharing that variable here would mean a
+        forgotten staging override silently redirects the next *scheduled* run:
+        production's library.db would be built from staging's catalog and
+        uploaded to production LML, with nothing failing and only a log line to
+        say so. On the soak a stale override costs a wasted run; here it costs
+        the catalog."""
+        sync = _backend_env(_step(SYNC_WORKFLOW, "Run library sync"))
+        parity = _backend_env(_step(PARITY_WORKFLOW, "Run catalog parity diff"))
+        assert sync["BACKEND_CATALOG_URL"] != parity["BACKEND_CATALOG_URL"]
+
+    def test_the_catalog_url_is_not_read_from_the_shared_repo_variable(self) -> None:
+        """Asserted against the resolved env expression, not the file text: the
+        comment beside it names ``vars.BACKEND_CATALOG_URL`` precisely because
+        that is the wiring it is warning against, and a text search cannot tell
+        the warning apart from the thing warned about."""
+        url = _backend_env(_step(SYNC_WORKFLOW, "Run library sync"))["BACKEND_CATALOG_URL"]
+        assert "vars.BACKEND_CATALOG_URL" not in url, (
+            "the daily sync must not read the repo-level variable the soak shares; "
+            "a stale staging override would redirect a scheduled production build"
         )
+
+    def test_a_scheduled_run_resolves_the_catalog_url_to_production(self) -> None:
+        """``inputs.*`` is empty on a scheduled run, so the fallback is what a
+        cron tick actually builds from -- it has to be the production URL
+        literally, not another indirection that can be edited out of band."""
+        url = _backend_env(_step(SYNC_WORKFLOW, "Run library sync"))["BACKEND_CATALOG_URL"]
+        assert "inputs.backend_catalog_url" in url
+        assert "'https://api.wxyc.org'" in url
+
+    def test_the_override_is_a_dispatch_input(self) -> None:
+        triggers = _load(SYNC_WORKFLOW).get("on", _load(SYNC_WORKFLOW).get(True))
+        inputs = (triggers.get("workflow_dispatch") or {}).get("inputs") or {}
+        assert "backend_catalog_url" in inputs, (
+            "the staging override has to exist somewhere an operator can reach; "
+            "a per-dispatch input cannot outlive the run that set it"
+        )
+        assert inputs["backend_catalog_url"].get("default") == "https://api.wxyc.org"
+
+
+class TestSyncWorkflowFailureNotifier:
+    """A daily job that writes production's catalog must alert when it fails.
+
+    It had no failure path at all: no ``if: failure()`` step and no webhook in
+    env, so the two stale-catalog days this month were found by a human rather
+    than by an alert. The script's own ``--notify`` is not the fix -- the
+    workflow never passes it, and a step also catches what the script cannot
+    see (the streaming-db download, the checkout, a runner death).
+    """
+
+    def _notifier(self) -> dict[str, Any]:
+        return _step(SYNC_WORKFLOW, "Notify Slack on failure")
+
+    def test_the_notifier_runs_only_on_failure(self) -> None:
+        assert self._notifier().get("if") == "failure()"
+
+    def test_the_notifier_reads_the_monitoring_webhook(self) -> None:
+        env = self._notifier().get("env") or {}
+        assert "secrets.SLACK_MONITORING_WEBHOOK" in env.get("SLACK_WEBHOOK_URL", "")
+
+    def test_a_missing_secret_is_itself_loud(self) -> None:
+        """Copied from rebuild-cache.yml deliberately: when the secret is unset
+        the notifier fails rather than skipping quietly, so the
+        nobody-is-listening state cannot be the thing that falls silent. That
+        is the #219 lesson, and this job is the one where it costs more."""
+        run = self._notifier().get("run", "")
+        assert "::error::" in run and "exit 1" in run
+
+    def test_the_alert_carries_a_link_to_the_run(self) -> None:
+        env = self._notifier().get("env") or {}
+        assert "github.run_id" in env.get("RUN_URL", "")
 
     def test_mysql_toolchain_steps_are_gone(self) -> None:
         """The client, the ssh-agent and the host-key scan existed only to
