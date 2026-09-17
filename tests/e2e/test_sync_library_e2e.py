@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import re
 import sqlite3
 import subprocess
@@ -360,7 +361,8 @@ class TestLibrarySelectRealNullVsLiteralNullText:
         NULL when no cross-reference exists (the common case: 63,904 NULL
         rows in prod) -- converts that NULL to ''. The wiring test in
         tests/unit/test_mysql_select_null_handling.py separately pins that
-        the actual subquery in sync-library.sh is wrapped this way.
+        the actual subquery in the harness's LIBRARY_SELECT_SQL is wrapped
+        this way.
         """
         conn = sqlite3.connect(":memory:")
         conn.execute("CREATE TABLE lc (id INTEGER PRIMARY KEY)")
@@ -393,3 +395,113 @@ class TestCompilationTrackArtistRealNullVsLiteralNullText:
         conn.close()
 
         assert rows == ["", "NULL"]
+
+
+# --- the pre-upload row floor (WXYC/discogs-etl#346) ------------------------
+#
+# These execute `scripts/sync-library.sh` for real, with $PYTHON_BIN pointed at
+# a stub standing in for `build_library_db.py`. A text assertion could pin that
+# the guard is *present*; only running it proves it aborts, and aborting is the
+# entire value of the guard. The upload replaces production's library.db
+# wholesale, and after the Kattare host goes away on 2026-09-22 there is no
+# second catalog left to notice a truncated build against -- so the guard is
+# the last thing between a partial export and a silently gutted LML search.
+_SYNC_SCRIPT_PATH = Path(__file__).resolve().parents[2] / "scripts" / "sync-library.sh"
+_REPO_ROOT = _SYNC_SCRIPT_PATH.parents[1]
+
+# The stub answers the shapes sync-library.sh invokes $PYTHON with: the builder
+# (writes a library.db holding a caller-chosen row count), `-c` (the inline
+# sqlite3 one-liners, which have to run for real -- the row count under test is
+# read by one of them), and anything else (derive_va_release.py, which is out of
+# scope here and succeeds quietly).
+_PYTHON_STUB = """#!/bin/bash
+if [[ "$1" == "-c" ]]; then exec {python} "$@"; fi
+for arg in "$@"; do
+  if [[ "$arg" == *build_library_db.py ]]; then
+    out=""
+    while [[ $# -gt 0 ]]; do
+      if [[ "$1" == "--output" ]]; then out="$2"; fi
+      shift
+    done
+    {python} -c "
+import sqlite3, sys
+conn = sqlite3.connect(sys.argv[1])
+conn.execute('CREATE TABLE library (id INTEGER PRIMARY KEY, title TEXT)')
+conn.executemany('INSERT INTO library VALUES (?, ?)', [(i, 'x') for i in range(1, {rows} + 1)])
+conn.commit()
+conn.close()
+" "$out"
+    echo "built $out"
+    exit 0
+  fi
+done
+exit 0
+"""
+
+
+def _run_sync(tmp_path: Path, rows: int, **env_overrides: str) -> subprocess.CompletedProcess:
+    """Run the real sync script against a stub builder that emits `rows` rows."""
+    stub = tmp_path / "python-stub"
+    stub.write_text(_PYTHON_STUB.format(python=sys.executable, rows=rows))
+    stub.chmod(0o755)
+
+    env = {
+        "PATH": os.environ.get("PATH", ""),
+        # A temp HOME keeps the run out of the developer's real ETL log, and
+        # makes the script fall back to a mktemp log file.
+        "HOME": str(tmp_path / "home"),
+        "PYTHON_BIN": str(stub),
+        "ADMIN_TOKEN": "test-token",
+        "BACKEND_CATALOG_TOKEN": "test-token",
+        # An empty LML checkout: streaming enrichment is skipped, so
+        # STREAMING_APPLE_FLOOR has to be opted out of or it fires first and
+        # the run never reaches the assertion under test.
+        "LML_REPO_DIR": str(tmp_path / "no-lml"),
+        "STREAMING_APPLE_FLOOR": "0",
+    }
+    # STAGING_URL / PRODUCTION_URL are deliberately absent: an upload must be
+    # unreachable from a test, not merely unreached.
+    env.update(env_overrides)
+    return subprocess.run(
+        ["bash", str(_SYNC_SCRIPT_PATH)],
+        capture_output=True,
+        text=True,
+        env=env,
+        cwd=str(_REPO_ROOT),
+    )
+
+
+@pytest.mark.skipif(
+    (_REPO_ROOT / ".env").exists(),
+    reason=(
+        "a repo-root .env would be sourced by sync-library.sh and could supply a real "
+        "STAGING_URL/PRODUCTION_URL, turning this test into a production upload"
+    ),
+)
+class TestLibraryRowFloor:
+    def test_a_short_build_aborts_before_upload(self, tmp_path: Path) -> None:
+        result = _run_sync(tmp_path, rows=5, LIBRARY_ROW_FLOOR="1000")
+        assert result.returncode == 1
+        combined = result.stdout + result.stderr
+        assert "5 rows" in combined and "1000" in combined
+        # The abort has to happen before the steps that touch anything real.
+        assert "Deriving va_release" not in combined
+
+    def test_a_full_build_passes_the_floor(self, tmp_path: Path) -> None:
+        result = _run_sync(tmp_path, rows=1500, LIBRARY_ROW_FLOOR="1000")
+        assert result.returncode == 0
+        assert "Library sync completed successfully" in result.stdout
+
+    def test_zero_opts_out(self, tmp_path: Path) -> None:
+        """Same escape hatch STREAMING_APPLE_FLOOR offers, for a local run."""
+        result = _run_sync(tmp_path, rows=5, LIBRARY_ROW_FLOOR="0")
+        assert result.returncode == 0
+
+    def test_the_default_floor_rejects_a_catastrophically_short_build(self, tmp_path: Path) -> None:
+        """No LIBRARY_ROW_FLOOR set at all: the built-in default must still bite.
+
+        An operator override that has to be remembered is not a guard, and the
+        daily GitHub Actions run sets no such variable.
+        """
+        result = _run_sync(tmp_path, rows=5)
+        assert result.returncode == 1

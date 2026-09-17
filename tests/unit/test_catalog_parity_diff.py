@@ -253,6 +253,11 @@ class _BackendStub:
         self.sign_in_statuses: list[int] = []
         self.exchange_statuses: list[int] = []
         self.sign_out_statuses: list[int] = []
+        # Same queue shape, for the bulk CTA export. A 5xx here is the
+        # "supplementary export is broken rather than empty" case the daily
+        # build has to survive; the catalog export has no such queue on
+        # purpose, since its failure must stay fatal.
+        self.cta_statuses: list[int] = []
         # Everything this stub has minted and not superseded.
         self.sessions: set[str] = set()
         self.jwts: set[str] = set()
@@ -411,6 +416,9 @@ class _BackendStub:
                 if self.path == "/library/catalog":
                     rows = stub.catalog_rows
                 elif self.path == "/library/catalog/compilation-tracks":
+                    if stub.cta_statuses:
+                        self.send_error(stub.cta_statuses.pop(0))
+                        return
                     rows = stub.cta_rows
                 else:
                     self.send_error(404)
@@ -2800,6 +2808,78 @@ class TestBackendProducer:
             "/library/catalog/compilation-tracks",
         ]
         assert {r.authorization for r in stub.requests} == {"Bearer svc-token"}
+
+    def test_a_broken_compilation_track_export_degrades_instead_of_failing(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """A CTA *fetch error* must warn and build without the table.
+
+        The retired MySQL path was explicit that ``LIBRARY_RELEASE`` "must
+        never be blocked by" the compilation-track query, and it warned and
+        continued on *any* CTA failure, not only on an absent table. Tolerating
+        an empty export but dying on a broken one would be a narrower
+        guarantee than the path this replaced -- and the cost of getting it
+        wrong is a day with no library.db at all, which replaces nothing in
+        production but leaves LML serving a stale catalog with no signal.
+        """
+        mod = _load_module()
+        monkeypatch.setenv(mod.BACKEND_TOKEN_ENV, "svc-token")
+        out = tmp_path / "backend.db"
+        with _BackendStub(
+            catalog_rows=[_catalog_row(legacy_release_id=72_301)],
+            cta_rows=[
+                {
+                    "legacy_release_id": 72_301,
+                    "artist_name": "Juana Molina",
+                    "track_title": "la paradoja",
+                }
+            ],
+        ) as stub:
+            # Every attempt fails, so this is the persistent-failure case, not
+            # a flake the snapshot retry would paper over.
+            stub.cta_statuses = [500, 500, 500, 500]
+            mod._build_library_db_from_backend(stub.base_url, str(out))
+
+        conn = sqlite3.connect(out)
+        try:
+            assert conn.execute("SELECT id FROM library").fetchone() == (72_301,)
+            assert conn.execute(
+                "SELECT count(*) FROM sqlite_master WHERE name = 'compilation_track_artist'"
+            ).fetchone() == (0,)
+        finally:
+            conn.close()
+
+    def test_a_broken_compilation_track_export_does_not_burn_the_snapshot_retries(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """Degrade on the first failure rather than re-fetching the catalog.
+
+        The snapshot retry exists to resolve a *torn* pair. A CTA export that
+        will not answer is not a tear -- there is no second side to disagree
+        with -- so re-fetching the whole catalog two more times only costs
+        Backend two full exports to reach the same answer.
+        """
+        mod = _load_module()
+        monkeypatch.setenv(mod.BACKEND_TOKEN_ENV, "svc-token")
+        out = tmp_path / "backend.db"
+        with _BackendStub(catalog_rows=[_catalog_row()], cta_rows=[]) as stub:
+            stub.cta_statuses = [503, 503, 503, 503]
+            mod._build_library_db_from_backend(stub.base_url, str(out))
+
+        assert [r.path for r in stub.requests] == [
+            "/library/catalog",
+            "/library/catalog/compilation-tracks",
+        ]
+
+    def test_a_broken_catalog_export_is_still_fatal(self, tmp_path: Path, monkeypatch) -> None:
+        """The asymmetry is the point: the catalog export is the build."""
+        mod = _load_module()
+        monkeypatch.setenv(mod.BACKEND_TOKEN_ENV, "svc-token")
+        out = tmp_path / "backend.db"
+        with _BackendStub(catalog_rows=[], cta_rows=[]) as stub:
+            with pytest.raises(mod.SourceError):
+                mod._build_library_db_from_backend(stub.base_url, str(out))
+        assert not out.exists()
 
     def test_reads_an_identity_encoded_body(self, tmp_path: Path, monkeypatch) -> None:
         """Content-Encoding is honoured, not assumed: a non-gzip body still parses."""

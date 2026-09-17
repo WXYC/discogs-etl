@@ -1,10 +1,13 @@
 """Diff-two-files core of the discogs-etl#346 catalog-parity harness.
 
-discogs-etl builds the production ``library.db`` nightly from tubafrenzy's
-MySQL database (``scripts/sync-library.sh``). To retire that MySQL
-dependency ahead of the 2026-09-07 tubafrenzy turndown, the daily build must
-move to Backend-Service as its catalog source -- but only once a
-Backend-sourced ``library.db`` is proven equivalent to the MySQL-sourced one.
+discogs-etl built the production ``library.db`` nightly from tubafrenzy's
+MySQL database (``scripts/sync-library.sh``). To retire that MySQL dependency
+ahead of the 2026-09-22 tubafrenzy turndown, the daily build had to move to
+Backend-Service as its catalog source -- but only once a Backend-sourced
+``library.db`` was proven equivalent to the MySQL-sourced one. That flip has
+since landed (WXYC/discogs-etl#346); this harness outlives it, because the
+proof has to stay reproducible for as long as the MySQL side can still
+answer.
 
 This script is the comparison core of that proof: given two already-built
 ``library.db`` SQLite files, it diffs them field-by-field and reports where
@@ -17,9 +20,11 @@ build the corresponding ``library.db`` first, so a single invocation can
 build both sides and diff them.
 
 - ``--mysql-source mysql://user@host:port/dbname`` reproduces the daily
-  build's own read path -- the ``mysql`` CLI in batch/raw mode, running the
-  exact SELECTs from ``scripts/sync-library.sh`` (a source-grep test pins
-  them together), parsed by the same TSV parser production uses. The CLI, not
+  build's read path as it stood until WXYC/discogs-etl#346 flipped the daily
+  sync onto Backend -- the ``mysql`` CLI in batch/raw mode, running the two
+  SELECTs pinned in this module (the only copies left; the source-grep test
+  that held them against ``scripts/sync-library.sh`` retired with the shell
+  script's copy), parsed by the same TSV parser that build used. The CLI, not
   a Python driver, because tubafrenzy's MySQL 4.1 auth breaks those drivers.
   The password comes from ``$LIBRARY_DB_PASSWORD``: put in the DSN it would
   sit in this process's own argv, visible to ``ps`` for the whole run.
@@ -46,9 +51,11 @@ never be able to clobber a real ``library.db``. Each builds into a scratch
 file beside its target and renames it into place at the end, so a build that
 dies partway leaves nothing behind to refuse on the next parity day.
 
-**Still out of scope**: the operational cutover -- running the 7 clean parity
-days, flipping ``sync-library.sh``'s source, and taking ``/wxycdb`` dark --
-is WXYC/discogs-etl#346, deliberately human-gated.
+**Out of scope here**: the operational cutover -- the parity gate, flipping
+``sync-library.sh``'s source, and taking ``/wxycdb`` dark -- is
+WXYC/discogs-etl#346, deliberately human-gated. Two of the three have now
+happened (``/wxycdb`` went dark 2026-09-16, and the daily build flipped), so
+this harness's remaining job is evidence rather than gating.
 
 Schema note: the ``library`` table's 12 columns (``id, title, artist,
 call_letters, artist_call_number, release_call_number, genre, format,
@@ -472,16 +479,15 @@ def _rule_b_missing_reason(mysql_row: Mapping[str, object]) -> str | None:
     classifications change today. What it buys is forward-looking -- if a
     SQL NULL ever does appear in these columns, ``mysql -B -N`` on this
     server prints it as the literal text ``"NULL"`` (verified in prod,
-    documented at ``scripts/sync-library.sh``'s SELECT comment, which
+    documented at ``LIBRARY_SELECT_SQL``'s comment below, which
     ``IFNULL``-wrapped ``ALBUM_ARTIST`` for exactly this reason after 64,780
     rows leaked a literal ``'NULL'`` into ``library_fts``), and
     ``parse_library_tsv`` has no handling for that literal (it only maps
     ``\\N``). After this narrowing such a row is reported as unexplained
     drift -- loud, and correct -- rather than silently forgiven as expected
     residue, which is the point at which an ``IFNULL`` wrap on ``TITLE`` /
-    ``PRESENTATION_NAME`` in ``LIBRARY_SELECT_SQL`` and
-    ``scripts/sync-library.sh``'s SELECT would become worth landing. Neither
-    pinned SELECT is touched here.
+    ``PRESENTATION_NAME`` in ``LIBRARY_SELECT_SQL`` would become worth
+    landing. Neither pinned SELECT is touched here.
 
     ``_load_cta_counts`` already uses this same narrower ``str.strip() ==
     ""`` check, and the two predicates are consistent for the same
@@ -501,8 +507,8 @@ def _rule_b_missing_reason(mysql_row: Mapping[str, object]) -> str | None:
     two predicates answer different questions. Classification asks whether
     *this row's own* value is absent, where a literal ``"NULL"`` is a real
     value and forgiving it hides drift. Comparison asks whether the two sides
-    agree, and the Backend side still holds rows written before
-    ``sync-library.sh``'s ``ALBUM_ARTIST`` ``IFNULL`` fix -- 64,780 of them
+    agree, and the Backend side still holds rows written before the
+    ``ALBUM_ARTIST`` ``IFNULL`` fix -- 64,780 of them
     leaked the literal text ``'NULL'`` into ``library_fts`` -- so collapsing
     it there is what lets a corrected mysql side compare equal to a
     not-yet-rewritten Backend side. Narrowing ``_normalize`` would change all
@@ -1477,7 +1483,9 @@ LIBRARY_SELECT_SQL = (
 
 # Likewise the compilation-track SELECT. Supplementary to LIBRARY_RELEASE: on
 # a source with no COMPILATION_TRACK_ARTIST table this query fails and the
-# build continues without the table, exactly as sync-library.sh does.
+# build continues without the table. The Backend producer degrades the same
+# way, on both an empty export and an unfetchable one -- see
+# `_fetch_consistent_snapshot`'s `compilation_tracks_required`.
 COMPILATION_TRACK_SELECT_SQL = (
     "SELECT LIBRARY_RELEASE_ID, ARTIST_NAME, IFNULL(TRACK_TITLE, '')"
     " FROM COMPILATION_TRACK_ARTIST ORDER BY LIBRARY_RELEASE_ID"
@@ -1773,8 +1781,9 @@ _mysql_runner = _default_mysql_runner
 def _mysql_invocation(source: str) -> tuple[list[str], dict[str, str]]:
     """Build the ``mysql`` argv + env from a ``mysql://`` DSN.
 
-    Mirrors sync-library.sh: batch (``-B``) + raw (``-N``) mode over the CLI
-    rather than a Python driver, because tubafrenzy runs a MySQL old enough
+    Mirrors the read path the daily sync used until WXYC/discogs-etl#346:
+    batch (``-B``) + raw (``-N``) mode over the CLI rather than a Python
+    driver, because tubafrenzy runs a MySQL old enough
     that the drivers can't authenticate against it. The password reaches the
     CLI through ``MYSQL_PWD``, never its argv.
 
@@ -1815,19 +1824,21 @@ def _mysql_invocation(source: str) -> tuple[list[str], dict[str, str]]:
 
 
 def _build_library_db_from_mysql(source: str, output_path: str) -> None:
-    """Build the baseline library.db from tubafrenzy MySQL, the way prod does.
+    """Build the baseline library.db from tubafrenzy MySQL, the way prod did.
 
     Args:
         source: ``mysql://user@host:port/dbname``, with the password in
             ``$LIBRARY_DB_PASSWORD``. Point it at a local port when
-            tunnelling, as sync-library.sh does.
+            tunnelling, as the retired sync-library.sh read path did.
         output_path: Where to write the SQLite database. Must not exist.
 
     Raises:
         SourceError: on a refused overwrite, a malformed DSN, or a failed
             library export query. A failed *compilation-track* query is
             tolerated (that table is supplementary and absent on some
-            sources), matching sync-library.sh.
+            sources) -- the same asymmetry the Backend producer now carries
+            through ``compilation_tracks_required``, and the one the retired
+            sync-library.sh read path had.
     """
     _require_absent(output_path, "mysql")
     argv, env = _mysql_invocation(source)
