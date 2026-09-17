@@ -5,6 +5,11 @@ on:
     # Daily at noon UTC (7 AM EST / 8 AM EDT)
     - cron: "0 12 * * *"
   workflow_dispatch:
+    inputs:
+      backend_catalog_url:
+        description: "Backend catalog base URL to build from"
+        default: "https://api.wxyc.org"
+        required: false
 
 # Workflow-level GITHUB_TOKEN scope. No job in this file pushes code,
 # comments on PRs, or creates releases; all writes to external services
@@ -114,15 +119,25 @@ jobs:
         env:
           LML_REPO_DIR: /tmp/library-metadata-lookup
           LIBRARY_DB_OUTPUT: /tmp/library.db
-          # The catalog source (#346). Deliberately the same three names, the
-          # same secrets and the same default that catalog-parity.yml uses:
-          # one service account (catalog-parity@wxyc.invalid, #365) reads the
-          # Backend catalog export for both the soak and this build, and a
+          # The catalog source (#346). The service-account credentials below
+          # are deliberately the same secrets catalog-parity.yml uses -- one
+          # account (catalog-parity@wxyc.invalid, #365) reads the Backend
+          # catalog export for both the soak and this build, and a
           # tests/unit/test_sync_library_backend_source.py guard holds the two
-          # workflows in lockstep so a rotation cannot land on only one of
-          # them. Public hostname, so a variable with a default rather than a
-          # secret -- overridable to point a dispatch at staging.
-          BACKEND_CATALOG_URL: ${{ vars.BACKEND_CATALOG_URL || 'https://api.wxyc.org' }}
+          # in lockstep so a rotation cannot land on only one of them.
+          #
+          # The URL is the one name deliberately NOT shared with the soak. The
+          # soak reads a repo-level `vars.BACKEND_CATALOG_URL` so an operator
+          # can aim a dispatch at staging; a repo variable outlives the run
+          # that set it, so the same wiring here would let a forgotten staging
+          # override silently redirect the next SCHEDULED run -- production's
+          # library.db built from staging's catalog and uploaded to production
+          # LML, nothing failing, a log line the only evidence. On the soak a
+          # stale override costs a wasted run; here it costs the catalog. A
+          # per-dispatch input cannot outlive its run, and `inputs.*` is empty
+          # on a cron tick, so a scheduled build always resolves to the
+          # literal production URL below.
+          BACKEND_CATALOG_URL: ${{ inputs.backend_catalog_url || 'https://api.wxyc.org' }}
           # The service account's password, not a token: the JWT Backend
           # accepts expires in 15 minutes, so the build signs in per run.
           BACKEND_CATALOG_EMAIL: ${{ secrets.BACKEND_CATALOG_EMAIL }}
@@ -176,3 +191,33 @@ jobs:
         env:
           DATABASE_URL_DISCOGS: ${{ secrets.DATABASE_URL_DISCOGS }}
           SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
+
+      # This job writes production's catalog every day and, until #346, had no
+      # failure path at all: no notifier step, no webhook in env. The 09-15 and
+      # 09-16 runs both failed on the shared host's connection ceiling and LML
+      # served a two-day-stale library.db until a human noticed -- which is the
+      # failure mode this closes.
+      #
+      # Copied from rebuild-cache.yml's notifier, including the part that matters
+      # most: when SLACK_MONITORING_WEBHOOK is unset this step FAILS rather than
+      # skipping quietly, so "nobody is listening" cannot itself be the thing that
+      # falls silent (#219). Note the secret is not currently set on this repo, so
+      # until it is, that annotation is the alert.
+      #
+      # A workflow step rather than the script's own --notify: this also catches
+      # what the script cannot see -- the checkout, the streaming-db download, the
+      # release upload, a runner death mid-run.
+      - name: Notify Slack on failure
+        if: failure()
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_MONITORING_WEBHOOK }}
+          RUN_URL: "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+        run: |
+          if [ -z "${SLACK_WEBHOOK_URL:-}" ]; then
+            echo "::error::SLACK_MONITORING_WEBHOOK is not set in repo secrets. The daily library sync failed but no Slack alert was posted, so production LML is serving a stale library.db with no signal. Configure the secret per docs/automation.md 'Library Sync' -> 'Required GitHub secrets'. Failing this notifier step so the workflow's overall status stays red."
+            exit 1
+          fi
+          curl -s -X POST "$SLACK_WEBHOOK_URL" \
+            -H "Content-Type: application/json" \
+            -d "{\"text\":\":warning: *Daily library sync failed*\nProduction LML keeps yesterday's library.db until this is re-run.\nRun: $RUN_URL\"}" \
+            || true
