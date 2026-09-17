@@ -21,25 +21,22 @@ import gzip
 import json
 import logging
 import os
-import sys
 import time
 import zlib
 from collections.abc import Callable
-from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from lib.catalog_source_common import (  # noqa: E402
+from lib.catalog_source_common import (
     SourceError,
     _build_into,
     _report,
     _require_absent,
     _Row,
 )
-from lib.library_db import CROSS_REFERENCE_SEPARATOR  # noqa: E402
+from lib.library_db import CROSS_REFERENCE_SEPARATOR
 
 logger = logging.getLogger(__name__)
 

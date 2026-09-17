@@ -102,6 +102,7 @@ def test_init_logger_emits_json_with_repo_tag(capfd, monkeypatch):
         "resolve_collisions.py",
         "tsv_to_sqlite.py",
         "check_cache_drift.py",
+        "build_library_db.py",
     ],
 )
 def test_script_compiles(script):

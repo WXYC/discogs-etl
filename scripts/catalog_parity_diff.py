@@ -206,10 +206,17 @@ from lib.backend_library_source import (  # noqa: E402
 )
 
 # Re-exported with redundant aliases: these four are not referenced by the code
-# below, but the harness's tests reach them through this module rather than the
-# one that now defines them, so dropping them would break the very tests that
-# prove this extraction changed nothing. The ``X as X`` spelling is the
-# explicit-re-export convention, and it keeps the linter from deleting them again.
+# below, but the harness's tests read them through this module rather than
+# through the one that now defines them, so dropping them would break the very
+# tests that prove this extraction changed nothing. The ``X as X`` spelling is
+# the explicit-re-export convention and keeps the linter from deleting them.
+#
+# READ, not patch -- and unlike the `import time` shim above, these are value
+# snapshots, not a shared object. `monkeypatch.setattr(mod, "_JWT_REFRESH_
+# MARGIN_SECONDS", 0)` rebinds this module's copy while `_TokenSource` goes on
+# reading its own module global, so a refresh test written that way would
+# exercise the real 300 seconds and pass for the wrong reason. Patch these on
+# `lib.backend_library_source`.
 from lib.backend_library_source import BACKEND_AUTH_URL_ENV as BACKEND_AUTH_URL_ENV  # noqa: E402
 from lib.backend_library_source import _default_auth_url as _default_auth_url  # noqa: E402
 
