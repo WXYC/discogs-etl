@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import base64
 import gzip
+import io
 import json
 import logging
 import os
@@ -759,6 +760,41 @@ def _map_ndjson_lines(
     return rows
 
 
+class _CountedBody(io.RawIOBase):
+    """A response body that remembers how many bytes it actually delivered.
+
+    ``http.client`` will not tell us. ``HTTPResponse.readinto`` -- the path a
+    line-by-line read takes -- closes the connection on a short body and
+    returns, with a standing comment in the stdlib saying that raising
+    ``IncompleteRead`` there "might break compatibility". Only ``read()`` of
+    the whole body raises. So the byte count has to be kept here and compared
+    against ``Content-Length`` by the caller.
+    """
+
+    def __init__(self, response: Any) -> None:
+        self._response = response
+        self.bytes_read = 0
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, buffer: Any) -> int:
+        count = self._response.readinto(buffer) or 0
+        self.bytes_read += count
+        return count
+
+
+def _declared_length(response: Any) -> int | None:
+    """``Content-Length`` as an int, or None if absent or unparseable."""
+    raw = response.headers.get("Content-Length")
+    if raw is None:
+        return None
+    try:
+        return int(raw.strip())
+    except (AttributeError, ValueError):
+        return None
+
+
 def _fetch_ndjson(
     url: str, token_source: _TokenSource, mapper: Callable[[dict[str, Any]], _Row]
 ) -> tuple[list[_Row], str]:
@@ -813,8 +849,30 @@ def _fetch_ndjson_once(
                     "the library_watermark for the two-request snapshot to be checkable"
                 )
             encoding = (response.headers.get("Content-Encoding") or "").lower()
-            stream = gzip.GzipFile(fileobj=response) if encoding == "gzip" else response
+            declared = _declared_length(response)
+            if encoding != "gzip" and declared is None:
+                # Neither integrity signal is present, so a body cut on a line
+                # boundary is indistinguishable from a complete one -- chunked
+                # framing included, and a well-formed terminating 0-chunk
+                # after a short body most of all. Refuse rather than build a
+                # library.db out of however much arrived.
+                raise SourceError(
+                    f"{url} answered with neither Content-Encoding: gzip nor a Content-Length, "
+                    "so a truncated export could not be told apart from a complete one; "
+                    "something in front of Backend-Service is decompressing or re-framing "
+                    "the response"
+                )
+            body = io.BufferedReader(_CountedBody(response))
+            stream = gzip.GzipFile(fileobj=body) if encoding == "gzip" else body
             rows = _map_ndjson_lines(url, stream, mapper)
+            if declared is not None and body.raw.bytes_read < declared:
+                # Catches the identity short read, and also the one truncation
+                # gzip cannot see: a multi-member stream cut between members
+                # decompresses cleanly and simply ends early.
+                raise SourceError(
+                    f"{url} delivered {body.raw.bytes_read} of the declared {declared} bytes; "
+                    "the export was truncated in transit"
+                )
     except SourceError:
         raise
     except (gzip.BadGzipFile, EOFError, zlib.error) as exc:
