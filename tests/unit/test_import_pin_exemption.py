@@ -252,3 +252,135 @@ class TestMainForwardsKeepReleaseIds:
             _ic.main()
 
         assert mock_upsert.call_args.kwargs["keep_release_ids"] is None
+
+
+class TestMissingAllowlistFileIsRefused:
+    """An explicitly-passed allowlist file that does not exist must abort, not
+    silently disable both protections (#424 review, HIGH).
+
+    ``parse_keep_release_ids`` returns ``set()`` for a nonexistent path -- by
+    design, so "no override file" and "empty override file" read alike. But
+    ``main`` then collapsed that empty set to ``None`` via ``or None``, and a
+    falsy ``keep_ids`` means ``import_release_via_upsert`` runs the UNGUARDED
+    ``PRUNE_STALE_RELEASES_SQL`` *and* skips ``evaluate_pin_shortfall``
+    entirely -- with no log line anywhere.
+
+    Two realistic triggers, both ending in the 2026-09-04 outcome: an operator
+    typos the path in a manual ``--base-only`` invocation, or the parent's
+    ``tempfile.mkdtemp()`` directory is not visible to this child process
+    (TMPDIR is redirected onto the EBS ``$WORK_DIR`` on the rebuild host).
+
+    The sibling seam already refuses exactly this, at
+    ``scripts/dedup_releases.py``'s "fail fast, before opening the scratch-build
+    transaction" check. The seam that actually caused the incident must not be
+    the lenient one.
+    """
+
+    def _argv(self, keep_path: Path, csv_dir: Path, *extra: str) -> list[str]:
+        return [
+            "import_csv.py",
+            "--base-only",
+            *extra,
+            "--keep-release-ids",
+            str(keep_path),
+            str(csv_dir),
+            "postgresql:///discogs",
+        ]
+
+    def test_nonexistent_allowlist_aborts_before_any_destructive_work(self, tmp_path) -> None:
+        csv_dir = tmp_path / "csv"
+        csv_dir.mkdir()
+        missing = tmp_path / "typo.txt"
+        with (
+            patch.object(_ic.sys, "argv", self._argv(missing, csv_dir)),
+            patch.object(_ic.psycopg, "connect") as mock_connect,
+            patch.object(_ic, "import_release_via_upsert") as mock_upsert,
+            patch.object(_ic, "_import_tables_parallel") as mock_parallel,
+            pytest.raises(SystemExit) as exc,
+        ):
+            _ic.main()
+        assert exc.value.code != 0, "a missing allowlist must not exit 0"
+        mock_upsert.assert_not_called()
+        mock_parallel.assert_not_called()
+        mock_connect.assert_not_called()
+
+    def test_error_names_the_path_that_was_not_found(self, tmp_path, caplog) -> None:
+        csv_dir = tmp_path / "csv"
+        csv_dir.mkdir()
+        missing = tmp_path / "typo.txt"
+        with (
+            caplog.at_level(logging.ERROR),
+            patch.object(_ic.sys, "argv", self._argv(missing, csv_dir)),
+            patch.object(_ic.psycopg, "connect"),
+            pytest.raises(SystemExit),
+        ):
+            _ic.main()
+        assert str(missing) in caplog.text
+
+    def test_an_existing_but_empty_allowlist_is_still_allowed(self, tmp_path) -> None:
+        """Empty is a legitimate state (no pins yet), and distinguishable from
+        missing only because the file is there. It must keep working."""
+        csv_dir = tmp_path / "csv"
+        csv_dir.mkdir()
+        empty = tmp_path / "keep.txt"
+        empty.write_text("")
+        with (
+            patch.object(_ic.sys, "argv", self._argv(empty, csv_dir)),
+            patch.object(_ic.psycopg, "connect", return_value=MagicMock()),
+            patch.object(_ic, "import_release_via_upsert", return_value=1) as mock_upsert,
+            patch.object(_ic, "_import_tables_parallel", return_value=0),
+            patch.object(_ic, "import_artwork", return_value=0),
+            patch.object(_ic, "populate_release_year", return_value=0),
+            patch.object(_ic, "populate_cache_metadata", return_value=0),
+            patch.object(_ic, "create_track_count_table", return_value=0),
+            patch.object(_ic, "import_artist_details", return_value=0),
+            patch.object(_ic, "_import_masters_best_effort", return_value=0),
+        ):
+            _ic.main()
+        mock_upsert.assert_called_once()
+
+
+class TestTruncatePathDoesNotImplyPinProtection:
+    """``--truncate-existing`` takes the ``_import_tables_parallel`` branch,
+    which never parses the allowlist, never stages ``release_keep_ids`` and
+    never runs the shortfall guard -- while ``_truncate_tables`` wipes
+    ``release`` wholesale (#424 review, MEDIUM).
+
+    Pins survive that path only if Seam A put them in the CSVs; nothing on this
+    side of the pipe checks. Accepting the flag silently let a rebuild destroy
+    all 58K pins with the protective flag apparently applied. It must say so.
+    """
+
+    def test_combination_warns_that_the_exemption_does_not_apply(self, tmp_path, caplog) -> None:
+        csv_dir = tmp_path / "csv"
+        csv_dir.mkdir()
+        keep_file = tmp_path / "keep.txt"
+        keep_file.write_text("101\n")
+        argv = [
+            "import_csv.py",
+            "--base-only",
+            "--truncate-existing",
+            "--keep-release-ids",
+            str(keep_file),
+            str(csv_dir),
+            "postgresql:///discogs",
+        ]
+        with (
+            caplog.at_level(logging.WARNING),
+            patch.object(_ic.sys, "argv", argv),
+            patch.object(_ic.psycopg, "connect", return_value=MagicMock()),
+            patch.object(_ic, "_truncate_tables", return_value=None),
+            patch.object(_ic, "_import_tables_parallel", return_value=0),
+            patch.object(_ic, "import_artwork", return_value=0),
+            patch.object(_ic, "populate_release_year", return_value=0),
+            patch.object(_ic, "populate_cache_metadata", return_value=0),
+            patch.object(_ic, "create_track_count_table", return_value=0),
+            patch.object(_ic, "import_artist_details", return_value=0),
+            patch.object(_ic, "_import_masters_best_effort", return_value=0),
+        ):
+            _ic.main()
+        text = caplog.text.lower()
+        assert "truncate" in text and "keep-release-ids" in text, (
+            "the truncate path must warn that the prune exemption and the "
+            f"shortfall guard are both inactive. Got: {caplog.text!r}"
+        )

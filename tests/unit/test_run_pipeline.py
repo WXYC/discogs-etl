@@ -2659,3 +2659,49 @@ class TestAdvisoryLockGuardBehaviour:
 
         assert excinfo.value.code == 1
         release.assert_called_once_with(fake_conn)
+
+
+class TestShortfallRefusalRestoresLoggedTables:
+    """The pinned-shortfall refusal is a DESIGNED abort, so it must not leave the
+    cache worse than it found it (#424 review, MEDIUM).
+
+    ``_run_database_build`` calls ``set_tables_unlogged`` immediately before the
+    import step, and its matching ``set_tables_logged`` only runs near the end of
+    a *successful* build. So the refusal this change exists to trigger would
+    leave ``release`` and every child table UNLOGGED -- not crash-safe, truncated
+    by any crash recovery, repairable only by a manual ``ALTER TABLE .. SET
+    LOGGED``. That is exactly the residue the 2026-09-04 abort left behind:
+    ``release_track`` / ``release_track_artist`` / ``release_video`` are still
+    UNLOGGED in prod today, 15 days on.
+
+    Static-structural, following ``test_run_pipeline_lock_ordering.py``: the
+    alternative is mocking every collaborator of a 300-line build function, which
+    pins the mocks rather than the ordering.
+    """
+
+    @staticmethod
+    def _source() -> str:
+        return (Path(__file__).parent.parent.parent / "scripts" / "run_pipeline.py").read_text()
+
+    def test_import_step_is_wrapped_so_a_failure_restores_logged(self) -> None:
+        src = self._source()
+        start = src.index("# -- set_tables_unlogged")
+        end = src.index("# -- create_indexes", start)
+        region = src[start:end]
+        assert "set_tables_unlogged(db_url)" in region, "precondition"
+        assert 'run_step_safe("Import base CSVs"' in region, "precondition"
+        assert "except" in region and "set_tables_logged(db_url)" in region, (
+            "the import step must restore LOGGED on failure before the exception "
+            "escapes; otherwise the designed pinned-shortfall refusal leaves the "
+            f"cache un-crash-safe. Region:\n{region}"
+        )
+        assert "raise" in region, "the failure must still propagate and abort the build"
+
+    def test_restore_is_ordered_after_the_unlogged_call(self) -> None:
+        src = self._source()
+        start = src.index("# -- set_tables_unlogged")
+        end = src.index("# -- create_indexes", start)
+        region = src[start:end]
+        assert region.index("set_tables_unlogged(db_url)") < region.index(
+            "set_tables_logged(db_url)"
+        )
