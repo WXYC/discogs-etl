@@ -16,9 +16,18 @@ and a successful run and an aborted one left the same artifacts behind.
 1. **Writes ``<log-dir>/99-outcome.txt``.** ``rebuild-cache-bootstrap.sh``'s
    ``trap EXIT`` syncs the whole log directory to S3, so the outcome becomes
    visible in a bucket *listing* — no log-reading required — and it sorts after
-   the ``00-started.txt`` breadcrumb. **No ``99-outcome.txt`` at all** means the
-   script never reached a terminal path (SIGKILL, host loss, or a failure before
-   the venv existed), which is itself a distinct and readable state.
+   the ``00-started.txt`` breadcrumb.
+
+   The canonical marker describes **the run that holds the lock**, and only that
+   run. It stamps ``outcome=running`` the moment it acquires the lock, so the
+   three readings are total and unambiguous: **no marker at all** means no run
+   ever got as far as acquiring the lock; **``outcome=running``** means one did
+   and never reached a terminal path (SIGKILL, OOM, host loss); anything else is
+   that run's real outcome. A bystander tick that loses the flock files its
+   outcome under its own ``--marker-name`` instead, because ``$LOG_DIR`` — and
+   the bootstrap's S3 prefix — are shared with the live run, so a bystander
+   writing here would let its benign ``bowed_out`` stand in for a killed run's
+   fate. That is the #352 false-signal class, pointed the other way.
 2. **Emits the outcome on the JSON logger.** ``lib.observability.init_logger``
    forwards ``logger.error`` to Sentry when ``SENTRY_DSN`` is set, which it is
    on the rebuild host — the one channel proven to carry from that instance.
@@ -77,7 +86,14 @@ OUTCOME_FILENAME = "99-outcome.txt"
 # anything to the cache: not a rebuild that succeeded, not one that failed, and
 # not allowed to stay silent either — a silent smoke run would forge the
 # "no marker means the host was lost" signal.
-STATUSES = ("success", "failed", "bowed_out", "smoke_ok")
+# ``running`` is stamped by the run that OWNS the lock, the moment it acquires
+# it, so the canonical marker always describes the lock holder. It makes the
+# readings total: no marker at all means no run ever got as far as acquiring the
+# lock; ``running`` means one did and never reached a terminal path (SIGKILL,
+# OOM, host loss); anything else is that run's real outcome. It also overwrites
+# a stale marker from a previous run, which the script's log trim would not have
+# removed -- that matches only ``*.log``.
+STATUSES = ("success", "failed", "bowed_out", "smoke_ok", "running")
 FAILURE_STATUSES = ("failed",)
 
 
@@ -89,7 +105,22 @@ def init_logging_best_effort() -> bool:
     """
     try:
         from lib.observability import init_logger
-    except Exception as exc:  # pragma: no cover - exercised via subprocess
+
+        # Inside the try, NOT after it. Guarding only the import would leave the
+        # larger hazard open: on a host where lib.observability imports
+        # perfectly, a malformed or unreachable SENTRY_DSN, a sentry_sdk.init
+        # failure, or any error inside wxyc_etl.logger raises from THIS call. It
+        # would escape main() before run() ever wrote the marker, while
+        # report_outcome's `|| true` in rebuild-cache.sh swallowed the non-zero
+        # exit -- so a run that terminated cleanly would read in the S3 listing
+        # as "never reached a terminal path". The reporter would forge the exact
+        # signal it exists to provide.
+        #
+        # Sentry is initialized from SENTRY_DSN inside the shim; flushed at exit
+        # by wxyc_etl.logger's atexit hook, which matters here because the
+        # process exits within milliseconds of the capture.
+        init_logger(repo="discogs-etl", tool="discogs-etl report_rebuild_outcome")
+    except Exception as exc:
         logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
         print(
             f"[report_rebuild_outcome] logger unavailable ({exc!r}); writing the "
@@ -97,10 +128,6 @@ def init_logging_best_effort() -> bool:
             file=sys.stderr,
         )
         return False
-    # Sentry is initialized from SENTRY_DSN inside the shim; flushed at exit by
-    # wxyc_etl.logger's atexit hook, which matters here because the process
-    # exits within milliseconds of the capture.
-    init_logger(repo="discogs-etl", tool="discogs-etl report_rebuild_outcome")
     return True
 
 
@@ -114,24 +141,53 @@ def render_outcome(*, status: str, detail: str, run_log: str, utc_now: str) -> s
     return "\n".join(lines) + "\n"
 
 
-def write_outcome(log_dir: Path, body: str) -> Path:
+def write_outcome(log_dir: Path, body: str, filename: str = OUTCOME_FILENAME) -> Path:
+    """Write the marker. ``filename`` is overridable so a bow-out can file its
+    own outcome WITHOUT clobbering the canonical marker of the run that holds
+    the lock -- see ``--marker-name``."""
     log_dir.mkdir(parents=True, exist_ok=True)
-    path = log_dir / OUTCOME_FILENAME
+    path = log_dir / filename
     path.write_text(body, encoding="utf-8")
     return path
 
 
-def run(*, status: str, detail: str, log_dir: Path, run_log: str) -> int:
+def run(
+    *, status: str, detail: str, log_dir: Path, run_log: str, marker_name: str = OUTCOME_FILENAME
+) -> int:
     utc_now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     body = render_outcome(status=status, detail=detail, run_log=run_log, utc_now=utc_now)
-    path = write_outcome(log_dir, body)
+    # The marker and the logger are two independent channels on purpose, so
+    # neither one failing may take the other down with it. A full or unwritable
+    # $LOG_DIR is exactly the kind of host trouble worth a Sentry issue, and
+    # letting the OSError escape would instead lose the ERROR as well -- with
+    # report_outcome's `|| true` hiding both.
+    path: Path | None = None
+    write_error: OSError | None = None
+    try:
+        path = write_outcome(log_dir, body, marker_name)
+    except OSError as exc:
+        write_error = exc
     message = "discogs-cache rebuild outcome: %s (%s)"
     args = (status, detail or "no detail")
-    extra = {"step": "rebuild_outcome", "outcome": status, "outcome_marker": str(path)}
+    extra = {
+        "step": "rebuild_outcome",
+        "outcome": status,
+        "outcome_marker": str(path) if path is not None else "",
+    }
     if status in FAILURE_STATUSES:
         logger.error(message, *args, extra=extra)
     else:
         logger.info(message, *args, extra=extra)
+    if write_error is not None:
+        # Its own ERROR, so this raises a Sentry issue even when the outcome
+        # itself was benign: the S3 listing is about to be misleading (no marker,
+        # which reads as a lost host) and that is worth knowing about.
+        logger.error(
+            "could not write the rebuild outcome marker to %s: %r",
+            log_dir,
+            write_error,
+            extra={"step": "rebuild_outcome", "outcome": status, "marker_write_failed": True},
+        )
     return 0
 
 
@@ -147,11 +203,23 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--run-log", default="", help="Path of this run's log file, for the marker."
     )
+    parser.add_argument(
+        "--marker-name",
+        default=OUTCOME_FILENAME,
+        help="Marker filename. Override it so a bow-out files its own outcome "
+        "without clobbering the canonical marker of the run holding the lock.",
+    )
     args = parser.parse_args(argv)
 
     init_logging_best_effort()
 
-    return run(status=args.status, detail=args.detail, log_dir=args.log_dir, run_log=args.run_log)
+    return run(
+        status=args.status,
+        detail=args.detail,
+        log_dir=args.log_dir,
+        run_log=args.run_log,
+        marker_name=args.marker_name,
+    )
 
 
 if __name__ == "__main__":
