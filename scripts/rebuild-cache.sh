@@ -73,12 +73,26 @@ notify_slack() {
 #     and lib.observability is not importable. `python3` resolves pre-venv (the
 #     AMI's system interpreter) and post-venv (the venv's own, first on PATH),
 #     and the reporter defers its logger import so the marker still lands.
+# report_outcome <status> [detail] [marker-name]
+#
+# The third argument exists because $LOG_DIR is SHARED with whichever run holds
+# the lock (the flock is same-host only and LOCK_FILE defaults under $LOG_DIR),
+# and so is the bootstrap's S3 prefix. A bystander tick writing the canonical
+# marker would mean a later SIGKILL of the real run left `outcome=bowed_out` as
+# the newest thing the trap-EXIT sync uploads -- a lost host reading as a benign
+# no-op, the #352 false-signal class exactly. So a bystander names its own file,
+# and the lock holder stamps `running` on acquiring, which keeps the canonical
+# marker a description of the lock holder and nothing else.
+#
+# No bash array for the argv: `local a=()` then "${a[@]}" under `set -u` is fatal
+# on bash 3.2, which these regions are still tested against.
 report_outcome() {
-    local status="$1" detail="${2:-}"
+    local status="$1" detail="${2:-}" marker="${3:-99-outcome.txt}"
     python3 "$REPO_DIR/scripts/report_rebuild_outcome.py" \
         --status "$status" \
         --detail "$detail" \
         --log-dir "$LOG_DIR" \
+        --marker-name "$marker" \
         --run-log "${LOG_FILE:-}" || true
 }
 
@@ -138,10 +152,22 @@ LOCK_FILE="${LOCK_FILE:-$LOG_DIR/discogs-rebuild.lock}"
 exec 200>"$LOCK_FILE"
 if ! flock -n "$LOCK_FD"; then
     echo "[$(date -u +%H:%M:%SZ)] another rebuild is already running on this host; exiting"
-    report_outcome bowed_out "another rebuild holds the same-host flock"
+    # Distinct marker name: the canonical one belongs to the run holding the
+    # lock, and overwriting it here would let this benign no-op stand in for
+    # that run's fate if it is later killed. $$ keeps concurrent bystanders
+    # from overwriting each other too.
+    report_outcome bowed_out "another rebuild holds the same-host flock" "99-outcome-bowout-$$.txt"
     notify_slack ":lock:" "bowed out — another rebuild is already running on this host (flock); no cache write. Log: ${LOG_FILE}"
     exit 0
 fi
+
+# We own the lock. Stamp the canonical marker as in-flight before doing any
+# work: it makes "no marker" mean "no run ever acquired the lock" and
+# "outcome=running" mean "one did and never reached a terminal path" (SIGKILL,
+# OOM, host loss) -- which is what the 2026-09-04 abort needed and did not have.
+# It also clears any stale marker from a previous run on this host, which the
+# log trim at the end of this script would not have removed: it matches *.log.
+report_outcome running "rebuild in progress"
 
 echo "[$(date -u +%H:%M:%SZ)] starting rebuild — log: $LOG_FILE"
 

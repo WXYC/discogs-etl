@@ -10,14 +10,22 @@ watched. A successful run and an aborted one left the same artifacts behind.
 
 ``scripts/report_rebuild_outcome.py`` closes that by writing a
 ``99-outcome.txt`` marker into the log directory the bootstrap already syncs to
-S3, so the outcome is legible from a bucket *listing*. Two properties make the
-marker trustworthy, and both are pinned here:
+S3, so the outcome is legible from a bucket *listing*. Three properties make the
+marker trustworthy, and all three are pinned here:
 
-1. **Every terminal path reports.** Absence of the marker is meaningful -- it
-   means the script never reached a terminal path (SIGKILL, host loss) -- which
-   is only true if no terminal path is silent. A missed path would make a real
-   bow-out look like a lost host.
-2. **The marker never depends on the venv.** The flock bow-out fires at
+1. **Every terminal path reports, and the canonical marker only ever describes
+   the run holding the lock.** The lock holder stamps ``outcome=running`` on
+   acquiring, so the readings are total: no marker means no run ever acquired
+   the lock; ``running`` means one did and never reached a terminal path
+   (SIGKILL, OOM, host loss); anything else is that run's real outcome. A
+   bystander tick writes its own distinctly-named file, because ``$LOG_DIR`` and
+   the bootstrap's S3 prefix are shared with the live run -- see
+   ``TestMarkerCannotBeForgedByABystanderTick``.
+2. **The marker never depends on the venv, and never on the logger working.**
+   The import is deferred AND the ``init_logger`` call is inside the same
+   ``try``: a valid-looking but unreachable ``SENTRY_DSN`` raises from the call,
+   not the import, and letting that escape would write no marker at all while
+   ``report_outcome``'s ``|| true`` hid the failure. The flock bow-out fires at
    ``LOCK_FD=200`` / ``flock -n``, roughly 20 lines ABOVE the
    ``source "$REPO_DIR/.venv/bin/activate"`` in step 1, so at that point
    ``lib.observability`` (which pulls in ``wxyc_etl`` and ``sentry_sdk``) is not
@@ -27,6 +35,9 @@ marker trustworthy, and both are pinned here:
    a lost host. The marker write is stdlib-only and must survive an
    unimportable logger; only the Sentry leg is lost, and a bow-out logs at INFO
    there anyway, raising nothing.
+3. **The marker and the logger are independent channels.** Neither failing may
+   take the other down, so an unwritable ``$LOG_DIR`` still raises its own
+   ERROR rather than losing both signals behind ``|| true``.
 
 Test layers follow the convention of this file's siblings
 (``test_rebuild_cache_flock_bowout.py``, ``test_rebuild_cache_lock_bowout.py``):
@@ -44,6 +55,7 @@ import re
 import shutil
 import subprocess
 import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -173,6 +185,35 @@ class TestMarkerSurvivesAnUnimportableLogger:
         )
         assert "outcome=bowed_out" in marker.read_text()
 
+    def test_main_writes_the_marker_when_init_logger_itself_raises(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Guarding the IMPORT is not enough — the call has to be guarded too.
+
+        A malformed or unreachable ``SENTRY_DSN``, a ``sentry_sdk.init``
+        failure, or any error inside ``wxyc_etl.logger`` raises from
+        ``init_logger`` itself, on a host where the import succeeds perfectly.
+        If that escapes, ``main()`` dies before ``run()`` and NO marker is
+        written -- while ``report_outcome``'s ``|| true`` in rebuild-cache.sh
+        swallows the non-zero exit. The S3 listing would then show a run that
+        terminated cleanly as "never reached a terminal path (SIGKILL, host
+        loss)": the reporter forging the exact contract it exists to provide.
+        """
+        fake = types.ModuleType("lib.observability")
+
+        def boom(**_kwargs: object) -> None:
+            raise RuntimeError("Invalid Sentry DSN")
+
+        fake.init_logger = boom  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "lib.observability", fake)
+        rc = main(["--status", "failed", "--detail", "line 445", "--log-dir", str(tmp_path)])
+        assert rc == 0, "a broken logger must not fail the reporter"
+        marker = tmp_path / OUTCOME_FILENAME
+        assert marker.exists(), (
+            "the marker must survive init_logger raising, not just failing to import"
+        )
+        assert "outcome=failed" in marker.read_text()
+
 
 # ---------------------------------------------------------------------------
 # Static-structural: the shell wiring
@@ -225,6 +266,72 @@ class TestEveryTerminalPathReports:
 
     def test_success_path_reports_success(self, script_text: str) -> None:
         assert "report_outcome success" in script_text
+
+
+class TestMarkerCannotBeForgedByABystanderTick:
+    """$LOG_DIR is shared with whichever run currently holds the lock.
+
+    The flock is same-host only and LOCK_FILE defaults under $LOG_DIR, so a
+    second cron tick landing on a live rebuild shares that directory AND the
+    bootstrap's S3 prefix. If the bystander wrote the canonical marker, then a
+    later SIGKILL of the real run (OOM, host loss) would leave the bystander's
+    ``outcome=bowed_out`` as the newest thing the ``trap EXIT`` sync uploads --
+    a lost host reading as a benign no-op, which is precisely the false-signal
+    class incident #352 exists to eliminate.
+
+    Two rules close it, and together they strengthen the contract rather than
+    just patching the hole:
+
+    * a bystander writes its own distinctly-named marker and never the
+      canonical one;
+    * the run that DOES own the lock stamps ``outcome=running`` immediately on
+      acquiring it, so the canonical marker always describes the lock holder.
+
+    The resulting readings are total: no canonical marker means no run ever
+    acquired the lock; ``running`` means one did and never reached a terminal
+    path; anything else is that run's real outcome. The stamp also overwrites
+    any stale marker from a previous run, which the log trim at the end of the
+    script would not have removed -- it matches only ``*.log``.
+    """
+
+    def test_running_is_a_valid_non_failure_status(self) -> None:
+        assert "running" in STATUSES
+        assert "running" not in FAILURE_STATUSES
+
+    def test_marker_name_is_overridable(self, tmp_path: Path) -> None:
+        rc = main(
+            ["--status", "bowed_out", "--log-dir", str(tmp_path), "--marker-name", "99-bowout.txt"]
+        )
+        assert rc == 0
+        assert (tmp_path / "99-bowout.txt").exists()
+        assert not (tmp_path / OUTCOME_FILENAME).exists(), (
+            "a bystander must not write the canonical marker"
+        )
+
+    def test_flock_bowout_writes_a_distinct_marker_name(self, script_lines: list[str]) -> None:
+        start = _index_of(script_lines, "LOCK_FD=200")
+        end = next(i for i in range(start, len(script_lines)) if script_lines[i].strip() == "fi")
+        region = "\n".join(script_lines[start : end + 1])
+        assert "report_outcome bowed_out" in region
+        assert OUTCOME_FILENAME not in region, (
+            "the bow-out must pass a marker name that is NOT the canonical one"
+        )
+        assert re.search(r"report_outcome bowed_out [^\n]*99-", region), (
+            "the bow-out must pass an explicit, distinct marker name as its 3rd arg"
+        )
+
+    def test_lock_holder_stamps_running_after_acquiring(self, script_lines: list[str]) -> None:
+        lock_end = next(
+            i
+            for i in range(_index_of(script_lines, "LOCK_FD=200"), len(script_lines))
+            if script_lines[i].strip() == "fi"
+        )
+        after = "\n".join(script_lines[lock_end : lock_end + 12])
+        assert "report_outcome running" in after, (
+            "the lock holder must stamp outcome=running immediately after "
+            "acquiring, so the canonical marker always describes it -- and so a "
+            "stale marker from a previous run is overwritten"
+        )
 
 
 class TestReportingCannotBreakTheRebuild:
