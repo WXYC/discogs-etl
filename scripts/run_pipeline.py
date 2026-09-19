@@ -823,6 +823,73 @@ def write_keep_release_ids(db_url: str, output_path: Path) -> int:
     return len(ids)
 
 
+def prepare_converter_keep_release_ids(db_url: str) -> Path | None:
+    """Build the Seam-A allowlist file the converter consumes, or None (#424).
+
+    Seam A (``discogs-xml-converter#81``) is what gets a pinned release into the
+    converter's output in the first place: without it the pair-wise
+    ``(artist, title)`` filter drops every pin whose credited artist is outside
+    library scope, and the #327/#328 dedup and prune exemptions have nothing to
+    protect. It has to be written *before* the converter starts scanning.
+
+    Best-effort on purpose. The *protective* read of
+    ``lml_cache.library_release_override`` is the one
+    ``_run_database_build`` / ``_run_database_build_post_import`` already
+    perform, and that one propagates every error per #327. This earlier read
+    only widens the converter's output, so a failure here logs loudly and
+    degrades to the converter's default scope rather than aborting a rebuild
+    before a byte of the dump has been read — at which point ``import_csv.py``'s
+    pin exemption keeps the pins from being deleted and its shortfall guard
+    refuses the import outright if the gap is material.
+    """
+    path = Path(tempfile.mkdtemp(prefix="discogs_keep_release_ids_")) / "keep_release_ids.txt"
+    try:
+        write_keep_release_ids(db_url, path)
+    except (psycopg.Error, OSError) as exc:
+        logger.warning(
+            "[#424] could not build the converter's pinned-release allowlist (%s); "
+            "the converter will run at its default scope and pinned releases will be "
+            "retained-but-not-refreshed by the import seam",
+            exc,
+            extra={"step": "keep_release_ids"},
+        )
+        return None
+    return path
+
+
+def converter_supports_keep_release_ids(converter: str, subcommand: str) -> bool:
+    """Feature-probe ``<converter> <subcommand> --help`` for ``--keep-release-ids``.
+
+    ``rebuild-cache.sh`` downloads the converter's *latest* GitHub release with
+    no ``--tag``, so there is no pin to read the capability off — it has to be
+    probed. The flag is declared per-subcommand on the converter side, so probe
+    the subcommand we are about to invoke.
+
+    Every ambiguous outcome (missing binary, timeout, unreadable help) resolves
+    to False: passing an unknown argument to the converter would abort the whole
+    rebuild, whereas omitting it degrades to the pre-#424 scope that the import
+    seam's pin exemption now backstops. This is the fail-safe direction the
+    converter's own CLAUDE.md asks the caller for.
+    """
+    try:
+        proc = subprocess.run(
+            [converter, subcommand, "--help"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.warning(
+            "[#424] could not probe %s for --keep-release-ids (%s); assuming unsupported",
+            converter,
+            exc,
+            extra={"step": "keep_release_ids"},
+        )
+        return False
+    return "--keep-release-ids" in ((proc.stdout or "") + (proc.stderr or ""))
+
+
 def prune_audit_dump_args() -> list[str]:
     """Extra ``verify_cache.py`` args to capture the prune classification, or [].
 
@@ -900,6 +967,7 @@ def convert_and_filter(
     library_db: Path | None = None,
     database_url: str | None = None,
     xml_type: str | None = None,
+    keep_release_ids: Path | None = None,
 ) -> None:
     """Convert Discogs XML to CSV using discogs-xml-converter.
 
@@ -920,6 +988,11 @@ def convert_and_filter(
     auto-detection. Required for FIFO inputs (the rebuild-cache.sh
     monthly path) where the auto-detect open/close pattern would
     SIGPIPE the upstream curl writer before the real scan opens the file.
+
+    keep_release_ids, when set, is Seam A (#424): the allowlist of WXYC pinned
+    release ids the converter must emit — with their full child row sets — even
+    when they fail the filter. Passed only to a converter that advertises the
+    flag; see converter_supports_keep_release_ids for why it is probed.
     """
     subcommand = "import" if database_url else "build"
     cmd = [converter, subcommand, str(xml_file), "--data-dir", str(output_dir)]
@@ -931,6 +1004,19 @@ def convert_and_filter(
         cmd.extend(["--database-url", database_url])
     if xml_type:
         cmd.extend(["--xml-type", xml_type])
+    if keep_release_ids is not None:
+        if converter_supports_keep_release_ids(converter, subcommand):
+            cmd.extend(["--keep-release-ids", str(keep_release_ids)])
+        else:
+            logger.warning(
+                "[#424] converter %s does not advertise --keep-release-ids; converting at "
+                "its default scope. Pinned releases the filter rejects will be retained "
+                "but not refreshed by the import seam, and the import refuses to run at "
+                "all if the shortfall is material. Publish a converter release that "
+                "understands the flag (discogs-xml-converter#81) to restore Seam A.",
+                converter,
+                extra={"step": "keep_release_ids"},
+            )
     description = (
         "Convert and import XML to PostgreSQL" if database_url else "Convert and filter XML to CSV"
     )
@@ -1126,6 +1212,10 @@ def _run_xml_pipeline(
             # This skips WAL writes during the bulk import phase.
             set_tables_unlogged(db_url)
 
+            # Seam A (#424): the pinned-release allowlist must exist before the
+            # scan starts — the converter decides what to emit as it streams.
+            keep_release_ids = prepare_converter_keep_release_ids(db_url)
+
             # Converter streams releases into PG; supplementary CSVs still
             # go to csv_out (artist_alias.csv, label_hierarchy.csv).
             convert_and_filter(
@@ -1136,6 +1226,7 @@ def _run_xml_pipeline(
                 library_db=args.library_db,
                 database_url=db_url,
                 xml_type=args.xml_type,
+                keep_release_ids=keep_release_ids,
             )
 
             # Auto-detect label_hierarchy.csv
@@ -1159,11 +1250,14 @@ def _run_xml_pipeline(
                 catalog_db_url=args.catalog_db_url,
             )
         else:
-            # Standard CSV mode. The converter applies whichever filter the
-            # operator picked: --library-artists for artist-only (~4M rows)
-            # or --library-db for the pair-wise (artist, title) filter
-            # (~50K rows). Both narrow the release.csv stream inside the
-            # streaming scanner before any disk write.
+            # Standard CSV mode — the monthly rebuild's path. The converter
+            # applies whichever filter the operator picked: --library-artists
+            # for artist-only (~4M rows) or --library-db for the pair-wise
+            # (artist, title) filter (~50K rows). Both narrow the release.csv
+            # stream inside the streaming scanner before any disk write, which
+            # is why Seam A's allowlist has to be handed over up front (#424).
+            keep_release_ids = prepare_converter_keep_release_ids(db_url)
+
             convert_and_filter(
                 args.xml,
                 csv_out,
@@ -1171,6 +1265,7 @@ def _run_xml_pipeline(
                 library_artists=args.library_artists,
                 library_db=args.library_db,
                 xml_type=args.xml_type,
+                keep_release_ids=keep_release_ids,
             )
 
             # Auto-detect label_hierarchy.csv
@@ -1560,6 +1655,12 @@ def _run_database_build(
         import_cmd = [python, str(SCRIPT_DIR / "import_csv.py"), "--base-only"]
         if truncate_existing:
             import_cmd.append("--truncate-existing")
+        # Third consumer of the allowlist (#424). import_release_via_upsert's
+        # PRUNE_STALE_RELEASES_SQL deletes every release absent from the dump;
+        # #327 exempted the dedup and verify-prune seams but not this one, and
+        # on 2026-09-04 it deleted 27,286 of 58,012 pins. Not forwarded to the
+        # tracks step below: that step never prunes releases.
+        import_cmd.extend(["--keep-release-ids", str(keep_release_ids_path)])
         import_cmd.extend([str(csv_dir), db_url])
         run_step_safe("Import base CSVs", import_cmd)
         if state:
