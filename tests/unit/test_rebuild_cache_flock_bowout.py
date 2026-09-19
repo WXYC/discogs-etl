@@ -188,6 +188,13 @@ def _build_harness(flock_rc: int, tmp_path: Path) -> str:
             # doesn't hit the network; it still runs its own body, proving
             # the function is defined and callable at this point.
             'curl() { echo "CURL_CALLED $*"; return 0; }',
+            # The extracted region also carries the REAL report_outcome (#424),
+            # which reads $REPO_DIR and shells out to python3. Provide the one
+            # and stub the other, so this test keeps testing lock semantics
+            # rather than the marker -- that is
+            # test_rebuild_outcome_marker.py's job.
+            f'REPO_DIR="{SCRIPT_PATH.parent.parent}"',
+            'python3() { echo "PYTHON3_CALLED $*"; }',
             region,
             'echo "FELL THROUGH PAST LOCK GUARD"',
         ]

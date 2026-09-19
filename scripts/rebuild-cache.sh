@@ -50,6 +50,38 @@ notify_slack() {
         --max-time 10 || true
 }
 
+# report_outcome <status> [detail] — file this run's terminal outcome (#424).
+#
+# Writes $LOG_DIR/99-outcome.txt, which the bootstrap's `trap EXIT` syncs to S3
+# alongside its 00-started.txt breadcrumb, and logs the outcome (ERROR for a
+# failure, so SENTRY_DSN raises an issue tagged step=rebuild_outcome that an
+# alert rule can target). On 2026-09-04 the rebuild aborted and nobody learned
+# for 14 days: the Slack webhook was unset, so every notify_slack above was a
+# bare `return 0`, and a clean finish and an abort left identical artifacts.
+#
+# EVERY terminal path must call this, because absence of the marker is itself
+# the signal for "never reached a terminal path" (SIGKILL, host loss). A silent
+# path would forge that signal.
+#
+# Two things this must never do:
+#
+#   - fail its caller. on_error() calls it, and under `set -e` + the ERR trap a
+#     non-zero exit here would re-enter on_error: mutual recursion on the one
+#     path that most needs to terminate. Hence `|| true`.
+#   - depend on the venv. The flock bow-out below reports from ~20 lines ABOVE
+#     `source "$REPO_DIR/.venv/bin/activate"`, so `python` does not exist yet
+#     and lib.observability is not importable. `python3` resolves pre-venv (the
+#     AMI's system interpreter) and post-venv (the venv's own, first on PATH),
+#     and the reporter defers its logger import so the marker still lands.
+report_outcome() {
+    local status="$1" detail="${2:-}"
+    python3 "$REPO_DIR/scripts/report_rebuild_outcome.py" \
+        --status "$status" \
+        --detail "$detail" \
+        --log-dir "$LOG_DIR" \
+        --run-log "${LOG_FILE:-}" || true
+}
+
 # Trap surfaces unexpected exits to Slack with the failing line context.
 # exit_code reads $2 first, falling back to $?. Multi-command ERR traps
 # that need to run cleanup before on_error MUST snapshot $? themselves
@@ -71,6 +103,7 @@ notify_slack() {
 on_error() {
     local exit_code=${2:-$?}
     local line=$1
+    report_outcome failed "line ${line} (exit ${exit_code})"
     notify_slack ":warning:" "failed at line ${line} (exit ${exit_code}). Log: ${LOG_FILE}"
     exit "$exit_code"
 }
@@ -80,6 +113,7 @@ trap 'on_error $LINENO' ERR
 # then exit non-zero. Use this for explicit-failure paths that ERR doesn't
 # catch (`exit N` doesn't fire ERR; neither does the non-zero side of an `if`).
 fail() {
+    report_outcome failed "$1"
     notify_slack ":warning:" "$1. Log: ${LOG_FILE}"
     exit 1
 }
@@ -104,6 +138,7 @@ LOCK_FILE="${LOCK_FILE:-$LOG_DIR/discogs-rebuild.lock}"
 exec 200>"$LOCK_FILE"
 if ! flock -n "$LOCK_FD"; then
     echo "[$(date -u +%H:%M:%SZ)] another rebuild is already running on this host; exiting"
+    report_outcome bowed_out "another rebuild holds the same-host flock"
     notify_slack ":lock:" "bowed out — another rebuild is already running on this host (flock); no cache write. Log: ${LOG_FILE}"
     exit 0
 fi
@@ -303,6 +338,7 @@ if [ "${REBUILD_SMOKE:-}" = "1" ]; then
     else
         echo "    masters smoke SKIP: masters dump not reachable (best-effort phase)"
     fi
+    report_outcome smoke_ok "REBUILD_SMOKE=1; no DB write performed"
     notify_slack ":mag:" "smoke test passed (no DB write performed)"
     exit 0
 fi
@@ -439,6 +475,7 @@ REBUILD_LOCK_BOWED_OUT_EXIT_CODE=75
 
 if [ "$PIPELINE_EXIT_CODE" -eq "$REBUILD_LOCK_BOWED_OUT_EXIT_CODE" ]; then
     echo "[$(date -u +%H:%M:%SZ)] bowed out: another rebuild already holds the discogs-cache advisory lock (key 354001); no cache write"
+    report_outcome bowed_out "another rebuild holds the advisory lock (key 354001)"
     notify_slack ":no_entry:" "bowed out — another rebuild holds the discogs-cache advisory lock (key 354001); no cache write. Log: ${LOG_FILE}"
     exit 0
 elif [ "$PIPELINE_EXIT_CODE" -ne 0 ]; then
@@ -454,6 +491,7 @@ python "$REPO_DIR/scripts/check_cache_drift.py" \
     --min-ratio "$DRIFT_MIN_RATIO"
 
 echo "[$(date -u +%H:%M:%SZ)] rebuild complete"
+report_outcome success ""
 notify_slack ":white_check_mark:" "rebuilt successfully (log: ${LOG_FILE})"
 
 # ---------------------------------------------------------------------------

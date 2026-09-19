@@ -239,6 +239,11 @@ def _build_harness(stub_rc: int) -> str:
             # Stand-in for the real notify_slack (which curls a webhook);
             # everything else below is the script's own code, verbatim.
             'notify_slack() { echo "NOTIFY $1 $2"; }',
+            # Likewise for report_outcome (#424), which shells out to
+            # scripts/report_rebuild_outcome.py. on_error() is extracted
+            # verbatim below and calls it, so it has to exist here; the marker's
+            # own behavior is pinned in test_rebuild_outcome_marker.py.
+            'report_outcome() { echo "OUTCOME $1 ${2:-}"; }',
             _extract_function(source, "on_error"),
             *_extract_err_traps(source),
             _extract_exit_code_region(lines, "STUB_RC"),
