@@ -12,7 +12,7 @@ import logging
 import os
 import re
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import TypedDict
 
@@ -30,6 +30,7 @@ from wxyc_etl.pg import to_pg_text_form  # noqa: E402
 
 from lib.dsn import redact_dsn  # noqa: E402
 from lib.format_normalization import normalize_format  # noqa: E402
+from lib.keep_release_ids import parse_keep_release_ids  # noqa: E402
 from lib.observability import init_logger  # noqa: E402
 
 logger = logging.getLogger(__name__)
@@ -688,14 +689,166 @@ PRUNE_STALE_RELEASES_SQL = (
     "DELETE FROM release r WHERE NOT EXISTS (SELECT 1 FROM release_staging s WHERE s.id = r.id)"
 )
 
+# ---------------------------------------------------------------------------
+# Pinned-release protection at the import seam (WXYC/discogs-etl#424)
+# ---------------------------------------------------------------------------
+# PRUNE_STALE_RELEASES_SQL above deletes every release the incoming dump does
+# not carry. #327 exempted WXYC's library pinned overrides
+# (lml_cache.library_release_override) at the dedup and verify-prune seams, but
+# not here — so this was an unguarded third seam, and on 2026-09-04 it deleted
+# 27,286 of 58,012 pinned releases, mechanically undoing the #329 backfill. The
+# run then aborted at #357's copy-swap shortfall guard, i.e. one seam *after*
+# the damage had already committed. Forensics:
+# https://github.com/WXYC/discogs-etl/issues/422#issuecomment-5736586382
+#
+# Second anti-join leg, not a NOT IN: same planner constraint as the first leg
+# (see PRUNE_STALE_RELEASES_SQL) — TestPrunePinExemptionSql pins both.
+PRUNE_STALE_RELEASES_EXEMPT_PINS_SQL = (
+    "DELETE FROM release r "
+    "WHERE NOT EXISTS (SELECT 1 FROM release_staging s WHERE s.id = r.id) "
+    "AND NOT EXISTS (SELECT 1 FROM release_keep_ids k WHERE k.release_id = r.id)"
+)
 
-def import_release_via_upsert(conn, csv_dir: Path) -> int:
+# A pin the dump did not carry keeps its `release` row but loses its children:
+# the child tables are TRUNCATEd wholesale and only re-COPYed for releases the
+# converter emitted. LML's release cache-hit predicate is `not_found OR
+# artwork_checked_at IS NOT NULL OR tracklist` (discogs/service.py), so leaving
+# artwork_checked_at set would make LML serve that row as a hit with an empty
+# tracklist and never re-fetch it — a silent wrong answer, strictly worse than
+# the miss the old DELETE produced. NULLing the column restores miss → Discogs
+# API → write_release, which re-hydrates every child row. artwork_url is
+# deliberately left alone: it is still the best URL we have, and preserving it
+# is the whole contract of this function.
+MARK_RETAINED_PINS_STALE_SQL = (
+    "UPDATE release r SET artwork_checked_at = NULL "
+    "WHERE EXISTS (SELECT 1 FROM release_keep_ids k WHERE k.release_id = r.id) "
+    "AND NOT EXISTS (SELECT 1 FROM release_staging s WHERE s.id = r.id)"
+)
+
+# (pins currently in the cache, of which absent from the incoming dump).
+# Pins that are already absent from `release` cannot be deleted by the prune,
+# so they are excluded from both counts — the ratio has to mean "share of what
+# we still hold that this dump would strand".
+COUNT_PINS_MISSING_FROM_DUMP_SQL = (
+    "SELECT count(*), count(*) FILTER ("
+    "  WHERE NOT EXISTS (SELECT 1 FROM release_staging s WHERE s.id = k.release_id)) "
+    "FROM release_keep_ids k "
+    "WHERE EXISTS (SELECT 1 FROM release r WHERE r.id = k.release_id)"
+)
+
+# Share of cached pinned releases the incoming dump may strand before the
+# import refuses to proceed. A *share* rather than an absolute count: upstream
+# churn strands a few pins every month (releases deleted from Discogs, ids that
+# no longer resolve), and an absolute floor would either hair-trigger on that
+# or be useless at scale. 2026-09-04 was 47% — the fingerprint of the converter
+# running without its Seam-A allowlist — while ordinary churn is single-digit
+# percent. Override via the MAX_PIN_SHORTFALL_RATIO env var (1.0 disables the
+# guard) when an operator deliberately wants a rebuild through.
+DEFAULT_MAX_PIN_SHORTFALL_RATIO = 0.25
+MAX_PIN_SHORTFALL_RATIO_ENV = "MAX_PIN_SHORTFALL_RATIO"
+
+
+class PinnedReleaseShortfallError(RuntimeError):
+    """The incoming dump is missing too large a share of the pinned releases.
+
+    Raised before the import's first destructive statement, so the cache is
+    left exactly as it was — unlike #357's shortfall guard, which fires one
+    seam downstream of a prune that has already committed.
+    """
+
+
+def resolve_max_pin_shortfall_ratio(env: Mapping[str, str] | None = None) -> float:
+    """Read MAX_PIN_SHORTFALL_RATIO, falling back to the default.
+
+    An unparseable or out-of-range value logs a WARNING and uses the default
+    rather than failing: the operator writes this by hand under time pressure,
+    and a typo must not turn into either a skipped guard or a dead rebuild.
+    """
+    raw = (os.environ if env is None else env).get(MAX_PIN_SHORTFALL_RATIO_ENV, "")
+    if not raw:
+        return DEFAULT_MAX_PIN_SHORTFALL_RATIO
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning(
+            "%s=%r is not a number; using the default %.2f",
+            MAX_PIN_SHORTFALL_RATIO_ENV,
+            raw,
+            DEFAULT_MAX_PIN_SHORTFALL_RATIO,
+        )
+        return DEFAULT_MAX_PIN_SHORTFALL_RATIO
+    if not 0.0 <= value <= 1.0:
+        logger.warning(
+            "%s=%r is outside [0, 1]; using the default %.2f",
+            MAX_PIN_SHORTFALL_RATIO_ENV,
+            raw,
+            DEFAULT_MAX_PIN_SHORTFALL_RATIO,
+        )
+        return DEFAULT_MAX_PIN_SHORTFALL_RATIO
+    return value
+
+
+def evaluate_pin_shortfall(
+    *, pinned_present: int, pinned_missing: int, max_ratio: float
+) -> str | None:
+    """Return an abort reason when the dump strands too many pins, else None.
+
+    ``pinned_present == 0`` (a fresh cache, or no pins at all) is always fine:
+    there is nothing to strand.
+    """
+    if pinned_present <= 0:
+        return None
+    ratio = pinned_missing / pinned_present
+    if ratio <= max_ratio:
+        return None
+    return (
+        f"the incoming dump is missing {pinned_missing:,} of {pinned_present:,} cached "
+        f"pinned releases ({ratio:.1%} > the {max_ratio:.1%} ceiling). This is the "
+        "fingerprint of a converter run without its --keep-release-ids allowlist "
+        "(WXYC/discogs-etl#424); refusing to import before anything is deleted. Set "
+        f"{MAX_PIN_SHORTFALL_RATIO_ENV} to override."
+    )
+
+
+def stage_keep_release_ids(conn, keep_release_ids: set[int]) -> int:
+    """COPY the pinned-release allowlist into a temp table for the prune.
+
+    A temp table rather than an ``= ANY(%s)`` array: the allowlist is ~58K ids
+    on the monthly path, and the PRIMARY KEY gives the prune's second leg an
+    index to anti-join against.
+    """
+    with conn.cursor() as cur:
+        cur.execute("DROP TABLE IF EXISTS release_keep_ids")
+        cur.execute("CREATE TEMP TABLE release_keep_ids (release_id integer PRIMARY KEY)")
+        with cur.copy("COPY release_keep_ids (release_id) FROM STDIN") as copy:
+            for release_id in keep_release_ids:
+                copy.write_row((release_id,))
+        cur.execute("ANALYZE release_keep_ids")
+    return len(keep_release_ids)
+
+
+def count_pins_missing_from_dump(conn) -> tuple[int, int]:
+    """Return ``(pins_in_cache, pins_in_cache_absent_from_the_dump)``."""
+    with conn.cursor() as cur:
+        cur.execute(COUNT_PINS_MISSING_FROM_DUMP_SQL)
+        present, missing = cur.fetchone()
+    return int(present or 0), int(missing or 0)
+
+
+def import_release_via_upsert(conn, csv_dir: Path, keep_release_ids: set[int] | None = None) -> int:
     """Reload ``release`` from CSV while preserving artwork columns.
 
     Staging-table COPY + UPSERT with ``artwork_url`` and
     ``artwork_checked_at`` excluded from the SET list, plus a DELETE step
     pruning releases not in the new dump. Child tables of ``release`` are
     TRUNCATEd first so the subsequent COPYs don't append duplicates.
+
+    *keep_release_ids* is the WXYC pinned-release allowlist (#424). When
+    non-empty it (a) exempts those ids from the prune, (b) aborts before the
+    first destructive statement if the dump strands more than
+    ``MAX_PIN_SHORTFALL_RATIO`` of the pins it currently holds, and (c) marks
+    any pin the dump did not refresh as stale so LML re-hydrates its children.
+    An empty/absent allowlist keeps the pre-#424 behaviour exactly.
 
     Returns the staging row count (number of rows COPYed from release.csv).
     """
@@ -704,12 +857,6 @@ def import_release_via_upsert(conn, csv_dir: Path) -> int:
     if not csv_path.exists():
         logger.warning(f"Skipping {release_config['csv_file']} (not found)")
         return 0
-
-    logger.info("Truncating child tables of release ahead of upsert...")
-    with conn.cursor() as cur:
-        quoted = ", ".join(f'"{t}"' for t in _RELEASE_CHILD_TABLES)
-        cur.execute(f"TRUNCATE {quoted} CASCADE")
-    conn.commit()
 
     logger.info("Creating release_staging temp table...")
     with conn.cursor() as cur:
@@ -750,6 +897,39 @@ def import_release_via_upsert(conn, csv_dir: Path) -> int:
         cur.execute("CREATE INDEX ON release_staging (id)")
         cur.execute("ANALYZE release_staging")
 
+    # Pinned-release protection (#424). Everything here is read-only or
+    # temp-table work, and it runs BEFORE the child TRUNCATE below on purpose:
+    # an abort past that point would leave the release-full / children-empty
+    # state of #298 in prod, so the guard has to be the last thing that can
+    # still say no.
+    keep_ids = keep_release_ids or set()
+    pinned_missing = 0
+    if keep_ids:
+        stage_keep_release_ids(conn, keep_ids)
+        pinned_present, pinned_missing = count_pins_missing_from_dump(conn)
+        logger.info(
+            "  pinned releases: %d in cache, %d absent from this dump",
+            pinned_present,
+            pinned_missing,
+        )
+        reason = evaluate_pin_shortfall(
+            pinned_present=pinned_present,
+            pinned_missing=pinned_missing,
+            max_ratio=resolve_max_pin_shortfall_ratio(),
+        )
+        if reason:
+            with conn.cursor() as cur:
+                cur.execute("DROP TABLE release_staging")
+                cur.execute("DROP TABLE IF EXISTS release_keep_ids")
+            conn.commit()
+            raise PinnedReleaseShortfallError(reason)
+
+    logger.info("Truncating child tables of release ahead of upsert...")
+    with conn.cursor() as cur:
+        quoted = ", ".join(f'"{t}"' for t in _RELEASE_CHILD_TABLES)
+        cur.execute(f"TRUNCATE {quoted} CASCADE")
+    conn.commit()
+
     logger.info(f"Upserting {rows:,} releases (preserving artwork columns)...")
     with conn.cursor() as cur:
         # artwork_url, artwork_checked_at intentionally NOT in the SET
@@ -774,11 +954,25 @@ def import_release_via_upsert(conn, csv_dir: Path) -> int:
         )
         # Prune releases absent from the new dump. NOT EXISTS, not NOT IN — see
         # PRUNE_STALE_RELEASES_SQL for the incident rationale (WXYC/discogs-etl#298).
-        cur.execute(PRUNE_STALE_RELEASES_SQL)
+        # With a keep set, pinned releases are exempted (#424).
+        cur.execute(PRUNE_STALE_RELEASES_EXEMPT_PINS_SQL if keep_ids else PRUNE_STALE_RELEASES_SQL)
         pruned = cur.rowcount
+        retained = 0
+        if keep_ids and pinned_missing:
+            cur.execute(MARK_RETAINED_PINS_STALE_SQL)
+            retained = cur.rowcount
         cur.execute("DROP TABLE release_staging")
+        if keep_ids:
+            cur.execute("DROP TABLE IF EXISTS release_keep_ids")
     conn.commit()
     logger.info(f"  Upsert complete; pruned {pruned:,} releases not in new dump")
+    if retained:
+        logger.warning(
+            "  [#424] retained %d pinned release(s) this dump did not carry and marked "
+            "them stale (artwork_checked_at = NULL) so LML re-hydrates their children. "
+            "Expect ~0 here when the converter ran with --keep-release-ids.",
+            retained,
+        )
     return rows
 
 
@@ -1305,6 +1499,18 @@ def main():
         "Preserves the entity schema and alembic_version. Without this flag, "
         "a duplicate-key violation on the first table aborts the pipeline.",
     )
+    parser.add_argument(
+        "--keep-release-ids",
+        type=Path,
+        default=None,
+        help="Path to a newline-separated release_id allowlist (WXYC library pinned "
+        "overrides, written by run_pipeline.py::write_keep_release_ids). Those ids are "
+        "exempt from --base-only's stale-release prune, and the import refuses to start "
+        "when this dump would strand more than MAX_PIN_SHORTFALL_RATIO of the pins the "
+        "cache holds (WXYC/discogs-etl#424). Only the default (upsert) --base-only path "
+        "honours it: --truncate-existing wipes the release table wholesale, and "
+        "--tracks-only / --masters-only never prune releases.",
+    )
 
     args = parser.parse_args()
     csv_dir = args.csv_dir
@@ -1359,7 +1565,14 @@ def main():
         else:
             conn.close()
             upsert_conn = psycopg.connect(db_url)
-            upsert_rows = import_release_via_upsert(upsert_conn, csv_dir)
+            keep_release_ids = (
+                parse_keep_release_ids(args.keep_release_ids) or None
+                if args.keep_release_ids
+                else None
+            )
+            upsert_rows = import_release_via_upsert(
+                upsert_conn, csv_dir, keep_release_ids=keep_release_ids
+            )
             upsert_conn.close()
             total = upsert_rows + _import_tables_parallel(
                 db_url, csv_dir, parent_tables=[], child_tables=BASE_TABLES[1:]

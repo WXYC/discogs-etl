@@ -898,6 +898,10 @@ class TestXmlModeLibraryDbForwarding:
         with (
             patch.object(run_pipeline, "convert_and_filter", side_effect=fake_convert),
             patch.object(run_pipeline, "_run_database_build"),
+            # Seam A's allowlist read (#424) happens before the converter runs;
+            # stub it so this unit test stays off the network. Its own coverage
+            # is tests/unit/test_seam_a_keep_release_ids.py.
+            patch.object(run_pipeline, "prepare_converter_keep_release_ids", return_value=None),
             patch.object(run_pipeline, "parse_args", return_value=args),
         ):
             run_pipeline.main()
@@ -933,6 +937,10 @@ class TestXmlModeLibraryDbForwarding:
         with (
             patch.object(run_pipeline, "convert_and_filter", side_effect=fake_convert),
             patch.object(run_pipeline, "_run_database_build"),
+            # Seam A's allowlist read (#424) happens before the converter runs;
+            # stub it so this unit test stays off the network. Its own coverage
+            # is tests/unit/test_seam_a_keep_release_ids.py.
+            patch.object(run_pipeline, "prepare_converter_keep_release_ids", return_value=None),
             patch.object(run_pipeline, "parse_args", return_value=args),
         ):
             run_pipeline.main()
