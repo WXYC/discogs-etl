@@ -1662,7 +1662,35 @@ def _run_database_build(
         # tracks step below: that step never prunes releases.
         import_cmd.extend(["--keep-release-ids", str(keep_release_ids_path)])
         import_cmd.extend([str(csv_dir), db_url])
-        run_step_safe("Import base CSVs", import_cmd)
+        try:
+            run_step_safe("Import base CSVs", import_cmd)
+        except BaseException:
+            # The pinned-shortfall refusal (#424) is a DESIGNED abort, so it must
+            # not leave the cache worse than it found it. set_tables_unlogged ran
+            # just above and its matching set_tables_logged only runs near the end
+            # of a *successful* build, so without this the refusal would strand
+            # `release` and every child table UNLOGGED -- not crash-safe, and
+            # truncated outright by crash recovery. That is the exact residue the
+            # 2026-09-04 abort left: release_track/_artist/_video are still
+            # UNLOGGED in prod. Restoring here is what makes
+            # PinnedReleaseShortfallError's "left exactly as it was" claim true of
+            # the pipeline and not just of the import transaction.
+            #
+            # BaseException, not Exception: a KeyboardInterrupt or SIGTERM during
+            # a multi-hour import is at least as likely as a clean failure, and
+            # leaves the same un-crash-safe cache behind.
+            logger.warning(
+                "[#424] import step failed; restoring LOGGED on the pipeline tables "
+                "before aborting so the cache is left crash-safe"
+            )
+            try:
+                set_tables_logged(db_url)
+            except Exception:
+                # Never mask the real failure with a cleanup failure; the operator
+                # needs the import's error, and docs/migrations-runbook.md covers
+                # the manual SET LOGGED repair.
+                logger.exception("[#424] could not restore LOGGED; manual repair needed")
+            raise
         if state:
             state.mark_completed("import_csv")
             _save_state()

@@ -751,9 +751,21 @@ MAX_PIN_SHORTFALL_RATIO_ENV = "MAX_PIN_SHORTFALL_RATIO"
 class PinnedReleaseShortfallError(RuntimeError):
     """The incoming dump is missing too large a share of the pinned releases.
 
-    Raised before the import's first destructive statement, so the cache is
-    left exactly as it was — unlike #357's shortfall guard, which fires one
-    seam downstream of a prune that has already committed.
+    Raised before the import's first destructive statement, so no row is added,
+    deleted or changed — unlike #357's shortfall guard, which fires one seam
+    downstream of a prune that has already committed.
+
+    Scoped claim, deliberately: "no row changed" is true of this process. It is
+    NOT true that the *database* is untouched, because the caller has already
+    reshaped it. ``run_pipeline._run_database_build`` calls
+    ``set_tables_unlogged`` immediately before invoking this script, and its
+    matching ``set_tables_logged`` only runs near the end of a successful build,
+    so this refusal used to strand ``release`` and every child table UNLOGGED —
+    the same un-crash-safe residue the 2026-09-04 abort left in prod. That caller
+    now restores LOGGED on any import failure before re-raising (#424 review), so
+    the state an operator finds after this error is the state they started with.
+    A direct ``import_csv.py`` invocation never touches persistence mode at all
+    and so was never affected.
     """
 
 
@@ -1519,6 +1531,43 @@ def main():
     if not csv_dir.exists():
         logger.error(f"CSV directory not found: {csv_dir}")
         sys.exit(1)
+
+    # Refuse an explicitly-requested allowlist file that isn't there, before
+    # anything connects or truncates (#424 review). parse_keep_release_ids
+    # returns an empty set for a nonexistent path -- deliberately, so that "no
+    # override file" and "empty override file" read alike -- but below, an empty
+    # set collapses to None and a falsy keep_ids makes import_release_via_upsert
+    # run the UNGUARDED prune *and* skip the shortfall guard. Silently. A typo'd
+    # path, or a parent's tempfile.mkdtemp() dir this child cannot see (TMPDIR is
+    # redirected onto the EBS $WORK_DIR on the rebuild host), would then
+    # reproduce 2026-09-04 exactly while looking protected.
+    #
+    # scripts/dedup_releases.py already refuses this at its own seam; the seam
+    # that actually caused the incident must not be the lenient one. An existing
+    # but empty file is still fine -- that is a real state (no pins yet), and it
+    # is distinguishable from missing precisely because the file exists.
+    if args.keep_release_ids and not args.keep_release_ids.exists():
+        logger.error("Keep-release-ids file not found: %s", args.keep_release_ids)
+        sys.exit(1)
+
+    # --truncate-existing takes the _import_tables_parallel branch, which never
+    # parses the allowlist, never stages release_keep_ids and never runs the
+    # shortfall guard -- while _truncate_tables wipes `release` wholesale. Pins
+    # survive that path only if Seam A put them in the CSVs, and nothing on this
+    # side of the pipe verifies that it did. Accepting the flag silently let a
+    # rebuild destroy every pin with the protective flag apparently applied, so
+    # say it out loud rather than refuse: the combination is reachable from
+    # run_pipeline's own truncate mode, and a warning that names both missing
+    # protections is more use to an operator than an abort they will re-run with
+    # the flag dropped.
+    if args.keep_release_ids and args.truncate_existing and not args.masters_only:
+        logger.warning(
+            "--truncate-existing ignores --keep-release-ids (%s): this path wipes "
+            "`release` wholesale, so neither the prune pin-exemption nor the "
+            "pinned-shortfall guard is active. Pin retention depends entirely on "
+            "the converter having emitted them (Seam A). See WXYC/discogs-etl#424.",
+            args.keep_release_ids,
+        )
 
     logger.info("Connecting to %s", redact_dsn(db_url))
     conn = psycopg.connect(db_url)
