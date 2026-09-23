@@ -1671,7 +1671,7 @@ PRUNE_COPY_TABLES = [
     (
         "release",
         "new_release",
-        "id, title, release_year, country, artwork_url, released, format, master_id, artwork_checked_at, not_found",
+        "id, title, release_year, country, artwork_url, released, format, master_id, artwork_checked_at, not_found, status, notes, data_quality",
         "id",
     ),
     (
@@ -1774,6 +1774,9 @@ COPY_TABLE_SPEC = [
             "master_id",
             "artwork_checked_at",
             "not_found",
+            "status",
+            "notes",
+            "data_quality",
         ],
     ),
     (

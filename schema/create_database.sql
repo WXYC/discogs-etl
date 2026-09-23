@@ -63,7 +63,15 @@ CREATE TABLE IF NOT EXISTS release (
     format              text,              -- normalized format category: 'Vinyl', 'CD', etc.
     master_id           integer,           -- Discogs master ID; used by dedup partitioning, persists post-swap (see DEDUP_TABLES in scripts/dedup_releases.py)
     artwork_checked_at  timestamptz,       -- WXYC/discogs-etl#239. NULL = never asked, set = LML asked Discogs at lookup time. LML's predicate honors this so genuinely-imageless releases aren't refetched. Index below covers LML#221's never-asked drain.
-    not_found           boolean NOT NULL DEFAULT FALSE   -- WXYC/library-metadata-lookup#510. Tombstone marker for Discogs 404s on get_release. LML's read short-circuits on TRUE; rebuild/UPSERT paths clear to FALSE on fresh data. Mirrored in alembic/versions/0010_release_not_found.py.
+    not_found           boolean NOT NULL DEFAULT FALSE,  -- WXYC/library-metadata-lookup#510. Tombstone marker for Discogs 404s on get_release. LML's read short-circuits on TRUE; rebuild/UPSERT paths clear to FALSE on fresh data. Mirrored in alembic/versions/0010_release_not_found.py.
+    -- The three Discogs release qualifiers (WXYC/discogs-etl#428). The converter
+    -- has always emitted them in release.csv; the import used to drop them. All
+    -- three are nullable with no default so an older release.csv that lacks the
+    -- columns still imports, leaving them NULL. Mirrored in
+    -- alembic/versions/0016_release_status_notes_dq.py.
+    status              text,              -- Discogs editorial state: 'Accepted', 'Draft', 'Deleted'.
+    notes               text,              -- Discogs freeform release note; often records reissue provenance in prose. Weak and unstructured — never a discriminator on its own.
+    data_quality        text               -- Discogs's own confidence rating for the record: 'Correct', 'Needs Vote', 'Entirely Incorrect', ...
 );
 
 -- Partial index for LML#221's never-asked top-up drain (WXYC/discogs-etl#239).

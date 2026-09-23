@@ -420,7 +420,7 @@ DEDUP_TABLES: list[tuple[str, str, str, str]] = [
     (
         "release",
         "new_release",
-        "id, title, release_year, country, artwork_url, released, format, master_id, artwork_checked_at, not_found",
+        "id, title, release_year, country, artwork_url, released, format, master_id, artwork_checked_at, not_found, status, notes, data_quality",
         "id",
     ),
     (
