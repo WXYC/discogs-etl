@@ -109,6 +109,18 @@ BASE_TABLES: list[TableConfig] = [
         "required": ["id", "title"],
         "transforms": {"format": normalize_format},
         "unique_key": ["id"],
+        # The three Discogs release qualifiers (WXYC/discogs-etl#428). The
+        # converter's writer has always emitted ``id, status, title, country,
+        # released, notes, data_quality, master_id, format``, so these three
+        # were produced on every run and dropped here.
+        #
+        # OPTIONAL, not in ``csv_columns`` above, for the #204 reason: a
+        # ``release.csv`` from a converter that predates them would otherwise
+        # fail the "Missing columns" header check and write ZERO rows — and on
+        # the default ``import_release_via_upsert`` path zero rows is not a
+        # soft failure, it raises rather than DELETE every release. Absent
+        # columns fall through to NULL (no DB-side default).
+        "optional_csv_columns": ["status", "notes", "data_quality"],
     },
     {
         "csv_file": "release_artist.csv",
@@ -886,6 +898,10 @@ def import_release_via_upsert(conn, csv_dir: Path, keep_release_ids: set[int] | 
         required_columns=release_config["required"],
         transforms=release_config["transforms"],
         unique_key=release_config.get("unique_key"),
+        # Without this the qualifier columns (#428) would never leave the CSV:
+        # release_staging is LIKE release so it has the columns, but import_csv
+        # only COPYs an optional column when it is told the column is optional.
+        optional_csv_columns=release_config.get("optional_csv_columns"),
     )
 
     # Safety floor: refuse to apply an empty rebuild against a populated
@@ -951,17 +967,32 @@ def import_release_via_upsert(conn, csv_dir: Path, keep_release_ids: set[int] | 
         # authoritative, so any prior LML 404 tombstone clears here.
         # Without this, a tombstoned id would survive every rebuild and
         # stay unreachable until LML's admin recovery endpoint deletes it.
+        #
+        # status / notes / data_quality (#428) are in both lists for the same
+        # "the dump is authoritative" reason: they are purely dump-derived,
+        # unlike the artwork columns above, which LML back-patches at runtime.
+        # A legacy CSV lacking them COPYs NULL into release_staging and so
+        # sets NULL here, which is the correct reading of a dump that does not
+        # carry the field.
         cur.execute(
             """
-            INSERT INTO release (id, title, country, released, format, master_id, not_found)
-            SELECT id, title, country, released, format, master_id, FALSE FROM release_staging
+            INSERT INTO release (
+                id, title, country, released, format, master_id, not_found,
+                status, notes, data_quality
+            )
+            SELECT id, title, country, released, format, master_id, FALSE,
+                   status, notes, data_quality
+            FROM release_staging
             ON CONFLICT (id) DO UPDATE SET
-                title     = EXCLUDED.title,
-                country   = EXCLUDED.country,
-                released  = EXCLUDED.released,
-                format    = EXCLUDED.format,
-                master_id = EXCLUDED.master_id,
-                not_found = EXCLUDED.not_found
+                title        = EXCLUDED.title,
+                country      = EXCLUDED.country,
+                released     = EXCLUDED.released,
+                format       = EXCLUDED.format,
+                master_id    = EXCLUDED.master_id,
+                not_found    = EXCLUDED.not_found,
+                status       = EXCLUDED.status,
+                notes        = EXCLUDED.notes,
+                data_quality = EXCLUDED.data_quality
             """
         )
         # Prune releases absent from the new dump. NOT EXISTS, not NOT IN — see
