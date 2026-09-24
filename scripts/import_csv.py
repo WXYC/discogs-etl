@@ -12,7 +12,7 @@ import logging
 import os
 import re
 import sys
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import TypedDict
 
@@ -52,6 +52,27 @@ def extract_year(released: str | None) -> str | None:
     if released and YEAR_RE.match(released):
         return released[:4]
     return None
+
+
+def read_csv_header(csv_path: Path) -> list[str]:
+    """Return a CSV's header row, or ``[]`` for an empty/headerless file."""
+    with open(csv_path, encoding="utf-8", errors="replace") as f:
+        return next(csv.reader(f), None) or []
+
+
+def present_optional_columns(
+    header: Sequence[str], optional_csv_columns: list[str] | None
+) -> list[str]:
+    """Which of ``optional_csv_columns`` this CSV's header actually carries.
+
+    Shared by ``import_csv`` (which uses it to widen the COPY column list) and
+    ``import_release_via_upsert`` (which uses it to decide what its UPSERT is
+    allowed to overwrite). Keeping one definition matters: if the two ever
+    disagreed about whether a column was carried, the upsert would either
+    write NULL over data the CSV never spoke about, or refuse to refresh a
+    column the CSV did carry.
+    """
+    return [col for col in (optional_csv_columns or []) if col in header]
 
 
 def count_tracks_from_csv(csv_path: Path) -> dict[int, int]:
@@ -467,7 +488,7 @@ def import_csv(
         # the duration of this call. Older converters that don't emit
         # them get the legacy behavior (PG defaults populate the
         # absent columns).
-        present_optional = [col for col in (optional_csv_columns or []) if col in header]
+        present_optional = present_optional_columns(header, optional_csv_columns)
         if present_optional:
             csv_columns = list(csv_columns) + present_optional
             db_columns = list(db_columns) + present_optional
@@ -968,31 +989,39 @@ def import_release_via_upsert(conn, csv_dir: Path, keep_release_ids: set[int] | 
         # Without this, a tombstoned id would survive every rebuild and
         # stay unreachable until LML's admin recovery endpoint deletes it.
         #
-        # status / notes / data_quality (#428) are in both lists for the same
-        # "the dump is authoritative" reason: they are purely dump-derived,
-        # unlike the artwork columns above, which LML back-patches at runtime.
-        # A legacy CSV lacking them COPYs NULL into release_staging and so
-        # sets NULL here, which is the correct reading of a dump that does not
-        # carry the field.
+        # status / notes / data_quality (#428) are dump-derived, so a dump that
+        # carries them is authoritative for them — including for a row whose
+        # cell is empty, which means "Discogs has no value here" and must
+        # clear a stale one. But only the columns THIS dump carries may be
+        # written. release_staging is LIKE release, so the qualifier columns
+        # exist and hold NULL whether or not the CSV had them; naming them
+        # unconditionally would write NULL over every populated row on a
+        # rebuild from an older release.csv, silently, and contradict 0016's
+        # "a NULL means this row predates #428" invariant.
+        #
+        # Hence the SET list is built from the header rather than fixed.
+        # COALESCE(EXCLUDED.x, release.x) would be smaller but collapses the
+        # two cases the column list keeps apart — an emptied `notes` could
+        # then never be cleared, pinning a note Discogs has since removed.
+        # Same shape as the narrowing `WHERE artist.not_found = TRUE` on the
+        # artist stub upsert below.
+        carried = present_optional_columns(
+            read_csv_header(csv_path), release_config.get("optional_csv_columns")
+        )
+        insert_cols = ["id", "title", "country", "released", "format", "master_id", "not_found"]
+        # `not_found` is cleared to FALSE rather than read from the dump:
+        # a fresh dump retires any prior LML 404 tombstone (LML#510).
+        select_exprs = ["id", "title", "country", "released", "format", "master_id", "FALSE"]
+        update_cols = ["title", "country", "released", "format", "master_id", "not_found"]
+        set_clause = ",\n                ".join(
+            f"{col} = EXCLUDED.{col}" for col in (*update_cols, *carried)
+        )
         cur.execute(
-            """
-            INSERT INTO release (
-                id, title, country, released, format, master_id, not_found,
-                status, notes, data_quality
-            )
-            SELECT id, title, country, released, format, master_id, FALSE,
-                   status, notes, data_quality
-            FROM release_staging
+            f"""
+            INSERT INTO release ({", ".join((*insert_cols, *carried))})
+            SELECT {", ".join((*select_exprs, *carried))} FROM release_staging
             ON CONFLICT (id) DO UPDATE SET
-                title        = EXCLUDED.title,
-                country      = EXCLUDED.country,
-                released     = EXCLUDED.released,
-                format       = EXCLUDED.format,
-                master_id    = EXCLUDED.master_id,
-                not_found    = EXCLUDED.not_found,
-                status       = EXCLUDED.status,
-                notes        = EXCLUDED.notes,
-                data_quality = EXCLUDED.data_quality
+                {set_clause}
             """
         )
         # Prune releases absent from the new dump. NOT EXISTS, not NOT IN — see

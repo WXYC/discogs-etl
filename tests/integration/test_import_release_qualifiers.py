@@ -175,6 +175,47 @@ class TestUpsertPathCarriesQualifiers(_FreshCache):
         assert rows == len(MODERN_ROWS)
         assert self._qualifiers() == {rid: (None, None, None) for rid, *_ in MODERN_ROWS}
 
+    def test_legacy_dump_does_not_clobber_previously_populated_qualifiers(self, tmp_path) -> None:
+        """The UPDATE branch of the same legacy case — and the one with teeth.
+
+        The test above runs against an empty ``release``, so every row takes
+        the INSERT branch and it passes whether the upsert preserves or
+        clobbers. This one pre-seeds a row that a *modern* dump already
+        populated, then feeds a six-column CSV over it.
+
+        ``release_staging`` is ``LIKE release``, so the qualifier columns exist
+        and hold NULL whether or not the CSV carried them. A SET list that
+        names them unconditionally therefore writes NULL over every populated
+        row — silently, and in direct contradiction of the invariant 0016's
+        docstring states: a NULL means "this row predates #428", not "Discogs
+        had no value". The SET list must be built from the columns the dump
+        actually carries.
+        """
+        conn = psycopg.connect(self.db_url)
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO release (id, title, status, notes, data_quality) "
+                "VALUES (9201, 'DOGA', 'Accepted', 'Reissue of the 2013 Sonamos LP.', 'Correct')"
+            )
+        conn.commit()
+        conn.close()
+
+        _write_legacy_csv(tmp_path)
+        conn = psycopg.connect(self.db_url)
+        import_release_via_upsert(conn, tmp_path)
+        conn.close()
+
+        assert self._qualifiers()[9201] == (
+            "Accepted",
+            "Reissue of the 2013 Sonamos LP.",
+            "Correct",
+        ), (
+            "A release.csv lacking the qualifier columns wrote NULL over a row a "
+            "previous rebuild had populated. A dump that does not carry a field "
+            "says nothing about it; only a dump that carries it and leaves the "
+            "cell empty means 'Discogs has no value here'."
+        )
+
 
 class TestImportCsvPathCarriesQualifiers(_FreshCache):
     """The direct ``import_csv`` COPY, driven by the ``release`` table config."""

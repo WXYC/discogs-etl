@@ -39,6 +39,14 @@ No backfill runs here. Existing rows stay NULL until the next rebuild carries
 values in; a NULL therefore means "this row predates #428", not "Discogs had
 no value".
 
+That invariant is enforced on the write side rather than merely asserted here:
+``import_release_via_upsert`` builds its ``ON CONFLICT DO UPDATE SET`` list
+from the columns the incoming ``release.csv`` actually carries, so a rebuild
+from an older dump leaves a populated row alone instead of writing NULL over
+it. A dump that *does* carry the column is authoritative for it, empty cell
+included — an emptied ``notes`` clears. Pinned by
+``tests/integration/test_import_release_qualifiers.py::TestUpsertPathCarriesQualifiers``.
+
 Dual-write convention
 ---------------------
 
