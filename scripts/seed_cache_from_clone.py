@@ -109,6 +109,11 @@ _CONFLICT_TARGET = {
     "artist_name_variation": "artist_id, name",
 }
 
+# Conflict targets that are not the table's primary key -- the only ones
+# where ON CONFLICT DO NOTHING can collapse source-side duplicates, and so
+# the only ones whose dry-run plan must count DISTINCT.
+_NON_PK_CONFLICT = frozenset({"artist_name_variation"})
+
 # Freshness tables that are seeded FRESH rather than copied from the clone: the
 # clone's cache_metadata.cached_at is nullable and carries NULLs, which would
 # violate prod's NOT NULL on a straight copy — and a vintage cached_at would
@@ -279,8 +284,13 @@ def _dry_run_counts(source_conn, spec, new_ids: set[int], pk_table: str) -> dict
             # for -- a plain count(*) overstates the plan and cannot be
             # reconciled with the real run's output. (Still an upper bound:
             # rows already on the target are also skipped.)
+            # DISTINCT only where the conflict target is not the primary
+            # key: on release/cache_metadata/artist it keys on the PK, where
+            # count(DISTINCT pk) equals count(*) by construction and only
+            # buys a sort. artist_name_variation is the one table where
+            # source-side duplicates exist to be collapsed.
             conflict = _CONFLICT_TARGET.get(table)
-            counted = f"DISTINCT ({conflict})" if conflict else "*"
+            counted = f"DISTINCT ({conflict})" if conflict and table in _NON_PK_CONFLICT else "*"
             cur.execute(
                 f"SELECT count({counted}) FROM {table} WHERE {filter_col} = ANY({array_literal})"
             )

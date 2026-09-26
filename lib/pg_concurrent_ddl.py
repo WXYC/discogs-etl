@@ -216,10 +216,14 @@ def _drop_invalid_index_if_present(conn: psycopg.Connection, index_name: str) ->
         )
         if cur.fetchone() is None:
             return False
-        # DROP INDEX takes AccessExclusive on the index itself but not on
-        # the underlying table; safe to run on a live cache because the
-        # index is INVALID and therefore not used for query planning.
-        cur.execute(f"DROP INDEX IF EXISTS {index_name}")
+        # CONCURRENTLY because a plain DROP INDEX takes ACCESS EXCLUSIVE on
+        # the *table*, not merely on the index -- so on a live cache it would
+        # queue every reader and writer of that table behind it, which is the
+        # stall class this module exists to avoid (WXYC/discogs-etl#286). The
+        # invalid index is still being maintained on every write, so this is
+        # reached exactly when the table is busy. Callers are autocommit by
+        # contract (see _connection_in_transaction), which CONCURRENTLY needs.
+        cur.execute(f"DROP INDEX CONCURRENTLY IF EXISTS {index_name}")
     logger.warning(
         "Dropped INVALID leftover index %s before re-running CONCURRENTLY build "
         "(prior CREATE INDEX CONCURRENTLY likely interrupted)",
