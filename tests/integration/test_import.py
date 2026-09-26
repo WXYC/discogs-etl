@@ -30,6 +30,7 @@ populate_release_year = _ic.populate_release_year
 _import_tables = _ic._import_tables
 TABLES = _ic.TABLES
 BASE_TABLES = _ic.BASE_TABLES
+ARTIST_CHILD_KEYS = _ic.ARTIST_CHILD_KEYS
 TRACK_TABLES = _ic.TRACK_TABLES
 VIDEO_TABLES = _ic.VIDEO_TABLES
 
@@ -1761,6 +1762,62 @@ class TestImportArtistChildrenIsIdempotent:
         conn = psycopg.connect(self.db_url)
         import_artist_details(conn, CSV_DIR)
         conn.close()
+
+    def test_an_unmigrated_database_fails_with_an_actionable_error(self) -> None:
+        """A missing 0017 must name 0017, not just say 42P10.
+
+        Only ``rebuild-cache.sh`` runs ``alembic upgrade head``;
+        ``run_pipeline.py`` never does. So a hand-restarted import, or a dev
+        volume that predates the revision, reaches this merge hours in and
+        dies at the artist step. Postgres's own message
+        (``there is no unique or exclusion constraint matching the ON
+        CONFLICT specification``) names neither the revision nor the issue,
+        and ``CREATE TABLE IF NOT EXISTS`` cannot repair it -- so an operator
+        reading the raw error has no next step.
+        """
+        conn = psycopg.connect(self.db_url, autocommit=True)
+        with conn.cursor() as cur:
+            for table in ARTIST_CHILD_TABLES:
+                cur.execute(
+                    f"ALTER TABLE {table} DROP CONSTRAINT IF EXISTS "
+                    f"{table}_{'_'.join(ARTIST_CHILD_KEYS[table])}_key"
+                )
+        conn.close()
+
+        conn = psycopg.connect(self.db_url)
+        with pytest.raises(RuntimeError) as excinfo:
+            import_artist_details(conn, CSV_DIR)
+        conn.close()
+
+        message = str(excinfo.value)
+        assert "0017_artist_child_unique" in message
+        assert "alembic upgrade head" in message
+        assert "#433" in message
+
+    def test_the_stage_drop_cannot_reach_a_permanent_table(self) -> None:
+        """The pre-CREATE ``DROP TABLE IF EXISTS`` must be pg_temp-scoped.
+
+        On the first pass through a table there is no temp entry yet, so an
+        unqualified stage name resolves against ``public`` -- and a permanent
+        table that happens to share the name would be dropped without a word.
+        """
+        conn = psycopg.connect(self.db_url, autocommit=True)
+        with conn.cursor() as cur:
+            cur.execute("CREATE TABLE public._stage_artist_alias (canary int)")
+            cur.execute("INSERT INTO public._stage_artist_alias VALUES (1)")
+        conn.close()
+
+        self._import()
+
+        conn = psycopg.connect(self.db_url)
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+                "WHERE n.nspname = 'public' AND c.relname = '_stage_artist_alias'"
+            )
+            survived = cur.fetchone()[0]
+        conn.close()
+        assert survived == 1, "the import dropped a permanent public table"
 
     def test_a_second_import_adds_no_rows(self) -> None:
         """The regression guard: rebuild twice against one dump, same counts."""

@@ -113,6 +113,15 @@ def _refuse_on_duplicates(conn: psycopg.Connection) -> None:
     with conn.cursor() as cur:
         for table, key in ARTIST_CHILD_KEYS.items():
             columns = ", ".join(key)
+            # Probe before counting. The exact surplus needs a full scan plus
+            # an aggregate over ~4M rows on artist_name_variation, and the
+            # runbook's retry loop pays it per iteration -- including for
+            # tables already constrained by a partly-applied run, which
+            # cannot have duplicates at all. The probe stops at the first
+            # duplicate; only a table that has one pays for the count.
+            cur.execute(f"SELECT 1 FROM {table} GROUP BY {columns} HAVING count(*) > 1 LIMIT 1")
+            if cur.fetchone() is None:
+                continue
             cur.execute(f"SELECT count(*) - count(DISTINCT ({columns})) FROM {table}")
             surplus = cur.fetchone()[0]  # type: ignore[index]
             if surplus:

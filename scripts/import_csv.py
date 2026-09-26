@@ -1314,9 +1314,11 @@ def _import_artist_children(conn, csv_dir: Path, artist_ids: set[int]) -> int:
         )
 
         with conn.cursor() as cur:
-            # Only ever a leftover from an aborted run on this same session;
-            # the name is not one any real table uses.
-            cur.execute(f"DROP TABLE IF EXISTS {stage}")
+            # Only ever a leftover from an aborted run on this same session.
+            # pg_temp-qualified: before the CREATE below there is no temp
+            # entry, so an unqualified name would resolve against public and
+            # a same-named permanent table would be silently dropped.
+            cur.execute(f"DROP TABLE IF EXISTS pg_temp.{stage}")
             cur.execute(f"CREATE TEMP TABLE {stage} (LIKE {table} INCLUDING DEFAULTS)")
         import_csv(
             conn,
@@ -1327,14 +1329,37 @@ def _import_artist_children(conn, csv_dir: Path, artist_ids: set[int]) -> int:
             table_config["required"],
             table_config["transforms"],
             unique_key=table_config.get("unique_key"),
+            # Forwarded even though no ARTIST_TABLES entry uses them yet:
+            # _import_tables forwarded both, and declaring a new converter
+            # column optional is this repo's forward-compatibility pattern
+            # (#218, #293). Dropped here, an optional_unique_key would widen
+            # nothing while the DB conflict target stayed narrow -- and the
+            # merge below would then discard rows the wider key was added to
+            # keep.
+            optional_csv_columns=table_config.get("optional_csv_columns"),
+            optional_unique_key=table_config.get("optional_unique_key"),
             id_filter=artist_ids if filter_column else None,
             id_filter_column=filter_column,
         )
         with conn.cursor() as cur:
-            cur.execute(
-                f"INSERT INTO {table} ({columns}) SELECT {columns} FROM {stage} "
-                f"ON CONFLICT ({conflict_target}) DO NOTHING"
-            )
+            try:
+                cur.execute(
+                    f"INSERT INTO {table} ({columns}) SELECT {columns} FROM {stage} "
+                    f"ON CONFLICT ({conflict_target}) DO NOTHING"
+                )
+            except psycopg.errors.InvalidColumnReference as exc:
+                # 42P10: no unique index matches the conflict target. Only
+                # rebuild-cache.sh runs `alembic upgrade head`; run_pipeline.py
+                # does not, so a hand-restarted import or a stale local volume
+                # reaches here -- hours in, at the artist step -- with an error
+                # naming neither the revision nor the issue.
+                raise RuntimeError(
+                    f"{table} has no UNIQUE ({conflict_target}); this import needs "
+                    "alembic 0017_artist_child_unique (WXYC/discogs-etl#433). Run "
+                    "`alembic upgrade head` against this database and re-run. Note "
+                    "0017 refuses while duplicates remain -- see "
+                    "docs/dedup-artist-children-runbook.md."
+                ) from exc
             inserted = cur.rowcount
             cur.execute(f"DROP TABLE {stage}")
         conn.commit()
