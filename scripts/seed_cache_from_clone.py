@@ -96,7 +96,18 @@ _ARTIST_SPEC = [
 # Tables whose primary key lets us use ON CONFLICT ... DO NOTHING as a
 # belt-and-suspenders guard against a concurrent seed. Everything else is an
 # arbiter-less child, gated on the new-parent-id set.
-_CONFLICT_TARGET = {"release": "id", "cache_metadata": "release_id", "artist": "id"}
+#
+# artist_name_variation is the exception that is not a PK: WXYC/discogs-etl#433
+# gave it UNIQUE (artist_id, name), and a clone taken before that ticket's
+# dedupe carries the same ~4.8 copies of every row prod did. Seeding those
+# arbiter-less would raise 23505 and abort the whole seed. The duplicates are
+# byte-identical, so dropping them on arrival loses nothing.
+_CONFLICT_TARGET = {
+    "release": "id",
+    "cache_metadata": "release_id",
+    "artist": "id",
+    "artist_name_variation": "artist_id, name",
+}
 
 # Freshness tables that are seeded FRESH rather than copied from the clone: the
 # clone's cache_metadata.cached_at is nullable and carries NULLs, which would
@@ -261,7 +272,18 @@ def _dry_run_counts(source_conn, spec, new_ids: set[int], pk_table: str) -> dict
             counts[table] = 0
             continue
         with source_conn.cursor() as cur:
-            cur.execute(f"SELECT count(*) FROM {table} WHERE {filter_col} = ANY({array_literal})")
+            # Count what the real insert will let through, not what the source
+            # holds: tables with a _CONFLICT_TARGET go in under ON CONFLICT
+            # DO NOTHING, so source-side duplicates never land. Against a
+            # pre-dedupe clone -- the case artist_name_variation's entry exists
+            # for -- a plain count(*) overstates the plan and cannot be
+            # reconciled with the real run's output. (Still an upper bound:
+            # rows already on the target are also skipped.)
+            conflict = _CONFLICT_TARGET.get(table)
+            counted = f"DISTINCT ({conflict})" if conflict else "*"
+            cur.execute(
+                f"SELECT count({counted}) FROM {table} WHERE {filter_col} = ANY({array_literal})"
+            )
             counts[table] = cur.fetchone()[0]
     for table, _f, _c in spec:
         if table in _FRESH_SEED:

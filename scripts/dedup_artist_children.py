@@ -9,6 +9,8 @@ filesystem afterwards (a plain ``VACUUM`` would not). Holds the rebuild
 advisory lock throughout and bows out with exit 75 if a rebuild has it.
 
 Which row survives is a per-table decision -- see :data:`TIE_BREAK_TERMS`.
+The keys come from ``import_csv.ARTIST_CHILD_KEYS``, shared with the loader
+and with ``alembic/versions/0017_artist_child_unique.py``.
 ``alembic/versions/0009_cache_metadata_unique.py`` is the in-repo precedent
 for the shape. Operator procedure and expected prod counts:
 ``docs/dedup-artist-children-runbook.md``.
@@ -43,7 +45,7 @@ from lib.rebuild_lock import (  # noqa: E402
     release_rebuild_lock,
     try_acquire_rebuild_lock,
 )
-from scripts.import_csv import ARTIST_TABLES  # noqa: E402
+from scripts.import_csv import ARTIST_CHILD_KEYS  # noqa: E402
 
 logger = logging.getLogger(__name__)
 _STEP = {"step": "dedup_artist_children"}
@@ -64,25 +66,10 @@ DEDUPE_ATTEMPTS = 5
 DEDUPE_BACKOFF_SECONDS: tuple[float, ...] = (5.0, 15.0, 45.0, 90.0)
 
 
-def _artist_child_keys() -> dict[str, tuple[str, ...]]:
-    """Map each ``artist_*`` child table to its key, in database columns.
-
-    Derived from ``import_csv.ARTIST_TABLES``, not restated, so this script
-    and the UNIQUE constraint that follows cannot drift apart. CSV names are
-    not always column names (``artist_member``'s key is ``group_artist_id,
-    member_artist_id`` there, ``artist_id, member_id`` here), so the mapping
-    goes through ``csv_columns -> db_columns``.
-    """
-    return {
-        config["table"]: tuple(
-            dict(zip(config["csv_columns"], config["db_columns"]))[column]
-            for column in config["unique_key"]
-        )
-        for config in ARTIST_TABLES
-    }
-
-
-ARTIST_CHILD_KEYS: dict[str, tuple[str, ...]] = _artist_child_keys()
+# ARTIST_CHILD_KEYS is imported above rather than derived here: it lives
+# beside ARTIST_TABLES in import_csv, where the loader's ON CONFLICT target
+# and alembic/versions/0017_artist_child_unique.py's UNIQUE constraint read
+# it too. One constant, three consumers -- a second derivation could drift.
 
 #: Rank terms ahead of ctid, per table; ``{t}`` is the row alias. The
 #: minimum rank survives and ``false < true``, so each term names the

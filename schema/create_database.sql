@@ -179,24 +179,28 @@ CREATE TABLE IF NOT EXISTS artist (
 CREATE TABLE IF NOT EXISTS artist_alias (
     artist_id       integer NOT NULL REFERENCES artist(id) ON DELETE CASCADE,
     alias_id        integer,
-    alias_name      text NOT NULL
+    alias_name      text NOT NULL,
+    UNIQUE (artist_id, alias_name)   -- WXYC/discogs-etl#433. Mirrors alembic/versions/0017_artist_child_unique.py. alias_id is out of the key on purpose: the ETL never loads it, so it is NULL on dump rows and set on LML's.
 );
 
 CREATE TABLE IF NOT EXISTS artist_name_variation (
     artist_id       integer NOT NULL REFERENCES artist(id) ON DELETE CASCADE,
-    name            text NOT NULL
+    name            text NOT NULL,
+    UNIQUE (artist_id, name)         -- WXYC/discogs-etl#433. Mirrors alembic/versions/0017_artist_child_unique.py.
 );
 
 CREATE TABLE IF NOT EXISTS artist_member (
     artist_id       integer NOT NULL REFERENCES artist(id) ON DELETE CASCADE,
     member_id       integer NOT NULL,
     member_name     text NOT NULL,
-    active          boolean DEFAULT true
+    active          boolean DEFAULT true,
+    UNIQUE (artist_id, member_id)    -- WXYC/discogs-etl#433. Mirrors alembic/versions/0017_artist_child_unique.py. member_name is functionally dependent on member_id and stays out of the key.
 );
 
 CREATE TABLE IF NOT EXISTS artist_url (
     artist_id       integer NOT NULL REFERENCES artist(id) ON DELETE CASCADE,
-    url             text NOT NULL
+    url             text NOT NULL,
+    UNIQUE (artist_id, url)          -- WXYC/discogs-etl#433. Mirrors alembic/versions/0017_artist_child_unique.py. Widest key measured on prod is 1017 bytes, well inside the btree index-tuple limit.
 );
 
 -- ============================================
@@ -286,11 +290,12 @@ CREATE INDEX IF NOT EXISTS idx_release_track_release_id ON release_track(release
 CREATE INDEX IF NOT EXISTS idx_release_track_artist_release_id ON release_track_artist(release_id);
 CREATE INDEX IF NOT EXISTS idx_release_video_release_id ON release_video(release_id);
 
--- Artist detail indexes
-CREATE INDEX IF NOT EXISTS idx_artist_alias_artist_id ON artist_alias(artist_id);
-CREATE INDEX IF NOT EXISTS idx_artist_name_variation_artist_id ON artist_name_variation(artist_id);
-CREATE INDEX IF NOT EXISTS idx_artist_member_artist_id ON artist_member(artist_id);
-CREATE INDEX IF NOT EXISTS idx_artist_url_artist_id ON artist_url(artist_id);
+-- Artist detail indexes: none. The UNIQUE (artist_id, <key>) constraints
+-- declared above (WXYC/discogs-etl#433) index artist_id as their leading
+-- column, so the old idx_artist_*_artist_id indexes were strict prefixes and
+-- pure overhead -- 38 MB of it on artist_name_variation alone. 0017 drops them
+-- on existing databases; re-declaring them here would have the next rebuild
+-- recreate every one.
 
 -- Partial index on master_id: speeds the dedup partition scan AND, since
 -- WXYC/discogs-etl#412, LML's post-rebuild master_id sibling lookups

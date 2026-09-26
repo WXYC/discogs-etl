@@ -169,10 +169,27 @@ class TestCreateDatabase:
         assert expected_fk_tables.issubset(fk_tables)
 
     def test_no_unique_constraints_on_child_tables(self) -> None:
-        """Child tables must not have UNIQUE constraints (Python-level dedup handles this).
+        """The three *release-side* child tables must not have UNIQUE constraints.
 
-        UNIQUE constraints on text columns cause btree overflow when artist_name
-        exceeds ~900 bytes. Dedup is handled by import_csv.py's unique_key filtering.
+        For ``release_artist`` / ``release_label`` / ``release_track_artist``
+        the rebuild is the only writer, so ``import_csv.py``'s ``unique_key``
+        filtering sees every row that will ever be inserted and dedup is
+        cheaper in Python than as a database constraint.
+
+        The four ``artist_*`` child tables are the deliberate exception and
+        are absent from the roster below: WXYC/discogs-etl#433 gave each a
+        ``UNIQUE (artist_id, <key>)``. Python-level dedup cannot work there,
+        because library-metadata-lookup writes those tables live and an
+        import-time pass cannot see rows LML has already inserted — which is
+        how prod came to hold ~4.8 copies of every row. The database has to
+        enforce it, and the constraint doubles as the arbiter for the
+        loader's ``ON CONFLICT``.
+
+        On the btree limit this test used to cite as the reason: the figure
+        was ~900 bytes, and it is not the ceiling. PostgreSQL's index-tuple
+        limit is ~2704 bytes (a third of an 8 kB page), and prod holds a
+        1017-byte ``artist_url.url`` today — inside the real limit, outside
+        the one recorded here. Measured 2026-09-25 on #433.
         """
         conn = self._connect()
         with conn.cursor() as cur:

@@ -296,6 +296,31 @@ ARTIST_TABLES: list[TableConfig] = [
     },
 ]
 
+
+def _artist_child_keys() -> dict[str, tuple[str, ...]]:
+    """Map each ``artist_*`` child table to its uniqueness key, in DB columns.
+
+    Derived from :data:`ARTIST_TABLES` rather than restated, so the three
+    things that must agree cannot drift: this module's ``ON CONFLICT``
+    target, ``scripts/dedup_artist_children.py``'s DELETE, and the ``UNIQUE``
+    constraint in ``alembic/versions/0017_artist_child_unique.py``
+    (WXYC/discogs-etl#433). The mapping goes through ``csv_columns ->
+    db_columns`` because CSV names are not always column names:
+    ``artist_member``'s key is ``group_artist_id, member_artist_id`` in the
+    dump and ``artist_id, member_id`` in the table.
+    """
+    return {
+        config["table"]: tuple(
+            dict(zip(config["csv_columns"], config["db_columns"]))[column]
+            for column in config["unique_key"]
+        )
+        for config in ARTIST_TABLES
+    }
+
+
+ARTIST_CHILD_KEYS: dict[str, tuple[str, ...]] = _artist_child_keys()
+
+
 MASTER_TABLES: list[TableConfig] = [
     {
         "csv_file": "master.csv",
@@ -1245,6 +1270,79 @@ def _import_tables_parallel(
     return total
 
 
+def _import_artist_children(conn, csv_dir: Path, artist_ids: set[int]) -> int:
+    """Merge the four ``artist_*`` child CSVs, skipping keys already present.
+
+    Staged rather than COPYed straight in: alembic 0017 put ``UNIQUE
+    (artist_id, <key>)`` on all four tables (WXYC/discogs-etl#433) and the
+    monthly rebuild re-COPYs the whole dump, so a direct COPY would raise on
+    the first repeated key -- which is also what let prod accumulate ~4.8
+    copies of every row back when there was no key to raise on. ``CREATE
+    TEMP TABLE ... (LIKE t INCLUDING DEFAULTS)`` copies columns, types, NOT
+    NULLs and defaults but **not** constraints, so the stage still accepts
+    the dump's own duplicates and :func:`import_csv`'s header check,
+    artist-id filter and per-file dedup are reused verbatim. It is
+    deliberately not ``ON COMMIT DROP``: ``import_csv`` commits when its COPY
+    finishes, which would take the stage with it.
+
+    ``ON CONFLICT ... DO NOTHING`` rather than an anti-join, because LML
+    writes these tables live and can insert the same key between a ``NOT
+    EXISTS`` probe and the INSERT; only an arbiter makes that race a no-op.
+    ``DO NOTHING`` rather than ``DO UPDATE`` is what preserves the columns
+    only LML populates -- ``artist_alias.alias_id`` and
+    ``artist_member.active``, neither of which the dump carries, so an
+    upsert would overwrite real values with NULL and ``DEFAULT true``.
+
+    Returns rows actually inserted: zero for an unchanged dump.
+    """
+    total = 0
+    for table_config in ARTIST_TABLES:
+        csv_path = csv_dir / table_config["csv_file"]
+        if not csv_path.exists():
+            logger.warning(f"Skipping {table_config['csv_file']} (not found)")
+            continue
+
+        table = table_config["table"]
+        stage = f"_stage_{table}"
+        columns = ", ".join(table_config["db_columns"])
+        conflict_target = ", ".join(ARTIST_CHILD_KEYS[table])
+        # Same rule _import_tables applies: the first CSV column whose name
+        # carries 'artist_id' (plain on three tables, group_artist_id on
+        # artist_member).
+        filter_column = next(
+            (col for col in table_config["csv_columns"] if "artist_id" in col), None
+        )
+
+        with conn.cursor() as cur:
+            # Only ever a leftover from an aborted run on this same session;
+            # the name is not one any real table uses.
+            cur.execute(f"DROP TABLE IF EXISTS {stage}")
+            cur.execute(f"CREATE TEMP TABLE {stage} (LIKE {table} INCLUDING DEFAULTS)")
+        import_csv(
+            conn,
+            csv_path,
+            stage,
+            table_config["csv_columns"],
+            table_config["db_columns"],
+            table_config["required"],
+            table_config["transforms"],
+            unique_key=table_config.get("unique_key"),
+            id_filter=artist_ids if filter_column else None,
+            id_filter_column=filter_column,
+        )
+        with conn.cursor() as cur:
+            cur.execute(
+                f"INSERT INTO {table} ({columns}) SELECT {columns} FROM {stage} "
+                f"ON CONFLICT ({conflict_target}) DO NOTHING"
+            )
+            inserted = cur.rowcount
+            cur.execute(f"DROP TABLE {stage}")
+        conn.commit()
+        logger.info(f"  {table}: {inserted:,} new rows (existing keys left untouched)")
+        total += inserted
+    return total
+
+
 def import_artist_details(conn, csv_dir: Path) -> int:
     """Import artist detail tables from CSV.
 
@@ -1259,8 +1357,11 @@ def import_artist_details(conn, csv_dir: Path) -> int:
        staging table populated from a Python-deduplicated dict (last-
        value-wins on duplicate artist_id). Pre-filters CSV rows to those
        whose artist_id is in `artist_ids`.
-    4. Load `artist_alias`, `artist_name_variation`, and `artist_member`
-       via _import_tables, filtered to `artist_ids`.
+    4. Load `artist_alias`, `artist_name_variation`, `artist_member` and
+       `artist_url` via `_import_artist_children`, filtered to `artist_ids`:
+       a TEMP stage per table plus an `ON CONFLICT (artist_id, <key>) DO
+       NOTHING` merge, so a re-run against the same dump adds no rows and
+       LML's live writes survive (WXYC/discogs-etl#433).
 
     Contract on `_artist_profile`: the staging table has no PRIMARY KEY;
     uniqueness is guaranteed by the caller-side dict, which is
@@ -1369,7 +1470,7 @@ def import_artist_details(conn, csv_dir: Path) -> int:
     else:
         logger.info("No artist.csv found, skipping profile import")
 
-    total += _import_tables(conn, csv_dir, ARTIST_TABLES, artist_id_filter=artist_ids)
+    total += _import_artist_children(conn, csv_dir, artist_ids)
     return total
 
 

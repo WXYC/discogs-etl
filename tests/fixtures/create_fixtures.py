@@ -331,6 +331,74 @@ def create_release_image_csv() -> None:
     write_csv("release_image.csv", headers, rows)
 
 
+def create_artist_child_csvs() -> None:
+    """Create the four ``artist_*`` child CSVs that ``import_artist_details`` loads.
+
+    Shaped for WXYC/discogs-etl#433, which made those four tables UNIQUE on
+    ``(artist_id, <key>)`` and the loader ``ON CONFLICT``-idempotent. Three
+    properties are deliberate and load-bearing for the tests that read these
+    files:
+
+    * **An in-file duplicate per key-bearing file** (Autechre's ``Gescom``
+      alias, Stereolab's Lætitia Sadier membership) so the loader's existing
+      Python-side ``unique_key`` dedup is exercised, and so a run against a
+      row LML already wrote collapses to one row rather than two.
+    * **artist_id 999 appears in no ``release_artist`` row**, so every file
+      carries a row the ``artist_ids`` filter must drop — without it a
+      foreign-key violation would be the only thing standing between the
+      loader and importing artists outside the WXYC-filtered set.
+    * **artist_id 3 (DJ Unknown) appears in none of these files**, which
+      makes it the stand-in for an artist LML hydrated and the dump does not
+      mention: its children must survive an import that never sees them.
+    """
+    write_csv(
+        "artist_alias.csv",
+        ["artist_id", "alias_name"],
+        [
+            [1, "Gescom"],
+            [1, "Gescom"],  # in-file duplicate
+            [1, "Lego Feet"],
+            [2, "The Groop"],
+            [5, "Nilufer Yanya"],
+            [999, "Ghost Artist"],  # filtered: not in release_artist
+        ],
+    )
+    write_csv(
+        "artist_name_variation.csv",
+        ["artist_id", "name"],
+        [
+            [1, "AUTECHRE"],
+            [1, "Autechre (2)"],
+            [2, "Stereo Lab"],
+            [9, "Duke Ellington & His Orchestra"],
+            [13, "John Coltrane Quartet"],
+            [999, "Ghost Artist Variation"],
+        ],
+    )
+    write_csv(
+        "artist_member.csv",
+        ["group_artist_id", "member_artist_id", "member_name"],
+        [
+            [1, 101, "Sean Booth"],
+            [1, 102, "Rob Brown"],
+            [2, 103, "Lætitia Sadier"],
+            [2, 103, "Lætitia Sadier"],  # in-file duplicate
+            [999, 104, "Nobody At All"],
+        ],
+    )
+    write_csv(
+        "artist_url.csv",
+        ["artist_id", "url"],
+        [
+            [1, "https://autechre.ws/"],
+            [1, "https://bleep.com/artist/103/autechre"],
+            [2, "https://stereolab.co.uk/"],
+            [5, "https://niluferyanya.com/"],
+            [999, "https://example.invalid/ghost"],
+        ],
+    )
+
+
 def create_library_labels_csv() -> None:
     """Create library_labels.csv with WXYC label preferences.
 
@@ -502,6 +570,7 @@ def main() -> None:
     create_release_label_csv()
     create_release_video_csv()
     create_release_image_csv()
+    create_artist_child_csvs()
     create_library_labels_csv()
     create_label_hierarchy_csv()
     print()
