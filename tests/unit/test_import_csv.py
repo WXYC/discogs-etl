@@ -27,6 +27,15 @@ TableConfig = _ic.TableConfig
 _import_tables_parallel = _ic._import_tables_parallel
 import_artist_details = _ic.import_artist_details
 
+# 0017 is loaded by path: alembic/versions/ is not an importable package.
+_M0017_PATH = (
+    Path(__file__).parent.parent.parent / "alembic" / "versions" / "0017_artist_child_unique.py"
+)
+_m0017_spec = importlib.util.spec_from_file_location("alembic_0017", _M0017_PATH)
+assert _m0017_spec is not None and _m0017_spec.loader is not None
+_m0017 = importlib.util.module_from_spec(_m0017_spec)
+_m0017_spec.loader.exec_module(_m0017)
+
 FIXTURES_DIR = Path(__file__).parent.parent / "fixtures"
 CSV_DIR = FIXTURES_DIR / "csv"
 
@@ -1789,16 +1798,15 @@ class TestImportArtistDetailsFiltersById:
         mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
         mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
 
-        with patch.object(_ic, "_import_tables") as mock_import:
+        with patch.object(_ic, "_import_artist_children") as mock_import:
             mock_import.return_value = 1
             import_artist_details(mock_conn, tmp_path)
 
-        # _import_tables should be called with an artist_id_filter
+        # The child loader gets the artist-id snapshot, so rows for artists
+        # outside the WXYC-filtered set never reach the staging COPY.
         mock_import.assert_called_once()
-        call_kwargs = mock_import.call_args
-        assert "artist_id_filter" in call_kwargs[1] or (
-            len(call_kwargs[0]) > 3 and call_kwargs[0][3] is not None
-        )
+        args, kwargs = mock_import.call_args
+        assert {1} in (kwargs.get("artist_ids"), args[2] if len(args) > 2 else None)
 
 
 class TestImportArtistDetailsProfileCopy:
@@ -1848,7 +1856,7 @@ class TestImportArtistDetailsProfileCopy:
 
         mock_conn, mock_copy = self._setup_mock_conn(db_artist_ids=[1])
 
-        with patch.object(_ic, "_import_tables", return_value=0):
+        with patch.object(_ic, "_import_artist_children", return_value=0):
             import_artist_details(mock_conn, tmp_path)
 
         written = [c.args[0] for c in mock_copy.write_row.call_args_list]
@@ -1871,7 +1879,7 @@ class TestImportArtistDetailsProfileCopy:
 
         mock_conn, mock_copy = self._setup_mock_conn(db_artist_ids=[1])
 
-        with patch.object(_ic, "_import_tables", return_value=0):
+        with patch.object(_ic, "_import_artist_children", return_value=0):
             import_artist_details(mock_conn, tmp_path)
 
         written = [c.args[0] for c in mock_copy.write_row.call_args_list]
@@ -1891,7 +1899,7 @@ class TestImportArtistDetailsProfileCopy:
 
         mock_conn, mock_copy = self._setup_mock_conn(db_artist_ids=[1])
 
-        with patch.object(_ic, "_import_tables", return_value=0):
+        with patch.object(_ic, "_import_artist_children", return_value=0):
             with caplog_at_warning(_ic.logger.name) as caplog:
                 import_artist_details(mock_conn, tmp_path)
 
@@ -1918,7 +1926,7 @@ class TestImportArtistDetailsProfileCopy:
 
         mock_conn, mock_copy = self._setup_mock_conn(db_artist_ids=[1, 2, 3])
 
-        with patch.object(_ic, "_import_tables", return_value=0):
+        with patch.object(_ic, "_import_artist_children", return_value=0):
             import_artist_details(mock_conn, tmp_path)
 
         written = [c.args[0] for c in mock_copy.write_row.call_args_list]
@@ -1940,7 +1948,7 @@ class TestImportArtistDetailsProfileCopy:
 
         mock_conn, mock_copy = self._setup_mock_conn(db_artist_ids=[1])
 
-        with patch.object(_ic, "_import_tables", return_value=0):
+        with patch.object(_ic, "_import_artist_children", return_value=0):
             import_artist_details(mock_conn, tmp_path)
 
         cursor = mock_conn.cursor.return_value.__enter__.return_value
@@ -2000,6 +2008,56 @@ class TestReleasePruneAntiJoin:
         assert "not exists" in norm, f"prune must use a NOT EXISTS anti-join; SQL: {executed}"
         assert "create index" in norm and "release_staging" in norm, (
             f"release_staging must be indexed so the anti-join is fast; SQL: {executed}"
+        )
+
+
+class TestArtistChildKeysMatchMigration0017:
+    """One key mapping, three consumers (WXYC/discogs-etl#433).
+
+    ``scripts/import_csv.py`` owns ``ARTIST_CHILD_KEYS``; the loader's ``ON
+    CONFLICT`` target, ``scripts/dedup_artist_children.py``'s DELETE and
+    0017's UNIQUE constraint all read it. Drift between any two of them is a
+    silent failure: a constraint on one key pair and an ``ON CONFLICT`` on
+    another raises ``InvalidColumnReference`` at rebuild time, months after
+    the edit. Every expectation below is re-derived from ``ARTIST_TABLES``
+    inside the test rather than imported, so a hand-edited DDL string in
+    0017 fails here instead of on prod.
+    """
+
+    @staticmethod
+    def _expected_key(config: dict) -> tuple[str, ...]:
+        csv_to_db = dict(zip(config["csv_columns"], config["db_columns"]))
+        return tuple(csv_to_db[column] for column in config["unique_key"])
+
+    def test_loader_exposes_a_key_for_every_artist_child_table(self) -> None:
+        assert set(_ic.ARTIST_CHILD_KEYS) == {config["table"] for config in ARTIST_TABLES}
+
+    @pytest.mark.parametrize("config", ARTIST_TABLES, ids=lambda c: str(c["table"]))
+    def test_key_is_the_csv_unique_key_mapped_to_db_columns(self, config: dict) -> None:
+        assert _ic.ARTIST_CHILD_KEYS[config["table"]] == self._expected_key(config)
+
+    @pytest.mark.parametrize("config", ARTIST_TABLES, ids=lambda c: str(c["table"]))
+    def test_0017_constrains_exactly_that_key(self, config: dict) -> None:
+        table = config["table"]
+        key = ", ".join(self._expected_key(config))
+        assert f"ON {table} ({key})" in _m0017.CREATE_UNIQUE_INDEX_DDL[table]
+
+    @pytest.mark.parametrize("config", ARTIST_TABLES, ids=lambda c: str(c["table"]))
+    def test_0017_uses_postgres_default_constraint_naming(self, config: dict) -> None:
+        # The name must match what an inline ``UNIQUE (...)`` in
+        # schema/create_database.sql produces, or the two build paths drift
+        # apart in pg_indexes even though both are "correct".
+        table = config["table"]
+        expected = f"{table}_{'_'.join(self._expected_key(config))}_key"
+        assert _m0017.CONSTRAINT_NAMES[table] == expected
+        assert len(expected) <= 63, "PostgreSQL truncates identifiers past 63 bytes"
+
+    @pytest.mark.parametrize("config", ARTIST_TABLES, ids=lambda c: str(c["table"]))
+    def test_0017_drops_the_plain_artist_id_index_the_key_supersedes(self, config: dict) -> None:
+        table = config["table"]
+        assert _m0017.SUPERSEDED_INDEX_NAMES[table] == f"idx_{table}_artist_id"
+        assert self._expected_key(config)[0] == "artist_id", (
+            "the dropped index is only redundant because artist_id leads the new key"
         )
 
 

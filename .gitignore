@@ -20,3 +20,7 @@ artist_mappings.json
 !tests/fixtures/**/*.tsv
 worklog/
 .DS_Store
+
+# Written by the test suites (run_pipeline state + coverage data)
+.pipeline_state.json
+.coverage

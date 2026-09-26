@@ -1,6 +1,11 @@
 -- Enrich Discogs cache: restore dropped columns, add artist detail tables
 -- Run once against the existing database (post-migration 01).
--- Idempotent: safe to re-run.
+-- Idempotent: safe to re-run
+--
+-- The four idx_artist_*_artist_id indexes this file used to create were
+-- removed with alembic 0017, which replaced each with a UNIQUE index whose
+-- leading column is artist_id -- a strict superset. Re-creating them here
+-- would put back ~38 MB of dead weight that 0017 exists to drop..
 --
 -- Usage:
 --   psql -U postgres -d discogs -f 02_enrich_data.sql
@@ -47,13 +52,11 @@ CREATE TABLE IF NOT EXISTS artist_alias (
     alias_id   integer,
     alias_name text NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_artist_alias_artist_id ON artist_alias(artist_id);
 
 CREATE TABLE IF NOT EXISTS artist_name_variation (
     artist_id  integer NOT NULL REFERENCES artist(id) ON DELETE CASCADE,
     name       text NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_artist_name_variation_artist_id ON artist_name_variation(artist_id);
 
 CREATE TABLE IF NOT EXISTS artist_member (
     artist_id   integer NOT NULL REFERENCES artist(id) ON DELETE CASCADE,
@@ -61,12 +64,10 @@ CREATE TABLE IF NOT EXISTS artist_member (
     member_name text NOT NULL,
     active      boolean DEFAULT true
 );
-CREATE INDEX IF NOT EXISTS idx_artist_member_artist_id ON artist_member(artist_id);
 
 CREATE TABLE IF NOT EXISTS artist_url (
     artist_id integer NOT NULL REFERENCES artist(id) ON DELETE CASCADE,
     url       text NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_artist_url_artist_id ON artist_url(artist_id);
 
 COMMIT;

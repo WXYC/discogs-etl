@@ -658,3 +658,73 @@ class TestSeedArtistsFromClone:
             fetched_at = cur.fetchone()[0]
         conn.close()
         assert fetched_at is not None
+
+
+class TestSeedArtistNameVariationDuplicates:
+    """A clone taken before the #433 dedupe carries duplicated variations.
+
+    ``artist_name_variation`` was the worst of the four child tables — 3.99M
+    rows for 809,820 distinct keys on prod, 2026-09-25 — and a clone is a
+    snapshot of exactly that. Once 0017 puts ``UNIQUE (artist_id, name)`` on
+    the target, seeding those rows arbiter-less raises ``23505`` and takes
+    the whole seed down, so ``_CONFLICT_TARGET`` needs an entry for the
+    table. The duplicate is dropped on arrival rather than deduped on the
+    clone: the rows are byte-identical, so there is nothing to choose
+    between them.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _set_up(self):
+        source_url, source_name = _create_temp_database()
+        target_url, target_name = _create_temp_database()
+        self.source_url = source_url
+        self.target_url = target_url
+
+        # The clone predates 0017, so it can hold duplicates the target cannot.
+        _apply_schema(source_url)
+        conn = psycopg.connect(source_url, autocommit=True)
+        with conn.cursor() as cur:
+            cur.execute(
+                "ALTER TABLE artist_name_variation "
+                "DROP CONSTRAINT artist_name_variation_artist_id_name_key"
+            )
+            cur.execute("INSERT INTO artist (id, name) VALUES (700, 'Chuquimamani-Condori')")
+            cur.execute(
+                "INSERT INTO artist_name_variation (artist_id, name) VALUES "
+                "(700, 'DJ E'), (700, 'DJ E'), (700, 'DJ E'), (700, 'Elysia Crampton')"
+            )
+        conn.close()
+
+        _apply_schema(target_url)
+
+        yield
+
+        _drop_database(source_name)
+        _drop_database(target_name)
+
+    def test_dry_run_counts_what_will_actually_land(self) -> None:
+        """The dry run is what an operator sizes a seed from, so it has to
+        agree with the real run.
+
+        This fixture's artist 700 carries duplicated variations -- which is
+        the whole reason ``artist_name_variation`` has a ``_CONFLICT_TARGET``
+        entry. A source-side ``count(*)`` reports the duplicates that
+        ``ON CONFLICT DO NOTHING`` will discard, so against a pre-dedupe clone
+        the plan overstates the real result and the two cannot be reconciled.
+        """
+        planned = seed_artists_additive(self.source_url, self.target_url, [700], dry_run=True)
+        landed = seed_artists_additive(self.source_url, self.target_url, [700])
+        assert planned["artist_name_variation"] == landed["artist_name_variation"]
+
+    def test_duplicated_variations_seed_once(self) -> None:
+        seed_artists_additive(self.source_url, self.target_url, [700])
+
+        conn = psycopg.connect(self.target_url)
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT name, count(*) FROM artist_name_variation "
+                "WHERE artist_id = 700 GROUP BY name ORDER BY name"
+            )
+            rows = cur.fetchall()
+        conn.close()
+        assert rows == [("DJ E", 1), ("Elysia Crampton", 1)]

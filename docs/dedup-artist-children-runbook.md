@@ -2,7 +2,7 @@
 
 `scripts/dedup_artist_children.py` collapses each `(artist_id, <key>)` group in the four `artist_*` child tables down to one row. Every monthly rebuild appends the Discogs dump's rows without deduplicating against what is already there, so the cache accumulates roughly one extra copy per rebuild; as of 2026-09-25 it holds about 4.8 copies of each row. Tracked at [discogs-etl#433](https://github.com/WXYC/discogs-etl/issues/433).
 
-This is the `B1p` step of the Railway memory-reduction sequence. The follow-up (`B2`) adds the UNIQUE constraints and an `ON CONFLICT` loader so the duplication stops recurring; until that lands, a rebuild re-introduces one copy and this script is simply re-run.
+This is the `B1p` step of the Railway memory-reduction sequence. `alembic` revision `0017_artist_child_unique` is the other half: it adds the `UNIQUE (artist_id, <key>)` constraints, and `scripts/import_csv.py` now merges the child CSVs with `ON CONFLICT ... DO NOTHING`, so the duplication stops recurring. **Apply 0017 in this same operator session, minutes after step 3** — step 5 below. Until 0017 is applied, a rebuild re-introduces one copy and this script is simply re-run.
 
 ## When to run
 
@@ -108,6 +108,31 @@ UNION ALL SELECT 'artist_url', count(*), count(DISTINCT (artist_id, url)) FROM a
 Both counts must match per table. Then check the preservation invariant — every artist that held at least one child row still holds one. Measured floors from 2026-09-25: `artist_name_variation` 127,788 · `artist_url` 80,169 · `artist_alias` 32,740 · `artist_member` 23,648.
 
 Do **not** use `artist.fetched_at` to separate LML-hydrated artists from imported ones. The column is `NOT NULL DEFAULT now()`, so the ETL stamps it too — 209,677 of 209,677 artists satisfy `fetched_at IS NOT NULL`, and any check built on it is measuring nothing.
+
+### 5. Apply `0017_artist_child_unique`, in this same session
+
+Do not leave this for the monthly rebuild. `0017` refuses on any duplicate, and a target-less `ON CONFLICT DO NOTHING` is inert until a unique index exists — so between step 2 and 0017 landing, one LML hydration whose Discogs response repeats a URL or alias re-creates a duplicate and the unattended rebuild aborts at its `alembic upgrade head`. Keep the window minutes long and attended.
+
+First re-check the LML prerequisite; nothing stops a later prod deploy from reverting it:
+
+```sh
+git -C ../library-metadata-lookup show origin/prod:discogs/cache_service.py | grep -c 'ON CONFLICT DO NOTHING'   # must print 5
+```
+
+Then two deliberate steps, because `0016` is unapplied on prod and alembic walks the chain to reach `0017` whichever target you name. `0016` opens its own connection and issues a bare `ALTER TABLE release ADD COLUMN`, so it cannot inherit a `lock_timeout` from your psql session — `PGOPTIONS` is the only way in:
+
+```sh
+PGOPTIONS='-c lock_timeout=10s' alembic upgrade 0016_release_status_notes_dq
+alembic upgrade 0017_artist_child_unique
+```
+
+If `0017` raises `RuntimeError` naming this script, a duplicate reappeared: re-run steps 1-2 and retry the upgrade. Loop until it passes. Then confirm the four constraints exist and the four superseded indexes are gone:
+
+```sql
+SELECT conname FROM pg_constraint WHERE contype = 'u'
+  AND conrelid::regclass::text IN ('artist_alias','artist_name_variation','artist_member','artist_url');
+SELECT indexname FROM pg_indexes WHERE indexname LIKE 'idx_artist_%_artist_id';   -- expect zero rows
+```
 
 Finally record `pg_database_size(current_database())` before and after on #433 and on [#432](https://github.com/WXYC/discogs-etl/issues/432), which sizes `shared_buffers` from that number.
 
