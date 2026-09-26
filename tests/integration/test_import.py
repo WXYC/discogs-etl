@@ -1704,3 +1704,151 @@ class TestImportMasters:
             "0 master" in rec.message.lower() or "no master rows" in rec.message.lower()
             for rec in caplog.records
         ), f"expected a zero-masters-loaded warning; got {[r.message for r in caplog.records]}"
+
+
+ARTIST_CHILD_TABLES = ("artist_alias", "artist_name_variation", "artist_member", "artist_url")
+
+
+class TestImportArtistChildrenIsIdempotent:
+    """``import_artist_details`` must be re-runnable (WXYC/discogs-etl#433).
+
+    Before #433 the four ``artist_*`` child tables were loaded by a plain
+    COPY with no key in the database, so every monthly rebuild appended a
+    fresh copy of the dump's rows — 4.8 copies on prod by 2026-09-25. The
+    loader now stages each CSV in a TEMP table and merges with ``ON CONFLICT
+    (artist_id, <key>) DO NOTHING``, which has to satisfy two invariants at
+    once: a second import adds nothing, and rows only LML wrote (an artist
+    the dump does not mention, or a column the ETL never populates) survive
+    untouched. The second is why this is a merge and not a
+    truncate-and-reload.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _set_up(self, fresh_db_url):
+        self.db_url = fresh_db_url
+        conn = psycopg.connect(fresh_db_url, autocommit=True)
+        with conn.cursor() as cur:
+            cur.execute(SCHEMA_DIR.joinpath("create_database.sql").read_text())
+        conn.close()
+        # import_artist_details stubs `artist` rows out of release_artist, so
+        # the release side has to exist before the child tables can.
+        conn = psycopg.connect(fresh_db_url)
+        for table_config in BASE_TABLES:
+            csv_path = CSV_DIR / table_config["csv_file"]
+            if csv_path.exists():
+                import_csv_func(
+                    conn,
+                    csv_path,
+                    table_config["table"],
+                    table_config["csv_columns"],
+                    table_config["db_columns"],
+                    table_config["required"],
+                    table_config["transforms"],
+                )
+        conn.close()
+
+    def _counts(self) -> dict[str, int]:
+        conn = psycopg.connect(self.db_url)
+        with conn.cursor() as cur:
+            counts = {}
+            for table in ARTIST_CHILD_TABLES:
+                cur.execute(f"SELECT count(*) FROM {table}")
+                counts[table] = cur.fetchone()[0]
+        conn.close()
+        return counts
+
+    def _import(self) -> None:
+        conn = psycopg.connect(self.db_url)
+        import_artist_details(conn, CSV_DIR)
+        conn.close()
+
+    def test_a_second_import_adds_no_rows(self) -> None:
+        """The regression guard: rebuild twice against one dump, same counts."""
+        self._import()
+        first = self._counts()
+        assert all(n > 0 for n in first.values()), (
+            f"fixture CSVs must actually load something; got {first}"
+        )
+
+        self._import()
+
+        assert self._counts() == first
+
+    def test_every_key_is_unique_after_two_imports(self) -> None:
+        self._import()
+        self._import()
+        conn = psycopg.connect(self.db_url)
+        with conn.cursor() as cur:
+            for table, key in (
+                ("artist_alias", "artist_id, alias_name"),
+                ("artist_name_variation", "artist_id, name"),
+                ("artist_member", "artist_id, member_id"),
+                ("artist_url", "artist_id, url"),
+            ):
+                cur.execute(f"SELECT count(*), count(DISTINCT ({key})) FROM {table}")
+                total, distinct = cur.fetchone()
+                assert total == distinct, f"{table} carries {total - distinct} duplicate keys"
+        conn.close()
+
+    def test_children_of_an_artist_absent_from_the_csv_survive(self) -> None:
+        """Artist 3 is in release_artist but in none of the artist_* CSVs.
+
+        That is the shape of an artist LML hydrated from the Discogs API and
+        the dump does not describe. A truncate-and-reload loader would erase
+        it on every rebuild, turning a cached artist back into a live API
+        call — which is the cost this merge exists to avoid.
+        """
+        conn = psycopg.connect(self.db_url, autocommit=True)
+        with conn.cursor() as cur:
+            cur.execute("INSERT INTO artist (id, name) VALUES (3, 'DJ Unknown')")
+            cur.execute("INSERT INTO artist_url (artist_id, url) VALUES (3, 'https://lml-only/')")
+        conn.close()
+
+        self._import()
+
+        conn = psycopg.connect(self.db_url)
+        with conn.cursor() as cur:
+            cur.execute("SELECT count(*) FROM artist_url WHERE artist_id = 3")
+            assert cur.fetchone()[0] == 1
+        conn.close()
+
+    def test_in_file_duplicate_plus_a_preexisting_row_yields_one_row(self) -> None:
+        """Two dedup layers have to compose, and LML's row is the survivor.
+
+        ``artist_alias.csv`` lists Autechre's ``Gescom`` alias twice (the
+        CSV-side ``unique_key`` filter collapses that), and LML has already
+        written the same key with a real ``alias_id`` (``ON CONFLICT DO
+        NOTHING`` leaves it alone). The ETL never loads ``alias_id``, so an
+        upsert here would overwrite it with NULL.
+        """
+        conn = psycopg.connect(self.db_url, autocommit=True)
+        with conn.cursor() as cur:
+            cur.execute("INSERT INTO artist (id, name) VALUES (1, 'Autechre')")
+            cur.execute(
+                "INSERT INTO artist_alias (artist_id, alias_id, alias_name) "
+                "VALUES (1, 55555, 'Gescom')"
+            )
+        conn.close()
+
+        self._import()
+
+        conn = psycopg.connect(self.db_url)
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT alias_id FROM artist_alias WHERE artist_id = 1 AND alias_name = 'Gescom'"
+            )
+            rows = cur.fetchall()
+        conn.close()
+        assert rows == [(55555,)], (
+            f"expected exactly one Gescom row, still carrying LML's alias_id; got {rows!r}"
+        )
+
+    def test_rows_for_artists_outside_the_library_scope_are_filtered(self) -> None:
+        """artist_id 999 is in every fixture CSV and in no release_artist row."""
+        self._import()
+        conn = psycopg.connect(self.db_url)
+        with conn.cursor() as cur:
+            for table in ARTIST_CHILD_TABLES:
+                cur.execute(f"SELECT count(*) FROM {table} WHERE artist_id = 999")
+                assert cur.fetchone()[0] == 0, f"{table} imported an out-of-scope artist"
+        conn.close()

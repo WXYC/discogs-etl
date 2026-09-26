@@ -70,9 +70,20 @@ def _artists_with_children(db_url: str, table: str) -> set[int]:
 
 @pytest.fixture()
 def cache_db(fresh_db_url: str) -> str:
-    """An empty cache database built from ``schema/create_database.sql``."""
+    """An empty cache database in its **pre-0017** shape.
+
+    ``schema/create_database.sql`` now declares ``UNIQUE (artist_id, <key>)``
+    on all four child tables, so a database built straight from it cannot
+    hold the duplicates this script exists to remove. That is not a problem
+    with the tests: this script only ever runs against a database that
+    predates ``alembic`` revision ``0017_artist_child_unique`` — it is the
+    dedupe 0017's precondition guard demands before the constraint can be
+    created at all. Dropping the four constraints reproduces that state.
+    """
     with psycopg.connect(fresh_db_url, autocommit=True) as conn, conn.cursor() as cur:
         cur.execute(SCHEMA_SQL.read_text(encoding="utf-8"))
+        for table, key in ARTIST_CHILD_KEYS.items():
+            cur.execute(f"ALTER TABLE {table} DROP CONSTRAINT {table}_{'_'.join(key)}_key")
     return fresh_db_url
 
 
