@@ -85,7 +85,7 @@ jobs:
       # version floor must equal pyproject.toml's
       # (tests/unit/test_catalog_parity_workflow.py holds them in lockstep).
       - name: Install wxyc-catalog
-        run: pip install --quiet "wxyc-catalog>=0.2.0"
+        run: pip install --quiet "wxyc-catalog>=0.2.0" "wxyc-etl>=0.8.0,<0.11.0"
 
       - name: Install MariaDB client
         # Not interchangeable with the Oracle/Homebrew MySQL client: a 9.x

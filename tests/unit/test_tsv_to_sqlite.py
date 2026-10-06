@@ -1117,3 +1117,61 @@ class TestCtaEscaping:
         conn.close()
 
         assert rows == [("Stereolab", "Some Track"), ("Juana Molina", "Other Track")]
+
+
+_ELEVEN = "{id}\t{title}\tStereolab\tST\t100\t1\tRock\tCD\t\\N\t\\N\t\\N"
+
+
+class TestVolumeLetterColumn:
+    """Arity is a property of the file, and the 12th field is folded like the Backend producer."""
+
+    def test_extra_raw_tab_in_eleven_column_file_is_not_inserted_shifted(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture
+    ) -> None:
+        """An unescaped TAB turns an 11-field row into 12; it must be skipped, not
+        accepted with every later column shifted."""
+        tsv = (
+            _ELEVEN.format(id=1, title="Aluminum Tunes")
+            + "\n"
+            + _ELEVEN.format(id=2, title="Bad\tTitle")
+            + "\n"
+            + _ELEVEN.format(id=3, title="DOGA")
+            + "\n"
+        )
+        tsv_file = tmp_path / "input.tsv"
+        tsv_file.write_text(tsv, encoding="utf-8")
+        db_path = tmp_path / "library.db"
+
+        count = tsv_to_sqlite(str(tsv_file), str(db_path))
+
+        assert count == 2
+        conn = sqlite3.connect(str(db_path))
+        ids = [r[0] for r in conn.execute("SELECT id FROM library ORDER BY id")]
+        conn.close()
+        assert ids == [1, 3]
+        assert "12 fields" in capsys.readouterr().err
+
+    def test_twelve_column_file_rejects_an_eleven_field_row(self, tmp_path: Path) -> None:
+        tsv = _ELEVEN.format(id=1, title="A") + "\tB\n" + _ELEVEN.format(id=2, title="C") + "\n"
+        tsv_file = tmp_path / "input.tsv"
+        tsv_file.write_text(tsv, encoding="utf-8")
+        db_path = tmp_path / "library.db"
+
+        assert tsv_to_sqlite(str(tsv_file), str(db_path)) == 1
+
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [("b", "B"), ("B", "B"), ("", None), ("\\N", None), ("  ", None)],
+    )
+    def test_volume_letter_is_folded(self, tmp_path: Path, raw: str, expected: str | None) -> None:
+        tsv = _ELEVEN.format(id=1, title="A") + "\t" + raw + "\n"
+        tsv_file = tmp_path / "input.tsv"
+        tsv_file.write_text(tsv, encoding="utf-8")
+        db_path = tmp_path / "library.db"
+
+        tsv_to_sqlite(str(tsv_file), str(db_path))
+
+        conn = sqlite3.connect(str(db_path))
+        got = conn.execute("SELECT release_call_letters FROM library").fetchone()[0]
+        conn.close()
+        assert got == expected

@@ -138,6 +138,22 @@ class TestWxyccatalogInstall:
         start = source.index("Install wxyc-catalog for the Backend library build")
         block = source[start : source.index("name: Run library sync", start)]
         assert "set +e" not in block and "::warning::" not in block
+        assert "continue-on-error" not in block
+        sync_start = source.index("name: Run library sync")
+        sync_block = source[sync_start : source.index("\n      - name:", sync_start + 1)]
+        assert "\n        if:" not in block or "\n        if:" in sync_block
+
+    def test_wxyc_etl_pinned_alongside_wxyc_catalog_in_both_workflows(self) -> None:
+        """wxyc-catalog's own dependency (wxyc-etl>=0.1.0) is unpinned, so the bare
+        interpreter would take a future wxyc-etl 0.11; copy pyproject's cap."""
+        match = re.search(r'"(wxyc-etl>=[^"]+)"', (REPO_ROOT / "pyproject.toml").read_text())
+        assert match
+        for name in ("sync-library.yml", "catalog-parity.yml"):
+            text = (REPO_ROOT / ".github" / "workflows" / name).read_text()
+            line = next(
+                ln for ln in text.splitlines() if "pip install" in ln and "wxyc-catalog" in ln
+            )
+            assert f'"{match.group(1)}"' in line, name
 
     def test_dockerfile_pin_matches_pyproject(self) -> None:
         assert f'"{self._pyproject_floor()}"' in (REPO_ROOT / "Dockerfile").read_text()

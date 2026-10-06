@@ -4656,3 +4656,33 @@ class TestProducerCli:
         assert runner.calls == []
         assert existing.read_bytes() == b"precious"
         assert not (tmp_path / "mysql.db").exists()
+
+
+class TestLoadLibraryRowsColumnTolerance:
+    """Only the trailing ``release_call_letters`` may be absent from a library.db."""
+
+    @staticmethod
+    def _db_without(path: Path, column: str) -> sqlite3.Connection:
+        conn = sqlite3.connect(path)
+        cols = [c for c in _LIBRARY_COLUMNS if c != column]
+        conn.execute(f"CREATE TABLE library ({', '.join(cols)})")
+        conn.execute(
+            f"INSERT INTO library VALUES ({', '.join('?' for _ in cols)})",
+            [1 if c == "id" else "x" for c in cols],
+        )
+        return conn
+
+    def test_missing_release_call_letters_loads_as_null(self, tmp_path: Path) -> None:
+        mod = _load_module()
+        conn = self._db_without(tmp_path / "old.db", "release_call_letters")
+        rows = mod._load_library_rows(conn, "mysql")
+        conn.close()
+        assert rows[1]["release_call_letters"] is None
+
+    @pytest.mark.parametrize("column", ["label", "cross_reference_names", "album_artist"])
+    def test_missing_any_other_column_raises(self, tmp_path: Path, column: str) -> None:
+        mod = _load_module()
+        conn = self._db_without(tmp_path / "bad.db", column)
+        with pytest.raises(mod.SourceError, match=column):
+            mod._load_library_rows(conn, "mysql")
+        conn.close()
