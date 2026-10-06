@@ -1,6 +1,7 @@
 """Convert a MySQL TSV dump to a SQLite database with FTS5 index.
 
-Reads a tab-separated file (as produced by ``mysql -B -N``) with 11 columns
+Reads a tab-separated file (as produced by ``mysql -B -N``) with 11 columns (or 12,
+when the producer also selects the trailing per-release volume letter)
 corresponding to the WXYC library catalog schema and creates a
 ``library.db``: a ``library`` table, its FTS5 companion, the search indexes,
 and optionally a ``compilation_track_artist`` table.
@@ -18,8 +19,12 @@ code (e.g. a release filed under a band name carries its member's personal
 name), sourced from ``LIBRARY_CODE_CROSS_REFERENCE`` via the correlated
 subquery in ``sync-library.sh``. See WXYC/discogs-etl#334.
 
-MySQL ``\\N`` values are converted to SQL NULL. Rows that do not contain
-exactly 11 tab-separated fields are skipped with a warning on stderr.
+MySQL ``\\N`` values are converted to SQL NULL. The row width (11 or 12) is
+locked from the first row; any later row of a different width is skipped with
+a warning on stderr. A 12th field, ``release_call_letters``, is folded through
+``normalize_volume_letters`` (stripped, upper-cased, empty -> NULL) via
+``lib.library_db.fold_volume_letters``, the same fold the parity harness and
+the Backend producer apply; an 11-field file leaves the column NULL.
 
 Optionally also imports a ``compilation_track_artist`` table from a second,
 3-column TSV (``library_release_id``, ``artist_name``, ``track_title``)
@@ -37,6 +42,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from lib.library_db import (  # noqa: E402
     build_library_db,
+    fold_volume_letters,
     parse_compilation_track_tsv,
     parse_library_tsv,
 )
@@ -58,7 +64,7 @@ def tsv_to_sqlite(tsv_path: str, db_path: str, cta_tsv_path: str | None = None) 
         compilation_track_artist import counts).
     """
     cta_rows = parse_compilation_track_tsv(cta_tsv_path) if cta_tsv_path else None
-    return build_library_db(db_path, parse_library_tsv(tsv_path), cta_rows)
+    return build_library_db(db_path, fold_volume_letters(parse_library_tsv(tsv_path)), cta_rows)
 
 
 def _parse_args(argv: list[str]) -> tuple[str, str, str | None]:

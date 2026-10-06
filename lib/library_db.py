@@ -55,8 +55,10 @@ from __future__ import annotations
 
 import sqlite3
 import sys
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Iterator, Sequence
 from typing import Callable
+
+from wxyc_catalog import normalize_volume_letters
 
 # Every column of the `library` table, in declaration order.
 LIBRARY_COLUMNS = (
@@ -133,12 +135,34 @@ def insert_library_rows(cur: sqlite3.Cursor, rows: Iterable[Sequence[object]]) -
         The number of rows inserted.
     """
     count = 0
+    full = len(LIBRARY_INSERT_COLUMNS)
     for row in rows:
+        if len(row) not in (full, full - 1):
+            raise ValueError(
+                f"library row has {len(row)} columns; expected {full} "
+                f"(or {full - 1}, without the trailing release_call_letters)"
+            )
         columns = LIBRARY_INSERT_COLUMNS[: len(row)]
         placeholders = ", ".join("?" for _ in columns)
         cur.execute(f"INSERT INTO library ({', '.join(columns)}) VALUES ({placeholders})", row)
         count += 1
     return count
+
+
+def fold_volume_letters(rows: Iterable[Sequence[object]]) -> Iterator[Sequence[object]]:
+    """Fold a MySQL row's trailing ``release_call_letters`` like the Backend producer.
+
+    The MySQL query emits ``IFNULL(r.CALL_LETTERS, '')`` as its 12th field;
+    ``normalize_volume_letters`` turns that into the same upper-cased letter
+    or NULL that the Backend producer stores for ``code_volume_letters``. An
+    11-value row (an older fixture or the legacy sync's TSV) passes through
+    untouched and reads as NULL.
+    """
+    width = len(LIBRARY_INSERT_COLUMNS)
+    for row in rows:
+        if len(row) == width:
+            row = [*row[:-1], normalize_volume_letters(row[-1])]
+        yield row
 
 
 def finalize_library(cur: sqlite3.Cursor) -> None:
@@ -309,7 +333,10 @@ def parse_library_tsv(tsv_path: str) -> Iterable[Sequence[object]]:
     The file has 11 tab-separated fields per line, matching
     ``TSV_INSERT_COLUMNS``, or 12 when the producer also selects the trailing
     ``release_call_letters`` (``LIBRARY_INSERT_COLUMNS``; the parity harness's
-    MySQL query does, the legacy sync's did not). MySQL ``\N`` becomes SQL NULL (tested
+    MySQL query does, the legacy sync's did not). The width is locked from the
+    first row of either accepted length, and any later row of a different
+    length is skipped with a WARNING, so a stray raw TAB cannot turn an
+    11-column row into an accepted, column-shifted 12-field one. MySQL ``\N`` becomes SQL NULL (tested
     against the raw field, before unescaping -- see
     ``_parse_nullable_field``). Every surviving field is then unescaped:
     ``mysql -B -N`` (no ``--raw``) escapes embedded backslash/tab/newline/NUL
@@ -358,8 +385,10 @@ def parse_library_tsv(tsv_path: str) -> Iterable[Sequence[object]]:
     compares collation weights rather than bytes on this server and
     spuriously matches non-ASCII/mojibake content -- see WXYC/discogs-etl#373
     for the false-positive counts that trap produced): every free-text column
-    behind *both* parsers returns zero CR-bearing rows -- the seven in
-    ``LIBRARY_SELECT_SQL`` and, for ``parse_compilation_track_tsv``,
+    behind *both* parsers returns zero CR-bearing rows -- the free-text
+    columns in ``LIBRARY_SELECT_SQL`` (as measured, before the trailing
+    ``CALL_LETTERS`` volume letter joined it; that column is a single letter and
+    was not part of the measurement) and, for ``parse_compilation_track_tsv``,
     ``COMPILATION_TRACK_ARTIST.ARTIST_NAME`` and ``TRACK_TITLE``. The class is
     real and reachable but currently latent -- this fix changes no row's
     ingestion outcome today, for either parser. See WXYC/discogs-etl#370.
@@ -375,10 +404,19 @@ def parse_library_tsv(tsv_path: str) -> Iterable[Sequence[object]]:
 
     A generator, so warnings interleave with the inserts they describe.
     """
+    # Arity is a property of the file: locked from the first row of an accepted
+    # width, so an unescaped TAB in one row of an 11-column file (which makes
+    # it 12 fields) cannot slip through as a shifted row.
+    arity: int | None = None
     with open(tsv_path, encoding="utf-8", newline="\n") as f:
         for line in f:
             fields = line.rstrip("\n").split("\t")
-            if len(fields) not in (len(TSV_INSERT_COLUMNS), len(LIBRARY_INSERT_COLUMNS)):
+            if arity is None and len(fields) in (
+                len(TSV_INSERT_COLUMNS),
+                len(LIBRARY_INSERT_COLUMNS),
+            ):
+                arity = len(fields)
+            if len(fields) != arity:
                 print(
                     f"WARNING: skipping malformed row with {len(fields)} fields",
                     file=sys.stderr,
