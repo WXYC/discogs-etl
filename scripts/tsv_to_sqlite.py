@@ -1,7 +1,7 @@
 """Convert a MySQL TSV dump to a SQLite database with FTS5 index.
 
-Reads a tab-separated file (as produced by ``mysql -B -N``) with 11 columns (or 12,
-when the producer also selects the trailing per-release volume letter)
+Reads a tab-separated file (as produced by ``mysql -B -N``) with 11 base columns (plus
+the optional trailing per-release volume letter and artist comp letter, for 12 or 13)
 corresponding to the WXYC library catalog schema and creates a
 ``library.db``: a ``library`` table, its FTS5 companion, the search indexes,
 and optionally a ``compilation_track_artist`` table.
@@ -19,7 +19,7 @@ code (e.g. a release filed under a band name carries its member's personal
 name), sourced from ``LIBRARY_CODE_CROSS_REFERENCE`` via the correlated
 subquery in ``sync-library.sh``. See WXYC/discogs-etl#334.
 
-MySQL ``\\N`` values are converted to SQL NULL. The row width (11 or 12) is
+MySQL ``\\N`` values are converted to SQL NULL. The row width (11, 12, or 13) is
 locked from the first row; any later row of a different width is skipped with
 a warning on stderr. A 12th field, ``release_call_letters``, is folded through
 ``normalize_volume_letters`` (stripped, upper-cased, empty -> NULL) via

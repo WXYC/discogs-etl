@@ -3180,7 +3180,7 @@ class TestBackendProducer:
 
 
 class TestCatalogRowToLibraryRowVolumeLetters:
-    """``release_call_letters`` is the LAST column, folded by wxyc-catalog's
+    """``release_call_letters`` is the second-to-last column (``artist_comp_letter`` trails it), folded by wxyc-catalog's
     ``normalize_volume_letters`` (strip, upper-case, '' -> NULL)."""
 
     @pytest.mark.parametrize(
@@ -3219,7 +3219,13 @@ class TestCatalogRowToLibraryRowVolumeLetters:
 class TestCatalogRowToLibraryRowCompLetter:
     @pytest.mark.parametrize(
         ("overrides", "expected"),
-        [({"code_comp_letter": "M"}, "M"), ({"code_comp_letter": None}, None), ({}, None)],
+        [
+            ({"code_comp_letter": "M"}, "M"),
+            ({"code_comp_letter": None}, None),
+            ({}, None),
+            ({"code_comp_letter": ""}, None),
+            ({"code_comp_letter": "  "}, None),
+        ],
     )
     def test_code_comp_letter_lands_as_is(self, overrides: dict, expected: str | None) -> None:
         sys.path.insert(0, str(REPO_ROOT))
