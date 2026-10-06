@@ -162,6 +162,7 @@ import argparse
 import json
 import logging
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -250,6 +251,7 @@ from lib.fffd_pair_capture import (  # noqa: E402
 from lib.library_db import (  # noqa: E402
     CROSS_REFERENCE_SEPARATOR,
     LIBRARY_COLUMNS,
+    OPTIONAL_TRAILING_COLUMNS,
     fold_volume_letters,
     parse_compilation_track_tsv,
     parse_library_tsv,
@@ -933,6 +935,28 @@ def _classify_release_call_letters(
     return ("mismatch", None)
 
 
+_COMP_LETTER_RE = re.compile(r"Z-([A-Z])")
+
+
+def _classify_artist_comp_letter(
+    mysql_row: Mapping[str, object], backend_row: Mapping[str, object]
+) -> tuple[str, str | None]:
+    """``artist_comp_letter``: the MySQL side has no such column, so the expectation
+    is the letter of a raw ``Z-<letter>`` ``call_letters`` in Rock or Soundtracks,
+    NULL otherwise. A Backend NULL against a derived letter is ``pending_backfill``
+    (BS#2834 has not run), not drift.
+    """
+    raw = mysql_row["call_letters"]
+    match = _COMP_LETTER_RE.match(raw) if isinstance(raw, str) else None
+    expected = match.group(1) if match and mysql_row["genre"] in ("Rock", "Soundtracks") else None
+    backend_value = backend_row["artist_comp_letter"]
+    if backend_value == expected:
+        return ("agree", None)
+    if backend_value is None:
+        return ("normalized", "pending_backfill")
+    return ("mismatch", None)
+
+
 # Keyed by column name (never a positional/ordered table) so
 # `TestColumnModelsDriftGuard` can assert `set(COLUMN_MODELS) == set(DIFF_COLUMNS)`
 # -- set equality, not containment, so an added OR removed diffed column
@@ -953,6 +977,7 @@ COLUMN_MODELS: dict[
     # Both producers fold with `normalize_volume_letters` (the MySQL side via
     # `fold_volume_letters`), so a byte compare.
     "release_call_letters": _classify_release_call_letters,
+    "artist_comp_letter": _classify_artist_comp_letter,
 }
 
 
@@ -1211,10 +1236,12 @@ def _load_library_rows(conn: sqlite3.Connection, label: str) -> dict[int, dict[s
     last (hiding a row-count divergence this parity harness exists to catch),
     so we raise ``SourceError`` instead of under-counting.
     """
-    # A library.db built before `release_call_letters` lacks trailing columns;
+    # A library.db built before an optional trailing column lacks it;
     # select only what exists and read the rest as NULL.
     present = {r[1] for r in conn.execute("PRAGMA table_info(library)")}
-    missing = [c for c in LIBRARY_COLUMNS if c not in present and c != "release_call_letters"]
+    missing = [
+        c for c in LIBRARY_COLUMNS if c not in present and c not in OPTIONAL_TRAILING_COLUMNS
+    ]
     if missing:
         raise SourceError(f"{label} database is missing library column(s): {', '.join(missing)}")
     columns = [c for c in LIBRARY_COLUMNS if c in present]

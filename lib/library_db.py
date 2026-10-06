@@ -60,6 +60,11 @@ from typing import Callable
 
 from wxyc_catalog import normalize_volume_letters
 
+# Nullable columns that sit after the base ones; a producer may stop short of
+# any of them. `release_call_letters` (#439) is supplied by the MySQL and
+# Backend producers, `artist_comp_letter` (#440) by Backend only.
+OPTIONAL_TRAILING_COLUMNS = ("release_call_letters", "artist_comp_letter")
+
 # Every column of the `library` table, in declaration order.
 LIBRARY_COLUMNS = (
     "id",
@@ -74,9 +79,8 @@ LIBRARY_COLUMNS = (
     "album_artist",
     "label",
     "cross_reference_names",
-    # Appended LAST so no existing column position shifts. Nullable: the
-    # tubafrenzy TSV producer predates it and never supplies it.
-    "release_call_letters",
+    # Appended LAST so no existing column position shifts.
+    *OPTIONAL_TRAILING_COLUMNS,
 )
 
 # The columns a producer actually supplies, in the order `build_library_db`
@@ -84,9 +88,9 @@ LIBRARY_COLUMNS = (
 # docstring); it stays NULL for every row.
 LIBRARY_INSERT_COLUMNS = tuple(c for c in LIBRARY_COLUMNS if c != "label")
 
-# The tubafrenzy TSV carries every insert column except the trailing
-# `release_call_letters`; its rows are 11 values, a prefix of the above.
-TSV_INSERT_COLUMNS = LIBRARY_INSERT_COLUMNS[:-1]
+# The 11 base columns, which every producer supplies; a TSV row is at least
+# this wide and at most `LIBRARY_INSERT_COLUMNS`.
+TSV_INSERT_COLUMNS = LIBRARY_INSERT_COLUMNS[: -len(OPTIONAL_TRAILING_COLUMNS)]
 
 CROSS_REFERENCE_SEPARATOR = " | "
 
@@ -113,7 +117,7 @@ def create_library_schema(cur: sqlite3.Cursor) -> None:
         artist_call_number INTEGER, release_call_number INTEGER,
         genre TEXT, format TEXT, alternate_artist_name TEXT,
         album_artist TEXT, label TEXT, cross_reference_names TEXT,
-        release_call_letters TEXT
+        release_call_letters TEXT, artist_comp_letter TEXT
     )""")
     cur.execute(
         "CREATE VIRTUAL TABLE library_fts USING fts5("
@@ -126,7 +130,7 @@ def create_library_schema(cur: sqlite3.Cursor) -> None:
 
 def insert_library_rows(cur: sqlite3.Cursor, rows: Iterable[Sequence[object]]) -> int:
     """Insert ``rows`` (``LIBRARY_INSERT_COLUMNS`` order; a row may stop short of
-    the trailing nullable ``release_call_letters``, as the 11-value TSV rows do).
+    any ``OPTIONAL_TRAILING_COLUMNS``, as the 11-value TSV rows do).
 
     Consumes ``rows`` lazily so a producer can stream and emit its own
     per-row warnings interleaved with the insert, as the TSV parser does.
@@ -135,12 +139,12 @@ def insert_library_rows(cur: sqlite3.Cursor, rows: Iterable[Sequence[object]]) -
         The number of rows inserted.
     """
     count = 0
-    full = len(LIBRARY_INSERT_COLUMNS)
+    base, full = len(TSV_INSERT_COLUMNS), len(LIBRARY_INSERT_COLUMNS)
     for row in rows:
-        if len(row) not in (full, full - 1):
+        if not base <= len(row) <= full:
             raise ValueError(
-                f"library row has {len(row)} columns; expected {full} "
-                f"(or {full - 1}, without the trailing release_call_letters)"
+                f"library row has {len(row)} columns; expected {base} to {full} "
+                "(the optional trailing columns may be omitted)"
             )
         columns = LIBRARY_INSERT_COLUMNS[: len(row)]
         placeholders = ", ".join("?" for _ in columns)
@@ -150,7 +154,7 @@ def insert_library_rows(cur: sqlite3.Cursor, rows: Iterable[Sequence[object]]) -
 
 
 def fold_volume_letters(rows: Iterable[Sequence[object]]) -> Iterator[Sequence[object]]:
-    """Fold a MySQL row's trailing ``release_call_letters`` like the Backend producer.
+    """Fold a row's ``release_call_letters`` like the Backend producer.
 
     The MySQL query emits ``IFNULL(r.CALL_LETTERS, '')`` as its 12th field;
     ``normalize_volume_letters`` turns that into the same upper-cased letter
@@ -158,10 +162,10 @@ def fold_volume_letters(rows: Iterable[Sequence[object]]) -> Iterator[Sequence[o
     11-value row (an older fixture or the legacy sync's TSV) passes through
     untouched and reads as NULL.
     """
-    width = len(LIBRARY_INSERT_COLUMNS)
+    index = LIBRARY_INSERT_COLUMNS.index("release_call_letters")
     for row in rows:
-        if len(row) == width:
-            row = [*row[:-1], normalize_volume_letters(row[-1])]
+        if len(row) > index:
+            row = [*row[:index], normalize_volume_letters(row[index]), *row[index + 1 :]]
         yield row
 
 
@@ -411,9 +415,8 @@ def parse_library_tsv(tsv_path: str) -> Iterable[Sequence[object]]:
     with open(tsv_path, encoding="utf-8", newline="\n") as f:
         for line in f:
             fields = line.rstrip("\n").split("\t")
-            if arity is None and len(fields) in (
-                len(TSV_INSERT_COLUMNS),
-                len(LIBRARY_INSERT_COLUMNS),
+            if arity is None and (
+                len(TSV_INSERT_COLUMNS) <= len(fields) <= len(LIBRARY_INSERT_COLUMNS)
             ):
                 arity = len(fields)
             if len(fields) != arity:

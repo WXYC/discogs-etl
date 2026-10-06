@@ -65,6 +65,7 @@ _LIBRARY_COLUMNS = (
     "label",
     "cross_reference_names",
     "release_call_letters",
+    "artist_comp_letter",
 )
 
 _DEFAULT_ROW = {
@@ -80,6 +81,7 @@ _DEFAULT_ROW = {
     "label": None,
     "cross_reference_names": None,
     "release_call_letters": None,
+    "artist_comp_letter": None,
 }
 
 
@@ -103,7 +105,7 @@ def _make_library_db(
         artist_call_number INTEGER, release_call_number INTEGER,
         genre TEXT, format TEXT, alternate_artist_name TEXT,
         album_artist TEXT, label TEXT, cross_reference_names TEXT,
-        release_call_letters TEXT
+        release_call_letters TEXT, artist_comp_letter TEXT
     )"""
     )
     for row in rows:
@@ -2717,6 +2719,7 @@ class TestBackendProducer:
                 None,
                 "",
                 None,
+                None,
             )
             assert conn.execute(
                 "SELECT library_release_id, artist_name, track_title FROM compilation_track_artist"
@@ -3196,20 +3199,58 @@ class TestCatalogRowToLibraryRowVolumeLetters:
         sys.path.insert(0, str(REPO_ROOT))
         from lib.backend_library_source import _catalog_row_to_library_row
 
-        assert _catalog_row_to_library_row(_catalog_row(code_volume_letters=wire))[-1] == expected
+        row = _catalog_row_to_library_row(_catalog_row(code_volume_letters=wire))
+        assert row[-2] == expected
 
     def test_absent_key_is_null(self) -> None:
         sys.path.insert(0, str(REPO_ROOT))
         from lib.backend_library_source import _catalog_row_to_library_row
 
         assert "code_volume_letters" not in _catalog_row()
-        assert _catalog_row_to_library_row(_catalog_row())[-1] is None
+        assert _catalog_row_to_library_row(_catalog_row())[-2] is None
 
-    def test_is_the_last_insert_column(self) -> None:
+    def test_trailing_columns_are_pinned_in_order(self) -> None:
         sys.path.insert(0, str(REPO_ROOT))
         from lib.library_db import LIBRARY_COLUMNS
 
-        assert LIBRARY_COLUMNS[-1] == "release_call_letters"
+        assert LIBRARY_COLUMNS[-2:] == ("release_call_letters", "artist_comp_letter")
+
+
+class TestCatalogRowToLibraryRowCompLetter:
+    @pytest.mark.parametrize(
+        ("overrides", "expected"),
+        [({"code_comp_letter": "M"}, "M"), ({"code_comp_letter": None}, None), ({}, None)],
+    )
+    def test_code_comp_letter_lands_as_is(self, overrides: dict, expected: str | None) -> None:
+        sys.path.insert(0, str(REPO_ROOT))
+        from lib.backend_library_source import _catalog_row_to_library_row
+
+        row = _catalog_row_to_library_row(_catalog_row(**overrides))
+        assert len(row) == 13
+        assert row[-1] == expected
+
+
+class TestArtistCompLetterParity:
+    @pytest.mark.parametrize(
+        ("genre", "call_letters", "backend", "expected"),
+        [
+            ("Rock", "Z-M", "M", ("agree", None)),
+            ("Soundtracks", "Z-B", "B", ("agree", None)),
+            ("Rock", "Z-M", None, ("normalized", "pending_backfill")),
+            ("Rock", "V/A", None, ("agree", None)),
+            ("Hiphop", "Z-M", None, ("agree", None)),
+            ("Hiphop", "Z-M", "M", ("mismatch", None)),
+            ("Rock", "Z-M", "N", ("mismatch", None)),
+        ],
+    )
+    def test_classifier(self, genre: str, call_letters: str, backend: str | None, expected) -> None:
+        mod = _load_module()
+        got = mod.classify_field(
+            "artist_comp_letter",
+            _row(genre=genre, call_letters=call_letters),
+            _row(genre=genre, call_letters=call_letters, artist_comp_letter=backend),
+        )
+        assert got == expected
 
 
 class TestReleaseCallLettersParity:
@@ -4659,12 +4700,12 @@ class TestProducerCli:
 
 
 class TestLoadLibraryRowsColumnTolerance:
-    """Only the trailing ``release_call_letters`` may be absent from a library.db."""
+    """Only the optional trailing columns may be absent from a library.db."""
 
     @staticmethod
-    def _db_without(path: Path, column: str) -> sqlite3.Connection:
+    def _db_without(path: Path, *absent: str) -> sqlite3.Connection:
         conn = sqlite3.connect(path)
-        cols = [c for c in _LIBRARY_COLUMNS if c != column]
+        cols = [c for c in _LIBRARY_COLUMNS if c not in absent]
         conn.execute(f"CREATE TABLE library ({', '.join(cols)})")
         conn.execute(
             f"INSERT INTO library VALUES ({', '.join('?' for _ in cols)})",
@@ -4672,12 +4713,18 @@ class TestLoadLibraryRowsColumnTolerance:
         )
         return conn
 
-    def test_missing_release_call_letters_loads_as_null(self, tmp_path: Path) -> None:
+    @pytest.mark.parametrize(
+        "absent",
+        [("artist_comp_letter",), ("release_call_letters", "artist_comp_letter")],
+    )
+    def test_missing_optional_trailing_columns_load_as_null(
+        self, tmp_path: Path, absent: tuple[str, ...]
+    ) -> None:
         mod = _load_module()
-        conn = self._db_without(tmp_path / "old.db", "release_call_letters")
+        conn = self._db_without(tmp_path / "old.db", *absent)
         rows = mod._load_library_rows(conn, "mysql")
         conn.close()
-        assert rows[1]["release_call_letters"] is None
+        assert all(rows[1][c] is None for c in absent)
 
     @pytest.mark.parametrize("column", ["label", "cross_reference_names", "album_artist"])
     def test_missing_any_other_column_raises(self, tmp_path: Path, column: str) -> None:
