@@ -2735,6 +2735,34 @@ class TestBackendProducer:
         finally:
             conn.close()
 
+    @pytest.mark.parametrize(
+        ("wire", "expected"), [("b ", "B"), ("C", "C"), (None, None), ("", None)]
+    )
+    def test_volume_letter_round_trips_into_release_call_letters(
+        self, tmp_path: Path, monkeypatch, wire: str | None, expected: str | None
+    ) -> None:
+        """A non-NULL ``code_volume_letters`` must actually land in the column.
+
+        ``None`` is also what a never-written column reads as, so the mapper's
+        own unit test cannot catch an INSERT that drops the trailing value.
+        """
+        mod = _load_module()
+        monkeypatch.setenv(mod.BACKEND_TOKEN_ENV, "svc-token")
+        out = tmp_path / "backend.db"
+        with _BackendStub(
+            catalog_rows=[_catalog_row(legacy_release_id=72_101, code_volume_letters=wire)],
+            cta_rows=[],
+        ) as stub:
+            mod._build_library_db_from_backend(stub.base_url, str(out))
+
+        conn = sqlite3.connect(out)
+        try:
+            assert conn.execute("SELECT release_call_letters FROM library").fetchall() == [
+                (expected,)
+            ]
+        finally:
+            conn.close()
+
     def test_pipe_joins_cross_reference_names(self, tmp_path: Path, monkeypatch) -> None:
         """The wire carries an ARRAY; library.db stores the ' | '-joined string."""
         mod = _load_module()
@@ -4320,6 +4348,59 @@ class TestMysqlProducer:
             ).fetchone() == (0,)
         finally:
             conn.close()
+
+    @pytest.mark.parametrize(
+        ("letters_field", "expected"),
+        [("b", "B"), (" c ", "C"), ("", None), ("\\N", None)],
+    )
+    def test_folds_the_volume_letter_like_the_backend_producer(
+        self, tmp_path: Path, monkeypatch, letters_field: str, expected: str | None
+    ) -> None:
+        """The 12th TSV field (``IFNULL(r.CALL_LETTERS, '')``) lands in
+        ``release_call_letters`` through ``normalize_volume_letters``, so a
+        lettered release compares equal to Backend's ``code_volume_letters``."""
+        mod = _load_module()
+        out = tmp_path / "mysql.db"
+        runner = _FakeMysqlRunner(
+            library_tsv=f"72101\tAluminum Tunes\tStereolab\tST\t100\t1\tRock\tCD\t\t\t\t{letters_field}\n",
+            cta_tsv=None,
+        )
+        monkeypatch.setattr(mod, "_mysql_runner", runner)
+
+        mod._build_library_db_from_mysql("mysql://wxyc:sekrit@127.0.0.1/wxycmusic", str(out))
+
+        conn = sqlite3.connect(out)
+        try:
+            assert conn.execute("SELECT release_call_letters FROM library").fetchall() == [
+                (expected,)
+            ]
+        finally:
+            conn.close()
+
+    def test_lettered_release_compares_equal_across_producers(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """End to end through both producers and the diff: no mismatch."""
+        mod = _load_module()
+        monkeypatch.setenv(mod.BACKEND_TOKEN_ENV, "svc-token")
+        mysql_db, backend_db = tmp_path / "mysql.db", tmp_path / "backend.db"
+        monkeypatch.setattr(
+            mod,
+            "_mysql_runner",
+            _FakeMysqlRunner(
+                library_tsv="72101\tAluminum Tunes\tStereolab\tST\t100\t1\tRock\tCD\t\t\t\tb\n",
+                cta_tsv=None,
+            ),
+        )
+        mod._build_library_db_from_mysql("mysql://wxyc:sekrit@127.0.0.1/wxycmusic", str(mysql_db))
+        with _BackendStub(
+            catalog_rows=[_catalog_row(legacy_release_id=72_101, code_volume_letters="b ")],
+            cta_rows=[],
+        ) as stub:
+            mod._build_library_db_from_backend(stub.base_url, str(backend_db))
+
+        result = mod.run_diff(str(mysql_db), str(backend_db))
+        assert result.field_mismatches.get("release_call_letters", 0) == 0
 
     def test_refuses_to_overwrite_an_existing_file(self, tmp_path: Path) -> None:
         mod = _load_module()

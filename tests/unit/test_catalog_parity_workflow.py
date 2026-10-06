@@ -44,6 +44,7 @@ what this file pins:
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any
 
@@ -412,3 +413,13 @@ class TestDocumentation:
         automation = (REPO_ROOT / "docs" / "automation.md").read_text()
         assert "BACKEND_CATALOG_EMAIL" in automation
         assert "BACKEND_CATALOG_PASSWORD" in automation
+
+
+def test_wxyc_catalog_installed_before_the_harness_runs() -> None:
+    """catalog_parity_diff.py imports lib.backend_library_source, which imports
+    wxyc_catalog at module level; the job's bare interpreter needs it first."""
+    workflow = (REPO_ROOT / ".github" / "workflows" / "catalog-parity.yml").read_text()
+    match = re.search(r'"(wxyc-catalog>=[^"]+)"', (REPO_ROOT / "pyproject.toml").read_text())
+    assert match
+    install_pos = workflow.index(f'pip install --quiet "{match.group(1)}"')
+    assert install_pos < workflow.index("python scripts/catalog_parity_diff.py")

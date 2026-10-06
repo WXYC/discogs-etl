@@ -113,3 +113,31 @@ class TestSyncWorkflowInstallOrdering:
         release_pos = source.index("name: Update library.db in LML release", sync_pos)
         sync_step = source[sync_pos:release_pos]
         assert "VA_RELEASE_FLOOR" in sync_step
+
+
+class TestWxyccatalogInstall:
+    """lib/backend_library_source.py imports wxyc_catalog at module level, and
+    scripts/build_library_db.py (the core of the sync) imports that module, so
+    the bare setup-python interpreter must have the package before the sync."""
+
+    @staticmethod
+    def _pyproject_floor() -> str:
+        match = re.search(r'"(wxyc-catalog>=[^"]+)"', (REPO_ROOT / "pyproject.toml").read_text())
+        assert match, "pyproject.toml must declare wxyc-catalog"
+        return match.group(1)
+
+    def test_install_precedes_run_library_sync_with_the_pyproject_floor(self) -> None:
+        source = SYNC_WORKFLOW.read_text()
+        install_pos = source.index(f'pip install --quiet "{self._pyproject_floor()}"')
+        assert install_pos < source.index("name: Run library sync")
+
+    def test_install_is_not_soft_fail(self) -> None:
+        """The build cannot run without the package, so a failed install must
+        fail the job (contrast with the soft-fail psycopg step)."""
+        source = SYNC_WORKFLOW.read_text()
+        start = source.index("Install wxyc-catalog for the Backend library build")
+        block = source[start : source.index("name: Run library sync", start)]
+        assert "set +e" not in block and "::warning::" not in block
+
+    def test_dockerfile_pin_matches_pyproject(self) -> None:
+        assert f'"{self._pyproject_floor()}"' in (REPO_ROOT / "Dockerfile").read_text()

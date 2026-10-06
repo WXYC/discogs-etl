@@ -307,13 +307,15 @@ def parse_library_tsv(tsv_path: str) -> Iterable[Sequence[object]]:
     r"""Yield ``library`` row tuples from a ``mysql -B -N`` TSV dump.
 
     The file has 11 tab-separated fields per line, matching
-    ``TSV_INSERT_COLUMNS``. MySQL ``\N`` becomes SQL NULL (tested
+    ``TSV_INSERT_COLUMNS``, or 12 when the producer also selects the trailing
+    ``release_call_letters`` (``LIBRARY_INSERT_COLUMNS``; the parity harness's
+    MySQL query does, the legacy sync's did not). MySQL ``\N`` becomes SQL NULL (tested
     against the raw field, before unescaping -- see
     ``_parse_nullable_field``). Every surviving field is then unescaped:
     ``mysql -B -N`` (no ``--raw``) escapes embedded backslash/tab/newline/NUL
     bytes into the two-char sequences ``\\``/``\t``/``\n``/``\0``, and this
     parser undoes that so the served catalog holds the real bytes rather
-    than their escaped spelling. Rows without exactly 11 fields are skipped
+    than their escaped spelling. Rows with any other field count are skipped
     with a WARNING on stderr (never silently dropped).
 
     **Fragile by construction, and the dependency is one-sided.** The
@@ -376,7 +378,7 @@ def parse_library_tsv(tsv_path: str) -> Iterable[Sequence[object]]:
     with open(tsv_path, encoding="utf-8", newline="\n") as f:
         for line in f:
             fields = line.rstrip("\n").split("\t")
-            if len(fields) != len(TSV_INSERT_COLUMNS):
+            if len(fields) not in (len(TSV_INSERT_COLUMNS), len(LIBRARY_INSERT_COLUMNS)):
                 print(
                     f"WARNING: skipping malformed row with {len(fields)} fields",
                     file=sys.stderr,

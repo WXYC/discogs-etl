@@ -80,9 +80,15 @@ class TestLibrarySelectNullableTextColumnsWrapped:
         # closes right before the query moves on to LIBRARY_RELEASE r JOIN...,
         # not merely appearing somewhere earlier in the string.
         assert re.search(
-            r"AND xlc\.ID != lc\.ID\), ''\)\s+FROM LIBRARY_RELEASE r JOIN",
+            r"AND xlc\.ID != lc\.ID\), ''\), IFNULL\(r\.CALL_LETTERS, ''\)\s+FROM LIBRARY_RELEASE r JOIN",
             select_text,
         ), "cross_reference_names subquery is not wrapped all the way to its closing paren"
+
+    def test_release_call_letters_selected_and_wrapped_in_ifnull(self) -> None:
+        """The volume letter (LIBRARY_RELEASE.CALL_LETTERS, nullable) is the
+        12th field; without it the parity harness compares NULL against the
+        Backend side's letter for every lettered release."""
+        assert "IFNULL(r.CALL_LETTERS, '')" in _library_select()
 
     def test_not_null_columns_left_unwrapped(self) -> None:
         """Columns that carry no SQL NULL must NOT be wrapped -- doing so
