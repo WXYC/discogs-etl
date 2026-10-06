@@ -920,6 +920,17 @@ def _classify_cross_reference_names(
     return ("mismatch", None)
 
 
+def _classify_release_call_letters(
+    mysql_row: Mapping[str, object], backend_row: Mapping[str, object]
+) -> tuple[str, str | None]:
+    """``release_call_letters``: byte compare, no tier between agree and mismatch."""
+    if _normalize(backend_row["release_call_letters"]) == _normalize(
+        mysql_row["release_call_letters"]
+    ):
+        return ("agree", None)
+    return ("mismatch", None)
+
+
 # Keyed by column name (never a positional/ordered table) so
 # `TestColumnModelsDriftGuard` can assert `set(COLUMN_MODELS) == set(DIFF_COLUMNS)`
 # -- set equality, not containment, so an added OR removed diffed column
@@ -937,6 +948,8 @@ COLUMN_MODELS: dict[
     "alternate_artist_name": _make_tab_nl_classifier("alternate_artist_name"),
     "album_artist": _make_tab_nl_classifier("album_artist"),
     "cross_reference_names": _classify_cross_reference_names,
+    # Both producers fold with `normalize_volume_letters`, so a byte compare.
+    "release_call_letters": _classify_release_call_letters,
 }
 
 
@@ -1195,11 +1208,15 @@ def _load_library_rows(conn: sqlite3.Connection, label: str) -> dict[int, dict[s
     last (hiding a row-count divergence this parity harness exists to catch),
     so we raise ``SourceError`` instead of under-counting.
     """
-    cols = ", ".join(LIBRARY_COLUMNS)
-    rows = conn.execute(f"SELECT {cols} FROM library").fetchall()
+    # A library.db built before `release_call_letters` lacks trailing columns;
+    # select only what exists and read the rest as NULL.
+    present = {r[1] for r in conn.execute("PRAGMA table_info(library)")}
+    columns = [c for c in LIBRARY_COLUMNS if c in present]
+    rows = conn.execute(f"SELECT {', '.join(columns)} FROM library").fetchall()
     result: dict[int, dict[str, object]] = {}
     for row in rows:
-        record = dict(zip(LIBRARY_COLUMNS, row, strict=True))
+        record = dict.fromkeys(LIBRARY_COLUMNS)
+        record.update(zip(columns, row, strict=True))
         row_id = int(record["id"])
         if row_id in result:
             raise SourceError(

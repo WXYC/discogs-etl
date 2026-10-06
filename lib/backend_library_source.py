@@ -30,6 +30,8 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
+from wxyc_catalog import normalize_volume_letters
+
 from lib.catalog_source_common import (
     SourceError,
     _build_into,
@@ -307,6 +309,8 @@ def _catalog_row_to_library_row(row: dict[str, Any]) -> list[object]:
         # into phantom aliases by the delimiter; the join happens here, at the
         # one place that writes the SQLite column.
         CROSS_REFERENCE_SEPARATOR.join(cross_reference_names),
+        # Optional on the wire: an older Backend omits it, which lands as NULL.
+        normalize_volume_letters(row.get("code_volume_letters")),
     ]
 
 
