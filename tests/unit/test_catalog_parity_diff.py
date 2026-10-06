@@ -64,6 +64,7 @@ _LIBRARY_COLUMNS = (
     "album_artist",
     "label",
     "cross_reference_names",
+    "release_call_letters",
 )
 
 _DEFAULT_ROW = {
@@ -78,6 +79,7 @@ _DEFAULT_ROW = {
     "album_artist": None,
     "label": None,
     "cross_reference_names": None,
+    "release_call_letters": None,
 }
 
 
@@ -100,7 +102,8 @@ def _make_library_db(
         id INTEGER PRIMARY KEY, title TEXT, artist TEXT, call_letters TEXT,
         artist_call_number INTEGER, release_call_number INTEGER,
         genre TEXT, format TEXT, alternate_artist_name TEXT,
-        album_artist TEXT, label TEXT, cross_reference_names TEXT
+        album_artist TEXT, label TEXT, cross_reference_names TEXT,
+        release_call_letters TEXT
     )"""
     )
     for row in rows:
@@ -2713,6 +2716,7 @@ class TestBackendProducer:
                 "",
                 None,
                 "",
+                None,
             )
             assert conn.execute(
                 "SELECT library_release_id, artist_name, track_title FROM compilation_track_artist"
@@ -3142,6 +3146,70 @@ class TestBackendProducer:
             ).fetchall() == [(72_101,)]
         finally:
             conn.close()
+
+
+class TestCatalogRowToLibraryRowVolumeLetters:
+    """``release_call_letters`` is the LAST column, folded by wxyc-catalog's
+    ``normalize_volume_letters`` (strip, upper-case, '' -> NULL)."""
+
+    @pytest.mark.parametrize(
+        ("wire", "expected"),
+        [
+            ("A", "A"),
+            ("b", "B"),
+            ("b ", "B"),
+            ("  g", "G"),
+            ("", None),
+            ("   ", None),
+            (None, None),
+        ],
+    )
+    def test_folds_code_volume_letters(self, wire: str | None, expected: str | None) -> None:
+        sys.path.insert(0, str(REPO_ROOT))
+        from lib.backend_library_source import _catalog_row_to_library_row
+
+        assert _catalog_row_to_library_row(_catalog_row(code_volume_letters=wire))[-1] == expected
+
+    def test_absent_key_is_null(self) -> None:
+        sys.path.insert(0, str(REPO_ROOT))
+        from lib.backend_library_source import _catalog_row_to_library_row
+
+        assert "code_volume_letters" not in _catalog_row()
+        assert _catalog_row_to_library_row(_catalog_row())[-1] is None
+
+    def test_is_the_last_insert_column(self) -> None:
+        sys.path.insert(0, str(REPO_ROOT))
+        from lib.library_db import LIBRARY_COLUMNS
+
+        assert LIBRARY_COLUMNS[-1] == "release_call_letters"
+
+
+class TestReleaseCallLettersParity:
+    def test_byte_compare_flags_a_case_difference(self) -> None:
+        mod = _load_module()
+        agree = mod.classify_field(
+            "release_call_letters", _row(release_call_letters="B"), _row(release_call_letters="B")
+        )
+        differ = mod.classify_field(
+            "release_call_letters", _row(release_call_letters="b"), _row(release_call_letters="B")
+        )
+        assert agree == ("agree", None)
+        assert differ == ("mismatch", None)
+
+    def test_older_library_db_without_the_column_loads_as_null(self, tmp_path: Path) -> None:
+        mod = _load_module()
+        path = tmp_path / "old.db"
+        conn = sqlite3.connect(path)
+        conn.execute(
+            "CREATE TABLE library (id INTEGER PRIMARY KEY, title TEXT, artist TEXT, "
+            "call_letters TEXT, artist_call_number INTEGER, release_call_number INTEGER, "
+            "genre TEXT, format TEXT, alternate_artist_name TEXT, album_artist TEXT, "
+            "label TEXT, cross_reference_names TEXT)"
+        )
+        conn.execute("INSERT INTO library (id, title) VALUES (1, 'DOGA')")
+        rows = mod._load_library_rows(conn, "mysql")
+        conn.close()
+        assert rows[1]["release_call_letters"] is None
 
 
 class TestCatalogRowToIdMapEntry:

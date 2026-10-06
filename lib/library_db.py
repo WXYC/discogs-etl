@@ -27,9 +27,10 @@ missing tokenizer categories and index cost nothing today. Do not treat that
 as safe by construction; if that database ever becomes a served artifact, it
 has to move onto this module first.
 
-The ``library`` table's 12 columns are ``id, title, artist, call_letters,
+The ``library`` table's 13 columns are ``id, title, artist, call_letters,
 artist_call_number, release_call_number, genre, format,
-alternate_artist_name, album_artist, label, cross_reference_names``.
+alternate_artist_name, album_artist, label, cross_reference_names,
+release_call_letters``.
 ``label`` is never inserted -- it exists in the schema but is always NULL in
 production, because the MySQL SELECT that feeds the daily build has no label
 column.
@@ -71,12 +72,19 @@ LIBRARY_COLUMNS = (
     "album_artist",
     "label",
     "cross_reference_names",
+    # Appended LAST so no existing column position shifts. Nullable: the
+    # tubafrenzy TSV producer predates it and never supplies it.
+    "release_call_letters",
 )
 
 # The columns a producer actually supplies, in the order `build_library_db`
 # expects each row tuple. `label` is absent on purpose (see the module
 # docstring); it stays NULL for every row.
 LIBRARY_INSERT_COLUMNS = tuple(c for c in LIBRARY_COLUMNS if c != "label")
+
+# The tubafrenzy TSV carries every insert column except the trailing
+# `release_call_letters`; its rows are 11 values, a prefix of the above.
+TSV_INSERT_COLUMNS = LIBRARY_INSERT_COLUMNS[:-1]
 
 CROSS_REFERENCE_SEPARATOR = " | "
 
@@ -102,7 +110,8 @@ def create_library_schema(cur: sqlite3.Cursor) -> None:
         id INTEGER PRIMARY KEY, title TEXT, artist TEXT, call_letters TEXT,
         artist_call_number INTEGER, release_call_number INTEGER,
         genre TEXT, format TEXT, alternate_artist_name TEXT,
-        album_artist TEXT, label TEXT, cross_reference_names TEXT
+        album_artist TEXT, label TEXT, cross_reference_names TEXT,
+        release_call_letters TEXT
     )""")
     cur.execute(
         "CREATE VIRTUAL TABLE library_fts USING fts5("
@@ -114,7 +123,8 @@ def create_library_schema(cur: sqlite3.Cursor) -> None:
 
 
 def insert_library_rows(cur: sqlite3.Cursor, rows: Iterable[Sequence[object]]) -> int:
-    """Insert ``rows`` (11-value sequences, ``LIBRARY_INSERT_COLUMNS`` order).
+    """Insert ``rows`` (``LIBRARY_INSERT_COLUMNS`` order; a row may stop short of
+    the trailing nullable ``release_call_letters``, as the 11-value TSV rows do).
 
     Consumes ``rows`` lazily so a producer can stream and emit its own
     per-row warnings interleaved with the insert, as the TSV parser does.
@@ -122,11 +132,11 @@ def insert_library_rows(cur: sqlite3.Cursor, rows: Iterable[Sequence[object]]) -
     Returns:
         The number of rows inserted.
     """
-    columns = ", ".join(LIBRARY_INSERT_COLUMNS)
-    placeholders = ", ".join("?" for _ in LIBRARY_INSERT_COLUMNS)
     count = 0
     for row in rows:
-        cur.execute(f"INSERT INTO library ({columns}) VALUES ({placeholders})", row)
+        columns = LIBRARY_INSERT_COLUMNS[: len(row)]
+        placeholders = ", ".join("?" for _ in columns)
+        cur.execute(f"INSERT INTO library ({', '.join(columns)}) VALUES ({placeholders})", row)
         count += 1
     return count
 
@@ -207,8 +217,8 @@ def build_library_db(
             exist as a populated database -- callers are responsible for
             choosing a fresh path (SQLite would otherwise fail on the
             ``CREATE TABLE``).
-        library_rows: Iterable of 11-value sequences in
-            ``LIBRARY_INSERT_COLUMNS`` order.
+        library_rows: Iterable of sequences in ``LIBRARY_INSERT_COLUMNS``
+            order (11 values from the TSV, 12 from Backend).
         cta_rows: Optional iterable of ``(library_release_id, artist_name,
             track_title)`` triples. ``None`` (or empty) skips the
             ``compilation_track_artist`` table entirely.
@@ -297,7 +307,7 @@ def parse_library_tsv(tsv_path: str) -> Iterable[Sequence[object]]:
     r"""Yield ``library`` row tuples from a ``mysql -B -N`` TSV dump.
 
     The file has 11 tab-separated fields per line, matching
-    ``LIBRARY_INSERT_COLUMNS``. MySQL ``\N`` becomes SQL NULL (tested
+    ``TSV_INSERT_COLUMNS``. MySQL ``\N`` becomes SQL NULL (tested
     against the raw field, before unescaping -- see
     ``_parse_nullable_field``). Every surviving field is then unescaped:
     ``mysql -B -N`` (no ``--raw``) escapes embedded backslash/tab/newline/NUL
@@ -366,7 +376,7 @@ def parse_library_tsv(tsv_path: str) -> Iterable[Sequence[object]]:
     with open(tsv_path, encoding="utf-8", newline="\n") as f:
         for line in f:
             fields = line.rstrip("\n").split("\t")
-            if len(fields) != len(LIBRARY_INSERT_COLUMNS):
+            if len(fields) != len(TSV_INSERT_COLUMNS):
                 print(
                     f"WARNING: skipping malformed row with {len(fields)} fields",
                     file=sys.stderr,
