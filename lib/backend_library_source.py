@@ -311,6 +311,9 @@ def _catalog_row_to_library_row(row: dict[str, Any]) -> list[object]:
         CROSS_REFERENCE_SEPARATOR.join(cross_reference_names),
         # Optional on the wire: an older Backend omits it, which lands as NULL.
         normalize_volume_letters(row.get("code_volume_letters")),
+        # Optional on the wire like the above; the DB constraint already
+        # guarantees ^[A-Z]$, so it is stored as-is.
+        row.get("code_comp_letter"),
     ]
 
 

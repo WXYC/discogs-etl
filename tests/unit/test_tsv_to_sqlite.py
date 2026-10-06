@@ -1175,3 +1175,23 @@ class TestVolumeLetterColumn:
         got = conn.execute("SELECT release_call_letters FROM library").fetchone()[0]
         conn.close()
         assert got == expected
+
+    @pytest.mark.parametrize(
+        ("suffix", "release_letters", "comp_letter"),
+        [("", None, None), ("\tb", "B", None), ("\tb\tM", "B", "M"), ("\t\\N\t\\N", None, None)],
+    )
+    def test_each_producer_width_builds(
+        self, tmp_path: Path, suffix: str, release_letters: str | None, comp_letter: str | None
+    ) -> None:
+        tsv_file = tmp_path / "input.tsv"
+        tsv_file.write_text(_ELEVEN.format(id=1, title="A") + suffix + "\n", encoding="utf-8")
+        db_path = tmp_path / "library.db"
+
+        assert tsv_to_sqlite(str(tsv_file), str(db_path)) == 1
+
+        conn = sqlite3.connect(str(db_path))
+        got = conn.execute(
+            "SELECT release_call_letters, artist_comp_letter FROM library"
+        ).fetchone()
+        conn.close()
+        assert got == (release_letters, comp_letter)
