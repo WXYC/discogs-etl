@@ -75,11 +75,17 @@ jobs:
         with:
           python-version: "3.12"
 
-      # No pip install step, deliberately: catalog_parity_diff.py is stdlib
-      # only apart from repo-local lib.* imports (it inserts the repo root on
-      # sys.path itself), and lib.observability degrades to basicConfig when
-      # wxyc_etl is absent. Adding a dependency to the harness's import graph
-      # means adding an install step here.
+      # catalog_parity_diff.py imports lib.backend_library_source, which
+      # imports wxyc_catalog at module level (it folds the per-release volume
+      # letter), so the package must be installed before the harness runs. The
+      # rest of the harness's import graph is stdlib plus repo-local lib.*
+      # (it inserts the repo root on sys.path itself), and lib.observability
+      # degrades to basicConfig when wxyc_etl is absent. Adding a dependency
+      # to the harness's import graph means adding an install step here. The
+      # version floor must equal pyproject.toml's
+      # (tests/unit/test_catalog_parity_workflow.py holds them in lockstep).
+      - name: Install wxyc-catalog
+        run: pip install --quiet "wxyc-catalog>=0.2.0"
 
       - name: Install MariaDB client
         # Not interchangeable with the Oracle/Homebrew MySQL client: a 9.x

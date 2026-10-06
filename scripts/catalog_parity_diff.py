@@ -57,9 +57,10 @@ WXYC/discogs-etl#346, deliberately human-gated. Two of the three have now
 happened (``/wxycdb`` went dark 2026-09-16, and the daily build flipped), so
 this harness's remaining job is evidence rather than gating.
 
-Schema note: the ``library`` table's 12 columns (``id, title, artist,
+Schema note: the ``library`` table's 13 columns (``id, title, artist,
 call_letters, artist_call_number, release_call_number, genre, format,
-alternate_artist_name, album_artist, label, cross_reference_names``) are
+alternate_artist_name, album_artist, label, cross_reference_names,
+release_call_letters``) are
 **imported** from ``lib/library_db.py`` -- the authoritative daily-sync
 shape, shared with ``scripts/tsv_to_sqlite.py`` so both producers build the
 same database. Imported rather than restated, so a column added there widens
@@ -175,7 +176,7 @@ import tempfile
 # name still resolves here.
 import time  # noqa: F401
 from collections import Counter
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -207,6 +208,7 @@ from lib.backend_library_source import (  # noqa: E402
     _require_legacy_release_id,
     _resolve_backend_base_url,
     _TokenSource,
+    normalize_volume_letters,
 )
 from lib.backend_library_source import (  # noqa: E402
     _JWT_REFRESH_MARGIN_SECONDS as _JWT_REFRESH_MARGIN_SECONDS,
@@ -249,6 +251,7 @@ from lib.fffd_pair_capture import (  # noqa: E402
 from lib.library_db import (  # noqa: E402
     CROSS_REFERENCE_SEPARATOR,
     LIBRARY_COLUMNS,
+    LIBRARY_INSERT_COLUMNS,
     parse_compilation_track_tsv,
     parse_library_tsv,
 )
@@ -948,7 +951,8 @@ COLUMN_MODELS: dict[
     "alternate_artist_name": _make_tab_nl_classifier("alternate_artist_name"),
     "album_artist": _make_tab_nl_classifier("album_artist"),
     "cross_reference_names": _classify_cross_reference_names,
-    # Both producers fold with `normalize_volume_letters`, so a byte compare.
+    # Both producers fold with `normalize_volume_letters` (the MySQL side via
+    # `_fold_mysql_volume_letters`), so a byte compare.
     "release_call_letters": _classify_release_call_letters,
 }
 
@@ -1211,6 +1215,9 @@ def _load_library_rows(conn: sqlite3.Connection, label: str) -> dict[int, dict[s
     # A library.db built before `release_call_letters` lacks trailing columns;
     # select only what exists and read the rest as NULL.
     present = {r[1] for r in conn.execute("PRAGMA table_info(library)")}
+    missing = [c for c in LIBRARY_COLUMNS if c not in present and c != "release_call_letters"]
+    if missing:
+        raise SourceError(f"{label} database is missing library column(s): {', '.join(missing)}")
     columns = [c for c in LIBRARY_COLUMNS if c in present]
     rows = conn.execute(f"SELECT {', '.join(columns)} FROM library").fetchall()
     result: dict[int, dict[str, object]] = {}
@@ -1493,7 +1500,8 @@ LIBRARY_SELECT_SQL = (
     " THEN xcr.CROSS_REFERENCING_ARTIST_ID ELSE NULL END"
     " AND (xcr.CROSS_REFERENCING_ARTIST_ID = lc.ID"
     " OR xcr.CROSS_REFERENCED_LIBRARY_CODE_ID = lc.ID)"
-    " AND xlc.ID != lc.ID), '')"
+    " AND xlc.ID != lc.ID), ''),"
+    " IFNULL(r.CALL_LETTERS, '')"
     " FROM LIBRARY_RELEASE r JOIN LIBRARY_CODE lc ON r.LIBRARY_CODE_ID = lc.ID"
     " JOIN FORMAT f ON r.FORMAT_ID = f.ID JOIN GENRE g ON lc.GENRE_ID = g.ID"
 )
@@ -1507,6 +1515,22 @@ COMPILATION_TRACK_SELECT_SQL = (
     "SELECT LIBRARY_RELEASE_ID, ARTIST_NAME, IFNULL(TRACK_TITLE, '')"
     " FROM COMPILATION_TRACK_ARTIST ORDER BY LIBRARY_RELEASE_ID"
 )
+
+
+def _fold_mysql_volume_letters(rows: Iterable[Sequence[object]]) -> Iterator[Sequence[object]]:
+    """Fold the MySQL row's trailing ``release_call_letters`` like the Backend producer.
+
+    ``LIBRARY_SELECT_SQL`` emits ``IFNULL(r.CALL_LETTERS, '')`` as its 12th
+    field; ``normalize_volume_letters`` turns that into the same upper-cased
+    letter or NULL that ``_catalog_row_to_library_row`` stores for Backend's
+    ``code_volume_letters``. A 11-value row (a stub or older fixture) passes
+    through untouched and reads as NULL.
+    """
+    width = len(LIBRARY_INSERT_COLUMNS)
+    for row in rows:
+        if len(row) == width:
+            row = [*row[:-1], normalize_volume_letters(row[-1])]
+        yield row
 
 
 def _catalog_row_to_id_map_entry(row: dict[str, Any]) -> tuple[int, int]:
@@ -1880,7 +1904,12 @@ def _build_library_db_from_mysql(source: str, output_path: str) -> None:
                 extra={"step": "mysql_producer"},
             )
 
-        count = _build_into(output_path, "mysql", parse_library_tsv(library_tsv), cta_rows)
+        count = _build_into(
+            output_path,
+            "mysql",
+            _fold_mysql_volume_letters(parse_library_tsv(library_tsv)),
+            cta_rows,
+        )
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
 

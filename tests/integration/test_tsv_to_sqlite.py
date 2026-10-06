@@ -125,6 +125,7 @@ class TestTsvToSqliteIntegration:
             (9, "album_artist", "TEXT", 0, None, 0),
             (10, "label", "TEXT", 0, None, 0),
             (11, "cross_reference_names", "TEXT", 0, None, 0),
+            (12, "release_call_letters", "TEXT", 0, None, 0),
         ]
 
         assert columns == expected_columns

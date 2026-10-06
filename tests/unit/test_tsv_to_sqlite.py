@@ -180,12 +180,12 @@ class TestTsvToSqlite:
         assert null_hits == []
 
     def test_eleven_column_validation(self, tmp_path: Path) -> None:
-        """Rows with != 11 fields are skipped; valid rows are still imported."""
+        """Rows with other than 11 (or 12, with the volume letter) fields are skipped; valid rows are still imported."""
         tsv = (
             "1\tAluminum Tunes\tStereolab\tST\t100\t1\tRock\tCD\t\\N\t\\N\t\\N\n"
             "bad\trow\twith\ttoo\tfew\n"
             "2\tDOGA\tJuana Molina\tMO\t200\t2\tRock\tLP\t\\N\t\\N\t\\N\n"
-            "3\textra\tfields\there\t1\t2\t3\t4\t5\t6\t7\t8\n"
+            "3\textra\tfields\there\t1\t2\t3\t4\t5\t6\t7\t8\t9\n"
         )
         tsv_file = tmp_path / "input.tsv"
         tsv_file.write_text(tsv, encoding="utf-8")

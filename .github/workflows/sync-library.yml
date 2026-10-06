@@ -114,6 +114,17 @@ jobs:
             echo "::warning::Failed to install psycopg (exit $rc); the va_release derive step will soft-fail inside sync-library.sh -- the library.db sync/upload is unaffected"
           fi
 
+      # lib/backend_library_source.py (imported by scripts/build_library_db.py,
+      # the core of the sync) imports wxyc_catalog at module level to fold the
+      # per-release volume letter, so the package must be present before the
+      # sync runs. Deliberately NOT soft-fail, unlike the psycopg step above:
+      # without it the build dies at import and production library.db is never
+      # rebuilt, so failing loudly here is the correct outcome. The version
+      # floor must equal pyproject.toml's (tests/unit/test_sync_library_derive_wiring.py
+      # holds them in lockstep).
+      - name: Install wxyc-catalog for the Backend library build
+        run: pip install --quiet "wxyc-catalog>=0.2.0"
+
       - name: Run library sync
         run: scripts/sync-library.sh
         env:
