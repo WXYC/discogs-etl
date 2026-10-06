@@ -27,10 +27,10 @@ missing tokenizer categories and index cost nothing today. Do not treat that
 as safe by construction; if that database ever becomes a served artifact, it
 has to move onto this module first.
 
-The ``library`` table's 13 columns are ``id, title, artist, call_letters,
+The ``library`` table's 14 columns are ``id, title, artist, call_letters,
 artist_call_number, release_call_number, genre, format,
 alternate_artist_name, album_artist, label, cross_reference_names,
-release_call_letters``.
+release_call_letters, artist_comp_letter``.
 ``label`` is never inserted -- it exists in the schema but is always NULL in
 production, because the MySQL SELECT that feeds the daily build has no label
 column.
@@ -246,7 +246,8 @@ def build_library_db(
             choosing a fresh path (SQLite would otherwise fail on the
             ``CREATE TABLE``).
         library_rows: Iterable of sequences in ``LIBRARY_INSERT_COLUMNS``
-            order (11 values from the TSV, 12 from Backend).
+            order (11 base values, plus any of the optional trailing
+            ``OPTIONAL_TRAILING_COLUMNS``: up to 13 from Backend).
         cta_rows: Optional iterable of ``(library_release_id, artist_name,
             track_title)`` triples. ``None`` (or empty) skips the
             ``compilation_track_artist`` table entirely.
@@ -335,12 +336,13 @@ def parse_library_tsv(tsv_path: str) -> Iterable[Sequence[object]]:
     r"""Yield ``library`` row tuples from a ``mysql -B -N`` TSV dump.
 
     The file has 11 tab-separated fields per line, matching
-    ``TSV_INSERT_COLUMNS``, or 12 when the producer also selects the trailing
-    ``release_call_letters`` (``LIBRARY_INSERT_COLUMNS``; the parity harness's
-    MySQL query does, the legacy sync's did not). The width is locked from the
-    first row of either accepted length, and any later row of a different
-    length is skipped with a WARNING, so a stray raw TAB cannot turn an
-    11-column row into an accepted, column-shifted 12-field one. MySQL ``\N`` becomes SQL NULL (tested
+    ``TSV_INSERT_COLUMNS``, plus any prefix of the optional trailing columns
+    (``OPTIONAL_TRAILING_COLUMNS``): 12 with ``release_call_letters`` (the
+    parity harness's MySQL query selects it, the legacy sync's did not), 13
+    with ``artist_comp_letter`` as well (``LIBRARY_INSERT_COLUMNS``). The width
+    is locked from the first row of any accepted length, and any later row of a
+    different length is skipped with a WARNING, so a stray raw TAB cannot turn
+    a narrower row into an accepted, column-shifted wider one. MySQL ``\N`` becomes SQL NULL (tested
     against the raw field, before unescaping -- see
     ``_parse_nullable_field``). Every surviving field is then unescaped:
     ``mysql -B -N`` (no ``--raw``) escapes embedded backslash/tab/newline/NUL

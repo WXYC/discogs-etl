@@ -57,10 +57,10 @@ WXYC/discogs-etl#346, deliberately human-gated. Two of the three have now
 happened (``/wxycdb`` went dark 2026-09-16, and the daily build flipped), so
 this harness's remaining job is evidence rather than gating.
 
-Schema note: the ``library`` table's 13 columns (``id, title, artist,
+Schema note: the ``library`` table's 14 columns (``id, title, artist,
 call_letters, artist_call_number, release_call_number, genre, format,
 alternate_artist_name, album_artist, label, cross_reference_names,
-release_call_letters``) are
+release_call_letters, artist_comp_letter``) are
 **imported** from ``lib/library_db.py`` -- the authoritative daily-sync
 shape, shared with ``scripts/tsv_to_sqlite.py`` so both producers build the
 same database. Imported rather than restated, so a column added there widens
