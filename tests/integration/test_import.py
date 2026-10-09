@@ -1362,6 +1362,235 @@ class TestImportClearsTombstones:
         )
 
 
+# Prod's own case from the 2026-10-03 rebuild failure (#444): release 313570
+# credits artist 232248 as `Dirt Nation` (main) and as `Dirt nation` (its
+# Written-By extra credit). Discogs' canonical name is `Dirt Nation`.
+DIRT_NATION_ID = 232248
+DIRT_NATION_RELEASE_ID = 313570
+STEREOLAB_ID = 2
+NILUFER_YANYA_ID = 5
+
+
+class TestArtistStubOneRowPerId:
+    """``import_artist_details`` stubs exactly one ``artist`` row per credited id (#408).
+
+    ``release_artist`` can credit one Discogs artist id under several literal
+    spellings: the dump's ``<name>`` is stored per credit, so a rename or a
+    case fix reaches some credits and not others. The stub INSERT's conflict
+    target is ``artist.id``, so it must dedup on ``artist_id`` alone. Deduping
+    on ``(artist_id, artist_name)`` handed one ``ON CONFLICT DO UPDATE`` two
+    rows for the same id and raised ``CardinalityViolation``, which killed the
+    2026-10-03 monthly rebuild (#444).
+
+    Which spelling survives is not arbitrary: nothing later in the import
+    rewrites ``artist.name`` (the ``artist.csv`` pass updates ``profile`` only),
+    so the stub's spelling becomes the persisted name that LML reads.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _fresh_schema(self, fresh_db_url):
+        self.db_url = fresh_db_url
+        conn = psycopg.connect(fresh_db_url, autocommit=True)
+        with conn.cursor() as cur:
+            cur.execute(SCHEMA_DIR.joinpath("create_database.sql").read_text())
+        conn.close()
+
+    def _credit(self, artist_id: int, credits: list[tuple[int, str, int]]) -> None:
+        """Insert ``(release_id, artist_name, extra)`` credits for *artist_id*."""
+        with psycopg.connect(self.db_url) as conn, conn.cursor() as cur:
+            for release_id in sorted({release_id for release_id, _, _ in credits}):
+                cur.execute(
+                    "INSERT INTO release (id, title) VALUES (%s, 'Aluminum Tunes') "
+                    "ON CONFLICT (id) DO NOTHING",
+                    (release_id,),
+                )
+            cur.executemany(
+                "INSERT INTO release_artist (release_id, artist_id, artist_name, extra) "
+                "VALUES (%s, %s, %s, %s)",
+                [(release_id, artist_id, name, extra) for release_id, name, extra in credits],
+            )
+
+    def _stub(self, tmp_path: Path) -> None:
+        # tmp_path holds no artist.csv and no child CSVs, so only the stub runs.
+        conn = psycopg.connect(self.db_url)
+        try:
+            import_artist_details(conn, tmp_path)
+        finally:
+            conn.close()
+
+    def _artist_rows(self, artist_id: int) -> list[tuple]:
+        with psycopg.connect(self.db_url) as conn, conn.cursor() as cur:
+            cur.execute("SELECT name, not_found FROM artist WHERE id = %s", (artist_id,))
+            return cur.fetchall()
+
+    def test_one_id_under_two_spellings_stubs_one_row(self, tmp_path) -> None:
+        """The #444 failure itself: two spellings of one new id on one release."""
+        self._credit(
+            DIRT_NATION_ID,
+            [
+                (DIRT_NATION_RELEASE_ID, "Dirt Nation", 0),
+                (DIRT_NATION_RELEASE_ID, "Dirt nation", 1),
+            ],
+        )
+
+        self._stub(tmp_path)
+
+        assert self._artist_rows(DIRT_NATION_ID) == [("Dirt Nation", False)]
+
+    @pytest.mark.parametrize(
+        ("artist_id", "credits", "expected"),
+        [
+            pytest.param(
+                DIRT_NATION_ID,
+                [(1, "Dirt Nation", 0), (2, "Dirt nation", 1), (3, "Dirt nation", 1)],
+                "Dirt Nation",
+                id="main-credit-outranks-more-frequent-extra-credits",
+            ),
+            pytest.param(
+                NILUFER_YANYA_ID,
+                [(1, "Nilüfer Yanya", 0), (2, "Nilüfer Yanya", 0), (3, "Nilufer Yanya", 0)],
+                "Nilüfer Yanya",
+                id="most-credited-main-spelling-beats-alphabetical",
+            ),
+            pytest.param(
+                NILUFER_YANYA_ID,
+                [(1, "Nilüfer Yanya", 0), (2, "Nilüfer Yanya", 1), (3, "Nilufer Yanya", 0)],
+                "Nilüfer Yanya",
+                id="main-tie-goes-to-most-credited-overall",
+            ),
+            pytest.param(
+                NILUFER_YANYA_ID,
+                [(1, "Nilüfer Yanya", 1), (2, "Nilüfer Yanya", 1), (3, "Nilufer Yanya", 1)],
+                "Nilüfer Yanya",
+                id="extra-only-id-takes-most-credited-spelling",
+            ),
+        ],
+    )
+    def test_chosen_spelling(self, tmp_path, artist_id, credits, expected) -> None:
+        """Main-credit count, then total credit count, then byte order.
+
+        Every case puts the expected spelling *after* the losing one in
+        alphabetical order under any collation, so a bare ``ORDER BY
+        artist_name`` cannot pass them.
+        """
+        self._credit(artist_id, credits)
+
+        self._stub(tmp_path)
+
+        assert self._artist_rows(artist_id) == [(expected, False)]
+
+    @pytest.mark.parametrize("collation", [None, "C", "und-x-icu"])
+    def test_tie_breaks_on_byte_order_whatever_the_column_collation(
+        self, tmp_path, collation
+    ) -> None:
+        """A full tie must resolve the same way on every database.
+
+        A plain ``ORDER BY artist_name`` follows the column's collation:
+        byte order puts ``Dirt Nation`` first, but a linguistic collation such
+        as glibc's ``en_US.utf8`` (the official postgres image's default) or
+        ICU puts ``Dirt nation`` first. The tie-break is pinned to ``"C"`` so
+        prod, CI and a laptop agree.
+        """
+        if collation is not None:
+            with psycopg.connect(self.db_url) as conn, conn.cursor() as cur:
+                cur.execute("SELECT 1 FROM pg_collation WHERE collname = %s", (collation,))
+                if cur.fetchone() is None:
+                    pytest.skip(f"collation {collation!r} not available on this server")
+                cur.execute(
+                    f'ALTER TABLE release_artist ALTER COLUMN artist_name TYPE text COLLATE "{collation}"'
+                )
+        self._credit(DIRT_NATION_ID, [(1, "Dirt nation", 0), (2, "Dirt Nation", 0)])
+
+        self._stub(tmp_path)
+
+        assert self._artist_rows(DIRT_NATION_ID) == [("Dirt Nation", False)]
+
+    @pytest.mark.parametrize(
+        "tombstoned",
+        [
+            pytest.param(True, id="tombstone-is-cleared"),
+            pytest.param(False, id="live-row-is-untouched"),
+        ],
+    )
+    def test_existing_row_keeps_its_name(self, tmp_path, tombstoned) -> None:
+        """An id already in ``artist`` keeps its name, profile and fetch stamp.
+
+        The conflict branch only clears an LML#510 tombstone, and only a
+        tombstoned row is rewritten at all (its row version changes; a live
+        row's does not). Here the dump credits the id under two spellings
+        that both differ from the stored name, so a branch that rewrote
+        ``name`` would show.
+        """
+        row_sql = (
+            "SELECT name, profile, fetched_at = '2026-09-01T00:00:00Z', not_found, xmin::text "
+            "FROM artist WHERE id = %s"
+        )
+        with psycopg.connect(self.db_url) as conn, conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO artist (id, name, profile, fetched_at, not_found) "
+                "VALUES (%s, 'Stereolab', 'Anglo-French group', "
+                "'2026-09-01T00:00:00Z', %s)",
+                (STEREOLAB_ID, tombstoned),
+            )
+            cur.execute(row_sql, (STEREOLAB_ID,))
+            version_before = cur.fetchone()[-1]
+        self._credit(STEREOLAB_ID, [(1, "stereolab", 0), (2, "stereolab", 0), (3, "StereoLab", 0)])
+
+        self._stub(tmp_path)
+
+        with psycopg.connect(self.db_url) as conn, conn.cursor() as cur:
+            cur.execute(row_sql, (STEREOLAB_ID,))
+            rows = cur.fetchall()
+        assert [row[:-1] for row in rows] == [("Stereolab", "Anglo-French group", True, False)]
+        assert (rows[0][-1] != version_before) is tombstoned
+
+    def test_single_spelling_ids_stub_exactly_the_pre_408_rows(self, tmp_path) -> None:
+        """The library-filtered path, where every id has one spelling, is unchanged.
+
+        Loads the fixture ``release`` / ``release_artist`` CSVs (12 ids, some
+        credited on several releases, one only as an extra credit) plus a
+        NULL-id credit, and compares the stubs against what the pre-#408
+        ``SELECT DISTINCT artist_id, artist_name`` produced.
+        """
+        with psycopg.connect(self.db_url) as conn:
+            for name in ("release", "release_artist"):
+                config = next(t for t in BASE_TABLES if t["table"] == name)
+                import_csv_func(
+                    conn,
+                    CSV_DIR / config["csv_file"],
+                    config["table"],
+                    config["csv_columns"],
+                    config["db_columns"],
+                    config["required"],
+                    config["transforms"],
+                )
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO release_artist (release_id, artist_id, artist_name) "
+                    "VALUES (1001, NULL, 'Unknown Artist')"
+                )
+                cur.execute(
+                    "SELECT count(*) FILTER (WHERE spellings = 1), count(*), max(n) FROM ("
+                    "  SELECT artist_id, count(DISTINCT artist_name) AS spellings, count(*) AS n"
+                    "  FROM release_artist WHERE artist_id IS NOT NULL GROUP BY artist_id"
+                    ") ids"
+                )
+                single_spelling_ids, ids, most_credits = cur.fetchone()
+                cur.execute(
+                    "SELECT DISTINCT artist_id, artist_name, FALSE FROM release_artist "
+                    "WHERE artist_id IS NOT NULL"
+                )
+                pre_408_rows = set(cur.fetchall())
+        assert single_spelling_ids == ids == 12, "fixture must credit each id under one spelling"
+        assert most_credits > 1, "fixture must credit some id on several releases"
+
+        self._stub(tmp_path)
+
+        with psycopg.connect(self.db_url) as conn, conn.cursor() as cur:
+            cur.execute("SELECT id, name, not_found FROM artist")
+            assert set(cur.fetchall()) == pre_408_rows
+
+
 class TestPruneStaleReleasesPlan:
     """The stale-release prune must plan as an anti-join, not a NOT IN SubPlan.
 
