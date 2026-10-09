@@ -1379,8 +1379,9 @@ class TestArtistStubOneRowPerId:
     case fix reaches some credits and not others. The stub INSERT's conflict
     target is ``artist.id``, so it must dedup on ``artist_id`` alone. Deduping
     on ``(artist_id, artist_name)`` handed one ``ON CONFLICT DO UPDATE`` two
-    rows for the same id and raised ``CardinalityViolation``, which killed the
-    2026-10-03 monthly rebuild (#444).
+    rows for the same id. For an id that was new or tombstoned, the first row
+    wrote it and the second then raised ``CardinalityViolation``, which killed
+    the 2026-10-03 monthly rebuild (#444).
 
     Which spelling survives is not arbitrary: nothing later in the import
     rewrites ``artist.name`` (the ``artist.csv`` pass updates ``profile`` only),
@@ -1448,9 +1449,15 @@ class TestArtistStubOneRowPerId:
             ),
             pytest.param(
                 NILUFER_YANYA_ID,
-                [(1, "Nilüfer Yanya", 0), (2, "Nilüfer Yanya", 0), (3, "Nilufer Yanya", 0)],
+                [
+                    (1, "Nilüfer Yanya", 0),
+                    (2, "Nilüfer Yanya", 0),
+                    (3, "Nilufer Yanya", 0),
+                    (4, "Nilufer Yanya", 1),
+                    (5, "Nilufer Yanya", 1),
+                ],
                 "Nilüfer Yanya",
-                id="most-credited-main-spelling-beats-alphabetical",
+                id="more-main-credits-outrank-more-credits-overall",
             ),
             pytest.param(
                 NILUFER_YANYA_ID,
@@ -1469,15 +1476,34 @@ class TestArtistStubOneRowPerId:
     def test_chosen_spelling(self, tmp_path, artist_id, credits, expected) -> None:
         """Main-credit count, then total credit count, then byte order.
 
-        Every case puts the expected spelling *after* the losing one in
-        alphabetical order under any collation, so a bare ``ORDER BY
-        artist_name`` cannot pass them.
+        Each expected spelling loses under a simpler rule: the first two cases
+        on total credits, the last three on alphabetical order (``Nilufer``
+        sorts before ``Nilüfer`` under every collation). So dropping a sort
+        key, swapping the first two, or reducing the main-credit count to a
+        has-any-main-credit flag fails a case.
         """
         self._credit(artist_id, credits)
 
         self._stub(tmp_path)
 
         assert self._artist_rows(artist_id) == [(expected, False)]
+
+    def test_unlinked_credits_stub_no_artist(self, tmp_path) -> None:
+        """``artist_id`` 0 marks a credit with no linked Discogs artist.
+
+        It is what the converter writes for a credit whose ``<id>`` does not
+        parse and what the Discogs API returns for an unlinked credit. Id 0 is
+        not an artist, so it must not become an ``artist`` row named after
+        whichever unrelated credit the spelling rule happens to pick.
+        """
+        self._credit(0, [(1, "Some Photographer", 1), (2, "Some Engineer", 1)])
+        self._credit(STEREOLAB_ID, [(1, "Stereolab", 0)])
+
+        self._stub(tmp_path)
+
+        with psycopg.connect(self.db_url) as conn, conn.cursor() as cur:
+            cur.execute("SELECT id FROM artist ORDER BY id")
+            assert cur.fetchall() == [(STEREOLAB_ID,)]
 
     @pytest.mark.parametrize("collation", [None, "C", "und-x-icu"])
     def test_tie_breaks_on_byte_order_whatever_the_column_collation(
@@ -1497,7 +1523,8 @@ class TestArtistStubOneRowPerId:
                 if cur.fetchone() is None:
                     pytest.skip(f"collation {collation!r} not available on this server")
                 cur.execute(
-                    f'ALTER TABLE release_artist ALTER COLUMN artist_name TYPE text COLLATE "{collation}"'
+                    "ALTER TABLE release_artist ALTER COLUMN artist_name "
+                    f'TYPE text COLLATE "{collation}"'
                 )
         self._credit(DIRT_NATION_ID, [(1, "Dirt nation", 0), (2, "Dirt Nation", 0)])
 
@@ -1545,44 +1572,40 @@ class TestArtistStubOneRowPerId:
         assert (rows[0][-1] != version_before) is tombstoned
 
     def test_single_spelling_ids_stub_exactly_the_pre_408_rows(self, tmp_path) -> None:
-        """The library-filtered path, where every id has one spelling, is unchanged.
+        """An id credited under one spelling stubs exactly as it did before #408.
 
-        Loads the fixture ``release`` / ``release_artist`` CSVs (12 ids, some
-        credited on several releases, one only as an extra credit) plus a
-        NULL-id credit, and compares the stubs against what the pre-#408
-        ``SELECT DISTINCT artist_id, artist_name`` produced.
+        Loads the fixture base CSVs the way the import does, adds a NULL-id
+        credit, and compares the stubs against what the pre-#408
+        ``SELECT DISTINCT artist_id, artist_name`` produced. Every fixture id
+        has one spelling; some are credited on several releases and one only
+        as an extra credit.
         """
         with psycopg.connect(self.db_url) as conn:
-            for name in ("release", "release_artist"):
-                config = next(t for t in BASE_TABLES if t["table"] == name)
-                import_csv_func(
-                    conn,
-                    CSV_DIR / config["csv_file"],
-                    config["table"],
-                    config["csv_columns"],
-                    config["db_columns"],
-                    config["required"],
-                    config["transforms"],
-                )
+            _import_tables(conn, CSV_DIR, BASE_TABLES)
             with conn.cursor() as cur:
                 cur.execute(
                     "INSERT INTO release_artist (release_id, artist_id, artist_name) "
                     "VALUES (1001, NULL, 'Unknown Artist')"
                 )
                 cur.execute(
-                    "SELECT count(*) FILTER (WHERE spellings = 1), count(*), max(n) FROM ("
-                    "  SELECT artist_id, count(DISTINCT artist_name) AS spellings, count(*) AS n"
+                    "SELECT count(*) FILTER (WHERE spellings = 1), count(*), max(n),"
+                    "       count(*) FILTER (WHERE main = 0) FROM ("
+                    "  SELECT artist_id, count(DISTINCT artist_name) AS spellings,"
+                    "         count(*) AS n, count(*) FILTER (WHERE extra = 0) AS main"
                     "  FROM release_artist WHERE artist_id IS NOT NULL GROUP BY artist_id"
                     ") ids"
                 )
-                single_spelling_ids, ids, most_credits = cur.fetchone()
+                single_spelling_ids, ids, most_credits, extra_only_ids = cur.fetchone()
                 cur.execute(
                     "SELECT DISTINCT artist_id, artist_name, FALSE FROM release_artist "
                     "WHERE artist_id IS NOT NULL"
                 )
                 pre_408_rows = set(cur.fetchall())
-        assert single_spelling_ids == ids == 12, "fixture must credit each id under one spelling"
+        assert ids > 0 and single_spelling_ids == ids, (
+            "fixture must credit each id under one spelling"
+        )
         assert most_credits > 1, "fixture must credit some id on several releases"
+        assert extra_only_ids > 0, "fixture must credit some id only as an extra credit"
 
         self._stub(tmp_path)
 
