@@ -1373,8 +1373,11 @@ def import_artist_details(conn, csv_dir: Path) -> int:
 
     Steps, in order:
 
-    1. Stub-INSERT artist (id, name) from release_artist (ON CONFLICT DO
-       NOTHING) so subsequent steps have a stable set of artist IDs.
+    1. Stub-INSERT artist (id, name) from release_artist, one row per
+       linked artist_id (the spelling rule is at the statement; #408), so
+       subsequent steps have a stable set of artist IDs. On conflict it
+       clears an LML#510 tombstone; every other existing row keeps its
+       values.
     2. Snapshot `SELECT id FROM artist` into `artist_ids`. Used to gate
        both the profile UPDATE and the child-table loads, so the rebuild
        doesn't bother staging artists outside the WXYC-filtered set.
@@ -1401,14 +1404,53 @@ def import_artist_details(conn, csv_dir: Path) -> int:
     # ON CONFLICT clears any prior LML#510 tombstone (`not_found = TRUE`).
     # `WHERE artist.not_found = TRUE` narrows the rewrite to actual
     # tombstones so non-tombstone rows aren't disturbed. Without this
-    # branch a tombstoned id would survive every rebuild.
+    # branch a tombstoned id would survive every rebuild. It never touches
+    # `name`, so an id already in `artist` keeps the name it has.
+    #
+    # One row per artist_id, because the conflict target is `id` (#408). The
+    # dump's `<name>` is stored per credit, so a rename or a case fix reaches
+    # some credits of an id and not others: prod credits 232248 as `Dirt
+    # Nation` (main) and `Dirt nation` (Written-By) on the same release. The
+    # old `SELECT DISTINCT artist_id, artist_name` kept both, and one ON
+    # CONFLICT DO UPDATE cannot touch a row twice, so a tombstoned or new id
+    # under two spellings raised CardinalityViolation and killed the
+    # 2026-10-03 rebuild (#444).
+    #
+    # The spelling we keep is permanent: nothing later rewrites artist.name
+    # (the artist.csv pass below updates `profile` only), and LML reads it as
+    # the artist's name. So it is chosen, not left to DISTINCT ON:
+    #   1. most main credits (extra = 0). Discogs displays the main credit as
+    #      the release's artist, which makes it the credit most likely to be
+    #      kept current; in the 232248 case it carries Discogs' canonical
+    #      spelling and the Written-By credit the stale one. LML also reads
+    #      artist.name through extra = 0 credits (get_release_artist_variations).
+    #   2. most credits overall. This decides for ids with no main credit,
+    #      common among new ids (most of the 68,550 in #444 came in through
+    #      extra = 1 credits), and breaks ties on (1).
+    #   3. byte order, as the final tie-break. COLLATE "C" because a plain
+    #      ORDER BY follows the database collation: glibc's en_US.utf8 and ICU
+    #      sort `Dirt nation` before `Dirt Nation`, and "C" does the reverse.
+    #
+    # `artist_id > 0` skips unlinked credits (and NULL ids). 0 is what the
+    # converter writes for a credit whose <id> does not parse and what the
+    # Discogs API returns for an unlinked credit. It is not an artist, and
+    # with the dedup on artist_id alone every such credit would collapse
+    # into one `artist` row 0 named after an arbitrary unrelated credit.
     logger.info("Creating stub artist rows from release_artist...")
     with conn.cursor() as cur:
         cur.execute("""
             INSERT INTO artist (id, name, not_found)
-            SELECT DISTINCT artist_id, artist_name, FALSE
-            FROM release_artist
-            WHERE artist_id IS NOT NULL
+            SELECT DISTINCT ON (artist_id) artist_id, artist_name, FALSE
+            FROM (
+                SELECT artist_id,
+                       artist_name,
+                       count(*) FILTER (WHERE extra = 0) AS main_credits,
+                       count(*) AS credits
+                FROM release_artist
+                WHERE artist_id > 0
+                GROUP BY artist_id, artist_name
+            ) spellings
+            ORDER BY artist_id, main_credits DESC, credits DESC, artist_name COLLATE "C"
             ON CONFLICT (id) DO UPDATE SET
                 not_found = FALSE
             WHERE artist.not_found = TRUE
