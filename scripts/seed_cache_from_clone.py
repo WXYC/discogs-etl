@@ -40,15 +40,18 @@ Design (see plans/bs1631-tail-cache-seed.md):
     ``SELECT`` / ``COPY ... TO STDOUT``. The new-parent-id set is embedded
     directly into each COPY's filter as an ``ANY(ARRAY[...]::integer[])``
     literal instead of being staged into a source-side temp table.
-  * A real run refuses to start while a rebuild holds the rebuild lock (key 354001)
-    on ``--target`` and holds that lock itself for the length of its write: a seed
+  * A real run refuses to start while the rebuild lock (key 354001) is held on
+    ``--target`` and holds that lock itself for the length of its write: a seed
     overlapping a rebuild either writes rows the import TRUNCATE / prune drops, or
     interleaves with the api_fetch restore and double-inserts child rows. Exit 75.
+    Because a real seed holds 354001, a second overlapping real seed against the
+    same target also refuses with exit 75 rather than waiting.
   * A transaction-scoped advisory lock (``pg_advisory_xact_lock``, key 330001 --
     see ``CLAUDE.md``'s "Advisory lock keys" table) on the target spans the
-    whole read (new-id computation) -> write window of a real run, so two
-    concurrent invocations against the same target can't both compute the same
-    parent as "new" and double-insert the arbiter-less child rows.
+    whole read (new-id computation) -> write window of a real run. It is a
+    backstop: 354001 already keeps two real seeds apart, but if that ever lapses,
+    330001 still stops two concurrent invocations from both computing the same
+    parent as "new" and double-inserting the arbiter-less child rows.
 
 Never runs ``verify_cache.py`` against the seeded rows: it prunes non-library
 releases, which is exactly what this seeds. Post-seed verification is a separate
@@ -149,7 +152,11 @@ _ADVISORY_LOCK_KEY = 330001
 
 
 class RebuildInProgressError(RuntimeError):
-    """A rebuild holds the rebuild advisory lock on the target; a real seed must not overlap it."""
+    """The rebuild advisory lock (354001) is held on the target, so a real seed must not write.
+
+    Any of its holders may hold it: a rebuild, dedup_artist_children, an operator
+    session, or another real seed.
+    """
 
 
 def _table_exists(conn: psycopg.Connection, table: str) -> bool:
@@ -416,13 +423,15 @@ def _seed_family(
     target_conn = psycopg.connect(target_url)
     rebuild_lock_conn = None
     try:
-        # Exclude a rebuild (and its api_fetch restore) from the whole write window;
-        # 330001 below only serializes seeds against each other.
+        # Exclude every 354001 holder (a rebuild and its api_fetch restore, dedup,
+        # an operator session, another seed) from the whole write window; 330001
+        # below is the seed-vs-seed backstop.
         rebuild_lock_conn = try_acquire_rebuild_lock(target_url)
         if rebuild_lock_conn is None:
             raise RebuildInProgressError(
-                f"a discogs-cache rebuild holds advisory lock {REBUILD_LOCK_KEY} on --target; "
-                "refusing to seed while it runs -- retry once the rebuild finishes"
+                f"the rebuild lock {REBUILD_LOCK_KEY} is held on --target (a rebuild, "
+                "dedup_artist_children, an operator session, or another seed); "
+                "refusing to seed -- nothing written, retry later"
             )
         with target_conn.cursor() as cur:
             cur.execute("SELECT pg_advisory_xact_lock(%s)", (_ADVISORY_LOCK_KEY,))
@@ -627,7 +636,9 @@ def main() -> int:
                 preserve_provenance=args.preserve_provenance,
             )
     except RebuildInProgressError as exc:
-        logger.error("%s", exc)
+        # Exit 75 is EX_TEMPFAIL (retry later), an expected outcome: WARNING, as
+        # dedup_artist_children.py does, so a refusal opens no Sentry error event.
+        logger.warning("%s", exc)
         return REBUILD_LOCK_BOWED_OUT_EXIT_CODE
     logger.info("%s: %s", "Planned" if args.dry_run else "Seeded", counts)
     return 0

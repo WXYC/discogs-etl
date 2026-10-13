@@ -75,6 +75,26 @@ def _rebuild_lock_is_free(url: str) -> bool:
         conn.close()  # closing the session frees the probe's own lock
 
 
+def _keep_rebuild_lock_conns(monkeypatch: pytest.MonkeyPatch) -> list[psycopg.Connection]:
+    """Keep a live reference to every rebuild-lock connection the seed opens.
+
+    Without this the seed's lock connection is a local that CPython finalizes on
+    return, which frees the lock even if the explicit release were missing; holding
+    a reference makes "the lock is free afterwards" prove the explicit release ran.
+    """
+    kept: list[psycopg.Connection] = []
+    real = _seed.try_acquire_rebuild_lock
+
+    def spy(url: str) -> psycopg.Connection | None:
+        conn = real(url)
+        if conn is not None:
+            kept.append(conn)
+        return conn
+
+    monkeypatch.setattr(_seed, "try_acquire_rebuild_lock", spy)
+    return kept
+
+
 # ---------------------------------------------------------------------------
 # Scratch database helpers (mirror test_copy_to_target.py)
 # ---------------------------------------------------------------------------
@@ -614,10 +634,18 @@ class TestSeedCacheFromClone:
             holder.close()
         assert planned["release"] > 0
 
-    def test_real_seed_releases_rebuild_lock_afterwards(self) -> None:
-        counts = self._seed_all()
-        assert counts["release"] > 0
-        assert _rebuild_lock_is_free(self.target_url)
+    def test_real_seed_releases_rebuild_lock_afterwards(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        kept = _keep_rebuild_lock_conns(monkeypatch)
+        try:
+            counts = self._seed_all()
+            assert counts["release"] > 0
+            assert len(kept) == 1
+            assert _rebuild_lock_is_free(self.target_url)
+        finally:
+            for conn in kept:
+                conn.close()
 
 
 def _insert_artist(
@@ -766,9 +794,17 @@ class TestSeedArtistsFromClone:
             holder.close()
         assert self._artist_ids() == before
 
-    def test_real_seed_releases_rebuild_lock_afterwards(self) -> None:
-        self._seed_all()
-        assert _rebuild_lock_is_free(self.target_url)
+    def test_real_seed_releases_rebuild_lock_afterwards(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        kept = _keep_rebuild_lock_conns(monkeypatch)
+        try:
+            self._seed_all()
+            assert len(kept) == 1
+            assert _rebuild_lock_is_free(self.target_url)
+        finally:
+            for conn in kept:
+                conn.close()
 
     def test_seed_inserts_only_new_artist(self) -> None:
         counts = seed_artists_additive(
