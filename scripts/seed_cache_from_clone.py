@@ -451,7 +451,7 @@ def _seed_family(
                         target_conn, new_ids, source_conn if preserve_provenance else None
                     )
                     result[table] = n
-                    logger.info("  %s: seeded %s fresh rows", table, f"{n:,}")
+                    logger.info("  %s: seeded %s rows", table, f"{n:,}")
             target_conn.commit()
         except Exception:
             target_conn.rollback()
