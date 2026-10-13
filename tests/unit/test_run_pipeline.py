@@ -2780,6 +2780,48 @@ class TestPreserveApiFetchWiring:
         calls = self._build(preserve=True, target_db_url="postgresql:///target")
         assert "snapshot" not in calls and "restore" not in calls
 
+    def _xml(self, tmp_path, *extra: str) -> list[str]:
+        """Run _run_xml_pipeline with the DB-touching steps recorded in call order."""
+        xml_file = tmp_path / "releases.xml.gz"
+        xml_file.touch()
+        args = run_pipeline.parse_args(["--xml", str(xml_file), "--preserve-api-fetch", *extra])
+        calls: list[str] = []
+
+        def record(name: str, result=None):
+            return lambda *a, **k: calls.append(name) or result
+
+        with (
+            patch.object(run_pipeline, "wait_for_postgres"),
+            patch.object(run_pipeline, "run_sql_file"),
+            patch.object(run_pipeline, "set_tables_unlogged"),
+            patch.object(run_pipeline, "prepare_converter_keep_release_ids", return_value=None),
+            patch.object(
+                run_pipeline.psycopg, "connect", side_effect=record("truncate", MagicMock())
+            ),
+            patch.object(run_pipeline, "convert_and_filter", side_effect=record("convert")),
+            patch.object(
+                run_pipeline, "snapshot_api_fetch_releases", side_effect=record("snapshot")
+            ),
+            patch.object(run_pipeline, "restore_api_fetch_releases", side_effect=record("restore")),
+            patch.object(run_pipeline, "_run_database_build", side_effect=record("build")),
+            patch.object(
+                run_pipeline, "_run_database_build_post_import", side_effect=record("post_import")
+            ),
+        ):
+            run_pipeline._run_xml_pipeline(args, sys.executable, "postgresql:///test")
+        return calls
+
+    def test_csv_mode_restores_a_left_behind_snapshot_before_converting(self, tmp_path) -> None:
+        assert self._xml(tmp_path) == ["restore", "convert", "build"]
+
+    def test_direct_pg_snapshots_before_the_truncate(self, tmp_path) -> None:
+        assert self._xml(tmp_path, "--direct-pg") == [
+            "snapshot",
+            "truncate",
+            "convert",
+            "post_import",
+        ]
+
     def test_restore_failure_relogs_tables_and_raises(self) -> None:
         with (
             patch.object(

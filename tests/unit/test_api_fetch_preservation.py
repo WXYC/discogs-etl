@@ -37,8 +37,8 @@ class TestPreservationSummaryFormat:
         summary = PreservationSummary(
             snapshotted=10,
             preserved=7,
+            rehydrated=1,
             superseded=2,
-            dropped=1,
             oldest_age=timedelta(days=400),
             median_age=timedelta(days=30),
             older_than_six_months=3,
@@ -47,13 +47,13 @@ class TestPreservationSummaryFormat:
         assert "snapshotted=10" in line
         assert "preserved=7" in line
         assert "superseded_by_dump=2" in line
-        assert "dropped=1" in line
+        assert "rehydrated=1" in line
         assert "oldest=400d" in line
         assert "median=30d" in line
         assert "older_than_6mo=3" in line
 
     def test_nothing_preserved_omits_ages(self) -> None:
-        summary = PreservationSummary(snapshotted=2, preserved=0, superseded=2, dropped=0)
+        summary = PreservationSummary(snapshotted=2, preserved=0, rehydrated=0, superseded=2)
         line = summary.format()
         assert "preserved=0" in line
         assert "oldest" not in line
