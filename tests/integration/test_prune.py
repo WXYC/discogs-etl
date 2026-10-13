@@ -62,6 +62,10 @@ get_table_sizes = _vc.get_table_sizes
 count_rows_to_delete = _vc.count_rows_to_delete
 prune_releases = _vc.prune_releases
 apply_release_overrides = _vc.apply_release_overrides
+load_present_release_ids = _vc.load_present_release_ids
+drop_absent_overrides = _vc.drop_absent_overrides
+prune_releases_copy_swap = _vc.prune_releases_copy_swap
+CopySwapShortfallError = _vc.CopySwapShortfallError
 
 pytestmark = [pytest.mark.pg]
 
@@ -365,6 +369,70 @@ class TestGetTableSizes:
         sizes = asyncio.run(_run())
         row_count, _ = sizes["release_track_artist"]
         assert row_count == 1
+
+
+class TestLoadPresentReleaseIds:
+    """load_present_release_ids returns the subset of ids with a ``release`` row (#446)."""
+
+    @pytest.fixture(autouse=True, scope="class")
+    def _set_up(self, db_url):
+        self.__class__._db_url = db_url
+        _set_up_tables_for_async(db_url)
+
+    @pytest.fixture(autouse=True)
+    def _store_url(self):
+        self.db_url = self.__class__._db_url
+
+    @pytest.mark.parametrize(
+        ("ids", "expected"),
+        [
+            pytest.param({101, 103}, {101, 103}, id="all-present"),
+            pytest.param({101, 99999}, {101}, id="one-absent"),
+            pytest.param({99998, 99999}, set(), id="all-absent"),
+            pytest.param(set(), set(), id="empty"),
+        ],
+    )
+    def test_returns_present_subset(self, ids, expected) -> None:
+        async def _run():
+            conn = await asyncpg.connect(self.db_url)
+            try:
+                return await load_present_release_ids(conn, ids)
+            finally:
+                await conn.close()
+
+        assert asyncio.run(_run()) == expected
+
+
+class TestCopySwapPruneWithAbsentPin:
+    """End-to-end for #446: a pin with no ``release`` row must not abort the
+    copy-swap prune, and a pin that is present must still survive it."""
+
+    def _release_ids(self, db_url: str) -> set[int]:
+        with psycopg.connect(db_url) as conn, conn.cursor() as cur:
+            cur.execute("SELECT id FROM release")
+            return {row[0] for row in cur.fetchall()}
+
+    def test_unfiltered_absent_pin_trips_the_shortfall_guard(self, fresh_db_url) -> None:
+        """Precondition: the 2026-10-13 failure shape reproduces without the fix."""
+        _set_up_tables_for_async(fresh_db_url)
+        with pytest.raises(CopySwapShortfallError):
+            prune_releases_copy_swap(fresh_db_url, keep_ids={101, 99999}, review_ids=set())
+        assert self._release_ids(fresh_db_url) == {101, 102, 103}, "live tables untouched"
+
+    def test_absent_pin_is_dropped_and_the_prune_completes(self, fresh_db_url) -> None:
+        _set_up_tables_for_async(fresh_db_url)
+        pins = {101, 99999}
+
+        async def _present():
+            conn = await asyncpg.connect(fresh_db_url)
+            try:
+                return await load_present_release_ids(conn, pins)
+            finally:
+                await conn.close()
+
+        keep = drop_absent_overrides(pins, asyncio.run(_present()))
+        prune_releases_copy_swap(fresh_db_url, keep_ids=keep, review_ids=set())
+        assert self._release_ids(fresh_db_url) == {101}
 
 
 class TestCountRowsToDelete:

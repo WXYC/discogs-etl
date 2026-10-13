@@ -2,6 +2,7 @@
 
 import importlib.util
 import json
+import logging
 import multiprocessing
 import sys
 from concurrent.futures import ProcessPoolExecutor
@@ -668,6 +669,7 @@ _classify_fuzzy_chunk = _vc._classify_fuzzy_chunk
 prune_releases_copy_swap = _vc.prune_releases_copy_swap
 load_keep_release_ids = _vc.load_keep_release_ids
 apply_release_overrides = _vc.apply_release_overrides
+drop_absent_overrides = _vc.drop_absent_overrides
 dump_classification = _vc.dump_classification
 
 parse_args = _vc.parse_args
@@ -1075,6 +1077,42 @@ class TestApplyReleaseOverrides:
         assert report.keep_ids == {101}
         assert report.prune_ids == {102}
         assert report.review_ids == {103}
+
+
+class TestDropAbsentOverrides:
+    """Test drop_absent_overrides -- a pin with no ``release`` row can never be
+    copied by the copy-swap prune, so it must not enter keep_ids, or
+    ``_assert_release_copy_count`` aborts the whole prune on it (#446)."""
+
+    @pytest.mark.parametrize(
+        ("override_ids", "present_ids", "expected"),
+        [
+            pytest.param({101, 202}, {101, 202, 303}, {101, 202}, id="all-present"),
+            pytest.param({101, 999}, {101, 202}, {101}, id="one-absent"),
+            pytest.param({998, 999}, {101}, set(), id="all-absent"),
+            pytest.param(set(), {101}, set(), id="no-pins"),
+        ],
+    )
+    def test_keeps_only_present_pins(self, override_ids, present_ids, expected):
+        assert drop_absent_overrides(override_ids, present_ids) == expected
+
+    def test_absent_pins_are_logged_with_count_and_sample(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            drop_absent_overrides({101, 998, 999}, {101})
+        assert "2 pinned release_id override(s) have no release row" in caplog.text
+        assert "998" in caplog.text and "999" in caplog.text
+
+    def test_nothing_logged_when_every_pin_is_present(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            drop_absent_overrides({101}, {101})
+        assert "no release row" not in caplog.text
+
+    def test_present_keep_id_missing_from_copy_still_trips_the_guard_count(self):
+        """The fix narrows the expected set; it must not loosen the guard. A
+        present pin stays in keep_ids, so the copy-count guard still expects it."""
+        report = TestApplyReleaseOverrides()._make_report(keep_ids=set(), prune_ids={101})
+        apply_release_overrides(report, drop_absent_overrides({101, 999}, {101}))
+        assert report.keep_ids | report.review_ids == {101}
 
 
 class TestDumpClassificationArg:
