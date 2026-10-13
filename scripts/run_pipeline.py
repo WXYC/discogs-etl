@@ -41,6 +41,10 @@ import psycopg
 from wxyc_etl.state import PipelineState
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from lib.api_fetch_preservation import (  # noqa: E402
+    restore_api_fetch_releases,
+    snapshot_api_fetch_releases,
+)
 from lib.dsn import redact_dsn  # noqa: E402
 from lib.observability import init_logger  # noqa: E402
 from lib.rebuild_lock import (  # noqa: E402
@@ -307,6 +311,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "preserved and LML-back-patched release.artwork_url + "
         "release.artwork_checked_at survive the rebuild via the "
         "staging-table UPSERT path (WXYC/discogs-etl#242).",
+    )
+    parser.add_argument(
+        "--preserve-api-fetch",
+        action="store_true",
+        help="Snapshot LML's api_fetch releases (cache_metadata.source = 'api_fetch') "
+        "before anything destructive and restore the ones the dump lacks after prune; "
+        "the dump wins an id collision. Off by default here; scripts/rebuild-cache.sh "
+        "turns it on (PRESERVE_API_FETCH=0 opts out). See WXYC/discogs-etl#450.",
     )
 
     args = parser.parse_args(argv)
@@ -1194,6 +1206,9 @@ def _run_xml_pipeline(
             # Direct-to-PG mode: create schema first, then converter writes
             # releases directly into PostgreSQL via COPY.
             wait_for_postgres(db_url)
+            # The TRUNCATE below destroys api_fetch releases; snapshot first (#450).
+            if args.preserve_api_fetch:
+                snapshot_api_fetch_releases(db_url)
             # create_functions.sql must run BEFORE create_database.sql:
             # create_database.sql's idx_master_title_trgm index expression
             # references f_unaccent (see #104).
@@ -1248,6 +1263,7 @@ def _run_xml_pipeline(
                 label_hierarchy=hierarchy_csv,
                 catalog_source=args.catalog_source,
                 catalog_db_url=args.catalog_db_url,
+                preserve_api_fetch=args.preserve_api_fetch,
             )
         else:
             # Standard CSV mode — the monthly rebuild's path. The converter
@@ -1288,6 +1304,7 @@ def _run_xml_pipeline(
                 catalog_db_url=args.catalog_db_url,
                 truncate_existing=args.truncate_existing,
                 fresh_rebuild=args.fresh_rebuild,
+                preserve_api_fetch=args.preserve_api_fetch,
             )
 
     if keep_csv_dir is not None:
@@ -1388,6 +1405,7 @@ def main() -> None:
                 state_file=args.state_file,
                 truncate_existing=args.truncate_existing,
                 fresh_rebuild=args.fresh_rebuild,
+                preserve_api_fetch=args.preserve_api_fetch,
             )
 
         total = time.monotonic() - pipeline_start
@@ -1404,6 +1422,24 @@ def main() -> None:
         release_rebuild_lock(lock_conn)
 
 
+def _restore_api_fetch_releases_crash_safe(db_url: str) -> None:
+    """Run the api_fetch restore (#450); on failure leave the cache LOGGED, then re-raise.
+
+    The restore runs while the pipeline tables are still UNLOGGED and its failure
+    aborts the run before the final set_tables_logged, which would strand them
+    un-crash-safe -- the same residue #424 repairs for a failed import. The
+    restore itself rolls back and retains its scratch tables.
+    """
+    try:
+        restore_api_fetch_releases(db_url)
+    except BaseException:
+        try:
+            set_tables_logged(db_url)
+        except Exception:
+            logger.exception("[#450] could not restore LOGGED; manual repair needed")
+        raise
+
+
 def _run_database_build_post_import(
     db_url: str,
     csv_dir: Path,
@@ -1414,6 +1450,7 @@ def _run_database_build_post_import(
     label_hierarchy: Path | None = None,
     catalog_source: str | None = None,
     catalog_db_url: str | None = None,
+    preserve_api_fetch: bool = False,
 ) -> None:
     """Post-import database build for --direct-pg mode.
 
@@ -1543,6 +1580,11 @@ def _run_database_build_post_import(
     else:
         logger.info("Skipping prune step (no library.db provided)")
 
+    # -- restore api_fetch releases the dump lacked (#450), after prune and
+    # before derive_va_release / SET LOGGED so they are part of the final cache.
+    if preserve_api_fetch:
+        _restore_api_fetch_releases_crash_safe(db_url)
+
     # -- derive_va_release (#344): re-derive the VA-compilation lookup table
     # now that dedup/prune have finalized release ids. Gated like prune: on a
     # build without library.db nothing consumes the table, and the unpruned
@@ -1581,6 +1623,7 @@ def _run_database_build(
     state_file: Path | None = None,
     truncate_existing: bool = False,
     fresh_rebuild: bool = False,
+    preserve_api_fetch: bool = False,
 ) -> None:
     """Database build: create_schema through vacuum.
 
@@ -1594,6 +1637,10 @@ def _run_database_build(
     for label-aware ranking.  When *catalog_source*/*catalog_db_url* are
     provided but *library_labels* is not, labels are extracted automatically
     before dedup.
+
+    When *preserve_api_fetch* is set, LML's ``api_fetch`` releases are
+    snapshotted before the first destructive statement and restored after
+    prune (discogs-etl#450). Not supported with *target_db_url* (deprecated).
     """
 
     def _save_state() -> None:
@@ -1601,6 +1648,17 @@ def _run_database_build(
             state.save(str(state_file))
 
     wait_for_postgres(db_url)
+
+    # -- snapshot api_fetch releases before anything destructive (#450). A
+    # failure here aborts the rebuild before the cache is touched. A resumed
+    # run (create_schema already done) reuses the snapshot its first attempt took.
+    if preserve_api_fetch and target_db_url:
+        logger.warning("--preserve-api-fetch is not supported with --target-db-url; skipping")
+        preserve_api_fetch = False
+    if preserve_api_fetch:
+        snapshot_api_fetch_releases(
+            db_url, reuse_existing=bool(state and state.is_completed("create_schema"))
+        )
 
     # -- read WXYC library pinned overrides once, threaded into every dedup
     # and verify_cache.py invocation below (discogs-etl#327)
@@ -1866,6 +1924,13 @@ def _run_database_build(
         if state:
             state.mark_completed("prune")
             _save_state()
+
+    # -- restore api_fetch releases the dump lacked (#450). After prune so the
+    # prune cannot drop them again, before derive_va_release / vacuum / set_logged
+    # so they are part of the final cache. Idempotent, so a resumed run that
+    # already restored is a no-op.
+    if preserve_api_fetch:
+        _restore_api_fetch_releases_crash_safe(db_url)
 
     # The DB consumers read: the copy-to target when set, otherwise the
     # source. Shared by derive_va_release, vacuum, and set_logged below so
