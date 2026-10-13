@@ -26,6 +26,7 @@ import os
 import sys as _sys
 import threading
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 import psycopg
@@ -310,6 +311,100 @@ class TestSeedCacheFromClone:
         for _rid, source, cached_at in rows:
             assert source == "bulk_import"
             assert cached_at is not None, "cached_at must default (not copy the clone's NULL)"
+
+    # --- --preserve-provenance ------------------------------------------
+
+    def _set_source_provenance(self, rows) -> None:
+        """Overwrite the clone's cache_metadata for the given (rid, source,
+        cached_at) rows; a None entry deletes the row instead."""
+        conn = psycopg.connect(self.source_url)
+        with conn.cursor() as cur:
+            for rid, source, cached_at in rows:
+                cur.execute("DELETE FROM cache_metadata WHERE release_id = %s", (rid,))
+                if source is not None:
+                    cur.execute(
+                        "INSERT INTO cache_metadata (release_id, source, cached_at) "
+                        "VALUES (%s, %s, %s)",
+                        (rid, source, cached_at),
+                    )
+        conn.commit()
+        conn.close()
+
+    def _restore_source_provenance(self) -> None:
+        self._set_source_provenance([(rid, "bulk_import", None) for rid in (101, 102, 200)])
+
+    def _target_provenance(self) -> dict[int, tuple]:
+        conn = psycopg.connect(self.target_url)
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT release_id, source, cached_at FROM cache_metadata "
+                "WHERE release_id = ANY(%s::integer[])",
+                ([101, 102, 200],),
+            )
+            rows = {r[0]: (r[1], r[2]) for r in cur.fetchall()}
+        conn.close()
+        return rows
+
+    def test_preserve_provenance_keeps_source_and_cached_at(self) -> None:
+        stamp = datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc)
+        self._set_source_provenance([(101, "api_fetch", stamp)])
+        try:
+            seed_releases_additive(
+                self.source_url,
+                self.target_url,
+                [rid for rid, _, _ in CLONE_RELEASES],
+                preserve_provenance=True,
+            )
+            rows = self._target_provenance()
+        finally:
+            self._restore_source_provenance()
+        assert rows[101] == ("api_fetch", stamp)
+
+    def test_preserve_provenance_falls_back_on_null_or_missing_source_row(self) -> None:
+        # 102 keeps the clone's NULL cached_at; 200's source row is deleted.
+        self._set_source_provenance([(102, "api_fetch", None), (200, None, None)])
+        try:
+            seed_releases_additive(
+                self.source_url,
+                self.target_url,
+                [rid for rid, _, _ in CLONE_RELEASES],
+                preserve_provenance=True,
+            )
+            rows = self._target_provenance()
+        finally:
+            self._restore_source_provenance()
+            self._set_source_provenance([(200, "bulk_import", None)])
+        for rid in (102, 200):
+            source, cached_at = rows[rid]
+            assert source == "bulk_import"
+            assert cached_at is not None
+
+    def test_without_preserve_provenance_rows_stay_fresh(self) -> None:
+        stamp = datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc)
+        self._set_source_provenance([(101, "api_fetch", stamp)])
+        try:
+            self._seed_all()
+            rows = self._target_provenance()
+        finally:
+            self._restore_source_provenance()
+        assert rows[101][0] == "bulk_import"
+        assert rows[101][1] != stamp
+
+    def test_preserve_provenance_dry_run_reports_preserved_and_fallback(self, caplog) -> None:
+        stamp = datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc)
+        self._set_source_provenance([(101, "api_fetch", stamp)])
+        try:
+            with caplog.at_level("INFO"):
+                seed_releases_additive(
+                    self.source_url,
+                    self.target_url,
+                    [rid for rid, _, _ in CLONE_RELEASES],
+                    dry_run=True,
+                    preserve_provenance=True,
+                )
+        finally:
+            self._restore_source_provenance()
+        assert "1 would preserve provenance, 2 would fall back" in caplog.text
 
     # --- (e) prod-only columns default ----------------------------------
 

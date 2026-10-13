@@ -253,18 +253,48 @@ def _copy_table(
     return inserted
 
 
-def _seed_fresh_cache_metadata(target_conn, new_ids: set[int]) -> int:
-    """Insert a fresh cache_metadata row per newly-seeded release (source
-    bulk_import, cached_at defaulted to now()), instead of copying the clone's
-    unreliable/nullable freshness rows. Idempotent via the release_id PK."""
+def _source_provenance(source_conn, new_ids: set[int]) -> list[tuple[int, str, object]]:
+    """(release_id, source, cached_at) for each new release whose source
+    cache_metadata row exists with both values non-NULL. SELECT only."""
+    if not _table_exists(source_conn, "cache_metadata"):
+        return []
+    with source_conn.cursor() as cur:
+        cur.execute(
+            "SELECT release_id, source, cached_at FROM cache_metadata "
+            "WHERE release_id = ANY(%s::integer[]) AND source IS NOT NULL "
+            "AND cached_at IS NOT NULL",
+            (list(new_ids),),
+        )
+        return cur.fetchall()
+
+
+def _seed_fresh_cache_metadata(target_conn, new_ids: set[int], source_conn=None) -> int:
+    """Insert a cache_metadata row per newly-seeded release. By default each is
+    fresh (source bulk_import, cached_at defaulted to now()), instead of copying
+    the clone's unreliable/nullable freshness rows. With ``source_conn``
+    (--preserve-provenance), releases whose source row has non-NULL source and
+    cached_at keep both; the rest fall back to the fresh row. Idempotent via
+    the release_id PK."""
+    inserted = 0
     with target_conn.cursor() as cur:
+        if source_conn is not None:
+            rows = _source_provenance(source_conn, new_ids)
+            cur.execute(
+                "INSERT INTO cache_metadata (release_id, source, cached_at) "
+                "SELECT r.id, p.source, p.cached_at "
+                "FROM unnest(%s::integer[], %s::text[], %s::timestamptz[]) "
+                "AS p(release_id, source, cached_at) JOIN release r ON r.id = p.release_id "
+                "ON CONFLICT (release_id) DO NOTHING",
+                ([r[0] for r in rows], [r[1] for r in rows], [r[2] for r in rows]),
+            )
+            inserted = cur.rowcount
         cur.execute(
             "INSERT INTO cache_metadata (release_id, source) "
             "SELECT id, 'bulk_import' FROM release WHERE id = ANY(%s::integer[]) "
             "ON CONFLICT (release_id) DO NOTHING",
             (list(new_ids),),
         )
-        return cur.rowcount
+        return inserted + cur.rowcount
 
 
 def _dry_run_counts(source_conn, spec, new_ids: set[int], pk_table: str) -> dict[str, int]:
@@ -316,6 +346,7 @@ def _seed_family(
     *,
     family: str,
     dry_run: bool,
+    preserve_provenance: bool = False,
 ) -> dict[str, int]:
     """Generic additive, parent-gated copy of one table family (release or
     artist) from the source clone into the target. Only parent ids absent from
@@ -348,6 +379,13 @@ def _seed_family(
         source_conn = psycopg.connect(source_url)
         try:
             counts = _dry_run_counts(source_conn, spec, new_ids, pk_table)
+            if preserve_provenance and "cache_metadata" in counts:
+                preserved = len(_source_provenance(source_conn, new_ids))
+                logger.info(
+                    "  [dry-run] cache_metadata: %s would preserve provenance, %s would fall back",
+                    f"{preserved:,}",
+                    f"{counts['cache_metadata'] - preserved:,}",
+                )
             for table, n in counts.items():
                 logger.info("  [dry-run] %s: would seed %s rows", table, f"{n:,}")
             return counts
@@ -409,7 +447,9 @@ def _seed_family(
                 logger.info("  %s: inserted %s rows", table, f"{inserted:,}")
             for table, _f, _c in spec:
                 if table == "cache_metadata":
-                    n = _seed_fresh_cache_metadata(target_conn, new_ids)
+                    n = _seed_fresh_cache_metadata(
+                        target_conn, new_ids, source_conn if preserve_provenance else None
+                    )
                     result[table] = n
                     logger.info("  %s: seeded %s fresh rows", table, f"{n:,}")
             target_conn.commit()
@@ -431,6 +471,7 @@ def seed_releases_additive(
     release_ids,
     *,
     dry_run: bool = False,
+    preserve_provenance: bool = False,
 ) -> dict[str, int]:
     """Additively copy the artist-scoped release row-set (``release_ids`` and its
     children) from the source clone into the target discogs-cache.
@@ -447,6 +488,7 @@ def seed_releases_additive(
         release_ids,
         family="releases",
         dry_run=dry_run,
+        preserve_provenance=preserve_provenance,
     )
 
 
@@ -526,6 +568,13 @@ def main() -> int:
         action="store_true",
         help="Report per-table row-set sizes without writing to the target.",
     )
+    parser.add_argument(
+        "--preserve-provenance",
+        action="store_true",
+        help="Copy cache_metadata source/cached_at from --source for each newly seeded "
+        "release when both are non-NULL (e.g. restoring a prod export); otherwise fall "
+        "back to a fresh bulk_import row. Release family only.",
+    )
     args = parser.parse_args()
 
     try:
@@ -539,8 +588,18 @@ def main() -> int:
     id_label = "artist_ids" if args.seed_artists else "release_ids"
     logger.info("Loaded %s %s from %s", f"{len(ids):,}", id_label, args.ids_file)
 
-    seed_fn = seed_artists_additive if args.seed_artists else seed_releases_additive
-    counts = seed_fn(args.source, args.target, ids, dry_run=args.dry_run)
+    if args.preserve_provenance and args.seed_artists:
+        parser.error("--preserve-provenance applies to the release family, not --seed-artists")
+    if args.seed_artists:
+        counts = seed_artists_additive(args.source, args.target, ids, dry_run=args.dry_run)
+    else:
+        counts = seed_releases_additive(
+            args.source,
+            args.target,
+            ids,
+            dry_run=args.dry_run,
+            preserve_provenance=args.preserve_provenance,
+        )
     logger.info("%s: %s", "Planned" if args.dry_run else "Seeded", counts)
     return 0
 
