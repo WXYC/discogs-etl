@@ -40,6 +40,10 @@ Design (see plans/bs1631-tail-cache-seed.md):
     ``SELECT`` / ``COPY ... TO STDOUT``. The new-parent-id set is embedded
     directly into each COPY's filter as an ``ANY(ARRAY[...]::integer[])``
     literal instead of being staged into a source-side temp table.
+  * A real run refuses to start while a rebuild holds the rebuild lock (key 354001)
+    on ``--target`` and holds that lock itself for the length of its write: a seed
+    overlapping a rebuild either writes rows the import TRUNCATE / prune drops, or
+    interleaves with the api_fetch restore and double-inserts child rows. Exit 75.
   * A transaction-scoped advisory lock (``pg_advisory_xact_lock``, key 330001 --
     see ``CLAUDE.md``'s "Advisory lock keys" table) on the target spans the
     whole read (new-id computation) -> write window of a real run, so two
@@ -76,6 +80,12 @@ from verify_cache import COPY_TABLE_SPEC  # noqa: E402
 
 from lib.keep_release_ids import parse_keep_release_ids  # noqa: E402
 from lib.observability import init_logger  # noqa: E402
+from lib.rebuild_lock import (  # noqa: E402
+    REBUILD_LOCK_BOWED_OUT_EXIT_CODE,
+    REBUILD_LOCK_KEY,
+    release_rebuild_lock,
+    try_acquire_rebuild_lock,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -136,6 +146,10 @@ _COALESCE_NOW_COLUMNS = {("artist", "fetched_at")}
 # lock keys (shared-PG registry)" table. 330001 = discogs-etl PR#330, first key
 # allocated by this repo (<issue-number> * 1000 + sequence convention).
 _ADVISORY_LOCK_KEY = 330001
+
+
+class RebuildInProgressError(RuntimeError):
+    """A rebuild holds the rebuild advisory lock on the target; a real seed must not overlap it."""
 
 
 def _table_exists(conn: psycopg.Connection, table: str) -> bool:
@@ -400,7 +414,16 @@ def _seed_family(
     # -- see the module docstring). Key 330001 = discogs-etl PR#330, first key
     # allocated; registered in CLAUDE.md's "Advisory lock keys" table.
     target_conn = psycopg.connect(target_url)
+    rebuild_lock_conn = None
     try:
+        # Exclude a rebuild (and its api_fetch restore) from the whole write window;
+        # 330001 below only serializes seeds against each other.
+        rebuild_lock_conn = try_acquire_rebuild_lock(target_url)
+        if rebuild_lock_conn is None:
+            raise RebuildInProgressError(
+                f"a discogs-cache rebuild holds advisory lock {REBUILD_LOCK_KEY} on --target; "
+                "refusing to seed while it runs -- retry once the rebuild finishes"
+            )
         with target_conn.cursor() as cur:
             cur.execute("SELECT pg_advisory_xact_lock(%s)", (_ADVISORY_LOCK_KEY,))
 
@@ -460,6 +483,8 @@ def _seed_family(
             source_conn.close()
     finally:
         target_conn.close()
+        if rebuild_lock_conn is not None:
+            release_rebuild_lock(rebuild_lock_conn)
 
     logger.info("Seed complete (%s): %s", family, {k: v for k, v in result.items() if v})
     return result
@@ -590,16 +615,20 @@ def main() -> int:
 
     if args.preserve_provenance and args.seed_artists:
         parser.error("--preserve-provenance applies to the release family, not --seed-artists")
-    if args.seed_artists:
-        counts = seed_artists_additive(args.source, args.target, ids, dry_run=args.dry_run)
-    else:
-        counts = seed_releases_additive(
-            args.source,
-            args.target,
-            ids,
-            dry_run=args.dry_run,
-            preserve_provenance=args.preserve_provenance,
-        )
+    try:
+        if args.seed_artists:
+            counts = seed_artists_additive(args.source, args.target, ids, dry_run=args.dry_run)
+        else:
+            counts = seed_releases_additive(
+                args.source,
+                args.target,
+                ids,
+                dry_run=args.dry_run,
+                preserve_provenance=args.preserve_provenance,
+            )
+    except RebuildInProgressError as exc:
+        logger.error("%s", exc)
+        return REBUILD_LOCK_BOWED_OUT_EXIT_CODE
     logger.info("%s: %s", "Planned" if args.dry_run else "Seeded", counts)
     return 0
 
