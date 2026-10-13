@@ -69,10 +69,13 @@ def test_main_dispatches_to_seed_releases_by_default(monkeypatch, tmp_path):
     ids_file.write_text("100\n101\n")
     calls: dict = {}
 
-    def fake_seed_releases_additive(source, target, ids, *, dry_run=False):
+    def fake_seed_releases_additive(
+        source, target, ids, *, dry_run=False, preserve_provenance=False
+    ):
         calls["fn"] = "release"
         calls["ids"] = ids
         calls["dry_run"] = dry_run
+        calls["preserve_provenance"] = preserve_provenance
         return {"release": 0}
 
     def fake_seed_artists_additive(*args, **kwargs):
@@ -154,3 +157,41 @@ def test_read_ids_file_delegates_to_shared_parser(tmp_path):
 def test_read_ids_file_missing_raises():
     with pytest.raises(FileNotFoundError):
         _seed._read_ids_file(Path("/nonexistent/path/to/ids.txt"))
+
+
+def _preserve_argv(tmp_path, *extra):
+    ids_file = tmp_path / "ids.txt"
+    ids_file.write_text("100\n")
+    return [
+        "seed_cache_from_clone.py",
+        "--source",
+        "postgresql://localhost:5432/discogs",
+        "--target",
+        "postgresql://localhost:5433/discogs_cache",
+        "--ids-file",
+        str(ids_file),
+        *extra,
+    ]
+
+
+def test_main_threads_preserve_provenance_to_seed_releases(monkeypatch, tmp_path):
+    calls: dict = {}
+    monkeypatch.setattr(_seed, "init_logger", lambda **kwargs: None)
+    monkeypatch.setattr(
+        _seed,
+        "seed_releases_additive",
+        lambda source, target, ids, **kwargs: calls.update(kwargs) or {"release": 0},
+    )
+    monkeypatch.setattr(sys, "argv", _preserve_argv(tmp_path, "--preserve-provenance"))
+    assert _seed.main() == 0
+    assert calls["preserve_provenance"] is True
+
+
+def test_main_rejects_preserve_provenance_with_seed_artists(monkeypatch, tmp_path):
+    monkeypatch.setattr(_seed, "init_logger", lambda **kwargs: None)
+    monkeypatch.setattr(
+        sys, "argv", _preserve_argv(tmp_path, "--preserve-provenance", "--seed-artists")
+    )
+    with pytest.raises(SystemExit) as exc_info:
+        _seed.main()
+    assert exc_info.value.code == 2
