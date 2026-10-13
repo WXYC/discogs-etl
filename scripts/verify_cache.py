@@ -742,6 +742,43 @@ def apply_release_overrides(report: ClassificationReport, override_ids: set[int]
     report.review_ids -= override_ids
 
 
+def drop_absent_overrides(override_ids: set[int], present_ids: set[int]) -> set[int]:
+    """Return the pinned overrides that have a ``release`` row; log the rest.
+
+    A pin with no ``release`` row cannot be kept: the copy-swap prune rebuilds
+    ``release`` from ``keep_ids ∪ review_ids``, so an absent pin is an expected
+    id that can never be copied, and ``_assert_release_copy_count`` would abort
+    the whole prune on it (#446: 13 absent pins stopped the 2026-10-13 run).
+    Excluding them narrows the expected set only. A *present* KEEP/REVIEW id
+    that fails to copy still trips the guard, exactly as #357 requires.
+
+    Absent pins are logged (count plus a sample), not fatal: they are pinned
+    ids the dump does not carry, which no pipeline step can restore. A large
+    count is the #422 class (pins lost upstream) and shows here first.
+    """
+    absent = override_ids - present_ids
+    if absent:
+        sample = sorted(absent)[:20]
+        logger.warning(
+            f"{len(absent):,} pinned release_id override(s) have no release row and "
+            f"will not be kept (sample, max 20): {sample}"
+        )
+    return override_ids & present_ids
+
+
+async def load_present_release_ids(conn: asyncpg.Connection, ids: set[int]) -> set[int]:
+    """Return the subset of *ids* that have a row in ``release``.
+
+    Checks ``release`` itself, not :func:`load_discogs_releases`' output: that
+    list joins ``extra = 0`` credits, so a pinned release with no main-artist
+    credit is absent from it but still present in the table, and still kept.
+    """
+    if not ids:
+        return set()
+    rows = await conn.fetch("SELECT id FROM release WHERE id = ANY($1::int[])", sorted(ids))
+    return {row["id"] for row in rows}
+
+
 def _write_release_ids(path: Path, ids: set[int]) -> None:
     """Write *ids* to *path*, sorted, one release_id per line."""
     with open(path, "w", encoding="utf-8") as f:
@@ -2640,6 +2677,9 @@ async def async_main():
         report = classify_all_releases(releases, index, matcher)
 
         override_ids = load_keep_release_ids(args.keep_release_ids)
+        override_ids = drop_absent_overrides(
+            override_ids, await load_present_release_ids(conn, override_ids)
+        )
         if override_ids:
             logger.info(f"Applying {len(override_ids):,} pinned release_id override(s)")
         apply_release_overrides(report, override_ids)
