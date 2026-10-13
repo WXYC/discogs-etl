@@ -19,6 +19,8 @@
 #   GH_TOKEN                     used by `gh release download` (any token with
 #                                read scope on WXYC/library-metadata-lookup)
 #   DRIFT_MIN_RATIO              watchdog threshold (default 0.7)
+#   PRESERVE_API_FETCH           set to 0 to stop the rebuild preserving LML's
+#                                api_fetch releases (default on; see #450)
 #   REBUILD_SMOKE                when set to 1, exercise everything that can
 #                                fail at host setup (env, gh auth, git pulls,
 #                                cargo build, library.db download, dump URL
@@ -439,6 +441,13 @@ else
 fi
 
 echo "[$(date -u +%H:%M:%SZ)] start pipeline"
+# Keep LML's api_fetch releases across the rebuild (#450): on unless the operator
+# sets PRESERVE_API_FETCH=0. Deliberately unquoted at the call site so an
+# opt-out expands to nothing.
+PRESERVE_API_FETCH_ARG="--preserve-api-fetch"
+if [ "${PRESERVE_API_FETCH:-1}" = "0" ]; then
+    PRESERVE_API_FETCH_ARG=""
+fi
 # Default mode (no --truncate-existing): the import path is idempotent via
 # `import_release_via_upsert` (staging-table COPY + UPSERT excluding the
 # artwork columns from the SET list), so a rerun against a populated DB
@@ -492,7 +501,7 @@ echo "[$(date -u +%H:%M:%SZ)] start pipeline"
 # `set -u` would abort on the unset variable below.
 PIPELINE_EXIT_CODE=0
 python "$REPO_DIR/scripts/run_pipeline.py" \
-    --xml "$WORK_DIR" \
+    --xml "$WORK_DIR" $PRESERVE_API_FETCH_ARG \
     --library-db "$WORK_DIR/library.db" || PIPELINE_EXIT_CODE=$?
 
 # Must match lib/rebuild_lock.py's REBUILD_LOCK_BOWED_OUT_EXIT_CODE exactly —

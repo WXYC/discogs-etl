@@ -57,3 +57,12 @@ class TestRebuildCacheFlags:
     def test_passes_library_db_path(self) -> None:
         tokens = _run_pipeline_invocation_tokens()
         assert "--library-db" in tokens, "rebuild-cache.sh must pass --library-db."
+
+    def test_preserves_api_fetch_releases_by_default(self) -> None:
+        # #450: the monthly rebuild keeps LML's api_fetch releases. The flag is
+        # off in run_pipeline.py itself; this script turns it on unless
+        # PRESERVE_API_FETCH=0, via a variable that expands to nothing on opt-out.
+        source = SCRIPT_PATH.read_text()
+        assert 'PRESERVE_API_FETCH_ARG="--preserve-api-fetch"' in source
+        assert '"${PRESERVE_API_FETCH:-1}" = "0"' in source
+        assert "$PRESERVE_API_FETCH_ARG" in _run_pipeline_invocation_tokens()

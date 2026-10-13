@@ -2705,3 +2705,88 @@ class TestShortfallRefusalRestoresLoggedTables:
         assert region.index("set_tables_unlogged(db_url)") < region.index(
             "set_tables_logged(db_url)"
         )
+
+
+class TestPreserveApiFetchWiring:
+    """--preserve-api-fetch (#450): snapshot before the first destructive step,
+    restore after prune and before the vacuum / SET LOGGED finalization."""
+
+    def test_flag_defaults_off_when_run_standalone(self) -> None:
+        assert run_pipeline.parse_args(["--csv-dir", "/tmp/csv"]).preserve_api_fetch is False
+
+    def test_flag_enables_preservation(self) -> None:
+        args = run_pipeline.parse_args(["--csv-dir", "/tmp/csv", "--preserve-api-fetch"])
+        assert args.preserve_api_fetch is True
+
+    def _build(self, *, preserve: bool, target_db_url: str | None = None) -> list[str]:
+        """Run _run_database_build with every step recorded in call order."""
+        calls: list[str] = []
+        with (
+            patch.object(
+                run_pipeline, "run_step", side_effect=lambda name, *a, **k: calls.append(name)
+            ),
+            patch.object(run_pipeline, "wait_for_postgres"),
+            patch.object(run_pipeline, "write_keep_release_ids"),
+            patch.object(
+                run_pipeline,
+                "run_sql_file",
+                side_effect=lambda *a, **k: calls.append("create_schema"),
+            ),
+            patch.object(run_pipeline, "run_sql_statements_parallel"),
+            patch.object(run_pipeline, "check_reload_invariant"),
+            patch.object(run_pipeline, "set_tables_unlogged"),
+            patch.object(
+                run_pipeline, "set_tables_logged", side_effect=lambda *a: calls.append("set_logged")
+            ),
+            patch.object(run_pipeline, "run_vacuum", side_effect=lambda *a: calls.append("vacuum")),
+            patch.object(run_pipeline, "report_sizes"),
+            patch.object(run_pipeline, "run_derive_va_release_step"),
+            patch.object(run_pipeline.psycopg, "connect"),
+            patch.object(
+                run_pipeline,
+                "snapshot_api_fetch_releases",
+                side_effect=lambda *a, **k: calls.append("snapshot"),
+            ),
+            patch.object(
+                run_pipeline,
+                "restore_api_fetch_releases",
+                side_effect=lambda *a, **k: calls.append("restore"),
+            ),
+        ):
+            run_pipeline._run_database_build(
+                "postgresql:///test",
+                Path("/tmp/csv"),
+                Path("/tmp/library.db"),
+                sys.executable,
+                target_db_url=target_db_url,
+                preserve_api_fetch=preserve,
+            )
+        return calls
+
+    def test_snapshot_precedes_destruction_and_restore_follows_prune(self) -> None:
+        calls = self._build(preserve=True)
+        assert calls.index("snapshot") < calls.index("create_schema")
+        assert calls.index("snapshot") < calls.index("Import base CSVs")
+        assert (
+            calls.index("Prune to library matches") < calls.index("restore") < calls.index("vacuum")
+        )
+        assert calls.index("restore") < calls.index("set_logged")
+
+    def test_disabled_by_default(self) -> None:
+        calls = self._build(preserve=False)
+        assert "snapshot" not in calls and "restore" not in calls
+
+    def test_skipped_with_deprecated_target_db_url(self) -> None:
+        calls = self._build(preserve=True, target_db_url="postgresql:///target")
+        assert "snapshot" not in calls and "restore" not in calls
+
+    def test_restore_failure_relogs_tables_and_raises(self) -> None:
+        with (
+            patch.object(
+                run_pipeline, "restore_api_fetch_releases", side_effect=RuntimeError("boom")
+            ),
+            patch.object(run_pipeline, "set_tables_logged") as set_logged,
+            pytest.raises(RuntimeError, match="boom"),
+        ):
+            run_pipeline._restore_api_fetch_releases_crash_safe("postgresql:///test")
+        set_logged.assert_called_once_with("postgresql:///test")
