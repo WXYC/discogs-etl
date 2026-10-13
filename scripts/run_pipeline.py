@@ -1274,6 +1274,13 @@ def _run_xml_pipeline(
             # is why Seam A's allowlist has to be handed over up front (#424).
             keep_release_ids = prepare_converter_keep_release_ids(db_url)
 
+            # A snapshot an earlier run left behind (it died before its
+            # restore) is restored now, not after the hours-long conversion,
+            # so a failure surfaces before that cost is paid (#450).
+            if args.preserve_api_fetch:
+                wait_for_postgres(db_url)
+                restore_api_fetch_releases(db_url)
+
             convert_and_filter(
                 args.xml,
                 csv_out,
@@ -1651,7 +1658,8 @@ def _run_database_build(
 
     # -- snapshot api_fetch releases before anything destructive (#450). A
     # failure here aborts the rebuild before the cache is touched. A resumed
-    # run (create_schema already done) reuses the snapshot its first attempt took.
+    # run (create_schema already done) reuses the snapshot its first attempt
+    # took; any other left-behind snapshot is restored, then replaced.
     if preserve_api_fetch and target_db_url:
         logger.warning("--preserve-api-fetch is not supported with --target-db-url; skipping")
         preserve_api_fetch = False
