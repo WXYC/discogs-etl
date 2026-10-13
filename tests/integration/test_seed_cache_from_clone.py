@@ -51,8 +51,28 @@ else:
 seed_releases_additive = _seed.seed_releases_additive
 seed_artists_additive = _seed.seed_artists_additive
 compute_new_release_ids = _seed.compute_new_release_ids
+RebuildInProgressError = _seed.RebuildInProgressError
+REBUILD_LOCK_KEY = 354001  # lib.rebuild_lock.REBUILD_LOCK_KEY; pinned here on purpose
 
 pytestmark = [pytest.mark.pg]
+
+
+def _hold_rebuild_lock(url: str) -> psycopg.Connection:
+    """Stand in for a running rebuild: a session-level 354001 on the target."""
+    holder = psycopg.connect(url, autocommit=True)
+    with holder.cursor() as cur:
+        cur.execute("SELECT pg_advisory_lock(%s)", (REBUILD_LOCK_KEY,))
+    return holder
+
+
+def _rebuild_lock_is_free(url: str) -> bool:
+    conn = psycopg.connect(url, autocommit=True)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT pg_try_advisory_lock(%s)", (REBUILD_LOCK_KEY,))
+            return cur.fetchone()[0]
+    finally:
+        conn.close()  # closing the session frees the probe's own lock
 
 
 # ---------------------------------------------------------------------------
@@ -569,6 +589,36 @@ class TestSeedCacheFromClone:
         assert not t.is_alive(), "seed must proceed once the lock is released"
         assert result_box["counts"]["release"] == 1
 
+    # --- refuses while a rebuild holds the rebuild lock (354001) ----------
+
+    def test_real_seed_refuses_while_rebuild_lock_held(self) -> None:
+        before = self._release_ids(self.target_url)
+        holder = _hold_rebuild_lock(self.target_url)
+        try:
+            with pytest.raises(RebuildInProgressError, match="354001"):
+                self._seed_all()
+        finally:
+            holder.close()
+        assert self._release_ids(self.target_url) == before
+
+    def test_dry_run_succeeds_while_rebuild_lock_held(self) -> None:
+        holder = _hold_rebuild_lock(self.target_url)
+        try:
+            planned = seed_releases_additive(
+                self.source_url,
+                self.target_url,
+                [rid for rid, _, _ in CLONE_RELEASES],
+                dry_run=True,
+            )
+        finally:
+            holder.close()
+        assert planned["release"] > 0
+
+    def test_real_seed_releases_rebuild_lock_afterwards(self) -> None:
+        counts = self._seed_all()
+        assert counts["release"] > 0
+        assert _rebuild_lock_is_free(self.target_url)
+
 
 def _insert_artist(
     cur: psycopg.Cursor,
@@ -703,6 +753,22 @@ class TestSeedArtistsFromClone:
         )
         assert self._artist_ids() == before
         assert planned["artist"] == 1  # only 501 is new
+
+    # --- refuses while a rebuild holds the rebuild lock (354001) ----------
+
+    def test_real_seed_refuses_while_rebuild_lock_held(self) -> None:
+        before = self._artist_ids()
+        holder = _hold_rebuild_lock(self.target_url)
+        try:
+            with pytest.raises(RebuildInProgressError, match="354001"):
+                self._seed_all()
+        finally:
+            holder.close()
+        assert self._artist_ids() == before
+
+    def test_real_seed_releases_rebuild_lock_afterwards(self) -> None:
+        self._seed_all()
+        assert _rebuild_lock_is_free(self.target_url)
 
     def test_seed_inserts_only_new_artist(self) -> None:
         counts = seed_artists_additive(

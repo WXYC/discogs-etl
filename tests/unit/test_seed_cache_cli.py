@@ -143,6 +143,32 @@ def test_main_dispatches_to_seed_artists_with_flag(monkeypatch, tmp_path):
     assert calls["dry_run"] is False
 
 
+def test_main_exits_75_when_a_rebuild_holds_the_lock(monkeypatch, tmp_path, caplog):
+    ids_file = tmp_path / "ids.txt"
+    ids_file.write_text("100\n")
+
+    def refuse(*args, **kwargs):
+        raise _seed.RebuildInProgressError("a rebuild holds advisory lock 354001")
+
+    monkeypatch.setattr(_seed, "seed_releases_additive", refuse)
+    monkeypatch.setattr(_seed, "init_logger", lambda **kwargs: None)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "seed_cache_from_clone.py",
+            "--source",
+            "postgresql://localhost:5432/discogs",
+            "--target",
+            "postgresql://localhost:5433/discogs_cache",
+            "--ids-file",
+            str(ids_file),
+        ],
+    )
+    assert _seed.main() == 75
+    assert "354001" in caplog.text
+
+
 # --- --ids-file parsing delegates to the shared allowlist parser (finding #8) -
 
 
