@@ -8,17 +8,19 @@ from the rate-limited Discogs API. This module keeps them, indefinitely:
 1. :func:`snapshot_api_fetch_releases` copies every ``api_fetch`` release, with
    its rows from all nine pipeline tables, into ``<table>_api_fetch_snap``
    scratch tables *before* the first destructive statement.
-2. :func:`restore_api_fetch_releases` runs after prune and re-inserts only the
-   snapshot releases whose ids are absent from ``release``. An id the rebuilt
-   cache already holds is the dump's copy, and the dump wins. Gating on the
-   parent id also keeps the arbiter-less child tables free of duplicates.
+2. :func:`restore_api_fetch_releases` runs after prune and restores the
+   snapshot releases the dump did not carry: ids absent from ``release``, and
+   pinned ids (#424) whose ``release`` row survived with no children. Any other
+   id the rebuilt cache holds is the dump's copy, and the dump wins. Gating on
+   the parent id also keeps the arbiter-less child tables free of duplicates.
 
-The snapshot is atomic and refuses to overwrite an existing one, because a
-second snapshot taken after the rebuild began would capture a cache that
-already lost the data. A failed restore is one rolled-back transaction that
-leaves the scratch tables in place for forensics and raises, the same
-asymmetry as ``_keep_ids_<suffix>`` (#357). Releases LML writes after the
-snapshot are not covered; that window is accepted.
+The snapshot is one REPEATABLE READ transaction. A snapshot left behind by a
+run that died before its restore is restored and then replaced, never
+overwritten blindly, because a second snapshot taken after the rebuild began
+would capture a cache that already lost the data. A failed restore is one
+rolled-back transaction that leaves the scratch tables in place for forensics
+and raises, the same asymmetry as ``_keep_ids_<suffix>`` (#357). Releases LML
+writes after the snapshot are not covered; that window is accepted.
 """
 
 from __future__ import annotations
@@ -49,7 +51,13 @@ SNAPSHOT_TABLES = (
     "cache_metadata",
 )
 
+CHILD_TABLES = SNAPSHOT_TABLES[1:-1]
+
 SIX_MONTHS = timedelta(days=183)
+
+# Bounds the restore's wait for LML's open write transactions on ``release``;
+# while queued, the lock request blocks every later LML write behind it.
+RESTORE_LOCK_TIMEOUT = "2min"
 
 
 class ApiFetchRestoreError(RuntimeError):
@@ -62,8 +70,8 @@ class PreservationSummary:
 
     snapshotted: int
     preserved: int
+    rehydrated: int
     superseded: int
-    dropped: int
     oldest_age: timedelta | None = None
     median_age: timedelta | None = None
     older_than_six_months: int = 0
@@ -71,8 +79,8 @@ class PreservationSummary:
     def format(self) -> str:
         line = (
             f"api_fetch preservation: snapshotted={self.snapshotted} "
-            f"preserved={self.preserved} superseded_by_dump={self.superseded} "
-            f"dropped={self.dropped}"
+            f"preserved={self.preserved} rehydrated={self.rehydrated} "
+            f"superseded_by_dump={self.superseded}"
         )
         if self.oldest_age is not None and self.median_age is not None:
             line += (
@@ -117,75 +125,121 @@ def snapshot_api_fetch_releases(db_url: str, *, reuse_existing: bool = False) ->
     """Snapshot every ``api_fetch`` release into scratch tables; return the release count.
 
     A database without ``release`` / ``cache_metadata`` has nothing to preserve
-    and returns 0. An existing snapshot raises unless *reuse_existing* (a resumed
-    run, whose snapshot predates the destruction) is set. Any failure rolls back
-    and propagates, so the caller aborts before touching the cache.
+    and returns 0. An existing snapshot is reused when *reuse_existing* (a
+    resumed run, whose snapshot predates the destruction) is set. Otherwise it
+    is a run that died between snapshot and restore: it is restored first --
+    the cache it left behind lacks those releases -- and then replaced by a
+    fresh snapshot, so one failed month never blocks the next. Any failure
+    propagates, so the caller aborts before touching the cache.
     """
     with psycopg.connect(db_url) as conn, conn.cursor() as cur:
         if not (_exists(cur, "release") and _exists(cur, "cache_metadata")):
             logger.info("No release/cache_metadata tables yet; nothing to snapshot (#450)")
             return 0
-        if _exists(cur, _snap("release")):
-            if not reuse_existing:
-                raise RuntimeError(
-                    f"{_snap('release')} already exists: an earlier run's api_fetch snapshot "
-                    "is still retained. Restore or drop the *_api_fetch_snap tables first "
-                    "(docs/ec2-rebuild-runbook.md)."
-                )
+        left_behind = _exists(cur, _snap("release"))
+        if left_behind and reuse_existing:
             cur.execute(f"SELECT count(*) FROM {_snap('release')}")
             count = cur.fetchone()[0]
             logger.warning("Reusing existing api_fetch snapshot of %d releases (#450)", count)
             return count
-        for table in SNAPSHOT_TABLES:
-            if not _exists(cur, table):
-                continue
-            cur.execute(
-                f"CREATE TABLE {_snap(table)} AS SELECT t.* FROM {table} t "
-                f"WHERE t.{_key(table)} IN "
-                "(SELECT release_id FROM cache_metadata WHERE source = 'api_fetch')"
-            )
-        cur.execute(f"SELECT count(*) FROM {_snap('release')}")
-        count = cur.fetchone()[0]
+    if left_behind:
+        logger.warning(
+            "An earlier run left its api_fetch snapshot behind; restoring it before "
+            "taking a fresh one (#450)"
+        )
+        restore_api_fetch_releases(db_url)
+    with psycopg.connect(db_url) as conn:
+        # One consistent cut across all nine tables while LML keeps writing.
+        conn.isolation_level = psycopg.IsolationLevel.REPEATABLE_READ
+        with conn.cursor() as cur:
+            for table in SNAPSHOT_TABLES:
+                if not _exists(cur, table):
+                    continue
+                cur.execute(
+                    f"CREATE TABLE {_snap(table)} AS SELECT t.* FROM {table} t "
+                    f"WHERE t.{_key(table)} IN "
+                    "(SELECT release_id FROM cache_metadata WHERE source = 'api_fetch')"
+                )
+            cur.execute(f"SELECT count(*) FROM {_snap('release')}")
+            count = cur.fetchone()[0]
     logger.info("Snapshotted %d api_fetch releases into *_%s tables (#450)", count, SNAPSHOT_SUFFIX)
     return count
 
 
-def restore_api_fetch_releases(db_url: str) -> PreservationSummary | None:
-    """Re-insert snapshot releases the rebuilt cache lacks, then drop the scratch tables.
+def _hollow(cur, alias: str) -> str:
+    """SQL predicate: release *alias*.id has no row in any live child table."""
+    checks = [
+        f"NOT EXISTS (SELECT 1 FROM {t} c WHERE c.release_id = {alias}.id)"
+        for t in CHILD_TABLES
+        if _exists(cur, t)
+    ]
+    return " AND ".join(checks) or "FALSE"
 
-    Returns ``None`` when no snapshot exists. Runs as one transaction holding a
-    SHARE ROW EXCLUSIVE lock on ``release`` so LML cannot write one of these ids
-    between the absence check and the insert. On any failure the transaction
-    rolls back, the scratch tables stay, and :class:`ApiFetchRestoreError` is raised.
+
+def restore_api_fetch_releases(db_url: str) -> PreservationSummary | None:
+    """Restore the snapshot releases the rebuilt dump did not carry, then drop the scratch tables.
+
+    Returns ``None`` when no snapshot exists. Two kinds are restored:
+
+    * **preserved** -- the id is absent from ``release``: every row is re-inserted.
+    * **rehydrated** -- the id is in ``release`` with no row in any child table.
+      That is a pinned release (#424) the dump did not carry: the prune kept its
+      ``release`` row but the child TRUNCATE emptied it, ``artwork_checked_at``
+      was NULLed and ``populate_cache_metadata`` re-labelled it ``bulk_import``.
+      Its children are re-inserted, ``artwork_checked_at`` and ``cache_metadata``
+      are set back to the snapshot. Every release the dump carries has at least
+      an artist row, so a dump copy is never mistaken for one of these.
+
+    Any other id is the dump's copy, and the dump wins. Runs as one transaction
+    holding a SHARE ROW EXCLUSIVE lock on ``release`` (bounded by
+    ``lock_timeout``) so LML cannot write one of these ids between the check and
+    the insert. On any failure the transaction rolls back, the scratch tables
+    stay, and :class:`ApiFetchRestoreError` is raised.
     """
     try:
         with psycopg.connect(db_url) as conn, conn.cursor() as cur:
             if not _exists(cur, _snap("release")):
                 logger.info("No api_fetch snapshot to restore (#450)")
                 return None
+            if not _exists(cur, "release"):
+                logger.warning("No release table to restore into; api_fetch snapshot retained")
+                return None
+            cur.execute(f"SET LOCAL lock_timeout = '{RESTORE_LOCK_TIMEOUT}'")
             cur.execute("LOCK TABLE release IN SHARE ROW EXCLUSIVE MODE")
             cur.execute(f"SELECT count(*) FROM {_snap('release')}")
             snapshotted = cur.fetchone()[0]
             cur.execute(
                 "CREATE TEMP TABLE _api_fetch_restore ON COMMIT DROP AS "
-                f"SELECT s.id FROM {_snap('release')} s "
-                "WHERE NOT EXISTS (SELECT 1 FROM release r WHERE r.id = s.id)"
+                "SELECT s.id, r.id IS NULL AS absent "
+                f"FROM {_snap('release')} s LEFT JOIN release r ON r.id = s.id "
+                f"WHERE r.id IS NULL OR ({_hollow(cur, 's')})"
             )
-            cur.execute("SELECT count(*) FROM _api_fetch_restore")
-            to_restore = cur.fetchone()[0]
+            cur.execute("SELECT count(*) FILTER (WHERE absent), count(*) FROM _api_fetch_restore")
+            preserved, restoring = cur.fetchone()
             for table in SNAPSHOT_TABLES:
                 if not _exists(cur, _snap(table)):
                     continue
                 snap_cols = set(_columns(cur, _snap(table)))
-                cols = ", ".join(c for c in _columns(cur, table) if c in snap_cols)
+                live_cols = [c for c in _columns(cur, table) if c in snap_cols]
+                cols = ", ".join(live_cols)
+                ids = "SELECT id FROM _api_fetch_restore"
+                if table == "release":
+                    ids += " WHERE absent"
+                    cur.execute(
+                        f"UPDATE release r SET artwork_checked_at = s.artwork_checked_at "
+                        f"FROM {_snap(table)} s, _api_fetch_restore x "
+                        "WHERE r.id = s.id AND x.id = s.id AND NOT x.absent"
+                    )
+                conflict = ""
+                if table == "cache_metadata":
+                    updates = ", ".join(
+                        f"{c} = EXCLUDED.{c}" for c in live_cols if c != "release_id"
+                    )
+                    conflict = f" ON CONFLICT (release_id) DO UPDATE SET {updates}"
                 cur.execute(
                     f"INSERT INTO {table} ({cols}) SELECT {cols} FROM {_snap(table)} "
-                    f"WHERE {_key(table)} IN (SELECT id FROM _api_fetch_restore)"
+                    f"WHERE {_key(table)} IN ({ids}){conflict}"
                 )
-            cur.execute(
-                "SELECT count(*) FROM release WHERE id IN (SELECT id FROM _api_fetch_restore)"
-            )
-            preserved = cur.fetchone()[0]
             cur.execute(
                 "SELECT now() - cached_at FROM cache_metadata "
                 "WHERE release_id IN (SELECT id FROM _api_fetch_restore)"
@@ -194,14 +248,12 @@ def restore_api_fetch_releases(db_url: str) -> PreservationSummary | None:
             summary = PreservationSummary(
                 snapshotted=snapshotted,
                 preserved=preserved,
-                superseded=snapshotted - to_restore,
-                dropped=to_restore - preserved,
+                rehydrated=restoring - preserved,
+                superseded=snapshotted - restoring,
                 oldest_age=oldest,
                 median_age=median,
                 older_than_six_months=old_count,
             )
-            if summary.dropped:
-                raise RuntimeError(f"{summary.dropped} snapshot releases missing after restore")
             for table in SNAPSHOT_TABLES:
                 cur.execute(f"DROP TABLE IF EXISTS {_snap(table)}")
     except Exception as exc:

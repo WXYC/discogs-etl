@@ -41,6 +41,12 @@ else:
     sys.modules["verify_cache"] = _vc
     _spec.loader.exec_module(_vc)
 
+_IC_PATH = Path(__file__).parent.parent.parent / "scripts" / "import_csv.py"
+_ic_spec = importlib.util.spec_from_file_location("import_csv_api_fetch_pg", _IC_PATH)
+assert _ic_spec is not None and _ic_spec.loader is not None
+_ic = importlib.util.module_from_spec(_ic_spec)
+_ic_spec.loader.exec_module(_ic)
+
 CHILD_TABLES = (
     "release_artist",
     "release_label",
@@ -55,6 +61,8 @@ ALL_TABLES = ("cache_metadata", *CHILD_TABLES, "release")
 # Dump-resident release (survives prune), an api_fetch-only release (the one to
 # preserve), and an api_fetch release the dump also carries (the dump wins).
 DUMP_ID, API_ONLY_ID, API_AND_DUMP_ID = 100, 200, 300
+# A WXYC-pinned api_fetch release the dump does not carry (#424 keep set).
+PINNED_API_ID = 400
 
 
 def _scratch(base: str) -> str:
@@ -145,7 +153,7 @@ class TestSnapshotRestoreRoundTrip:
 
         summary = restore_api_fetch_releases(seeded_db)
 
-        assert (summary.preserved, summary.superseded, summary.dropped) == (1, 1, 0)
+        assert (summary.preserved, summary.rehydrated, summary.superseded) == (1, 0, 1)
         for table in CHILD_TABLES:
             assert _rows(
                 seeded_db, f"SELECT count(*) FROM {table} WHERE release_id = {API_ONLY_ID}"
@@ -203,15 +211,95 @@ class TestSnapshotSafety:
         assert snapshot_api_fetch_releases(db_url) == 0
         assert restore_api_fetch_releases(db_url) is None
 
-    def test_existing_snapshot_is_never_overwritten(self, seeded_db) -> None:
+    def test_resumed_run_reuses_its_own_snapshot(self, seeded_db) -> None:
         snapshot_api_fetch_releases(seeded_db)
         _simulate_dump_rebuild(seeded_db)
-        # A second snapshot now would capture a cache that already lost the data.
-        with pytest.raises(RuntimeError, match="already exists"):
-            snapshot_api_fetch_releases(seeded_db)
-        # A resumed run opts in to reusing it, and still restores everything.
+        # A resumed run's snapshot predates the destruction, so it is reused as is.
         assert snapshot_api_fetch_releases(seeded_db, reuse_existing=True) == 2
         assert restore_api_fetch_releases(seeded_db).preserved == 1
+
+    def test_previous_run_left_a_snapshot_behind(self, seeded_db) -> None:
+        """A run that died between snapshot and restore must not block the next one."""
+        snapshot_api_fetch_releases(seeded_db)
+        # The run died after the base import's child TRUNCATE and its prune: the
+        # api_fetch-only release is gone and every survivor is children-less.
+        with psycopg.connect(seeded_db, autocommit=True) as conn, conn.cursor() as cur:
+            cur.execute(f"DELETE FROM release WHERE id = {API_ONLY_ID}")
+            for table in (*CHILD_TABLES, "cache_metadata"):
+                cur.execute(f"TRUNCATE {table}")
+
+        # The next run restores the left-behind snapshot, then takes a fresh one.
+        assert snapshot_api_fetch_releases(seeded_db) == 2
+        for release_id in (API_ONLY_ID, API_AND_DUMP_ID):
+            assert _rows(
+                seeded_db, f"SELECT source FROM cache_metadata WHERE release_id = {release_id}"
+            ) == [("api_fetch",)]
+            assert _rows(
+                seeded_db, f"SELECT count(*) FROM release_track WHERE release_id = {release_id}"
+            ) == [(1,)]
+
+        _simulate_dump_rebuild(seeded_db)
+        assert restore_api_fetch_releases(seeded_db).preserved == 1
+        assert _rows(seeded_db, f"SELECT 1 FROM release WHERE id = {API_ONLY_ID}") == [(1,)]
+
+
+class TestPinnedReleaseAbsentFromDump:
+    """A pinned api_fetch release the dump lacks keeps its ``release`` row through
+    the real import (#424) but loses its children and provenance; restore re-hydrates it."""
+
+    def test_rehydrates_children_and_provenance(self, seeded_db, tmp_path, monkeypatch) -> None:
+        with psycopg.connect(seeded_db, autocommit=True) as conn, conn.cursor() as cur:
+            _insert_release(cur, PINNED_API_ID, "Moon Pix", "Cat Power", "api_fetch", "2025-03-03")
+            cur.execute(
+                "UPDATE release SET artwork_checked_at = '2025-03-03' WHERE id = %s",
+                (PINNED_API_ID,),
+            )
+        assert snapshot_api_fetch_releases(seeded_db) == 3
+
+        # The real base import: the dump carries DUMP_ID and API_AND_DUMP_ID only.
+        (tmp_path / "release.csv").write_text(
+            "id,title,country,released,format,master_id\n"
+            f"{DUMP_ID},Doga,AR,2008,LP,\n{API_AND_DUMP_ID},Edits (dump),US,2023,LP,\n"
+        )
+        monkeypatch.setenv(_ic.MAX_PIN_SHORTFALL_RATIO_ENV, "0.5")
+        with psycopg.connect(seeded_db) as conn:
+            _ic.import_release_via_upsert(
+                conn, tmp_path, keep_release_ids={PINNED_API_ID, DUMP_ID, API_AND_DUMP_ID}
+            )
+            with conn.cursor() as cur:
+                # The child import: the dump's copies carry only an artist row.
+                for release_id in (DUMP_ID, API_AND_DUMP_ID):
+                    cur.execute(
+                        "INSERT INTO release_artist (release_id, artist_id, artist_name, extra) "
+                        "VALUES (%s, 1, 'dump artist', 0)",
+                        (release_id,),
+                    )
+            conn.commit()
+            _ic.populate_cache_metadata(conn)
+        assert _rows(
+            seeded_db, f"SELECT source FROM cache_metadata WHERE release_id = {PINNED_API_ID}"
+        ) == [("bulk_import",)]
+
+        summary = restore_api_fetch_releases(seeded_db)
+
+        assert (summary.preserved, summary.rehydrated, summary.superseded) == (1, 1, 1)
+        for table in CHILD_TABLES:
+            assert _rows(
+                seeded_db, f"SELECT count(*) FROM {table} WHERE release_id = {PINNED_API_ID}"
+            ) == [(1,)], table
+        assert _rows(
+            seeded_db,
+            "SELECT source, cached_at::date::text FROM cache_metadata "
+            f"WHERE release_id = {PINNED_API_ID}",
+        ) == [("api_fetch", "2025-03-03")]
+        assert _rows(
+            seeded_db,
+            f"SELECT artwork_checked_at::date::text FROM release WHERE id = {PINNED_API_ID}",
+        ) == [("2025-03-03",)]
+        # The dump still wins for the release it carried: no snapshot child is merged in.
+        assert _rows(
+            seeded_db, f"SELECT count(*) FROM release_label WHERE release_id = {API_AND_DUMP_ID}"
+        ) == [(0,)]
 
 
 class TestRestoreFailure:
