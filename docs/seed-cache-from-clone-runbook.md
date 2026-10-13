@@ -66,3 +66,12 @@ Drop `--dry-run` to write. `--ids-file` here holds artist_ids, one per line, in 
 ## Rollback
 
 There is nothing to roll back on a partial run — it is additive and re-runnable; a re-run computes a smaller new-parent-id set and completes. If seeded rows must be removed, delete by the exact seeded release_id list (never `verify_cache.py --prune`), after a `SELECT` with the same predicate to confirm scope.
+
+## Relation to the monthly rebuild
+
+The monthly rebuild preserves LML's `api_fetch` releases itself: `rebuild-cache.sh` passes `--preserve-api-fetch` (`PRESERVE_API_FETCH=0` opts out), snapshotting them before the base import and restoring them after prune. Design and the run-log line are in [`architecture.md`](architecture.md#api_fetch-release-preservation); failure handling is in the [`api_fetch` troubleshooting entry](ec2-rebuild-runbook.md#run-fails-with-an-api_fetch-snapshot-or-restore-error) of the EC2 runbook. So an export-before / re-seed-after round trip around a rebuild is no longer routine. A manual re-seed is needed only after a run that opted out with `PRESERVE_API_FETCH=0`, or when the snapshot was lost (for example the `*_api_fetch_snap` scratch tables were dropped by hand).
+
+Two limits to know before relying on a manual re-seed:
+
+- **It cannot rehydrate hollow pinned releases.** The seed skips every id already in `release`. A pinned release (#424) that survived a rebuild as a `release` row with no children and a `bulk_import` label is therefore skipped, not repaired. The pipeline's restore handles that case; the seed does not. After a manual re-seed, restore those ids' child rows and `cache_metadata` row separately.
+- **Seeded rows survive the next rebuild only as `source = 'api_fetch'`.** `verify_cache.py` prunes by library match, not by `cache_metadata.source`, so a non-library release is dropped by verify-prune whatever its label. What lets an `api_fetch` release outlast a rebuild is the snapshot and restore above, which select on `source = 'api_fetch'`. A default seed writes fresh `bulk_import` provenance, so non-library rows seeded that way are not snapshotted and do not survive. Use `--preserve-provenance` when seeding an `api_fetch` export.
