@@ -6,7 +6,13 @@ from datetime import timedelta
 
 import pytest
 
-from lib.api_fetch_preservation import PreservationSummary, summarize_ages
+from lib.api_fetch_preservation import (
+    CHILD_TABLES,
+    SNAPSHOT_TABLES,
+    PreservationSummary,
+    summarize_ages,
+)
+from scripts.verify_cache import COPY_TABLE_SPEC
 
 DAY = timedelta(days=1)
 
@@ -57,3 +63,18 @@ class TestPreservationSummaryFormat:
         line = summary.format()
         assert "preserved=0" in line
         assert "oldest" not in line
+
+
+class TestSnapshotRosterParity:
+    """SNAPSHOT_TABLES is a fourth copy-swap roster; a release child table added to
+    COPY_TABLE_SPEC but not here would lose its rows on every rebuild (#453)."""
+
+    def test_matches_copy_table_spec(self) -> None:
+        assert set(SNAPSHOT_TABLES) == {t for t, _, _ in COPY_TABLE_SPEC}
+
+    def test_parent_first_and_cache_metadata_last(self) -> None:
+        assert SNAPSHOT_TABLES[0] == "release"
+        assert SNAPSHOT_TABLES[-1] == "cache_metadata"
+
+    def test_child_tables_are_every_table_but_parent_and_cache_metadata(self) -> None:
+        assert set(CHILD_TABLES) == set(SNAPSHOT_TABLES) - {"release", "cache_metadata"}
