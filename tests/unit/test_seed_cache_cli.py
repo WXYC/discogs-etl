@@ -7,6 +7,7 @@ clone-vs-prod column-intersection contract).
 from __future__ import annotations
 
 import importlib.util
+import logging
 import sys
 from pathlib import Path
 
@@ -165,8 +166,11 @@ def test_main_exits_75_when_a_rebuild_holds_the_lock(monkeypatch, tmp_path, capl
             str(ids_file),
         ],
     )
-    assert _seed.main() == 75
-    assert "354001" in caplog.text
+    with caplog.at_level(logging.WARNING):
+        assert _seed.main() == 75
+    refusals = [r for r in caplog.records if "354001" in r.getMessage()]
+    # An expected, retry-later refusal: WARNING, not ERROR (no Sentry error event).
+    assert [r.levelno for r in refusals] == [logging.WARNING]
 
 
 # --- --ids-file parsing delegates to the shared allowlist parser (finding #8) -
