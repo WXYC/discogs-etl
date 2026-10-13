@@ -311,6 +311,14 @@ move the cache off Railway.
 The destination DB hasn't been alembic-stamped. Apply the procedure in
 [`docs/migrations-runbook.md`](migrations-runbook.md) once.
 
+### Run fails with an `api_fetch` snapshot or restore error
+
+The monthly rebuild preserves LML's `api_fetch` releases (`PRESERVE_API_FETCH=0` in the environment opts out; design in [`architecture.md`](architecture.md#api_fetch-release-preservation), [#450](https://github.com/WXYC/discogs-etl/issues/450)). A healthy run logs one line near the end: `api_fetch preservation: snapshotted=N preserved=N superseded_by_dump=N dropped=0 oldest=Nd median=Nd older_than_6mo=N`. `preserved` is what the dump lacked and was kept; `superseded_by_dump` is what the dump carried again, so the dump's copy won.
+
+- **`<table>_api_fetch_snap already exists`** (raised at the very start, before anything is touched): an earlier run left its snapshot behind, usually after a failed restore. Do not drop it blindly -- it may hold the only copy of those releases. Inspect `SELECT count(*), min(cached_at) FROM cache_metadata_api_fetch_snap`, restore what you need by hand (`INSERT ... SELECT` for ids absent from `release`), then drop the `*_api_fetch_snap` tables. (A resumed `--csv-dir` run reuses its own snapshot; the monthly `--xml` run does not resume.)
+- **`api_fetch restore failed and was rolled back`** (after prune): the restore is one transaction, so `release` and its children are exactly as prune left them and the scratch tables are retained. The log carries the underlying error (typically a NOT NULL or FK added to the live schema that the snapshot rows cannot satisfy). The pipeline re-flips the tables to LOGGED before aborting (best effort; see [`migrations-runbook.md`](migrations-runbook.md) for the manual SET LOGGED repair if that line logs a failure). Fix the cause, then restore from the scratch tables by hand.
+- Releases LML fetches *during* the rebuild window are not covered by the snapshot; expect LML to re-fetch those few.
+
 ### Run fails with `[#298] cache reload invariant violated`
 
 The post-reload gate in `run_pipeline.py` found `release` populated but the
