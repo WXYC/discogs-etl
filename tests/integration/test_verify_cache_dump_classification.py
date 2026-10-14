@@ -252,7 +252,7 @@ class TestDumpClassificationEndToEnd:
 CREDITLESS_PINNED_ID = 7
 # A pinned id with no ``release`` row at all: the 2026-10-13 shape (#446).
 ABSENT_PINNED_ID = 99_999
-ABSENT_PINNED_PHRASE = "pinned release_id override(s) have no release row"
+ABSENT_PINNED_PHRASE = "have no release row and will not be kept"
 
 
 class TestPinsWithoutAReleaseRow:
