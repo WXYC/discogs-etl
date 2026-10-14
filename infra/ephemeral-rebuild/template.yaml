@@ -71,10 +71,14 @@ Parameters:
 
   MaxInstanceAgeHours:
     Type: Number
-    Default: 3
+    Default: 6
     Description: >
       Sweeper failsafe. Any rebuild instance older than this is force-
       terminated and emits a StaleInstanceTerminated CloudWatch metric.
+      Six hours covers the same-night retry's worst case: ~30 min setup,
+      up to 180 min waiting on rebuild lock 354001, then a ~90 min rebuild,
+      plus an hour of margin because the hourly sweeper may fire up to an
+      hour past the threshold.
 
   AlertEmail:
     Type: String

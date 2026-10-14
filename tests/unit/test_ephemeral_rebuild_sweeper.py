@@ -3,7 +3,7 @@
 The sweeper is the failsafe for the bootstrap-crashed-before-shutdown
 case. EventBridge fires it hourly; it lists running instances tagged
 Project=discogs-rebuild, terminates any older than ``MAX_INSTANCE_AGE_HOURS``
-(default 3), and emits a ``StaleInstanceTerminated`` CloudWatch metric so
+(default 6), and emits a ``StaleInstanceTerminated`` CloudWatch metric so
 operators get a Slack/email page when the failsafe trips.
 """
 
@@ -183,3 +183,22 @@ def test_max_age_hours_env_override(handler_module, monkeypatch):
     result = handler_module.lambda_handler({}, None, ec2_client=ec2, cloudwatch_client=MagicMock())
 
     assert result == {"terminated": ["i-1h-old"]}
+
+
+def test_max_age_hours_defaults_to_six_when_env_unset(handler_module, monkeypatch):
+    """The fallback matches the template default: lock wait plus rebuild (#464)."""
+    monkeypatch.delenv("MAX_INSTANCE_AGE_HOURS", raising=False)
+    ec2 = _make_ec2(
+        reservations=[
+            {
+                "Instances": [
+                    {"InstanceId": "i-5h", "LaunchTime": _now() - timedelta(hours=5)},
+                    {"InstanceId": "i-7h", "LaunchTime": _now() - timedelta(hours=7)},
+                ]
+            }
+        ]
+    )
+
+    result = handler_module.lambda_handler({}, None, ec2_client=ec2, cloudwatch_client=MagicMock())
+
+    assert result == {"terminated": ["i-7h"]}
