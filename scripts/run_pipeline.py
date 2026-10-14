@@ -318,7 +318,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Snapshot LML's api_fetch releases (cache_metadata.source = 'api_fetch') "
         "before anything destructive and restore the ones the dump lacks after prune; "
         "the dump wins an id collision. Off by default here; scripts/rebuild-cache.sh "
-        "turns it on (PRESERVE_API_FETCH=0 opts out). See WXYC/discogs-etl#450.",
+        "(PRESERVE_API_FETCH=0 opts out) and the rebuild-cache.yml workflow_dispatch "
+        "fallback (preserve_api_fetch input) turn it on. See WXYC/discogs-etl#450.",
     )
 
     args = parser.parse_args(argv)
