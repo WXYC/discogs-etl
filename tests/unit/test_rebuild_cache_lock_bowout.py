@@ -38,6 +38,7 @@ tests/integration/test_rebuild_lock.py's TestRunPipelineBowsOutEndToEnd
 
 from __future__ import annotations
 
+import ast
 import re
 import shutil
 import subprocess
@@ -361,10 +362,69 @@ class TestBowOutWordingIsHolderNeutral:
         assert "another rebuild holds the advisory lock" not in text
         assert "another rebuild already holds" not in text
 
-    @pytest.mark.parametrize(
-        "relpath",
-        ["scripts/rebuild-cache.sh", ".github/workflows/rebuild-cache.yml"],
-    )
-    def test_names_lock_and_possible_holders(self, relpath: str) -> None:
-        text = (REPO_ROOT / relpath).read_text()
-        assert "held by another session (a rebuild, a dedup, or a seed)" in text
+    def test_shell_region_emits_every_holder(self, tmp_path: Path) -> None:
+        stdout = _run_harness(_python_sentinel_value(), tmp_path).stdout.splitlines()
+        _assert_names_every_holder(_only_line(stdout, r"NOTIFY :no_entry: "))
+        _assert_names_every_holder(_only_line(stdout, r"\[[0-9:]+Z\] bowed out: "))
+        # The outcome marker's detail is a short cause, not a list of holders.
+        outcome = _only_line(stdout, r"OUTCOME bowed_out ").lower()
+        assert "held by another session" in outcome
+        assert "another rebuild" not in outcome
+
+    def test_workflow_warning_names_every_holder(self) -> None:
+        lines = WORKFLOW_PATH.read_text().splitlines()
+        sentinel = _python_sentinel_value()
+        branch_idx = next(i for i, line in enumerate(lines) if f"-eq {sentinel} ]" in line)
+        _assert_names_every_holder(next(ln for ln in lines[branch_idx:] if "::warning::" in ln))
+
+    def test_run_pipeline_warning_names_every_holder(self) -> None:
+        tree = ast.parse((REPO_ROOT / "scripts" / "run_pipeline.py").read_text())
+        templates = [
+            node.args[0].value
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "warning"
+            and node.args
+            and isinstance(node.args[0], ast.Constant)
+            and isinstance(node.args[0].value, str)
+            and "bowing out" in node.args[0].value
+        ]
+        assert len(templates) == 1, f"expected one bow-out warning, found {templates!r}"
+        _assert_names_every_holder(templates[0] % _python_lock_key())
+
+    def test_automation_doc_quotes_the_slack_text(self, tmp_path: Path) -> None:
+        """docs/automation.md's failure item 5 is found by searching Slack's
+        text, so its heading must quote what the script posts today."""
+        stdout = _run_harness(_python_sentinel_value(), tmp_path).stdout.splitlines()
+        posted = _only_line(stdout, r"NOTIFY :no_entry: ").removeprefix("NOTIFY ")
+        quoted = posted.split("; no cache write")[0]
+        doc = (REPO_ROOT / "docs" / "automation.md").read_text()
+        assert f"**Slack posts `{quoted}`**" in doc
+
+
+# Every registered 354001 holder (CLAUDE.md's advisory-lock table): the rebuild,
+# dedup_artist_children.py, a real seed_cache_from_clone.py run, and an operator
+# session holding the lock by hand.
+_LOCK_HOLDERS = ("a rebuild", "a dedup", "a seed", "an operator session")
+
+
+def _python_lock_key() -> int:
+    match = re.search(r"^REBUILD_LOCK_KEY\s*=\s*(\d+)", LOCK_MODULE_PATH.read_text(), re.M)
+    assert match is not None, f"could not find REBUILD_LOCK_KEY = <int> in {LOCK_MODULE_PATH}"
+    return int(match.group(1))
+
+
+def _only_line(lines: list[str], prefix_pattern: str) -> str:
+    matches = [line for line in lines if re.match(prefix_pattern, line)]
+    assert len(matches) == 1, f"expected one line matching {prefix_pattern!r}, got {lines!r}"
+    return matches[0]
+
+
+def _assert_names_every_holder(message: str) -> None:
+    lowered = message.lower()
+    assert str(_python_lock_key()) in message, f"must name the lock key: {message!r}"
+    assert "another rebuild" not in lowered, f"must not claim a peer rebuild: {message!r}"
+    assert "held by another session" in lowered, message
+    missing = [holder for holder in _LOCK_HOLDERS if holder not in lowered]
+    assert not missing, f"bow-out text omits {missing}: {message!r}"

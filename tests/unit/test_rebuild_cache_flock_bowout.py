@@ -97,7 +97,7 @@ def test_flock_bowout_calls_notify_slack(script_lines: list[str]) -> None:
 def test_flock_bowout_message_is_distinct_from_advisory_lock_message(script_text: str) -> None:
     """The two bow-outs have different causes -- a concurrent run on the same
     host (flock) versus another session holding the destination DB's advisory
-    lock (key 354001; a rebuild, a dedup, or a seed) --
+    lock (key 354001; a rebuild, a dedup, a seed, or an operator session) --
     and must be distinguishable from Slack alone, without reading the log."""
     # Pull each notify_slack call's (emoji, message) pair out in source order.
     calls = re.findall(r'notify_slack\s+"(:[a-z_]+:)"\s+"([^"]*)"', script_text)
@@ -108,8 +108,10 @@ def test_flock_bowout_message_is_distinct_from_advisory_lock_message(script_text
         "could not find the advisory-lock (key 354001) bow-out notify_slack call"
     )
     # Dedup, seed and operator sessions also hold 354001, so the message must
-    # not assert that a peer rebuild is the holder.
-    assert "peer rebuild" not in advisory_lock_call[1].lower()
+    # not assert that another rebuild is the holder (the pre-#459 text did).
+    advisory_lock_message = advisory_lock_call[1].lower()
+    assert "another rebuild" not in advisory_lock_message
+    assert "held by another session" in advisory_lock_message
 
     flock_calls = [c for c in calls if c is not advisory_lock_call and "flock" in c[1].lower()]
     assert flock_calls, (

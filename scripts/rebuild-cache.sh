@@ -509,9 +509,9 @@ python "$REPO_DIR/scripts/run_pipeline.py" \
 REBUILD_LOCK_BOWED_OUT_EXIT_CODE=75
 
 if [ "$PIPELINE_EXIT_CODE" -eq "$REBUILD_LOCK_BOWED_OUT_EXIT_CODE" ]; then
-    echo "[$(date -u +%H:%M:%SZ)] bowed out: the discogs-cache rebuild lock (key 354001) is held by another session (a rebuild, a dedup, or a seed); no cache write"
+    echo "[$(date -u +%H:%M:%SZ)] bowed out: the discogs-cache rebuild lock (key 354001) is held by another session (a rebuild, a dedup, a seed, or an operator session); no cache write"
     report_outcome bowed_out "the rebuild lock (key 354001) is held by another session"
-    notify_slack ":no_entry:" "bowed out — the discogs-cache rebuild lock (key 354001) is held by another session (a rebuild, a dedup, or a seed); no cache write. Log: ${LOG_FILE}"
+    notify_slack ":no_entry:" "bowed out — the discogs-cache rebuild lock (key 354001) is held by another session (a rebuild, a dedup, a seed, or an operator session); no cache write. Log: ${LOG_FILE}"
     exit 0
 elif [ "$PIPELINE_EXIT_CODE" -ne 0 ]; then
     on_error "$LINENO" "$PIPELINE_EXIT_CODE"
