@@ -515,8 +515,8 @@ fi
 # turns the wait off). run_pipeline.py takes the lock before anything else, so a
 # refused attempt costs seconds. The call keeps the ERR-trap-safe shape above
 # inside the loop; only exit 75 is retried, so any other exit still reaches
-# on_error below. The wait is counted in sleeps rather than read off a clock, so
-# the tests can stub `sleep`. It must stay inside the instance's lifetime: see
+# on_error below. The wait adds up the sleeps plus the time each attempt and
+# lookup took (bash SECONDS), so the tests can stub `sleep` and advance SECONDS. It must stay inside the instance's lifetime: see
 # test_wait_fits_inside_the_instance_lifetime.
 REBUILD_LOCK_BOWED_OUT_EXIT_CODE=75
 REBUILD_LOCK_HOLDER_FREE_EXIT_CODE=3
@@ -586,7 +586,7 @@ while :; do
         LOCK_BOWOUT_NOTE=" Holder: ${LOCK_HOLDER_LABEL}."
         break
     elif [ "$REBUILD_LOCK_WAITED_SECONDS" -ge "$REBUILD_LOCK_WAIT_SECONDS" ]; then
-        LOCK_BOWOUT_NOTE=" Holder at the deadline: ${LOCK_HOLDER_LABEL}; the lock stayed held for the whole ${REBUILD_LOCK_WAIT_MINUTES}-minute wait."
+        LOCK_BOWOUT_NOTE=" Holder at the deadline: ${LOCK_HOLDER_LABEL}; the rebuild could not take the lock in the whole ${REBUILD_LOCK_WAIT_MINUTES}-minute wait."
         break
     fi
 
