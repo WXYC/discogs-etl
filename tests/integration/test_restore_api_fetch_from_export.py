@@ -285,8 +285,10 @@ class TestRestoreFromExport:
             assert _run(source, target) == 0
         assert "snapshotted=3 preserved=1 rehydrated=1 superseded_by_dump=1" in caplog.text
 
-    def test_a_source_without_a_table_the_target_has_still_restores(self, export_and_cache) -> None:
-        """A clone predating release_video: that family is skipped, not fatal."""
+    def test_a_source_without_a_table_the_target_has_still_restores(
+        self, export_and_cache, caplog
+    ) -> None:
+        """A clone predating release_video: that family is skipped with a warning, not fatal."""
         source, target = export_and_cache
         with psycopg.connect(source, autocommit=True) as conn, conn.cursor() as cur:
             cur.execute("DROP TABLE release_video")
@@ -299,6 +301,7 @@ class TestRestoreFromExport:
         assert _rows(target, f"SELECT 1 FROM release_track WHERE release_id = {ABSENT_ID}") == [
             (1,)
         ]
+        assert "release_video: the export has no such table; restoring without it" in caplog.text
 
     def test_a_source_column_the_target_lacks_is_left_out_with_a_warning(
         self, export_and_cache, caplog
