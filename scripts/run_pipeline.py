@@ -48,6 +48,7 @@ from lib.api_fetch_preservation import (  # noqa: E402
 from lib.dsn import redact_dsn  # noqa: E402
 from lib.observability import init_logger  # noqa: E402
 from lib.rebuild_lock import (  # noqa: E402
+    REBUILD_LOCK_HOLDER_REBUILD,
     REBUILD_LOCK_KEY,
     exit_bowed_out,
     release_rebuild_lock,
@@ -1349,7 +1350,7 @@ def main() -> None:
     # not exclude each other. That flag is on its way out and the monthly
     # rebuild never uses it; if it outlives this guard, key the lock on the
     # consumer DB instead.
-    lock_conn = try_acquire_rebuild_lock(args.database_url)
+    lock_conn = try_acquire_rebuild_lock(args.database_url, holder=REBUILD_LOCK_HOLDER_REBUILD)
     if lock_conn is None:
         logger.warning(
             "The discogs-cache rebuild lock (key %d) is held by another session "

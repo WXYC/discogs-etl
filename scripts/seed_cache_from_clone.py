@@ -85,6 +85,7 @@ from lib.keep_release_ids import parse_keep_release_ids  # noqa: E402
 from lib.observability import init_logger  # noqa: E402
 from lib.rebuild_lock import (  # noqa: E402
     REBUILD_LOCK_BOWED_OUT_EXIT_CODE,
+    REBUILD_LOCK_HOLDER_SEED,
     REBUILD_LOCK_KEY,
     release_rebuild_lock,
     try_acquire_rebuild_lock,
@@ -426,7 +427,7 @@ def _seed_family(
         # Exclude every 354001 holder (a rebuild and its api_fetch restore, dedup,
         # an operator session, another seed) from the whole write window; 330001
         # below is the seed-vs-seed backstop.
-        rebuild_lock_conn = try_acquire_rebuild_lock(target_url)
+        rebuild_lock_conn = try_acquire_rebuild_lock(target_url, holder=REBUILD_LOCK_HOLDER_SEED)
         if rebuild_lock_conn is None:
             raise RebuildInProgressError(
                 f"the rebuild lock {REBUILD_LOCK_KEY} is held on --target (a rebuild, "

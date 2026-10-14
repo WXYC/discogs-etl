@@ -45,6 +45,7 @@ deadlocks) unrelated work across services with no error to debug from.
 
 from __future__ import annotations
 
+import argparse
 import logging
 import os
 import sys
@@ -81,6 +82,22 @@ REBUILD_LOCK_KEY = 354001
 # scripts/rebuild-cache.sh checks for this exact numeric value; the two are
 # pinned in sync by tests/unit/test_rebuild_cache_lock_bowout.py.
 REBUILD_LOCK_BOWED_OUT_EXIT_CODE = 75
+
+# The ``application_name`` each holder's lock connection carries, so a refused
+# caller can say who it lost to (discogs-etl#465). scripts/rebuild-cache.sh
+# waits out any holder except REBUILD_LOCK_HOLDER_REBUILD -- a peer rebuild *is*
+# that tick's rebuild -- and pins its copy of that literal to this one in
+# tests/unit/test_rebuild_cache_lock_bowout.py.
+REBUILD_LOCK_HOLDER_REBUILD = "discogs-etl-rebuild"
+REBUILD_LOCK_HOLDER_DEDUP = "discogs-etl-dedup"
+REBUILD_LOCK_HOLDER_SEED = "discogs-etl-seed"
+REBUILD_LOCK_HOLDER_RESTORE_API_FETCH = "discogs-etl-restore-api-fetch"
+
+# ``--describe-holder``'s exit code when nobody holds the lock: stdout is empty
+# then, so it cannot be told from an unnamed holder (also empty) by output
+# alone. Not 1 (a crash) or 2 (argparse usage) or 75 (the bow-out).
+# scripts/rebuild-cache.sh keeps a copy, pinned by the same test file.
+REBUILD_LOCK_HOLDER_FREE_EXIT_CODE = 3
 
 # Client-side TCP keepalives for the dedicated lock connection.
 #
@@ -144,7 +161,7 @@ REBUILD_LOCK_CONNECT_ATTEMPTS = 3
 REBUILD_LOCK_CONNECT_BACKOFF_SECONDS = 2.0
 
 
-def _connection_kwargs(database_url: str) -> dict[str, int]:
+def _connection_kwargs(database_url: str) -> dict[str, int | str]:
     """Params from :data:`REBUILD_LOCK_CONNECT_PARAMS` not already pinned by
     ``database_url`` itself.
 
@@ -161,15 +178,21 @@ def _connection_kwargs(database_url: str) -> dict[str, int]:
     return {k: v for k, v in REBUILD_LOCK_CONNECT_PARAMS.items() if k not in supplied}
 
 
-def _connect_with_retry(database_url: str) -> psycopg.Connection:
+def _connect_with_retry(
+    database_url: str, application_name: str | None = None
+) -> psycopg.Connection:
     """Open the dedicated lock connection, retrying transient failures.
 
     Retries only ``psycopg.OperationalError`` (refused/reset/timed-out
     connections). Authentication and DSN-syntax errors are not transient and
     propagate on the first attempt. The final attempt's exception is raised
     unchanged so the caller sees psycopg's own message.
+
+    ``application_name``, when given, overrides any the DSN carries.
     """
     kwargs = _connection_kwargs(database_url)
+    if application_name is not None:
+        kwargs["application_name"] = application_name
     for attempt in range(1, REBUILD_LOCK_CONNECT_ATTEMPTS + 1):
         try:
             return psycopg.connect(database_url, autocommit=True, **kwargs)
@@ -190,8 +213,12 @@ def _connect_with_retry(database_url: str) -> psycopg.Connection:
     raise AssertionError("unreachable")  # pragma: no cover
 
 
-def try_acquire_rebuild_lock(database_url: str) -> psycopg.Connection | None:
+def try_acquire_rebuild_lock(database_url: str, *, holder: str) -> psycopg.Connection | None:
     """Attempt to acquire the discogs-cache rebuild's advisory lock.
+
+    ``holder`` becomes the connection's ``application_name`` -- one of the
+    ``REBUILD_LOCK_HOLDER_*`` names -- so :func:`describe_rebuild_lock_holder`
+    can say who has the lock. Required, so a new caller cannot hold it unnamed.
 
     Opens a **dedicated** ``autocommit=True`` connection distinct from any
     connection the rest of the pipeline uses. This matters because
@@ -221,7 +248,7 @@ def try_acquire_rebuild_lock(database_url: str) -> psycopg.Connection | None:
     doing so would let a broken connection string report itself as a
     peaceful, retry-later bow-out instead of the infra failure it is.
     """
-    conn = _connect_with_retry(database_url)
+    conn = _connect_with_retry(database_url, application_name=holder)
     try:
         with conn.cursor() as cur:
             cur.execute("SELECT pg_try_advisory_lock(%s)", (REBUILD_LOCK_KEY,))
@@ -233,6 +260,55 @@ def try_acquire_rebuild_lock(database_url: str) -> psycopg.Connection | None:
         conn.close()
         return None
     return conn
+
+
+def describe_rebuild_lock_holder(database_url: str) -> str | None:
+    """Name the session holding the rebuild lock: its ``application_name``.
+
+    ``''`` when the holder set none (an operator's ``psql``, a caller from an
+    older checkout); ``None`` when nobody holds the lock. A single bigint key
+    below 2**32 shows in ``pg_locks`` as ``classid = 0``, ``objid = key``,
+    ``objsubid = 1``. ``pg_stat_activity`` keeps another role's
+    ``application_name`` visible to an unprivileged reader, so a holder under a
+    different role still reads by name (pinned in the PG tests).
+    """
+    conn = _connect_with_retry(database_url)
+    try:
+        row = conn.execute(
+            "SELECT coalesce(a.application_name, '') FROM pg_locks l "
+            "LEFT JOIN pg_stat_activity a ON a.pid = l.pid "
+            "WHERE l.locktype = 'advisory' AND l.classid = 0 AND l.objid = %s "
+            "AND l.objsubid = 1 AND l.granted "
+            "AND l.database = (SELECT oid FROM pg_database WHERE datname = current_database())",
+            (REBUILD_LOCK_KEY,),
+        ).fetchone()
+    finally:
+        conn.close()
+    return None if row is None else row[0]
+
+
+def main(argv: list[str] | None = None) -> int:
+    """``--describe-holder``: print the holder for scripts/rebuild-cache.sh.
+
+    Exit 0 with the name on stdout (empty for an unnamed holder), or
+    :data:`REBUILD_LOCK_HOLDER_FREE_EXIT_CODE` with nothing on stdout.
+    """
+    parser = argparse.ArgumentParser(description=main.__doc__)
+    parser.add_argument("--describe-holder", action="store_true", required=True)
+    parser.add_argument("--database-url", default=None)
+    args = parser.parse_args(argv)
+    database_url = (
+        args.database_url
+        or os.environ.get("DATABASE_URL_DISCOGS")
+        or os.environ.get("DATABASE_URL")
+    )
+    if not database_url:
+        parser.error("no --database-url, DATABASE_URL_DISCOGS or DATABASE_URL")
+    holder = describe_rebuild_lock_holder(database_url)
+    if holder is None:
+        return REBUILD_LOCK_HOLDER_FREE_EXIT_CODE
+    print(holder)
+    return 0
 
 
 def exit_bowed_out() -> NoReturn:
@@ -304,3 +380,7 @@ def release_rebuild_lock(conn: psycopg.Connection) -> None:
         )
     finally:
         conn.close()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

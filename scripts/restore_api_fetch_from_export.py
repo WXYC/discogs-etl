@@ -44,6 +44,7 @@ from lib.api_fetch_preservation import (  # noqa: E402
 from lib.observability import init_logger  # noqa: E402
 from lib.rebuild_lock import (  # noqa: E402
     REBUILD_LOCK_BOWED_OUT_EXIT_CODE,
+    REBUILD_LOCK_HOLDER_RESTORE_API_FETCH,
     REBUILD_LOCK_KEY,
     release_rebuild_lock,
     try_acquire_rebuild_lock,
@@ -76,7 +77,7 @@ def main(argv: list[str] | None = None) -> int:
         logger.info("[dry-run] %s", plan_restore_from(args.source, args.target).format())
         return 0
 
-    lock_conn = try_acquire_rebuild_lock(args.target)
+    lock_conn = try_acquire_rebuild_lock(args.target, holder=REBUILD_LOCK_HOLDER_RESTORE_API_FETCH)
     if lock_conn is None:
         # EX_TEMPFAIL is an expected outcome (retry later): WARNING, so it opens no Sentry event.
         logger.warning(

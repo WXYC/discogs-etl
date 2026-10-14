@@ -85,8 +85,8 @@ def _keep_rebuild_lock_conns(monkeypatch: pytest.MonkeyPatch) -> list[psycopg.Co
     kept: list[psycopg.Connection] = []
     real = _seed.try_acquire_rebuild_lock
 
-    def spy(url: str) -> psycopg.Connection | None:
-        conn = real(url)
+    def spy(url: str, **kwargs: object) -> psycopg.Connection | None:
+        conn = real(url, **kwargs)
         if conn is not None:
             kept.append(conn)
         return conn
@@ -633,6 +633,22 @@ class TestSeedCacheFromClone:
         finally:
             holder.close()
         assert planned["release"] > 0
+
+    def test_real_seed_takes_the_lock_under_its_own_name(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        names: list[str] = []
+        real = _seed.try_acquire_rebuild_lock
+
+        def spy(url: str, **kwargs: object) -> psycopg.Connection | None:
+            conn = real(url, **kwargs)
+            if conn is not None:
+                names.append(conn.execute("SHOW application_name").fetchone()[0])
+            return conn
+
+        monkeypatch.setattr(_seed, "try_acquire_rebuild_lock", spy)
+        assert self._seed_all()["release"] > 0
+        assert names == ["discogs-etl-seed"]
 
     def test_real_seed_releases_rebuild_lock_afterwards(
         self, monkeypatch: pytest.MonkeyPatch

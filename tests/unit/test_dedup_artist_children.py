@@ -195,7 +195,7 @@ class TestMainBowOut:
     def test_exits_75_without_touching_the_database_when_the_lock_is_held(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setattr(dedup, "try_acquire_rebuild_lock", lambda _url: None)
+        monkeypatch.setattr(dedup, "try_acquire_rebuild_lock", lambda _url, **_kw: None)
 
         def _explode(**_kwargs: object) -> int:
             raise AssertionError("run() must not be reached when the lock is held")
@@ -204,12 +204,22 @@ class TestMainBowOut:
         exit_code = main(["--database-url", "postgresql://example/discogs", "--execute"])
         assert exit_code == dedup.REBUILD_LOCK_BOWED_OUT_EXIT_CODE == 75
 
+    def test_takes_the_lock_under_the_dedup_name(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        holders: list[str] = []
+
+        def acquire(_url: str, *, holder: str) -> None:
+            holders.append(holder)
+
+        monkeypatch.setattr(dedup, "try_acquire_rebuild_lock", acquire)
+        assert main(["--database-url", "postgresql://example/discogs"]) == 75
+        assert holders == ["discogs-etl-dedup"]
+
     def test_releases_the_lock_after_a_successful_run(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         released: list[object] = []
         sentinel = object()
-        monkeypatch.setattr(dedup, "try_acquire_rebuild_lock", lambda _url: sentinel)
+        monkeypatch.setattr(dedup, "try_acquire_rebuild_lock", lambda _url, **_kw: sentinel)
         monkeypatch.setattr(dedup, "release_rebuild_lock", released.append)
         monkeypatch.setattr(dedup, "run", lambda **_kwargs: 0)
         assert main(["--database-url", "postgresql://example/discogs"]) == 0

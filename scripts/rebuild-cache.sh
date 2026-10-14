@@ -21,6 +21,10 @@
 #   DRIFT_MIN_RATIO              watchdog threshold (default 0.7)
 #   PRESERVE_API_FETCH           set to 0 to stop the rebuild preserving LML's
 #                                api_fetch releases (default on; see #450)
+#   REBUILD_LOCK_WAIT_MINUTES    how long to retry (every 5 min) while a non-rebuild
+#                                session (dedup, seed, operator) holds the cache
+#                                rebuild lock, key 354001, before bowing out
+#                                (default 180; 0 = bow out at once; see #465)
 #   REBUILD_SMOKE                when set to 1, exercise everything that can
 #                                fail at host setup (env, gh auth, git pulls,
 #                                cargo build, library.db download, dump URL
@@ -475,7 +479,7 @@ fi
 # Exit-code handling (discogs-etl#354): run_pipeline.py's advisory-lock guard
 # (lib/rebuild_lock.py) acquires a session-level PG lock on the destination
 # cache DB before touching anything, and bows out with the distinct
-# REBUILD_LOCK_BOWED_OUT_EXIT_CODE below — not 0 — when a peer already holds
+# REBUILD_LOCK_BOWED_OUT_EXIT_CODE below — not 0 — when another session holds
 # it. Implemented literally as a plain "exit 0, matching #311's semantics"
 # (the original ticket wording for this guard), that bow-out would be
 # indistinguishable from a completed rebuild: `set -e` sees no error,
@@ -499,19 +503,78 @@ fi
 #
 # Seeded to 0 first: on success the `||` right-hand side never runs, and
 # `set -u` would abort on the unset variable below.
-PIPELINE_EXIT_CODE=0
-python "$REPO_DIR/scripts/run_pipeline.py" \
-    --xml "$WORK_DIR" $PRESERVE_API_FETCH_ARG \
-    --library-db "$WORK_DIR/library.db" || PIPELINE_EXIT_CODE=$?
-
-# Must match lib/rebuild_lock.py's REBUILD_LOCK_BOWED_OUT_EXIT_CODE exactly —
-# tests/unit/test_rebuild_cache_lock_bowout.py pins the two numbers in sync.
+#
+# Waiting out a non-rebuild holder (#465). The lock is also taken by dedup, a
+# real seed and operator sessions (#433, #454), each of which finishes in minutes
+# to an hour or two, so skipping the month for one of them costs a month of
+# freshness for nothing. Only a peer rebuild -- named discogs-etl-rebuild on its
+# lock connection -- is this tick's rebuild and ends the run at once. Any other
+# holder, an unnamed one included, is waited out: the pipeline is re-run every
+# REBUILD_LOCK_RETRY_SECONDS until REBUILD_LOCK_WAIT_MINUTES have passed (0
+# turns the wait off). run_pipeline.py takes the lock before anything else, so a
+# refused attempt costs seconds. The call keeps the ERR-trap-safe shape above
+# inside the loop; only exit 75 is retried, so any other exit still reaches
+# on_error below. The wait is counted in sleeps rather than read off a clock, so
+# the tests can stub `sleep`. It must stay inside the instance's lifetime: see
+# test_wait_fits_inside_the_instance_lifetime.
 REBUILD_LOCK_BOWED_OUT_EXIT_CODE=75
+REBUILD_LOCK_HOLDER_FREE_EXIT_CODE=3
+REBUILD_LOCK_REBUILD_HOLDER="discogs-etl-rebuild"
+REBUILD_LOCK_WAIT_MINUTES="${REBUILD_LOCK_WAIT_MINUTES:-180}"
+REBUILD_LOCK_RETRY_SECONDS=300
+REBUILD_LOCK_WAIT_SECONDS=$((REBUILD_LOCK_WAIT_MINUTES * 60))
+REBUILD_LOCK_WAITED_SECONDS=0
+REBUILD_LOCK_WAIT_ANNOUNCED=0
+LOCK_BOWOUT_NOTE=""
+while :; do
+    PIPELINE_EXIT_CODE=0
+    python "$REPO_DIR/scripts/run_pipeline.py" \
+        --xml "$WORK_DIR" $PRESERVE_API_FETCH_ARG \
+        --library-db "$WORK_DIR/library.db" || PIPELINE_EXIT_CODE=$?
+
+    if [ "$PIPELINE_EXIT_CODE" -ne "$REBUILD_LOCK_BOWED_OUT_EXIT_CODE" ] \
+        || [ "$REBUILD_LOCK_WAIT_SECONDS" -le 0 ]; then
+        break
+    fi
+
+    HOLDER_EXIT_CODE=0
+    LOCK_HOLDER=$(PYTHONPATH="$REPO_DIR" python -m lib.rebuild_lock --describe-holder) \
+        || HOLDER_EXIT_CODE=$?
+    if [ "$HOLDER_EXIT_CODE" -eq "$REBUILD_LOCK_HOLDER_FREE_EXIT_CODE" ]; then
+        continue  # released between the attempt and the lookup
+    elif [ "$HOLDER_EXIT_CODE" -ne 0 ]; then
+        LOCK_HOLDER_LABEL="an unknown session (the holder lookup failed)"
+    elif [ -z "$LOCK_HOLDER" ]; then
+        LOCK_HOLDER_LABEL="an unnamed session"
+    else
+        LOCK_HOLDER_LABEL="$LOCK_HOLDER"
+    fi
+
+    if [ "$HOLDER_EXIT_CODE" -eq 0 ] && [ "$LOCK_HOLDER" = "$REBUILD_LOCK_REBUILD_HOLDER" ]; then
+        LOCK_BOWOUT_NOTE=" Holder: ${LOCK_HOLDER_LABEL}."
+        break
+    elif [ "$REBUILD_LOCK_WAITED_SECONDS" -ge "$REBUILD_LOCK_WAIT_SECONDS" ]; then
+        LOCK_BOWOUT_NOTE=" Holder: ${LOCK_HOLDER_LABEL}, which held the lock for the whole ${REBUILD_LOCK_WAIT_MINUTES}-minute wait."
+        break
+    fi
+
+    if [ "$REBUILD_LOCK_WAIT_ANNOUNCED" -eq 0 ]; then
+        REBUILD_LOCK_WAIT_ANNOUNCED=1
+        LOCK_WAIT_DEADLINE_EPOCH=$(($(date +%s) + REBUILD_LOCK_WAIT_SECONDS))
+        # GNU date on the instance, BSD date where the tests run.
+        LOCK_WAIT_DEADLINE=$(TZ=America/Los_Angeles date -d "@$LOCK_WAIT_DEADLINE_EPOCH" "+%a %H:%M %Z" 2>/dev/null \
+            || TZ=America/Los_Angeles date -r "$LOCK_WAIT_DEADLINE_EPOCH" "+%a %H:%M %Z")
+        echo "[$(date -u +%H:%M:%SZ)] rebuild lock (key 354001) held by ${LOCK_HOLDER_LABEL}; retrying every $((REBUILD_LOCK_RETRY_SECONDS / 60)) min until ${LOCK_WAIT_DEADLINE}"
+        notify_slack ":hourglass_flowing_sand:" "rebuild lock (key 354001) held by ${LOCK_HOLDER_LABEL}; retrying every $((REBUILD_LOCK_RETRY_SECONDS / 60)) min until ${LOCK_WAIT_DEADLINE}. Log: ${LOG_FILE}"
+    fi
+    sleep "$REBUILD_LOCK_RETRY_SECONDS"
+    REBUILD_LOCK_WAITED_SECONDS=$((REBUILD_LOCK_WAITED_SECONDS + REBUILD_LOCK_RETRY_SECONDS))
+done
 
 if [ "$PIPELINE_EXIT_CODE" -eq "$REBUILD_LOCK_BOWED_OUT_EXIT_CODE" ]; then
-    echo "[$(date -u +%H:%M:%SZ)] bowed out: the discogs-cache rebuild lock (key 354001) is held by another session (a rebuild, a dedup, a seed, or an operator session); no cache write"
-    report_outcome bowed_out "the rebuild lock (key 354001) is held by another session"
-    notify_slack ":no_entry:" "bowed out — the discogs-cache rebuild lock (key 354001) is held by another session (a rebuild, a dedup, a seed, or an operator session); no cache write. Log: ${LOG_FILE}"
+    echo "[$(date -u +%H:%M:%SZ)] bowed out: the discogs-cache rebuild lock (key 354001) is held by another session (a rebuild, a dedup, a seed, or an operator session); no cache write.${LOCK_BOWOUT_NOTE}"
+    report_outcome bowed_out "the rebuild lock (key 354001) is held by another session.${LOCK_BOWOUT_NOTE}"
+    notify_slack ":no_entry:" "bowed out — the discogs-cache rebuild lock (key 354001) is held by another session (a rebuild, a dedup, a seed, or an operator session); no cache write.${LOCK_BOWOUT_NOTE} Log: ${LOG_FILE}"
     exit 0
 elif [ "$PIPELINE_EXIT_CODE" -ne 0 ]; then
     on_error "$LINENO" "$PIPELINE_EXIT_CODE"

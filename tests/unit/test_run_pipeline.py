@@ -2590,7 +2590,7 @@ class TestAdvisoryLockGuardBehaviour:
             run_pipeline.main()
 
         bow_out.assert_called_once_with()
-        acquire.assert_called_once_with(args.database_url)
+        acquire.assert_called_once_with(args.database_url, holder="discogs-etl-rebuild")
         mock_subprocess.Popen.assert_not_called()
         convert.assert_not_called()
         generate.assert_not_called()
@@ -2606,7 +2606,7 @@ class TestAdvisoryLockGuardBehaviour:
             patch.object(
                 run_pipeline,
                 "try_acquire_rebuild_lock",
-                side_effect=lambda _url: (order.append("acquire"), fake_conn)[1],
+                side_effect=lambda _url, **_kw: (order.append("acquire"), fake_conn)[1],
             ),
             patch.object(
                 run_pipeline,
