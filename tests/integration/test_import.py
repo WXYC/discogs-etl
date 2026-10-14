@@ -1381,7 +1381,10 @@ NILUFER_YANYA_ID = 5
 
 
 class TestArtistStubOneRowPerId:
-    """``import_artist_details`` stubs exactly one ``artist`` row per credited id (#408).
+    """``import_artist_details`` stubs exactly one ``artist`` row per linked id (#408).
+
+    A linked id is a positive ``artist_id``. An unlinked credit (id 0 or NULL)
+    stubs no row (``test_unlinked_credits_stub_no_artist``).
 
     ``release_artist`` can credit one Discogs artist id under several literal
     spellings: the dump's ``<name>`` is stored per credit, so a rename or a
@@ -1420,9 +1423,15 @@ class TestArtistStubOneRowPerId:
                 [(release_id, artist_id, name, extra) for release_id, name, extra in credits],
             )
 
-    def _stub(self, tmp_path: Path) -> None:
-        # tmp_path holds no artist.csv and no child CSVs, so only the stub runs.
-        conn = psycopg.connect(self.db_url)
+    def _stub(self, tmp_path: Path, *, hash_aggregate: bool = True) -> None:
+        """Run ``import_artist_details`` so that only the stub INSERT does work.
+
+        tmp_path holds no artist.csv and no child CSVs. ``hash_aggregate=False``
+        turns off the planner's HashAggregate, so the spellings are grouped by a
+        sorted GroupAggregate instead and reach DISTINCT ON in a different order.
+        """
+        options = "" if hash_aggregate else "-c enable_hashagg=off"
+        conn = psycopg.connect(self.db_url, options=options)
         try:
             import_artist_details(conn, tmp_path)
         finally:
@@ -1487,9 +1496,11 @@ class TestArtistStubOneRowPerId:
 
         Each expected spelling loses under a simpler rule: the first two cases
         on total credits, the last three on alphabetical order (``Nilufer``
-        sorts before ``Nilüfer`` under every collation). So dropping a sort
-        key, swapping the first two, or reducing the main-credit count to a
-        has-any-main-credit flag fails a case.
+        sorts before ``Nilüfer`` in byte order, glibc ``en_US.utf8`` and ICU
+        root order; German phonebook order, which reads ``ü`` as ``ue``, is an
+        exception). So dropping a sort key, swapping the first two, or
+        reducing the main-credit count to a has-any-main-credit flag fails a
+        case.
         """
         self._credit(artist_id, credits)
 
@@ -1514,17 +1525,28 @@ class TestArtistStubOneRowPerId:
             cur.execute("SELECT id FROM artist ORDER BY id")
             assert cur.fetchall() == [(STEREOLAB_ID,)]
 
+    @pytest.mark.parametrize(
+        "hash_aggregate",
+        [pytest.param(True, id="hash-aggregate"), pytest.param(False, id="sorted-aggregate")],
+    )
     @pytest.mark.parametrize("collation", [None, "C", "und-x-icu"])
     def test_tie_breaks_on_byte_order_whatever_the_column_collation(
-        self, tmp_path, collation
+        self, tmp_path, collation, hash_aggregate
     ) -> None:
-        """A full tie must resolve the same way on every database.
+        """A full tie must resolve the same way on every database and plan.
 
         A plain ``ORDER BY artist_name`` follows the column's collation:
         byte order puts ``Dirt Nation`` first, but a linguistic collation such
         as glibc's ``en_US.utf8`` (the official postgres image's default) or
         ICU puts ``Dirt nation`` first. The tie-break is pinned to ``"C"`` so
         prod, CI and a laptop agree.
+
+        Without any tie-break key, DISTINCT ON keeps whichever tied spelling
+        the plan emits first. A HashAggregate happens to emit ``Dirt Nation``
+        first, so under that plan alone a dropped tie-break would still pass.
+        A sorted GroupAggregate emits the column collation's order, which puts
+        ``Dirt nation`` first under the default and ICU collations, so the
+        sorted-aggregate cases fail when the key is missing.
         """
         if collation is not None:
             with psycopg.connect(self.db_url) as conn, conn.cursor() as cur:
@@ -1537,7 +1559,7 @@ class TestArtistStubOneRowPerId:
                 )
         self._credit(DIRT_NATION_ID, [(1, "Dirt nation", 0), (2, "Dirt Nation", 0)])
 
-        self._stub(tmp_path)
+        self._stub(tmp_path, hash_aggregate=hash_aggregate)
 
         assert self._artist_rows(DIRT_NATION_ID) == [("Dirt Nation", False)]
 
@@ -1660,33 +1682,36 @@ class TestArtistStubOneRowPerId:
         assert self._artist_rows(STEREOLAB_ID) == [("Stereolab", False)]
 
     def test_single_spelling_ids_stub_exactly_the_pre_408_rows(self, tmp_path) -> None:
-        """An id credited under one spelling stubs exactly as it did before #408.
+        """A linked id credited under one spelling stubs exactly as it did before #408.
 
         Loads the fixture base CSVs the way the import does, adds a NULL-id
-        credit, and compares the stubs against what the pre-#408
-        ``SELECT DISTINCT artist_id, artist_name`` produced. Every fixture id
-        has one spelling; some are credited on several releases and one only
-        as an extra credit.
+        and an id-0 credit, and compares the stubs against what the pre-#408
+        ``SELECT DISTINCT artist_id, artist_name`` produced for linked ids.
+        Unlinked credits are left out of the comparison on purpose: before
+        #408 the stub also wrote a row for id 0, which is not an artist
+        (``test_unlinked_credits_stub_no_artist``). Every fixture id has one
+        spelling; some are credited on several releases and one only as an
+        extra credit.
         """
         with psycopg.connect(self.db_url) as conn:
             _import_tables(conn, CSV_DIR, BASE_TABLES)
             with conn.cursor() as cur:
                 cur.execute(
-                    "INSERT INTO release_artist (release_id, artist_id, artist_name) "
-                    "VALUES (1001, NULL, 'Unknown Artist')"
+                    "INSERT INTO release_artist (release_id, artist_id, artist_name, extra) "
+                    "VALUES (1001, NULL, 'Unknown Artist', 0), (1001, 0, 'Some Engineer', 1)"
                 )
                 cur.execute(
                     "SELECT count(*) FILTER (WHERE spellings = 1), count(*), max(n),"
                     "       count(*) FILTER (WHERE main = 0) FROM ("
                     "  SELECT artist_id, count(DISTINCT artist_name) AS spellings,"
                     "         count(*) AS n, count(*) FILTER (WHERE extra = 0) AS main"
-                    "  FROM release_artist WHERE artist_id IS NOT NULL GROUP BY artist_id"
+                    "  FROM release_artist WHERE artist_id > 0 GROUP BY artist_id"
                     ") ids"
                 )
                 single_spelling_ids, ids, most_credits, extra_only_ids = cur.fetchone()
                 cur.execute(
                     "SELECT DISTINCT artist_id, artist_name, FALSE FROM release_artist "
-                    "WHERE artist_id IS NOT NULL"
+                    "WHERE artist_id > 0"
                 )
                 pre_408_rows = set(cur.fetchall())
         assert ids > 0 and single_spelling_ids == ids, (
