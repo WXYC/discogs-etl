@@ -107,6 +107,8 @@ The schedule rule should be named like `wxyc-discogs-rebuild-LauncherFunctionMon
 
 CI does not pass `ScheduleState`, and SAM sends `UsePreviousValue=true` for parameters it does not override, so a deliberate `DISABLED` survives redeploys until someone sets it back.
 
+CI does pass `MaxInstanceAgeHours`, on every deploy, so a lasting change goes in the template default and the workflow's `--parameter-overrides` together (a unit test fails if they differ). A temporary local `sam deploy --parameter-overrides MaxInstanceAgeHours=12` lasts only until the next CI deploy resets it to the pinned value.
+
 The sweeper's hourly rule is not gated by this parameter. It force-terminates rebuild instances past their wall-clock budget, including manually launched ones — disarming the monthly rebuild must not disarm the cleanup.
 
 Do not reach for the SAM `Enabled:` property as an alternative spelling. SAM resolves `Enabled` at transform time in Python, so an intrinsic like `!Ref` is always truthy and the rule comes out **armed** regardless of the parameter's value — silently, and `sam validate --lint` does not catch it. `tests/unit/test_ephemeral_rebuild_template.py` asserts against the transformed `AWS::Events::Rule` to keep that from creeping back in.
@@ -181,7 +183,7 @@ aws ec2 terminate-instances --instance-ids i-0xxxxxxx
 | Alarm | Fires when | First step |
 |---|---|---|
 | `discogs-rebuild-launcher-errors` | The launcher Lambda errored before completing `RunInstances`. | `aws logs tail /aws/lambda/discogs-rebuild-launcher --since 1h`. Usually IAM scope drift on `iam:PassRole` or a hand-edited launch template. |
-| `discogs-rebuild-stale-instance` | The sweeper terminated a rebuild EC2 that was past its 3h budget. | Pull the log archive from S3 (the sweeper terminates *after* shutdown would have, so the bootstrap's `trap EXIT` upload should have run). Check what step the bootstrap was on when it stalled. |
+| `discogs-rebuild-stale-instance` | The sweeper terminated a rebuild EC2 that was past its 6h budget. | Pull the log archive from S3 (the sweeper terminates *after* shutdown would have, so the bootstrap's `trap EXIT` upload should have run). Check what step the bootstrap was on when it stalled. |
 | `discogs-rebuild-release-count-floor` | The daily `release_count` reading fell below `ReleaseCountAlarmThreshold` — the cache likely lost a large share of its rows. | Compare against the prior successful run (`aws cloudwatch get-metric-statistics --namespace WXYC/DiscogsCache --metric-name release_count --statistics Minimum --period 86400 --start-time <t0> --end-time <t1>`), then read the most recent rebuild log in `s3://wxyc-discogs-rebuild-logs-<account>/`. The incident class is #352: a colliding rebuild truncating `release` and only partially reloading it. |
 
 `ReleaseCountAlarmThreshold` (default `75000`) is the floor. It is a template parameter so it can be revised as the cache grows — `sam deploy --parameter-overrides ReleaseCountAlarmThreshold=<n>`, never by hand-editing the alarm resource. The default is provisional and the parameter's own `Description` in `template.yaml` carries the full rationale, including the trap in recomputing it: a trailing-90-day minimum taken over a window that contains a collapse yields a floor *below* the collapses the alarm exists to catch, so exclude known-incident days.

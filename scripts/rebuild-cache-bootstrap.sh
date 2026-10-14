@@ -26,7 +26,7 @@
 #     InstanceInitiatedShutdownBehavior=terminate makes that release the
 #     instance even when the bootstrap crashed mid-stream.
 #   - The sweeper Lambda is the second line of defence: any rebuild-tagged
-#     instance still running >3h after launch is force-terminated.
+#     instance still running >6h after launch is force-terminated.
 #
 # Runbook: docs/ec2-rebuild-runbook.md (Ephemeral instance section).
 
@@ -117,7 +117,7 @@ notify_slack() {
 #
 # Fail-open only covers a *successful* query that legitimately finds zero
 # peers, or one that hasn't yet caught up to self (DescribeInstances is
-# eventually consistent) — the launcher precheck already ran and the >3h
+# eventually consistent) — the launcher precheck already ran and the >6h
 # sweeper is the backstop. TOCTOU note: DescribeInstances isn't atomic, but
 # this is the *late* authoritative check, a much narrower window than the
 # launcher's.

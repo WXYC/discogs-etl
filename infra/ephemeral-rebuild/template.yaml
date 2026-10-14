@@ -7,7 +7,7 @@ Description: >
   scripts/rebuild-cache-bootstrap.sh. The instance terminates itself via
   InstanceInitiatedShutdownBehavior=terminate when the bootstrap is done
   (or panics into trap EXIT). A second Lambda sweeps any rebuild instance
-  still running >3h after launch as a failsafe.
+  still running past MaxInstanceAgeHours after launch as a failsafe.
 
 Parameters:
   ScheduleExpression:
@@ -77,8 +77,9 @@ Parameters:
       terminated and emits a StaleInstanceTerminated CloudWatch metric.
       Six hours covers the same-night retry's worst case: ~30 min setup,
       up to 180 min waiting on rebuild lock 354001, then a ~90 min rebuild,
-      plus an hour of margin because the hourly sweeper may fire up to an
-      hour past the threshold.
+      plus an hour of margin over that estimate. The hourly sweeper
+      terminates only past the threshold, so it kills somewhere between 6 and
+      7 hours, never before 6.
 
   AlertEmail:
     Type: String
