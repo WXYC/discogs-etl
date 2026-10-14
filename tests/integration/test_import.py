@@ -1323,9 +1323,26 @@ class TestImportClearsTombstones:
             f"column list and the ON CONFLICT DO UPDATE SET clause."
         )
 
-    def test_rebuild_clears_artist_tombstone(self, tmp_path) -> None:
-        """A tombstoned artist in PG gets ``not_found`` reset when the
-        fresh dump's release_artist re-stubs its id."""
+    @pytest.mark.parametrize(
+        "not_found",
+        [
+            pytest.param(True, id="tombstone"),
+            pytest.param(False, id="tombstone-an-earlier-rebuild-cleared-without-a-name"),
+        ],
+    )
+    def test_rebuild_clears_artist_tombstone(self, tmp_path, not_found) -> None:
+        """A tombstoned artist gets ``not_found`` reset, and a name, when the
+        fresh dump's release_artist re-stubs its id.
+
+        LML#510 writes ``name = ''`` when it tombstones an id it never cached.
+        ``''`` is only the tombstone's sentinel, so clearing the tombstone must
+        also replace it with the dump's spelling. Otherwise LML serves a live
+        artist named ``''`` for good: its cache-hit test is ``fetched_at IS NOT
+        NULL``, and a tombstone row has ``fetched_at``. Rebuilds before this
+        fix cleared the tombstone and kept the ``''``, so a live row named
+        ``''`` must be named the same way. A real name is never replaced
+        (``TestArtistStubOneRowPerId.test_existing_row_keeps_its_name``).
+        """
         conn = psycopg.connect(self.db_url)
         with conn.cursor() as cur:
             # Set up a release + release_artist row referencing artist 701 so
@@ -1335,8 +1352,12 @@ class TestImportClearsTombstones:
                 "INSERT INTO release_artist (release_id, artist_id, artist_name) "
                 "VALUES (700, 701, 'Stereolab')"
             )
-            # Pre-existing tombstoned artist.
-            cur.execute("INSERT INTO artist (id, name, not_found) VALUES (701, '', TRUE)")
+            # The row LML#510 writes for an id it never cached, before or
+            # after an earlier rebuild cleared its tombstone.
+            cur.execute(
+                "INSERT INTO artist (id, name, not_found) VALUES (701, '', %s)",
+                (not_found,),
+            )
         conn.commit()
         conn.close()
 
@@ -1353,12 +1374,11 @@ class TestImportClearsTombstones:
             cur.execute("SELECT name, not_found FROM artist WHERE id = 701")
             row = cur.fetchone()
         conn.close()
-        assert row is not None
-        name, not_found = row
-        assert not_found is False, (
-            f"Rebuild must clear the artist tombstone (not_found=FALSE); "
-            f"got not_found={not_found!r}. The stub-INSERT in "
-            f"import_artist_details must update not_found = FALSE on conflict."
+        assert row == ("Stereolab", False), (
+            f"Rebuild must clear the artist tombstone (not_found=FALSE) and "
+            f"replace its empty sentinel name with the dump's spelling; got "
+            f"{row!r}. The stub-INSERT in import_artist_details must do both "
+            f"on conflict."
         )
 
 

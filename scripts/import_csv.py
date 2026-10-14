@@ -1028,8 +1028,7 @@ def import_release_via_upsert(conn, csv_dir: Path, keep_release_ids: set[int] | 
         # COALESCE(EXCLUDED.x, release.x) would be smaller but collapses the
         # two cases the column list keeps apart — an emptied `notes` could
         # then never be cleared, pinning a note Discogs has since removed.
-        # Same shape as the narrowing `WHERE artist.not_found = TRUE` on the
-        # artist stub upsert below.
+        # Same shape as the narrowing WHERE on the artist stub upsert below.
         carried = present_optional_columns(
             read_csv_header(csv_path), release_config.get("optional_csv_columns")
         )
@@ -1376,8 +1375,8 @@ def import_artist_details(conn, csv_dir: Path) -> int:
     1. Stub-INSERT artist (id, name) from release_artist, one row per
        linked artist_id (the spelling rule is at the statement; #408), so
        subsequent steps have a stable set of artist IDs. On conflict it
-       clears an LML#510 tombstone; every other existing row keeps its
-       values.
+       clears an LML#510 tombstone and fills an empty name; every other
+       existing row keeps its values.
     2. Snapshot `SELECT id FROM artist` into `artist_ids`. Used to gate
        both the profile UPDATE and the child-table loads, so the rebuild
        doesn't bother staging artists outside the WXYC-filtered set.
@@ -1402,10 +1401,16 @@ def import_artist_details(conn, csv_dir: Path) -> int:
     # Create stub artist rows from release_artist (id + name only)
     #
     # ON CONFLICT clears any prior LML#510 tombstone (`not_found = TRUE`).
-    # `WHERE artist.not_found = TRUE` narrows the rewrite to actual
-    # tombstones so non-tombstone rows aren't disturbed. Without this
-    # branch a tombstoned id would survive every rebuild. It never touches
-    # `name`, so an id already in `artist` keeps the name it has.
+    # Without this branch a tombstoned id would survive every rebuild. The
+    # WHERE narrows the rewrite to tombstones and empty names, so every other
+    # existing row is left alone. An id already in `artist` keeps a non-empty
+    # name. An empty name is only the sentinel LML writes when it tombstones an
+    # id it never cached (`VALUES ($1, '', ...)`), so it takes the dump's
+    # spelling. Keeping it would leave a live artist named '' that LML serves
+    # as a cache hit for good, because the tombstone row has `fetched_at`.
+    # Rebuilds before this fix left such rows behind with `not_found = FALSE`,
+    # so `artist.name = ''` matches them too. (The release upsert above
+    # writes the dump's title over a tombstone's '' title the same way.)
     #
     # One row per artist_id, because the conflict target is `id` (#408). The
     # dump's `<name>` is stored per credit, so a rename or a case fix reaches
@@ -1452,8 +1457,9 @@ def import_artist_details(conn, csv_dir: Path) -> int:
             ) spellings
             ORDER BY artist_id, main_credits DESC, credits DESC, artist_name COLLATE "C"
             ON CONFLICT (id) DO UPDATE SET
-                not_found = FALSE
-            WHERE artist.not_found = TRUE
+                not_found = FALSE,
+                name = COALESCE(NULLIF(artist.name, ''), EXCLUDED.name)
+            WHERE artist.not_found = TRUE OR artist.name = ''
         """)
         count = cur.rowcount
     conn.commit()
