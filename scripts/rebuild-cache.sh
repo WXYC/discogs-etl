@@ -521,12 +521,20 @@ fi
 REBUILD_LOCK_BOWED_OUT_EXIT_CODE=75
 REBUILD_LOCK_HOLDER_FREE_EXIT_CODE=3
 REBUILD_LOCK_REBUILD_HOLDER="discogs-etl-rebuild"
-REBUILD_LOCK_WAIT_MINUTES="${REBUILD_LOCK_WAIT_MINUTES:-180}"
+# A value that is not a whole number of minutes would abort the arithmetic below
+# without the ERR trap, so with no outcome marker and no Slack post.
+case "${REBUILD_LOCK_WAIT_MINUTES:-}" in
+    *[!0-9]*)
+        echo "[$(date -u +%H:%M:%SZ)] warning: REBUILD_LOCK_WAIT_MINUTES='${REBUILD_LOCK_WAIT_MINUTES}' is not a whole number of minutes; using the default" >&2
+        unset REBUILD_LOCK_WAIT_MINUTES
+        ;;
+esac
+REBUILD_LOCK_WAIT_MINUTES=$((10#${REBUILD_LOCK_WAIT_MINUTES:-180}))
 REBUILD_LOCK_RETRY_SECONDS=300
 REBUILD_LOCK_WAIT_SECONDS=$((REBUILD_LOCK_WAIT_MINUTES * 60))
 REBUILD_LOCK_WAITED_SECONDS=0
 REBUILD_LOCK_WAIT_ANNOUNCED=0
-REBUILD_LOCK_FREE_RETRIED=0
+REBUILD_LOCK_LAST_LOOKUP_FREE=0
 LOCK_BOWOUT_NOTE=""
 while :; do
     PIPELINE_EXIT_CODE=0
@@ -544,31 +552,36 @@ while :; do
         || HOLDER_EXIT_CODE=$?
     # The name goes into notify_slack's hand-built JSON: drop what would break it.
     LOCK_HOLDER=$(printf '%s' "$LOCK_HOLDER" | tr -d '"\\[:cntrl:]')
+    # Each lookup outcome sets the label and one action: retry_now, bow_out or
+    # wait. A holder the lookup could not name may be a peer rebuild, and waiting
+    # it out would risk a second full rebuild the same night, so it bows out.
+    LOCK_ACTION="wait"
+    LOCK_WAS_FREE=$REBUILD_LOCK_LAST_LOOKUP_FREE
+    REBUILD_LOCK_LAST_LOOKUP_FREE=0
     if [ "$HOLDER_EXIT_CODE" -eq "$REBUILD_LOCK_HOLDER_FREE_EXIT_CODE" ]; then
+        LOCK_HOLDER_LABEL="an unseen session (the holder lookup found the lock free)"
+        REBUILD_LOCK_LAST_LOOKUP_FREE=1
         # Released between the attempt and the lookup: retry at once, but only
         # once in a row, so a repeated 75-then-free still sleeps and meets the
         # deadline.
-        if [ "$REBUILD_LOCK_FREE_RETRIED" -eq 0 ]; then
-            REBUILD_LOCK_FREE_RETRIED=1
-            continue
+        if [ "$LOCK_WAS_FREE" -eq 0 ]; then
+            LOCK_ACTION="retry_now"
         fi
-        LOCK_HOLDER_LABEL="an unseen session (the holder lookup found the lock free)"
     elif [ "$HOLDER_EXIT_CODE" -ne 0 ]; then
         LOCK_HOLDER_LABEL="an unknown session (the holder lookup failed)"
+        LOCK_ACTION="bow_out"
+    elif [ "$LOCK_HOLDER" = "$REBUILD_LOCK_REBUILD_HOLDER" ]; then
+        LOCK_HOLDER_LABEL="$LOCK_HOLDER"
+        LOCK_ACTION="bow_out"
     elif [ -z "$LOCK_HOLDER" ]; then
         LOCK_HOLDER_LABEL="an unnamed session"
     else
         LOCK_HOLDER_LABEL="$LOCK_HOLDER"
     fi
-    if [ "$HOLDER_EXIT_CODE" -ne "$REBUILD_LOCK_HOLDER_FREE_EXIT_CODE" ]; then
-        REBUILD_LOCK_FREE_RETRIED=0
-    fi
 
-    # A holder the lookup could not name may be a peer rebuild; waiting it out
-    # would risk a second full rebuild the same night, so it ends the run too.
-    if { [ "$HOLDER_EXIT_CODE" -ne 0 ] \
-        && [ "$HOLDER_EXIT_CODE" -ne "$REBUILD_LOCK_HOLDER_FREE_EXIT_CODE" ]; } \
-        || { [ "$HOLDER_EXIT_CODE" -eq 0 ] && [ "$LOCK_HOLDER" = "$REBUILD_LOCK_REBUILD_HOLDER" ]; }; then
+    if [ "$LOCK_ACTION" = "retry_now" ]; then
+        continue
+    elif [ "$LOCK_ACTION" = "bow_out" ]; then
         LOCK_BOWOUT_NOTE=" Holder: ${LOCK_HOLDER_LABEL}."
         break
     elif [ "$REBUILD_LOCK_WAITED_SECONDS" -ge "$REBUILD_LOCK_WAIT_SECONDS" ]; then
@@ -579,14 +592,22 @@ while :; do
     if [ "$REBUILD_LOCK_WAIT_ANNOUNCED" -eq 0 ]; then
         REBUILD_LOCK_WAIT_ANNOUNCED=1
         LOCK_WAIT_DEADLINE_EPOCH=$(($(date +%s) + REBUILD_LOCK_WAIT_SECONDS))
-        # GNU date on the instance, BSD date where the tests run.
+        # GNU date on the instance, BSD date where the tests run. The deadline
+        # is only for display, so a date that supports neither must not fail
+        # the run through the ERR trap.
         LOCK_WAIT_DEADLINE=$(TZ=America/Los_Angeles date -d "@$LOCK_WAIT_DEADLINE_EPOCH" "+%a %H:%M %Z" 2>/dev/null \
-            || TZ=America/Los_Angeles date -r "$LOCK_WAIT_DEADLINE_EPOCH" "+%a %H:%M %Z")
+            || TZ=America/Los_Angeles date -r "$LOCK_WAIT_DEADLINE_EPOCH" "+%a %H:%M %Z" 2>/dev/null) \
+            || LOCK_WAIT_DEADLINE="${REBUILD_LOCK_WAIT_MINUTES} min from now"
         echo "[$(date -u +%H:%M:%SZ)] rebuild lock (key 354001) held by ${LOCK_HOLDER_LABEL}; retrying every $((REBUILD_LOCK_RETRY_SECONDS / 60)) min until ${LOCK_WAIT_DEADLINE}"
         notify_slack ":hourglass_flowing_sand:" "rebuild lock (key 354001) held by ${LOCK_HOLDER_LABEL}; retrying every $((REBUILD_LOCK_RETRY_SECONDS / 60)) min until ${LOCK_WAIT_DEADLINE}. Log: ${LOG_FILE}"
     fi
-    sleep "$REBUILD_LOCK_RETRY_SECONDS"
-    REBUILD_LOCK_WAITED_SECONDS=$((REBUILD_LOCK_WAITED_SECONDS + REBUILD_LOCK_RETRY_SECONDS))
+    # The last sleep stops at the deadline rather than overshooting it.
+    LOCK_SLEEP_SECONDS=$((REBUILD_LOCK_WAIT_SECONDS - REBUILD_LOCK_WAITED_SECONDS))
+    if [ "$LOCK_SLEEP_SECONDS" -gt "$REBUILD_LOCK_RETRY_SECONDS" ]; then
+        LOCK_SLEEP_SECONDS=$REBUILD_LOCK_RETRY_SECONDS
+    fi
+    sleep "$LOCK_SLEEP_SECONDS"
+    REBUILD_LOCK_WAITED_SECONDS=$((REBUILD_LOCK_WAITED_SECONDS + LOCK_SLEEP_SECONDS))
 done
 
 if [ "$PIPELINE_EXIT_CODE" -eq "$REBUILD_LOCK_BOWED_OUT_EXIT_CODE" ]; then
