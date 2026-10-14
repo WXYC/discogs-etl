@@ -152,6 +152,24 @@ class TestPostSlackAlert:
         assert captured["url"] == "https://hooks.slack.com/services/XXX"
         payload = json.loads(captured["data"].decode("utf-8"))
         assert "drift detected" in payload["text"]
+        assert payload["text"].startswith(":warning: *Discogs cache drift*\n")
+
+    def test_title_heads_the_post(self) -> None:
+        mod = _load_module()
+        captured: dict = {}
+
+        def fake_urlopen(req, timeout=None):  # noqa: ARG001
+            captured["data"] = req.data
+            raise OSError("stop after capture")
+
+        with patch.object(mod, "urlopen", fake_urlopen):
+            mod.post_slack_alert(
+                webhook_url="https://hooks.example.invalid/x",
+                message="body",
+                title="Discogs cache: pinned releases absent",
+            )
+        payload = json.loads(captured["data"].decode("utf-8"))
+        assert payload["text"] == ":warning: *Discogs cache: pinned releases absent*\nbody"
 
     def test_webhook_post_failure_is_swallowed(self) -> None:
         mod = _load_module()

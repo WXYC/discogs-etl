@@ -129,15 +129,17 @@ def evaluate_drift(*, library_count: int, cache_count: int, min_ratio: float) ->
     return DriftResult(ok=True, ratio=ratio, reason="")
 
 
-def post_slack_alert(*, webhook_url: str | None, message: str) -> bool:
-    """Best-effort Slack notification.
+def post_slack_alert(
+    *, webhook_url: str | None, message: str, title: str = "Discogs cache drift"
+) -> bool:
+    """Best-effort Slack notification, headed ``:warning: *<title>*``.
 
     Returns True when a request was made and accepted, False on no-op
     (no webhook configured) or on transport error. Never raises.
     """
     if not webhook_url:
         return False
-    payload = json.dumps({"text": f":warning: *Discogs cache drift*\n{message}"}).encode("utf-8")
+    payload = json.dumps({"text": f":warning: *{title}*\n{message}"}).encode("utf-8")
     try:
         # Built inside the try: Request raises ValueError on a webhook with no
         # URL scheme (a placeholder value), and this helper must never raise.

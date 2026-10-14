@@ -255,6 +255,11 @@ ABSENT_PINNED_ID = 99_999
 ABSENT_PINNED_PHRASE = "have no release row and will not be kept"
 
 
+def _absent_pin_levels(caplog) -> set[int]:
+    """The levels the absent-pin line was logged at."""
+    return {r.levelno for r in caplog.records if ABSENT_PINNED_PHRASE in r.getMessage()}
+
+
 class TestPinsWithoutAReleaseRow:
     """async_main applies only the pins that have a ``release`` row (#446, #447).
 
@@ -276,6 +281,13 @@ class TestPinsWithoutAReleaseRow:
                 "INSERT INTO release (id, title, format) VALUES (%s, %s, %s)",
                 (CREDITLESS_PINNED_ID, "Hollow Pin", "CD"),
             )
+        # One of three pins absent is over the default 5% threshold, so the run
+        # posts the #422-class alert. Record it rather than send it.
+        slack_posts: list[str] = []
+        monkeypatch.setattr(
+            _vc, "post_slack_alert", lambda *, message, **_: slack_posts.append(message) or True
+        )
+        monkeypatch.delenv("ABSENT_PIN_ALERT_RATIO", raising=False)
 
         with caplog.at_level(logging.WARNING, logger=_vc.logger.name):
             out_dir = _run_dump(
@@ -291,6 +303,9 @@ class TestPinsWithoutAReleaseRow:
         assert ABSENT_PINNED_ID not in keep
         assert ABSENT_PINNED_PHRASE in caplog.text
         assert f"[{ABSENT_PINNED_ID}]" in caplog.text
+        # The dry run posts the alert too: the check runs before the mode dispatch.
+        assert len(slack_posts) == 1 and "1 of 3 pinned" in slack_posts[0]
+        assert _absent_pin_levels(caplog) == {logging.ERROR}
 
 
 # One more prune id than the inline-DELETE limit in async_main, so --prune takes
@@ -355,6 +370,13 @@ class TestProductionPruneWithPins:
             return real_copy_swap(db_url, keep_ids, review_ids)
 
         monkeypatch.setattr(_vc, "prune_releases_copy_swap", _spy)
+        # One of three pins absent is over the default 5% threshold: record the
+        # #422-class alert rather than send it.
+        slack_posts: list[str] = []
+        monkeypatch.setattr(
+            _vc, "post_slack_alert", lambda *, message, **_: slack_posts.append(message) or True
+        )
+        monkeypatch.delenv("ABSENT_PIN_ALERT_RATIO", raising=False)
 
         with caplog.at_level(logging.WARNING, logger=_vc.logger.name):
             asyncio.run(_vc.async_main())
@@ -366,3 +388,5 @@ class TestProductionPruneWithPins:
         assert survivors == kept
         assert ABSENT_PINNED_PHRASE in caplog.text
         assert f"[{ABSENT_PINNED_ID}]" in caplog.text
+        assert len(slack_posts) == 1 and "1 of 3 pinned" in slack_posts[0]
+        assert _absent_pin_levels(caplog) == {logging.ERROR}
