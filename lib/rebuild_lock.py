@@ -64,18 +64,19 @@ logger = logging.getLogger(__name__)
 REBUILD_LOCK_KEY = 354001
 
 # Distinct process exit code for "bowed out: another session (a rebuild, a
-# dedup, a seed or an operator) already holds the advisory lock." Deliberately NOT 0 -- a lock-loser is not a successful
-# rebuild, and #352 exists precisely because a silent no-op success (a peer
-# guard that fails open) was indistinguishable from a real one. Also
-# deliberately not 1, the code every other validation failure in
-# scripts/run_pipeline.py already uses, so a caller can tell "bowed out"
-# apart from "crashed."
+# dedup, a seed, or an operator session) already holds the advisory lock."
+# Deliberately NOT 0 -- a lock-loser is not a successful rebuild, and #352
+# exists precisely because a silent no-op success (a peer guard that fails
+# open) was indistinguishable from a real one. Also deliberately not 1, the
+# code every other validation failure in scripts/run_pipeline.py already
+# uses, so a caller can tell "bowed out" apart from "crashed."
 #
 # 75 is EX_TEMPFAIL from BSD sysexits.h: "a temporary failure, indicating
 # something that is not really an error ... the request should be attempted
-# again later" -- precisely a lock-loser's situation, since a re-dispatch is
-# expected to succeed once the holder finishes. If the holder was not a
-# rebuild, this month's rebuild did not run and must be re-launched by hand.
+# again later" -- precisely a lock-loser's situation: every caller (the
+# rebuild, dedup_artist_children.py, seed_cache_from_clone.py) exits with
+# this code having written nothing, and a re-run once the holder finishes is
+# expected to succeed.
 #
 # scripts/rebuild-cache.sh checks for this exact numeric value; the two are
 # pinned in sync by tests/unit/test_rebuild_cache_lock_bowout.py.

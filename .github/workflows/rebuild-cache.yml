@@ -269,7 +269,7 @@ jobs:
           # This path is `workflow_dispatch`-only and non-canonical; the EC2
           # script is where a bow-out is reported properly.
           if [ "$PY_RC" -eq 75 ]; then
-            echo "::warning::bowed out — the discogs-cache rebuild lock (key 354001) is held by another session (a rebuild, a dedup, or a seed); no cache write. See discogs-etl#354."
+            echo "::warning::bowed out — the discogs-cache rebuild lock (key 354001) is held by another session (a rebuild, a dedup, a seed, or an operator session); no cache write. See discogs-etl#354."
             kill "$CURL_PID" 2>/dev/null || true
             wait "$CURL_PID" 2>/dev/null || true
             exit "$PY_RC"
