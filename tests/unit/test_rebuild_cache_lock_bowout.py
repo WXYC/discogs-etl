@@ -248,9 +248,10 @@ ERROR = "@error"
 def _build_harness(
     pipeline_rcs: list[int],
     holders: list[str],
-    wait_minutes: int | None,
+    wait_minutes: int | str | None,
     free_exit_code: int,
     real_notify: bool = False,
+    stubs: tuple[str, ...] = (),
 ) -> str:
     source = SCRIPT_PATH.read_text()
     lines = source.splitlines()
@@ -263,7 +264,7 @@ def _build_harness(
             'WORK_DIR="/nonexistent"',
             'REPO_DIR="/nonexistent"',
             'PRESERVE_API_FETCH_ARG=""',
-            *([f"REBUILD_LOCK_WAIT_MINUTES={wait_minutes}"] if wait_minutes is not None else []),
+            *([f"REBUILD_LOCK_WAIT_MINUTES='{wait_minutes}'"] if wait_minutes is not None else []),
             f"PIPELINE_RCS=({rcs})",
             f"HOLDER_REPLIES=({replies})",
             "ATTEMPT=0",
@@ -287,6 +288,7 @@ def _build_harness(
             # own behavior is pinned in test_rebuild_outcome_marker.py.
             'report_outcome() { echo "OUTCOME $1 ${2:-}"; }',
             'sleep() { echo "SLEEP $1"; }',
+            *stubs,
             # One stub for both python entry points the region calls. The
             # pipeline's attempt N exits PIPELINE_RCS[N-1]; the holder CLI,
             # called right after attempt N, answers HOLDER_REPLIES[N-1]. Both
@@ -321,8 +323,9 @@ def _run_harness(
     tmp_path: Path,
     *,
     holders: list[str] | None = None,
-    wait_minutes: int | None = None,
+    wait_minutes: int | str | None = None,
     real_notify: bool = False,
+    stubs: tuple[str, ...] = (),
 ) -> subprocess.CompletedProcess[str]:
     bash = shutil.which("bash")
     assert bash is not None, "bash is required to execute this region"
@@ -330,7 +333,12 @@ def _run_harness(
     harness = tmp_path / "harness.sh"
     harness.write_text(
         _build_harness(
-            rcs, holders or [REBUILD_HOLDER], wait_minutes, _python_free_exit_code(), real_notify
+            rcs,
+            holders or [REBUILD_HOLDER],
+            wait_minutes,
+            _python_free_exit_code(),
+            real_notify,
+            stubs,
         )
     )
     return subprocess.run(
@@ -492,6 +500,45 @@ class TestBowOutBranchActuallyExecutes:
         texts = [json.loads(p)["text"] for p in payloads]
         assert ":hourglass_flowing_sand:" in texts[0]
         assert "Holder: ops ddl x, which held the lock" in texts[1]
+
+    def test_the_last_sleep_stops_at_the_deadline(self, tmp_path: Path) -> None:
+        result = _run_harness([75], tmp_path, holders=["discogs-etl-seed"], wait_minutes=7)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert [ln for ln in result.stdout.splitlines() if ln.startswith("SLEEP")] == [
+            "SLEEP 300",
+            "SLEEP 120",
+        ]
+        assert "for the whole 7-minute wait" in result.stdout
+
+    @pytest.mark.parametrize("wait_minutes", ["90m", "3h", " 5"])
+    def test_a_wait_that_is_not_whole_minutes_falls_back_to_the_default(
+        self, tmp_path: Path, wait_minutes: str
+    ) -> None:
+        """A bad value must not abort the script outside the ERR trap, which
+        would leave no outcome marker and no Slack post."""
+        result = _run_harness(
+            [75, 0], tmp_path, holders=["discogs-etl-seed"], wait_minutes=wait_minutes
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "not a whole number of minutes" in result.stderr
+        assert "SLEEP 300" in result.stdout
+        assert "FELL THROUGH TO DRIFT WATCHDOG" in result.stdout
+
+    def test_a_leading_zero_is_read_as_decimal(self, tmp_path: Path) -> None:
+        result = _run_harness([75], tmp_path, holders=["discogs-etl-seed"], wait_minutes="08")
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "for the whole 8-minute wait" in result.stdout
+
+    def test_a_date_that_cannot_format_the_deadline_still_waits(self, tmp_path: Path) -> None:
+        """The deadline is display-only; it must not fail the run."""
+        failing_date = 'date() { case "$*" in *"%a"*) return 1 ;; *) command date "$@" ;; esac; }'
+        result = _run_harness(
+            [75, 0], tmp_path, holders=["discogs-etl-seed"], stubs=(failing_date,)
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "NOTIFY :warning:" not in result.stdout
+        assert "until 180 min from now" in result.stdout
+        assert "FELL THROUGH TO DRIFT WATCHDOG" in result.stdout
 
     def test_a_crash_while_waiting_still_fails_loudly(self, tmp_path: Path) -> None:
         result = _run_harness([75, 1], tmp_path, holders=["discogs-etl-seed"])
