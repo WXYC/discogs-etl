@@ -2,8 +2,8 @@
 """Restore an ``api_fetch`` export into the discogs-cache through the pipeline's own restore.
 
 For a run that kept no ``*_api_fetch_snap`` snapshot (``PRESERVE_API_FETCH=0``, a
-standalone ``run_pipeline.py``, ``--target-db-url``, the ``rebuild-cache.yml``
-fallback, or a snapshot dropped by hand), restore the ``api_fetch`` releases from an
+standalone ``run_pipeline.py``, ``--target-db-url``, a ``rebuild-cache.yml``
+dispatch with ``preserve_api_fetch`` false, or a snapshot dropped by hand), restore the ``api_fetch`` releases from an
 export taken before it. The export's ``api_fetch`` release family is staged on
 ``--target`` as the pipeline's own scratch tables
 (``lib.api_fetch_preservation.stage_snapshot_from``) and then restored by
