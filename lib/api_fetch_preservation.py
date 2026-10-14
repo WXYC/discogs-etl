@@ -203,6 +203,7 @@ def stage_snapshot_from(source_url: str, target_url: str) -> int:
                 return 0
             for table in SNAPSHOT_TABLES:
                 if not _exists(s, table):
+                    logger.warning("%s: the export has no such table; restoring without it", table)
                     continue
                 target_cols = set(_columns(t, table))
                 source_cols = _columns(s, table)
