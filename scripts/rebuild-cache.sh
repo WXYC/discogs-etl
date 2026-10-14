@@ -508,8 +508,9 @@ fi
 # real seed and operator sessions (#433, #454), each of which finishes in minutes
 # to an hour or two, so skipping the month for one of them costs a month of
 # freshness for nothing. Only a peer rebuild -- named discogs-etl-rebuild on its
-# lock connection -- is this tick's rebuild and ends the run at once. Any other
-# holder, an unnamed one included, is waited out: the pipeline is re-run every
+# lock connection -- is this tick's rebuild and ends the run at once, and so does
+# a failed holder lookup, which might hide one. Any other holder, an unnamed one
+# included, is waited out: the pipeline is re-run every
 # REBUILD_LOCK_RETRY_SECONDS until REBUILD_LOCK_WAIT_MINUTES have passed (0
 # turns the wait off). run_pipeline.py takes the lock before anything else, so a
 # refused attempt costs seconds. The call keeps the ERR-trap-safe shape above
@@ -525,6 +526,7 @@ REBUILD_LOCK_RETRY_SECONDS=300
 REBUILD_LOCK_WAIT_SECONDS=$((REBUILD_LOCK_WAIT_MINUTES * 60))
 REBUILD_LOCK_WAITED_SECONDS=0
 REBUILD_LOCK_WAIT_ANNOUNCED=0
+REBUILD_LOCK_FREE_RETRIED=0
 LOCK_BOWOUT_NOTE=""
 while :; do
     PIPELINE_EXIT_CODE=0
@@ -540,8 +542,17 @@ while :; do
     HOLDER_EXIT_CODE=0
     LOCK_HOLDER=$(PYTHONPATH="$REPO_DIR" python -m lib.rebuild_lock --describe-holder) \
         || HOLDER_EXIT_CODE=$?
+    # The name goes into notify_slack's hand-built JSON: drop what would break it.
+    LOCK_HOLDER=$(printf '%s' "$LOCK_HOLDER" | tr -d '"\\[:cntrl:]')
     if [ "$HOLDER_EXIT_CODE" -eq "$REBUILD_LOCK_HOLDER_FREE_EXIT_CODE" ]; then
-        continue  # released between the attempt and the lookup
+        # Released between the attempt and the lookup: retry at once, but only
+        # once in a row, so a repeated 75-then-free still sleeps and meets the
+        # deadline.
+        if [ "$REBUILD_LOCK_FREE_RETRIED" -eq 0 ]; then
+            REBUILD_LOCK_FREE_RETRIED=1
+            continue
+        fi
+        LOCK_HOLDER_LABEL="an unseen session (the holder lookup found the lock free)"
     elif [ "$HOLDER_EXIT_CODE" -ne 0 ]; then
         LOCK_HOLDER_LABEL="an unknown session (the holder lookup failed)"
     elif [ -z "$LOCK_HOLDER" ]; then
@@ -549,8 +560,15 @@ while :; do
     else
         LOCK_HOLDER_LABEL="$LOCK_HOLDER"
     fi
+    if [ "$HOLDER_EXIT_CODE" -ne "$REBUILD_LOCK_HOLDER_FREE_EXIT_CODE" ]; then
+        REBUILD_LOCK_FREE_RETRIED=0
+    fi
 
-    if [ "$HOLDER_EXIT_CODE" -eq 0 ] && [ "$LOCK_HOLDER" = "$REBUILD_LOCK_REBUILD_HOLDER" ]; then
+    # A holder the lookup could not name may be a peer rebuild; waiting it out
+    # would risk a second full rebuild the same night, so it ends the run too.
+    if { [ "$HOLDER_EXIT_CODE" -ne 0 ] \
+        && [ "$HOLDER_EXIT_CODE" -ne "$REBUILD_LOCK_HOLDER_FREE_EXIT_CODE" ]; } \
+        || { [ "$HOLDER_EXIT_CODE" -eq 0 ] && [ "$LOCK_HOLDER" = "$REBUILD_LOCK_REBUILD_HOLDER" ]; }; then
         LOCK_BOWOUT_NOTE=" Holder: ${LOCK_HOLDER_LABEL}."
         break
     elif [ "$REBUILD_LOCK_WAITED_SECONDS" -ge "$REBUILD_LOCK_WAIT_SECONDS" ]; then
