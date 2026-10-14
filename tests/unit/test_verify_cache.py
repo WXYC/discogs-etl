@@ -1084,6 +1084,20 @@ class TestDropAbsentOverrides:
     copied by the copy-swap prune, so it must not enter keep_ids, or
     ``_assert_release_copy_count`` aborts the whole prune on it (#446)."""
 
+    @pytest.fixture(autouse=True)
+    def slack_posts(self, monkeypatch) -> list[dict]:
+        """Record Slack posts instead of sending them, and use the default threshold."""
+        posts: list[dict] = []
+
+        def _record(**kwargs):
+            posts.append(kwargs)
+            return True
+
+        monkeypatch.setattr(_vc, "post_slack_alert", _record)
+        monkeypatch.delenv("ABSENT_PIN_ALERT_RATIO", raising=False)
+        monkeypatch.delenv("MAX_PIN_SHORTFALL_RATIO", raising=False)
+        return posts
+
     @pytest.mark.parametrize(
         ("override_ids", "present_ids", "expected"),
         [
@@ -1096,16 +1110,91 @@ class TestDropAbsentOverrides:
     def test_keeps_only_present_pins(self, override_ids, present_ids, expected):
         assert drop_absent_overrides(override_ids, present_ids) == expected
 
-    def test_absent_pins_are_logged_with_count_and_sample(self, caplog):
+    def test_absent_pins_are_logged_with_count_share_and_sample(self, caplog):
         with caplog.at_level(logging.WARNING):
             drop_absent_overrides({101, 998, 999}, {101})
-        assert "2 pinned release_id override(s) have no release row" in caplog.text
+        assert "2 of 3 pinned release_id override(s) (66.7%) have no release row" in caplog.text
         assert "998" in caplog.text and "999" in caplog.text
 
-    def test_nothing_logged_when_every_pin_is_present(self, caplog):
+    def test_nothing_logged_when_every_pin_is_present(self, caplog, slack_posts):
         with caplog.at_level(logging.WARNING):
             drop_absent_overrides({101}, {101})
         assert "no release row" not in caplog.text
+        assert slack_posts == []
+
+    @pytest.mark.parametrize(
+        ("pins", "absent", "env", "alerts"),
+        [
+            # The 2026-10-13 residue: 13 of ~58K (0.02%), far under the threshold.
+            pytest.param(1000, 13, {}, False, id="1.3%-under-default"),
+            # At the threshold is still fine.
+            pytest.param(20, 1, {}, False, id="5%-at-default"),
+            pytest.param(8, 1, {}, True, id="12.5%-over-default"),
+            # 2026-09-04 (#422) was 47%: the fingerprint of pins lost upstream.
+            pytest.param(3, 2, {}, True, id="66.7%-over-default"),
+            # The operator's ABSENT_PIN_ALERT_RATIO is honoured both ways.
+            pytest.param(1000, 13, {"ABSENT_PIN_ALERT_RATIO": "0.01"}, True, id="raised-share"),
+            pytest.param(8, 1, {"ABSENT_PIN_ALERT_RATIO": "0.2"}, False, id="raised-threshold"),
+            pytest.param(3, 2, {"ABSENT_PIN_ALERT_RATIO": "1.0"}, False, id="disabled"),
+            # A typo falls back to the default rather than switching the alert off.
+            pytest.param(8, 1, {"ABSENT_PIN_ALERT_RATIO": "abc"}, True, id="typo-uses-default"),
+            # Forcing an import through with the import's own knob must not
+            # silence this alert.
+            pytest.param(3, 2, {"MAX_PIN_SHORTFALL_RATIO": "1.0"}, True, id="import-knob-ignored"),
+        ],
+    )
+    def test_alerts_only_when_the_absent_share_passes_the_threshold(
+        self, caplog, monkeypatch, slack_posts, pins, absent, env, alerts
+    ):
+        """Above the threshold the absent pins are usually the #422 class (pins
+        lost upstream), which the copy-count guard used to catch by aborting. It
+        alerts at ERROR and on Slack instead, and still returns the present
+        pins: the run goes on."""
+        for name, value in env.items():
+            monkeypatch.setenv(name, value)
+        override_ids = set(range(1, pins + 1))
+        present_ids = set(range(1, pins - absent + 1))
+
+        with caplog.at_level(logging.WARNING):
+            kept = drop_absent_overrides(override_ids, present_ids)
+
+        assert kept == present_ids
+        levels = {record.levelno for record in caplog.records if "no release row" in record.message}
+        if alerts:
+            assert levels == {logging.ERROR}
+            assert len(slack_posts) == 1
+            text = slack_posts[0]["message"]
+            assert f"{absent:,} of {pins:,} pinned release_id override(s)" in text
+            assert "#422" in text
+            assert "check_override_parity.py" in text
+            assert slack_posts[0]["title"] == "Discogs cache: pinned releases absent"
+        else:
+            assert levels == {logging.WARNING}
+            assert slack_posts == []
+
+    def test_alert_names_a_fractional_threshold_exactly(self, monkeypatch, slack_posts):
+        """The threshold is printed to one decimal, so 0.125 reads 12.5%, not 12%."""
+        monkeypatch.setenv("ABSENT_PIN_ALERT_RATIO", "0.125")
+        drop_absent_overrides(set(range(1, 6)), set(range(1, 5)))
+        assert len(slack_posts) == 1
+        assert "over the 12.5% alert threshold" in slack_posts[0]["message"]
+
+    def test_alert_posts_to_the_monitoring_webhook(self, monkeypatch, slack_posts):
+        monkeypatch.setenv("SLACK_MONITORING_WEBHOOK", "https://hooks.example.invalid/pins")
+        drop_absent_overrides({101, 998, 999}, {101})
+        assert [post["webhook_url"] for post in slack_posts] == [
+            "https://hooks.example.invalid/pins"
+        ]
+
+    @pytest.mark.parametrize("posted", [True, False])
+    def test_an_alert_that_does_not_reach_slack_is_logged(self, caplog, monkeypatch, posted):
+        """With no webhook (or a failed post) the alert reaches no channel, so
+        the run says so at ERROR rather than letting the alert vanish."""
+        monkeypatch.setattr(_vc, "post_slack_alert", lambda **_: posted)
+        with caplog.at_level(logging.WARNING):
+            drop_absent_overrides({101, 998, 999}, {101})
+        undelivered = [r for r in caplog.records if "NOT posted to Slack" in r.message]
+        assert [r.levelno for r in undelivered] == ([] if posted else [logging.ERROR])
 
 
 class TestDumpClassificationArg:

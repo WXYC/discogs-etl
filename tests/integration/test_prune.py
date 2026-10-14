@@ -407,6 +407,12 @@ class TestCopySwapPruneWithAbsentPin:
     """End-to-end for #446: a pin with no ``release`` row must not abort the
     copy-swap prune, and a pin that is present must still survive it."""
 
+    @pytest.fixture(autouse=True)
+    def _no_slack(self, monkeypatch):
+        """Both cases reach a Slack post: the count guard's abort, and the
+        absent-pin alert (one of two pins absent is over the 5% threshold)."""
+        monkeypatch.setattr(_vc, "post_slack_alert", lambda **_: False)
+
     def _release_ids(self, db_url: str) -> set[int]:
         with psycopg.connect(db_url) as conn, conn.cursor() as cur:
             cur.execute("SELECT id FROM release")

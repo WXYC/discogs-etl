@@ -742,6 +742,40 @@ def apply_release_overrides(report: ClassificationReport, override_ids: set[int]
     report.review_ids -= override_ids
 
 
+# Share of all pins that may be absent from ``release`` at prune time before
+# drop_absent_overrides alerts. Its own knob, not the import's
+# MAX_PIN_SHORTFALL_RATIO: that one measures what a dump strands among the pins
+# the cache holds, and an operator sets it to 1.0 to force an import through,
+# which must not also silence this alert. The baseline is ~0.02% (13 of ~58K
+# absent on 2026-10-13); #422 was 47%.
+DEFAULT_ABSENT_PIN_ALERT_RATIO = 0.05
+ABSENT_PIN_ALERT_RATIO_ENV = "ABSENT_PIN_ALERT_RATIO"
+
+
+def resolve_absent_pin_alert_ratio() -> float:
+    """Read ABSENT_PIN_ALERT_RATIO, falling back to the default.
+
+    An unparseable or out-of-range value logs a WARNING and uses the default,
+    so a typo can neither crash the prune nor switch the alert off.
+    """
+    raw = os.environ.get(ABSENT_PIN_ALERT_RATIO_ENV, "")
+    if not raw:
+        return DEFAULT_ABSENT_PIN_ALERT_RATIO
+    try:
+        value = float(raw)
+    except ValueError:
+        value = -1.0
+    if not 0.0 <= value <= 1.0:
+        logger.warning(
+            "%s=%r is not a ratio in [0, 1]; using the default %.2f",
+            ABSENT_PIN_ALERT_RATIO_ENV,
+            raw,
+            DEFAULT_ABSENT_PIN_ALERT_RATIO,
+        )
+        return DEFAULT_ABSENT_PIN_ALERT_RATIO
+    return value
+
+
 def drop_absent_overrides(override_ids: set[int], present_ids: set[int]) -> set[int]:
     """Return the pinned overrides that have a ``release`` row; log the rest.
 
@@ -752,16 +786,59 @@ def drop_absent_overrides(override_ids: set[int], present_ids: set[int]) -> set[
     Excluding them narrows the expected set only. A *present* KEEP/REVIEW id
     that fails to copy still trips the guard, exactly as #357 requires.
 
-    Absent pins are logged (count plus a sample), not fatal: they are pinned
-    ids the dump does not carry, which no pipeline step can restore. A large
-    count is the #422 class (pins lost upstream) and shows here first.
+    Absent pins are logged (count, share of all pins and a sample), never
+    fatal. A few are expected every month: pinned ids that are not in
+    ``release`` when the prune runs. Pins with ``api_fetch`` provenance come
+    back after the prune when the rebuild runs with ``--preserve-api-fetch``
+    (#450). The rest stay out of the cache until a later dump carries them or
+    LML fetches them again.
+
+    A share above ``ABSENT_PIN_ALERT_RATIO`` (5% by default) is logged at
+    ERROR, which ``wxyc_etl.logger`` forwards to Sentry when ``SENTRY_DSN`` is
+    set, and posted to ``SLACK_MONITORING_WEBHOOK`` when that is set; a post
+    that does not go out is logged at ERROR too. It is usually the #422 class,
+    pins lost upstream, for example by a converter run without its Seam A
+    allowlist on a run that empties ``release`` before the import
+    (``--truncate-existing``, ``--direct-pg``, ``--fresh-rebuild``), where the
+    import's own pin guard cannot see the loss. Before #447 the copy-count
+    guard caught that by aborting. The share counts every pin with no row, so a
+    backlog of pins that were never cached reads the same; the alert says so.
+    It is not fatal: the rows are already gone, and an abort here would only
+    leave the track tables UNLOGGED and skip the api_fetch restore.
     """
     absent = override_ids - present_ids
-    if absent:
-        sample = sorted(absent)[:20]
-        logger.warning(
-            f"{len(absent):,} pinned release_id override(s) have no release row and "
-            f"will not be kept (sample, max 20): {sample}"
+    if not absent:
+        return override_ids
+    share = len(absent) / len(override_ids)
+    message = (
+        f"{len(absent):,} of {len(override_ids):,} pinned release_id override(s) "
+        f"({share:.1%}) have no release row and will not be kept "
+        f"(sample, max 20): {sorted(absent)[:20]}"
+    )
+    threshold = resolve_absent_pin_alert_ratio()
+    if share <= threshold:
+        logger.warning(message)
+        return override_ids & present_ids
+    message += (
+        f". That is over the {threshold:.1%} alert threshold ({ABSENT_PIN_ALERT_RATIO_ENV}). "
+        "Either pins were lost upstream (the WXYC/discogs-etl#422 class, e.g. a converter "
+        "run without its Seam A allowlist), or pinned releases were never cached (a "
+        "backlog). Check the import mode and the Seam A warnings in this run's log. A run "
+        "that empties release before the import (--truncate-existing, --direct-pg or "
+        "--fresh-rebuild) with --preserve-api-fetch restores the api_fetch pins after the "
+        "prune, so judge the loss with scripts/check_override_parity.py (missing_from_cache "
+        "per override source) once the run has finished."
+    )
+    logger.error(message)
+    posted = post_slack_alert(
+        webhook_url=os.environ.get("SLACK_MONITORING_WEBHOOK"),
+        message=message,
+        title="Discogs cache: pinned releases absent",
+    )
+    if not posted:
+        logger.error(
+            "The absent-pin alert above was NOT posted to Slack: SLACK_MONITORING_WEBHOOK "
+            "is unset or the post failed. This log is its only record."
         )
     return override_ids & present_ids
 
