@@ -21,6 +21,10 @@ would capture a cache that already lost the data. A failed restore is one
 rolled-back transaction that leaves the scratch tables in place for forensics
 and raises, the same asymmetry as ``_keep_ids_<suffix>`` (#357). Releases LML
 writes after the snapshot are not covered; that window is accepted.
+
+For a run that took no snapshot, :func:`stage_snapshot_from` builds the same
+scratch tables from a pre-run export, so ``scripts/restore_api_fetch_from_export.py``
+restores it through :func:`restore_api_fetch_releases` under the same rules (#462).
 """
 
 from __future__ import annotations
@@ -58,6 +62,9 @@ SIX_MONTHS = timedelta(days=183)
 # Bounds the restore's wait for LML's open write transactions on ``release``;
 # while queued, the lock request blocks every later LML write behind it.
 RESTORE_LOCK_TIMEOUT = "2min"
+
+# The release-family selector shared by the in-pipeline snapshot and the export staging.
+_API_FETCH_IDS = "IN (SELECT release_id FROM cache_metadata WHERE source = 'api_fetch')"
 
 
 class ApiFetchRestoreError(RuntimeError):
@@ -157,12 +164,57 @@ def snapshot_api_fetch_releases(db_url: str, *, reuse_existing: bool = False) ->
                     continue
                 cur.execute(
                     f"CREATE TABLE {_snap(table)} AS SELECT t.* FROM {table} t "
-                    f"WHERE t.{_key(table)} IN "
-                    "(SELECT release_id FROM cache_metadata WHERE source = 'api_fetch')"
+                    f"WHERE t.{_key(table)} {_API_FETCH_IDS}"
                 )
             cur.execute(f"SELECT count(*) FROM {_snap('release')}")
             count = cur.fetchone()[0]
     logger.info("Snapshotted %d api_fetch releases into *_%s tables (#450)", count, SNAPSHOT_SUFFIX)
+    return count
+
+
+def stage_snapshot_from(source_url: str, target_url: str) -> int:
+    """Stage *source_url*'s ``api_fetch`` release family as scratch tables on *target_url*.
+
+    The manual counterpart of :func:`snapshot_api_fetch_releases` (#462) for an
+    export taken before a run that kept no snapshot: it builds the same
+    ``<table>_api_fetch_snap`` tables, so :func:`restore_api_fetch_releases`
+    then applies the pipeline's own rules to them. Returns the staged release
+    count; a source without ``release`` / ``cache_metadata`` stages nothing and
+    returns 0. Columns are the ones both databases have, and a table the source
+    lacks is skipped. The source is only read (a read-only REPEATABLE READ
+    transaction, ``COPY ... TO STDOUT``); the target gets one transaction, so a
+    failure leaves no half-staged family. A snapshot already on the target (a
+    run that died before its restore) is restored first, never merged into.
+    """
+    with psycopg.connect(target_url) as conn, conn.cursor() as cur:
+        left_behind = _exists(cur, _snap("release"))
+    if left_behind:
+        logger.warning(
+            "The target holds an api_fetch snapshot from an earlier run; restoring it "
+            "before staging the export (#462)"
+        )
+        restore_api_fetch_releases(target_url)
+    with psycopg.connect(source_url) as src, psycopg.connect(target_url) as tgt:
+        src.isolation_level = psycopg.IsolationLevel.REPEATABLE_READ
+        src.read_only = True
+        with src.cursor() as s, tgt.cursor() as t:
+            if not (_exists(s, "release") and _exists(s, "cache_metadata")):
+                logger.info("The export has no release/cache_metadata tables; nothing to stage")
+                return 0
+            for table in SNAPSHOT_TABLES:
+                if not _exists(s, table):
+                    continue
+                target_cols = set(_columns(t, table))
+                cols = ", ".join(c for c in _columns(s, table) if c in target_cols)
+                t.execute(f"CREATE TABLE {_snap(table)} AS SELECT {cols} FROM {table} WHERE false")
+                select = f"SELECT {cols} FROM {table} WHERE {_key(table)} {_API_FETCH_IDS}"
+                with s.copy(f"COPY ({select}) TO STDOUT") as out:
+                    with t.copy(f"COPY {_snap(table)} ({cols}) FROM STDIN") as into:
+                        for data in out:
+                            into.write(data)
+            t.execute(f"SELECT count(*) FROM {_snap('release')}")
+            count = t.fetchone()[0]
+    logger.info("Staged %d api_fetch releases from the export (#462)", count)
     return count
 
 
@@ -266,3 +318,38 @@ def restore_api_fetch_releases(db_url: str) -> PreservationSummary | None:
         raise ApiFetchRestoreError(str(exc)) from exc
     logger.info(summary.format())
     return summary
+
+
+def plan_restore_from(source_url: str, target_url: str) -> PreservationSummary:
+    """Count what restoring *source_url*'s ``api_fetch`` releases would do, writing nothing (#462).
+
+    Applies :func:`restore_api_fetch_releases`' rule to the target as it stands:
+    absent ids are preserved, hollow ones rehydrated, the rest superseded by the
+    dump. Both databases are only read.
+    """
+    ids: list[int] = []
+    with psycopg.connect(source_url) as conn, conn.cursor() as cur:
+        if _exists(cur, "release") and _exists(cur, "cache_metadata"):
+            cur.execute(f"SELECT id FROM release WHERE id {_API_FETCH_IDS}")
+            ids = [row[0] for row in cur.fetchall()]
+    preserved = restoring = 0
+    with psycopg.connect(target_url) as conn, conn.cursor() as cur:
+        if _exists(cur, _snap("release")):
+            logger.warning(
+                "The target holds an api_fetch snapshot from an earlier run; a real run "
+                "restores it first, so these counts are against the cache as it stands"
+            )
+        if ids and _exists(cur, "release"):
+            cur.execute(
+                "SELECT count(*) FILTER (WHERE r.id IS NULL), count(*) "
+                "FROM unnest(%s::integer[]) AS x(id) LEFT JOIN release r ON r.id = x.id "
+                f"WHERE r.id IS NULL OR ({_hollow(cur, 'x')})",
+                (ids,),
+            )
+            preserved, restoring = cur.fetchone()
+    return PreservationSummary(
+        snapshotted=len(ids),
+        preserved=preserved,
+        rehydrated=restoring - preserved,
+        superseded=len(ids) - restoring,
+    )
