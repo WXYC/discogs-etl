@@ -8,6 +8,8 @@ Motivation: [Backend-Service#1631](https://github.com/WXYC/Backend-Service/issue
 
 When a bounded, known set of releases needs to exist in a populated cache and a full rebuild is not warranted. This is **not** the mechanism for widening the cache filter to open-ended demand (rejected as low-ROI). The target is a specific release_id list produced upstream.
 
+Do not run a real seed across the monthly rebuild tick (06:00 UTC on the 4th = 22:00 PST / 23:00 PDT on the 3rd): the seed holds rebuild lock `354001` for its whole write, so a rebuild that fires meanwhile bows out and that month's rebuild does not run. Schedule away from it, as the dedup runbook says for dedup.
+
 Do not run while a bulk job is hammering LML on the shared Discogs token — this seed does not call Discogs (clone → PG copy only), but the downstream backfill it unblocks does.
 
 ## Guarantees (why it is safe against a populated prod cache)

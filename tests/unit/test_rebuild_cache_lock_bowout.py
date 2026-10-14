@@ -340,3 +340,31 @@ def test_workflow_bow_out_reaps_curl_before_waiting() -> None:
         "the bow-out branch must kill the backgrounded curl, which is blocked "
         "in open() on a FIFO no reader will ever open, before exiting"
     )
+
+
+class TestBowOutWordingIsHolderNeutral:
+    """The lock (354001) is also taken by dedup, a real seed and operator
+    sessions (#433, #454), so the bow-out text must not assert a peer rebuild
+    holds it (#459)."""
+
+    @pytest.mark.parametrize(
+        "relpath",
+        [
+            "scripts/rebuild-cache.sh",
+            "scripts/run_pipeline.py",
+            ".github/workflows/rebuild-cache.yml",
+        ],
+    )
+    def test_no_peer_only_claim(self, relpath: str) -> None:
+        text = (REPO_ROOT / relpath).read_text().lower()
+        assert "another rebuild holds the discogs-cache advisory lock" not in text
+        assert "another rebuild holds the advisory lock" not in text
+        assert "another rebuild already holds" not in text
+
+    @pytest.mark.parametrize(
+        "relpath",
+        ["scripts/rebuild-cache.sh", ".github/workflows/rebuild-cache.yml"],
+    )
+    def test_names_lock_and_possible_holders(self, relpath: str) -> None:
+        text = (REPO_ROOT / relpath).read_text()
+        assert "held by another session (a rebuild, a dedup, or a seed)" in text

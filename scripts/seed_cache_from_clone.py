@@ -413,13 +413,13 @@ def _seed_family(
         finally:
             source_conn.close()
 
-    # Real (writing) run. Hold a transaction-scoped advisory lock on the target
-    # for the whole read (new-id computation) -> write window: two concurrent
-    # invocations against the same target must not both compute the same
-    # release/artist as "new" and double-insert the arbiter-less child rows
-    # (release_artist/label/genre/style/track/track_artist, artist_name_variation
-    # -- see the module docstring). Key 330001 = discogs-etl PR#330, first key
-    # allocated; registered in CLAUDE.md's "Advisory lock keys" table.
+    # Real (writing) run. Two concurrent invocations against the same target
+    # must not both compute the same release/artist as "new" and double-insert
+    # the arbiter-less child rows (release_artist/label/genre/style/track/
+    # track_artist, artist_name_variation -- see the module docstring). The
+    # 354001 try-lock below is what keeps them apart; a transaction-scoped
+    # advisory lock on key 330001 (discogs-etl PR#330, registered in CLAUDE.md's
+    # "Advisory lock keys" table) spans the read -> write window as a backstop.
     target_conn = psycopg.connect(target_url)
     rebuild_lock_conn = None
     try:
