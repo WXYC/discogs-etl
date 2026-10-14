@@ -138,13 +138,15 @@ def post_slack_alert(*, webhook_url: str | None, message: str) -> bool:
     if not webhook_url:
         return False
     payload = json.dumps({"text": f":warning: *Discogs cache drift*\n{message}"}).encode("utf-8")
-    req = Request(
-        webhook_url,
-        data=payload,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
     try:
+        # Built inside the try: Request raises ValueError on a webhook with no
+        # URL scheme (a placeholder value), and this helper must never raise.
+        req = Request(
+            webhook_url,
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
         with urlopen(req, timeout=10):
             return True
     except Exception as exc:  # pragma: no cover - logged for operators

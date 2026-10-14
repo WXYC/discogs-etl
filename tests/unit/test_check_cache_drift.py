@@ -166,6 +166,14 @@ class TestPostSlackAlert:
             )
         assert ok is False
 
+    @pytest.mark.parametrize("webhook_url", ["changeme", "hooks.slack.com/services/XXX"])
+    def test_malformed_webhook_is_swallowed(self, webhook_url) -> None:
+        """A webhook value with no URL scheme (a placeholder, a pasted host) is
+        rejected when the request is built, before any network call. That must
+        not raise either: the callers post from inside a rebuild."""
+        mod = _load_module()
+        assert mod.post_slack_alert(webhook_url=webhook_url, message="hi") is False
+
 
 class TestRunWatchdogCli:
     """CLI integration: build args, invoke run, check exit code."""
