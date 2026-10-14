@@ -52,6 +52,8 @@ After the pipeline succeeds, the workflow runs `scripts/check_cache_drift.py` ag
 
 **Caveat — capacity**: the production path disk-spools each dump to the EBS-backed work dir rather than streaming it (see the `scripts/rebuild-cache.sh` paragraph above), so the capacity constraints to watch are the EBS volume size and the EC2 wall-clock — not a GitHub free-runner's ~14 GB disk or 6-hour limits, which now bind only the `workflow_dispatch` escape-hatch workflow. The work dir has to hold every compressed dump that spools to it — `releases.xml.gz`, `artists.xml.gz`, and, since #317, `masters.xml.gz` — so size the EBS volume for the combined on-disk footprint of all three and re-check it whenever a dump is added to the fetch list. The wall-clock envelope is the ~60-90 min the "Why EC2" note cites; if a future month pushes materially past that, the lever is a larger EC2 instance or volume, not a hosted-runner tier.
 
+**`api_fetch` preservation (#460):** the workflow passes `--preserve-api-fetch` to `run_pipeline.py` by default, matching `scripts/rebuild-cache.sh`; the boolean `workflow_dispatch` input `preserve_api_fetch` (default true) opts out when set to false. Without it a manual dispatch would drop every `api_fetch` release the dump lacks. See [`architecture.md`](architecture.md#api_fetch-release-preservation).
+
 **Required GitHub secrets:**
 
 | Secret | Description |
