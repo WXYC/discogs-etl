@@ -32,6 +32,20 @@ except ImportError:
 ADMIN_URL = os.environ.get("DATABASE_URL_TEST", "postgresql://localhost:5433/postgres")
 
 
+@pytest.fixture(autouse=True)
+def _no_real_slack_webhook(monkeypatch):
+    """Unset the Slack webhooks for every test, so no test can post to a real channel.
+
+    Several code paths post through ``check_cache_drift.post_slack_alert`` when
+    ``SLACK_MONITORING_WEBHOOK`` is set (the copy-swap count guard, for one), and
+    some of their tests do not stub it. A shell that exports the webhook would
+    otherwise send their fake alerts for real. A test that needs a webhook sets
+    one itself, after this fixture has run.
+    """
+    monkeypatch.delenv("SLACK_MONITORING_WEBHOOK", raising=False)
+    monkeypatch.delenv("SLACK_WEBHOOK_URL", raising=False)
+
+
 def _postgres_available() -> bool:
     """Return True if we can connect to the test Postgres instance."""
     if not HAS_PSYCOPG:
