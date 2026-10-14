@@ -537,6 +537,7 @@ REBUILD_LOCK_WAIT_ANNOUNCED=0
 REBUILD_LOCK_LAST_LOOKUP_FREE=0
 LOCK_BOWOUT_NOTE=""
 while :; do
+    LOCK_ATTEMPT_STARTED=$SECONDS
     PIPELINE_EXIT_CODE=0
     python "$REPO_DIR/scripts/run_pipeline.py" \
         --xml "$WORK_DIR" $PRESERVE_API_FETCH_ARG \
@@ -585,7 +586,7 @@ while :; do
         LOCK_BOWOUT_NOTE=" Holder: ${LOCK_HOLDER_LABEL}."
         break
     elif [ "$REBUILD_LOCK_WAITED_SECONDS" -ge "$REBUILD_LOCK_WAIT_SECONDS" ]; then
-        LOCK_BOWOUT_NOTE=" Holder: ${LOCK_HOLDER_LABEL}, which held the lock for the whole ${REBUILD_LOCK_WAIT_MINUTES}-minute wait."
+        LOCK_BOWOUT_NOTE=" Holder at the deadline: ${LOCK_HOLDER_LABEL}; the lock stayed held for the whole ${REBUILD_LOCK_WAIT_MINUTES}-minute wait."
         break
     fi
 
@@ -601,10 +602,16 @@ while :; do
         echo "[$(date -u +%H:%M:%SZ)] rebuild lock (key 354001) held by ${LOCK_HOLDER_LABEL}; retrying every $((REBUILD_LOCK_RETRY_SECONDS / 60)) min until ${LOCK_WAIT_DEADLINE}"
         notify_slack ":hourglass_flowing_sand:" "rebuild lock (key 354001) held by ${LOCK_HOLDER_LABEL}; retrying every $((REBUILD_LOCK_RETRY_SECONDS / 60)) min until ${LOCK_WAIT_DEADLINE}. Log: ${LOG_FILE}"
     fi
-    # The last sleep stops at the deadline rather than overshooting it.
+    # The attempt and the lookup count against the wait too (each can spend
+    # most of a minute on connect retries), so the wait bounds real time. The
+    # last sleep stops at the deadline rather than overshooting it.
+    REBUILD_LOCK_WAITED_SECONDS=$((REBUILD_LOCK_WAITED_SECONDS + SECONDS - LOCK_ATTEMPT_STARTED))
     LOCK_SLEEP_SECONDS=$((REBUILD_LOCK_WAIT_SECONDS - REBUILD_LOCK_WAITED_SECONDS))
     if [ "$LOCK_SLEEP_SECONDS" -gt "$REBUILD_LOCK_RETRY_SECONDS" ]; then
         LOCK_SLEEP_SECONDS=$REBUILD_LOCK_RETRY_SECONDS
+    fi
+    if [ "$LOCK_SLEEP_SECONDS" -lt 0 ]; then
+        LOCK_SLEEP_SECONDS=0
     fi
     sleep "$LOCK_SLEEP_SECONDS"
     REBUILD_LOCK_WAITED_SECONDS=$((REBUILD_LOCK_WAITED_SECONDS + LOCK_SLEEP_SECONDS))
