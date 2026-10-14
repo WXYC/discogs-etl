@@ -147,8 +147,8 @@ def lock_conns(monkeypatch):
     kept: list[psycopg.Connection] = []
     real = _cli.try_acquire_rebuild_lock
 
-    def spy(url: str) -> psycopg.Connection | None:
-        conn = real(url)
+    def spy(url: str, *, holder: str) -> psycopg.Connection | None:
+        conn = real(url, holder=holder)
         if conn is not None:
             kept.append(conn)
         return conn

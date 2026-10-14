@@ -41,6 +41,7 @@ from lib.pg_concurrent_ddl import (  # noqa: E402
 )
 from lib.rebuild_lock import (  # noqa: E402
     REBUILD_LOCK_BOWED_OUT_EXIT_CODE,
+    REBUILD_LOCK_HOLDER_DEDUP,
     REBUILD_LOCK_KEY,
     release_rebuild_lock,
     try_acquire_rebuild_lock,
@@ -256,7 +257,7 @@ def main(argv: list[str] | None = None) -> int:
     # importing artist CSVs mid-DELETE is what must not overlap. Returned
     # rather than run_pipeline's os._exit: nothing downstream of this script
     # can mistake a bow-out for success.
-    lock_conn = try_acquire_rebuild_lock(database_url)
+    lock_conn = try_acquire_rebuild_lock(database_url, holder=REBUILD_LOCK_HOLDER_DEDUP)
     if lock_conn is None:
         held = f"Rebuild lock {REBUILD_LOCK_KEY} is held elsewhere; nothing touched."
         logger.warning(

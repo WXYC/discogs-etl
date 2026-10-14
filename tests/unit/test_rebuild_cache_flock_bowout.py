@@ -103,7 +103,9 @@ def test_flock_bowout_message_is_distinct_from_advisory_lock_message(script_text
     calls = re.findall(r'notify_slack\s+"(:[a-z_]+:)"\s+"([^"]*)"', script_text)
     assert calls, "expected at least one notify_slack call in rebuild-cache.sh"
 
-    advisory_lock_call = next((c for c in calls if "354001" in c[1]), None)
+    # The hourglass "waiting" post (#465) names the key too; the bow-out is the
+    # :no_entry: one.
+    advisory_lock_call = next((c for c in calls if c[0] == ":no_entry:" and "354001" in c[1]), None)
     assert advisory_lock_call is not None, (
         "could not find the advisory-lock (key 354001) bow-out notify_slack call"
     )

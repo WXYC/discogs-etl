@@ -8,7 +8,7 @@ This is the `B1p` step of the Railway memory-reduction sequence. `alembic` revis
 
 Off-peak, and nowhere near the monthly rebuild tick (EventBridge `cron(0 6 4 * ? *)` — the 3rd of the month at 23:00 PDT). Both the DELETE and the `VACUUM FULL` hold locks that block live LML writes and reads; a multi-minute block on `artist_name_variation` sits well past Backend-Service's 35 s client timeout.
 
-The script takes the rebuild advisory lock (key `354001`, the same key `scripts/run_pipeline.py` uses — same resource, same hazard) and exits `75` without touching anything if a rebuild already holds it. That is a backstop, not the plan: `scripts/rebuild-cache.sh` runs `alembic upgrade head` *before* `run_pipeline.py` takes the lock, so a rebuild starting mid-procedure is not prevented, only made to bow out later. Schedule away from the tick.
+The script takes the rebuild advisory lock (key `354001`, the same key `scripts/run_pipeline.py` uses — same resource, same hazard) and exits `75` without touching anything if a rebuild already holds it. That is a backstop, not the plan: `scripts/rebuild-cache.sh` runs `alembic upgrade head` *before* `run_pipeline.py` takes the lock, so a rebuild starting mid-procedure is not prevented, only made to bow out later. Schedule away from the tick. A dedup that overlaps the tick no longer costs the month: `rebuild-cache.sh` sees the holder (`discogs-etl-dedup`) and retries every 5 minutes for up to `REBUILD_LOCK_WAIT_MINUTES` (default 180), so it only delays the rebuild. The real window is wider than 06:00 UTC itself: the rebuild takes `354001` only after boot, the code refresh, alembic, the `library.db` download and the dump spool, often 30 or more minutes later. A dedup that runs past the wait still skips the month.
 
 ## Prereqs
 
@@ -148,7 +148,7 @@ If an `--execute` run aborted part-way, the per-table transaction rolled back an
 
 | Symptom | Meaning |
 |---|---|
-| exit `75` | A rebuild, a real `seed_cache_from_clone.py` run, or another operator session holds advisory lock `354001`. Wait; do not force it. |
+| exit `75` | A rebuild, a real `seed_cache_from_clone.py` run, or another operator session holds advisory lock `354001`. Wait; do not force it. This script's own connection is named `discogs-etl-dedup`; `python -m lib.rebuild_lock --describe-holder` names the current holder. |
 | exit `1`, "expected to delete N rows … but deleted M" | The DELETE and its count disagreed, or duplicates survived. That table rolled back. Re-run the dry-run; if the surplus has moved far from the table above, something else is writing. |
 | `SQLSTATE 40001 … retrying` warnings | Normal under live LML traffic. Five attempts per table; exhausting them exits non-zero with nothing committed. |
 | `VACUUM FULL` never gets its lock | A long LML read is holding the table. The 5 s timeout retries with backoff; if it keeps failing, run step 3 in a quieter window. |

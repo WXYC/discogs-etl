@@ -107,9 +107,10 @@ class TestLockConnectionKeepalives:
         with patch("lib.rebuild_lock.psycopg.connect") as mock_connect:
             cur = mock_connect.return_value.cursor.return_value.__enter__.return_value
             cur.fetchone.return_value = (True,)
-            try_acquire_rebuild_lock(url)
+            try_acquire_rebuild_lock(url, holder="discogs-etl-rebuild")
         _, kwargs = mock_connect.call_args
         assert kwargs["autocommit"] is True
+        assert kwargs["application_name"] == "discogs-etl-rebuild"
         for param, value in REBUILD_LOCK_CONNECT_PARAMS.items():
             assert kwargs[param] == value, (
                 f"{param} must reach psycopg.connect so the idle lock connection "
@@ -204,7 +205,7 @@ class TestConnectRetry:
         ):
             cur = mock_connect.return_value.cursor.return_value.__enter__.return_value
             cur.fetchone.return_value = (False,)
-            assert try_acquire_rebuild_lock("postgresql://u:p@host:5432/db") is None
+            assert try_acquire_rebuild_lock("postgresql://u:p@host:5432/db", holder="x") is None
         assert mock_connect.call_count == 1
         mock_sleep.assert_not_called()
         mock_connect.return_value.close.assert_called_once()

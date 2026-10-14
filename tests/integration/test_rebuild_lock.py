@@ -29,12 +29,17 @@ from pathlib import Path
 
 import psycopg
 import pytest
-from psycopg.conninfo import conninfo_to_dict
+from psycopg.conninfo import conninfo_to_dict, make_conninfo
 
 from lib.rebuild_lock import (
     REBUILD_LOCK_BOWED_OUT_EXIT_CODE,
     REBUILD_LOCK_CONNECT_PARAMS,
+    REBUILD_LOCK_HOLDER_DEDUP,
+    REBUILD_LOCK_HOLDER_FREE_EXIT_CODE,
+    REBUILD_LOCK_HOLDER_REBUILD,
+    REBUILD_LOCK_HOLDER_SEED,
     REBUILD_LOCK_KEY,
+    describe_rebuild_lock_holder,
     release_rebuild_lock,
     try_acquire_rebuild_lock,
 )
@@ -44,10 +49,14 @@ pytestmark = [pytest.mark.pg]
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT_DIR = REPO_ROOT / "scripts"
 
+# The name the contention tests below take the lock under; the tests that care
+# about names pass their own.
+_HOLDER = REBUILD_LOCK_HOLDER_REBUILD
+
 
 class TestTryAcquireRebuildLock:
     def test_acquires_when_unlocked(self, fresh_db_url: str) -> None:
-        conn = try_acquire_rebuild_lock(fresh_db_url)
+        conn = try_acquire_rebuild_lock(fresh_db_url, holder=_HOLDER)
         try:
             assert conn is not None
             assert not conn.closed
@@ -60,7 +69,7 @@ class TestTryAcquireRebuildLock:
         and reaches Railway through a public TCP proxy, so the keepalives are
         load-bearing rather than decorative. Asserted against a live
         connection's negotiated conninfo, not just the kwargs we passed."""
-        conn = try_acquire_rebuild_lock(fresh_db_url)
+        conn = try_acquire_rebuild_lock(fresh_db_url, holder=_HOLDER)
         try:
             assert conn is not None
             live = conninfo_to_dict(conn.info.dsn)
@@ -86,7 +95,7 @@ class TestTryAcquireRebuildLock:
         result_box: dict = {}
 
         def run_second_caller() -> None:
-            result_box["conn"] = try_acquire_rebuild_lock(fresh_db_url)
+            result_box["conn"] = try_acquire_rebuild_lock(fresh_db_url, holder=_HOLDER)
 
         t = threading.Thread(target=run_second_caller)
         start = time.monotonic()
@@ -136,7 +145,7 @@ class TestTryAcquireRebuildLock:
         try:
             before = backend_count()
 
-            refused = try_acquire_rebuild_lock(fresh_db_url)
+            refused = try_acquire_rebuild_lock(fresh_db_url, holder=_HOLDER)
             assert refused is None
 
             deadline = time.monotonic() + 10.0
@@ -162,13 +171,13 @@ class TestTryAcquireRebuildLock:
             (acquired,) = cur.fetchone()
         assert acquired
 
-        assert try_acquire_rebuild_lock(fresh_db_url) is None
+        assert try_acquire_rebuild_lock(fresh_db_url, holder=_HOLDER) is None
 
         with holder.cursor() as cur:
             cur.execute("SELECT pg_advisory_unlock(%s)", (REBUILD_LOCK_KEY,))
         holder.close()
 
-        conn = try_acquire_rebuild_lock(fresh_db_url)
+        conn = try_acquire_rebuild_lock(fresh_db_url, holder=_HOLDER)
         try:
             assert conn is not None, "lock must become acquirable once the holder releases"
         finally:
@@ -182,10 +191,10 @@ class TestTryAcquireRebuildLock:
         if fresh_db_url.rsplit("/", 1)[0] != db_url.rsplit("/", 1)[0]:
             pytest.skip("fixtures resolved to different Postgres servers")
 
-        holder = try_acquire_rebuild_lock(fresh_db_url)
+        holder = try_acquire_rebuild_lock(fresh_db_url, holder=_HOLDER)
         assert holder is not None
         try:
-            other = try_acquire_rebuild_lock(db_url)
+            other = try_acquire_rebuild_lock(db_url, holder=_HOLDER)
             try:
                 assert other is not None, (
                     "a lock held in one database must not block acquisition "
@@ -198,9 +207,157 @@ class TestTryAcquireRebuildLock:
             release_rebuild_lock(holder)
 
 
+def _hold_lock_by_hand(
+    url: str, application_name: str, **connect_kwargs: str
+) -> psycopg.Connection:
+    """Take 354001 the way a holder outside this module does (an operator's
+    psql, a caller from an older checkout): a raw connection, its own name."""
+    conn = psycopg.connect(
+        url, autocommit=True, application_name=application_name, **connect_kwargs
+    )
+    (acquired,) = conn.execute("SELECT pg_try_advisory_lock(%s)", (REBUILD_LOCK_KEY,)).fetchone()
+    assert acquired, "test setup: the hand-held lock must be acquired"
+    return conn
+
+
+class TestHolderApplicationName:
+    @pytest.mark.parametrize(
+        "holder",
+        [REBUILD_LOCK_HOLDER_REBUILD, REBUILD_LOCK_HOLDER_DEDUP, REBUILD_LOCK_HOLDER_SEED],
+    )
+    def test_lock_connection_names_itself_in_pg_stat_activity(
+        self, fresh_db_url: str, holder: str
+    ) -> None:
+        conn = try_acquire_rebuild_lock(fresh_db_url, holder=holder)
+        assert conn is not None
+        try:
+            with psycopg.connect(fresh_db_url) as observer:
+                row = observer.execute(
+                    "SELECT application_name FROM pg_stat_activity WHERE pid = %s",
+                    (conn.info.backend_pid,),
+                ).fetchone()
+            assert row == (holder,)
+        finally:
+            release_rebuild_lock(conn)
+
+    def test_the_three_names_are_distinct_and_namespaced(self) -> None:
+        names = {REBUILD_LOCK_HOLDER_REBUILD, REBUILD_LOCK_HOLDER_DEDUP, REBUILD_LOCK_HOLDER_SEED}
+        assert len(names) == 3
+        assert all(name.startswith("discogs-etl-") for name in names)
+
+
+class TestDescribeRebuildLockHolder:
+    def test_returns_the_named_holders_application_name(self, fresh_db_url: str) -> None:
+        conn = try_acquire_rebuild_lock(fresh_db_url, holder=REBUILD_LOCK_HOLDER_SEED)
+        assert conn is not None
+        try:
+            assert describe_rebuild_lock_holder(fresh_db_url) == REBUILD_LOCK_HOLDER_SEED
+        finally:
+            release_rebuild_lock(conn)
+
+    def test_returns_empty_string_for_an_unnamed_holder(self, fresh_db_url: str) -> None:
+        holder = _hold_lock_by_hand(fresh_db_url, "")
+        try:
+            assert describe_rebuild_lock_holder(fresh_db_url) == ""
+        finally:
+            holder.close()
+
+    def test_returns_none_when_nobody_holds_the_lock(self, fresh_db_url: str) -> None:
+        assert describe_rebuild_lock_holder(fresh_db_url) is None
+
+    def test_returns_none_after_the_holder_releases(self, fresh_db_url: str) -> None:
+        conn = try_acquire_rebuild_lock(fresh_db_url, holder=REBUILD_LOCK_HOLDER_DEDUP)
+        assert conn is not None
+        release_rebuild_lock(conn)
+        assert describe_rebuild_lock_holder(fresh_db_url) is None
+
+    def test_a_different_key_is_not_reported_as_the_holder(self, fresh_db_url: str) -> None:
+        with psycopg.connect(fresh_db_url, autocommit=True, application_name="other-key") as c:
+            c.execute("SELECT pg_advisory_lock(%s)", (REBUILD_LOCK_KEY + 1,))
+            assert describe_rebuild_lock_holder(fresh_db_url) is None
+
+    def test_a_holder_in_another_database_is_not_reported(
+        self, fresh_db_url: str, db_url: str
+    ) -> None:
+        if fresh_db_url.rsplit("/", 1)[0] != db_url.rsplit("/", 1)[0]:
+            pytest.skip("fixtures resolved to different Postgres servers")
+        conn = try_acquire_rebuild_lock(db_url, holder=REBUILD_LOCK_HOLDER_REBUILD)
+        assert conn is not None
+        try:
+            assert describe_rebuild_lock_holder(fresh_db_url) is None
+        finally:
+            release_rebuild_lock(conn)
+
+    def test_a_holder_under_another_role_still_reads_by_name(self, fresh_db_url: str) -> None:
+        """pg_stat_activity hides other roles' query text and state from an
+        unprivileged reader, but application_name stays visible. Pinned rather
+        than assumed: the monthly rebuild's role is not the role of a dedup, a
+        seed or an operator's psql, and a name that read as '' there would make
+        a peer rebuild look like a wait-worthy holder."""
+        role = f"rebuild_lock_probe_{time.monotonic_ns()}"
+        with psycopg.connect(fresh_db_url, autocommit=True) as admin:
+            admin.execute(f"CREATE ROLE {role} LOGIN PASSWORD 'probe'")
+        try:
+            held_by_other_role = _hold_lock_by_hand(
+                fresh_db_url, REBUILD_LOCK_HOLDER_REBUILD, user=role, password="probe"
+            )
+            try:
+                assert describe_rebuild_lock_holder(fresh_db_url) == REBUILD_LOCK_HOLDER_REBUILD
+            finally:
+                held_by_other_role.close()
+
+            named = try_acquire_rebuild_lock(fresh_db_url, holder=REBUILD_LOCK_HOLDER_SEED)
+            assert named is not None
+            try:
+                as_role = make_conninfo(fresh_db_url, user=role, password="probe")
+                assert describe_rebuild_lock_holder(as_role) == REBUILD_LOCK_HOLDER_SEED
+            finally:
+                release_rebuild_lock(named)
+        finally:
+            with psycopg.connect(fresh_db_url, autocommit=True) as admin:
+                admin.execute(f"DROP ROLE {role}")
+
+
+class TestDescribeHolderCli:
+    """The shell's view of the holder: scripts/rebuild-cache.sh reads stdout and
+    the exit code (0 = held, name on stdout, possibly empty; 3 = free)."""
+
+    @staticmethod
+    def _run(url: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, "-m", "lib.rebuild_lock", "--describe-holder", "--database-url", url],
+            capture_output=True,
+            text=True,
+            cwd=REPO_ROOT,
+            timeout=60,
+        )
+
+    def test_prints_the_holder_and_exits_zero(self, fresh_db_url: str) -> None:
+        conn = try_acquire_rebuild_lock(fresh_db_url, holder=REBUILD_LOCK_HOLDER_DEDUP)
+        assert conn is not None
+        try:
+            result = self._run(fresh_db_url)
+        finally:
+            release_rebuild_lock(conn)
+        assert (result.returncode, result.stdout) == (0, f"{REBUILD_LOCK_HOLDER_DEDUP}\n")
+
+    def test_an_unnamed_holder_is_exit_zero_with_empty_output(self, fresh_db_url: str) -> None:
+        holder = _hold_lock_by_hand(fresh_db_url, "")
+        try:
+            result = self._run(fresh_db_url)
+        finally:
+            holder.close()
+        assert (result.returncode, result.stdout.strip()) == (0, "")
+
+    def test_a_free_lock_has_its_own_exit_code(self, fresh_db_url: str) -> None:
+        result = self._run(fresh_db_url)
+        assert (result.returncode, result.stdout) == (REBUILD_LOCK_HOLDER_FREE_EXIT_CODE, "")
+        assert REBUILD_LOCK_HOLDER_FREE_EXIT_CODE not in (0, 1, 2, REBUILD_LOCK_BOWED_OUT_EXIT_CODE)
+
+
 class TestReleaseRebuildLock:
     def test_release_closes_the_connection(self, fresh_db_url: str) -> None:
-        conn = try_acquire_rebuild_lock(fresh_db_url)
+        conn = try_acquire_rebuild_lock(fresh_db_url, holder=_HOLDER)
         assert conn is not None
         release_rebuild_lock(conn)
         assert conn.closed
@@ -211,11 +368,11 @@ class TestReleaseRebuildLock:
         without ever issuing pg_advisory_unlock must still free the lock,
         because Postgres ties a session-level advisory lock to the backend's
         connection lifetime, not to an explicit unlock call."""
-        conn = try_acquire_rebuild_lock(fresh_db_url)
+        conn = try_acquire_rebuild_lock(fresh_db_url, holder=_HOLDER)
         assert conn is not None
         conn.close()  # no pg_advisory_unlock call at all
 
-        reacquired = try_acquire_rebuild_lock(fresh_db_url)
+        reacquired = try_acquire_rebuild_lock(fresh_db_url, holder=_HOLDER)
         try:
             assert reacquired is not None, (
                 "Postgres must release a session-level advisory lock when its "
@@ -250,7 +407,7 @@ class TestReleaseRebuildLock:
             assert line.strip() == "locked", f"holder subprocess failed to acquire: {line!r}"
 
             # Confirm real contention while the holder is alive.
-            assert try_acquire_rebuild_lock(fresh_db_url) is None
+            assert try_acquire_rebuild_lock(fresh_db_url, holder=_HOLDER) is None
 
             proc.kill()  # SIGKILL -- no chance for the holder to clean up
             proc.wait(timeout=10)
@@ -260,7 +417,7 @@ class TestReleaseRebuildLock:
             deadline = time.monotonic() + 10.0
             reacquired = None
             while time.monotonic() < deadline:
-                reacquired = try_acquire_rebuild_lock(fresh_db_url)
+                reacquired = try_acquire_rebuild_lock(fresh_db_url, holder=_HOLDER)
                 if reacquired is not None:
                     break
                 time.sleep(0.2)

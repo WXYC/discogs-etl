@@ -216,6 +216,13 @@ running on the same host: it posts a `:lock:` Slack message distinguishing
 this same-host bow-out from the destination-database advisory-lock bow-out
 (`:no_entry:`), then exits 0 (not a failure).
 
+When the destination-database lock `354001` is held by something other than a
+peer rebuild (a dedup, a seed, an operator session), the script does not bow
+out at once: it posts `:hourglass_flowing_sand:` naming the holder and re-runs
+`run_pipeline.py` every 5 minutes for up to `REBUILD_LOCK_WAIT_MINUTES`
+(default 180; `0` restores the immediate bow-out). The wait counts against the
+instance's `MaxInstanceAgeHours`. See `docs/automation.md` failure item 5.
+
 ### Smoke mode
 
 Same recipe with `REBUILD_SMOKE=1` exits before any DB write — useful to

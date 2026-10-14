@@ -75,6 +75,25 @@ def _first_index(lines: list[str], needle: str) -> int:
     raise AssertionError(f"{needle!r} not found in non-comment lines of {SCRIPT_PATH}")
 
 
+def _branch_index(lines: list[str]) -> int:
+    """The post-loop ``-eq`` test of the exit code (the constant's definition and
+    the loop's ``-ne`` exit test sit above it)."""
+    return _first_index(lines, '-eq "$REBUILD_LOCK_BOWED_OUT_EXIT_CODE"')
+
+
+def _python_constant(name: str) -> str:
+    match = re.search(rf'^{name}\s*=\s*(\d+|"[^"]*")', LOCK_MODULE_PATH.read_text(), re.M)
+    assert match is not None, f"could not find {name} = <literal> in {LOCK_MODULE_PATH}"
+    return match.group(1).strip('"')
+
+
+def _python_free_exit_code() -> int:
+    return int(_python_constant("REBUILD_LOCK_HOLDER_FREE_EXIT_CODE"))
+
+
+REBUILD_HOLDER = "discogs-etl-rebuild"
+
+
 def _python_sentinel_value() -> int:
     source = LOCK_MODULE_PATH.read_text()
     match = re.search(r"^REBUILD_LOCK_BOWED_OUT_EXIT_CODE\s*=\s*(\d+)", source, re.MULTILINE)
@@ -113,7 +132,7 @@ def test_bow_out_literal_matches_python_sentinel(script_text: str) -> None:
 
 def test_bow_out_branch_precedes_drift_watchdog(script_lines: list[str]) -> None:
     pipeline_idx = _first_index(script_lines, "run_pipeline.py")
-    bowout_check_idx = _first_index(script_lines, "REBUILD_LOCK_BOWED_OUT_EXIT_CODE")
+    bowout_check_idx = _branch_index(script_lines)
     watchdog_idx = _first_index(script_lines, "check_cache_drift.py")
     assert pipeline_idx < bowout_check_idx < watchdog_idx, (
         "the bow-out exit-code check must sit between the run_pipeline.py "
@@ -124,7 +143,7 @@ def test_bow_out_branch_precedes_drift_watchdog(script_lines: list[str]) -> None
 
 
 def test_bow_out_branch_precedes_success_notification(script_lines: list[str]) -> None:
-    bowout_check_idx = _first_index(script_lines, "REBUILD_LOCK_BOWED_OUT_EXIT_CODE")
+    bowout_check_idx = _branch_index(script_lines)
     success_idx = _first_index(script_lines, "rebuilt successfully")
     assert bowout_check_idx < success_idx, (
         "the bow-out branch must be checked before the "
@@ -138,7 +157,7 @@ def test_bow_out_branch_exits_before_reaching_success_path(script_lines: list[st
     """The bow-out branch must itself `exit` -- otherwise execution falls
     through into the drift watchdog / success notify even after correctly
     detecting the bow-out."""
-    bowout_check_idx = _first_index(script_lines, "REBUILD_LOCK_BOWED_OUT_EXIT_CODE")
+    bowout_check_idx = _branch_index(script_lines)
     watchdog_idx = _first_index(script_lines, "check_cache_drift.py")
     between = script_lines[bowout_check_idx:watchdog_idx]
     assert any(re.search(r"\bexit\s+0\b", line) for line in between), (
@@ -150,7 +169,7 @@ def test_bow_out_branch_exits_before_reaching_success_path(script_lines: list[st
 
 
 def test_bow_out_notifies_slack_with_a_distinct_message(script_lines: list[str]) -> None:
-    bowout_check_idx = _first_index(script_lines, "REBUILD_LOCK_BOWED_OUT_EXIT_CODE")
+    bowout_check_idx = _branch_index(script_lines)
     watchdog_idx = _first_index(script_lines, "check_cache_drift.py")
     between = "\n".join(script_lines[bowout_check_idx:watchdog_idx])
     assert "notify_slack" in between, (
@@ -170,7 +189,7 @@ def test_non_bow_out_non_zero_exit_still_treated_as_failure(script_lines: list[s
     """A real crash (any exit code other than 0 or the bow-out sentinel)
     must still be surfaced as a failure, not silently swallowed by the new
     branch."""
-    bowout_check_idx = _first_index(script_lines, "REBUILD_LOCK_BOWED_OUT_EXIT_CODE")
+    bowout_check_idx = _branch_index(script_lines)
     watchdog_idx = _first_index(script_lines, "check_cache_drift.py")
     between = "\n".join(script_lines[bowout_check_idx:watchdog_idx])
     assert "on_error" in between, (
@@ -201,42 +220,48 @@ def _extract_err_traps(source: str) -> list[str]:
     return traps
 
 
-def _extract_exit_code_region(lines: list[str], stub_rc_var: str) -> str:
-    """Return the pipeline-invocation + exit-code-branch region of the script,
-    with the ``run_pipeline.py`` invocation swapped for a stub exiting
-    ``$stub_rc_var`` and everything else -- the capture construct, the branch
-    conditions, the notify calls, the ``exit``s -- kept verbatim.
+def _extract_lock_wait_region(lines: list[str]) -> str:
+    """Return the retry loop and the exit-code branches after it, verbatim.
 
-    Anchored on ``PIPELINE_EXIT_CODE=0`` through the closing ``fi`` rather
-    than on line numbers, so the region tracks edits to the script.
+    Anchored on the constants block through the ``fi`` that closes the
+    ``on_error`` branch rather than on line numbers, so the region tracks edits
+    to the script. Nothing in it is replaced: the harness stubs ``python``,
+    ``sleep``, ``notify_slack`` and ``report_outcome`` as shell functions, so
+    the capture construct, the loop, the branch conditions and the ``exit``s are
+    the script's own text.
     """
-    start = next(i for i, line in enumerate(lines) if line.strip() == "PIPELINE_EXIT_CODE=0")
-    end = next(i for i in range(start, len(lines)) if lines[i].strip() == "fi")
-
-    region = lines[start : end + 1]
-    invoke_start = next(i for i, line in enumerate(region) if "scripts/run_pipeline.py" in line)
-    invoke_end = invoke_start
-    while region[invoke_end].rstrip().endswith("\\"):
-        invoke_end += 1
-
-    tail = region[invoke_end].split("\\")[-1]
-    # Preserve whatever the real invocation appends after the command itself
-    # (today: `|| PIPELINE_EXIT_CODE=$?`). That suffix is the thing under test.
-    suffix = tail.split('"', 2)[-1] if '"' in tail else tail
-    stub = f'sh -c "exit ${stub_rc_var}"{suffix}'
-    return "\n".join([*region[:invoke_start], stub, *region[invoke_end + 1 :]])
+    start = next(
+        i for i, line in enumerate(lines) if line.startswith("REBUILD_LOCK_BOWED_OUT_EXIT_CODE=")
+    )
+    on_error = next(i for i in range(start, len(lines)) if "on_error " in lines[i])
+    end = next(i for i in range(on_error, len(lines)) if lines[i].strip() == "fi")
+    return "\n".join(lines[start : end + 1])
 
 
-def _build_harness(stub_rc: int) -> str:
+# Replies for the stubbed holder CLI: a name, "" for an unnamed holder, FREE for
+# "nobody holds it" (the CLI's exit 3) and ERROR for a failed lookup.
+FREE = "@free"
+ERROR = "@error"
+
+
+def _build_harness(
+    pipeline_rcs: list[int], holders: list[str], wait_minutes: int | None, free_exit_code: int
+) -> str:
     source = SCRIPT_PATH.read_text()
     lines = source.splitlines()
+    rcs = " ".join(str(rc) for rc in pipeline_rcs)
+    replies = " ".join(f"'{holder}'" for holder in holders)
     return "\n".join(
         [
             "set -euo pipefail",
             'LOG_FILE="/dev/null"',
             'WORK_DIR="/nonexistent"',
             'REPO_DIR="/nonexistent"',
-            f"STUB_RC={stub_rc}",
+            'PRESERVE_API_FETCH_ARG=""',
+            *([f"REBUILD_LOCK_WAIT_MINUTES={wait_minutes}"] if wait_minutes is not None else []),
+            f"PIPELINE_RCS=({rcs})",
+            f"HOLDER_REPLIES=({replies})",
+            "ATTEMPT=0",
             # Stand-in for the real notify_slack (which curls a webhook);
             # everything else below is the script's own code, verbatim.
             'notify_slack() { echo "NOTIFY $1 $2"; }',
@@ -245,19 +270,50 @@ def _build_harness(stub_rc: int) -> str:
             # verbatim below and calls it, so it has to exist here; the marker's
             # own behavior is pinned in test_rebuild_outcome_marker.py.
             'report_outcome() { echo "OUTCOME $1 ${2:-}"; }',
+            'sleep() { echo "SLEEP $1"; }',
+            # One stub for both python entry points the region calls. The
+            # pipeline's attempt N exits PIPELINE_RCS[N-1]; the holder CLI,
+            # called right after attempt N, answers HOLDER_REPLIES[N-1]. Both
+            # arrays repeat their last entry.
+            "python() {",
+            "    local n=$ATTEMPT",
+            '    case "$*" in',
+            "        *scripts/run_pipeline.py*)",
+            "            ATTEMPT=$((ATTEMPT + 1)); n=$ATTEMPT",
+            '            echo "PIPELINE attempt $n"',
+            "            [ $n -gt ${#PIPELINE_RCS[@]} ] && n=${#PIPELINE_RCS[@]}",
+            '            return "${PIPELINE_RCS[$((n - 1))]}" ;;',
+            "        *'-m lib.rebuild_lock --describe-holder'*)",
+            "            [ $n -gt ${#HOLDER_REPLIES[@]} ] && n=${#HOLDER_REPLIES[@]}",
+            '            local reply="${HOLDER_REPLIES[$((n - 1))]}"',
+            f'            [ "$reply" = "{FREE}" ] && return {free_exit_code}',
+            '            [ "$reply" = "' + ERROR + '" ] && return 1',
+            '            echo "$reply"; return 0 ;;',
+            '        *) echo "unexpected python call: $*" >&2; return 99 ;;',
+            "    esac",
+            "}",
             _extract_function(source, "on_error"),
             *_extract_err_traps(source),
-            _extract_exit_code_region(lines, "STUB_RC"),
+            _extract_lock_wait_region(lines),
             'echo "FELL THROUGH TO DRIFT WATCHDOG"',
         ]
     )
 
 
-def _run_harness(stub_rc: int, tmp_path: Path) -> subprocess.CompletedProcess[str]:
+def _run_harness(
+    pipeline_rcs: int | list[int],
+    tmp_path: Path,
+    *,
+    holders: list[str] | None = None,
+    wait_minutes: int | None = None,
+) -> subprocess.CompletedProcess[str]:
     bash = shutil.which("bash")
     assert bash is not None, "bash is required to execute this region"
+    rcs = [pipeline_rcs] if isinstance(pipeline_rcs, int) else pipeline_rcs
     harness = tmp_path / "harness.sh"
-    harness.write_text(_build_harness(stub_rc))
+    harness.write_text(
+        _build_harness(rcs, holders or [REBUILD_HOLDER], wait_minutes, _python_free_exit_code())
+    )
     return subprocess.run(
         [bash, str(harness)], capture_output=True, text=True, timeout=30, cwd=tmp_path
     )
@@ -306,8 +362,125 @@ class TestBowOutBranchActuallyExecutes:
         )
         assert "NOTIFY" not in result.stdout, "a clean run must not notify from this region"
 
+    def test_a_peer_rebuild_holder_bows_out_at_once(self, tmp_path: Path) -> None:
+        result = _run_harness([75], tmp_path, holders=[REBUILD_HOLDER])
+        assert result.returncode == 0, result.stdout
+        assert result.stdout.count("PIPELINE attempt") == 1
+        assert "SLEEP" not in result.stdout
+        assert "hourglass" not in result.stdout
+        assert "NOTIFY :no_entry:" in result.stdout
+        assert f"Holder: {REBUILD_HOLDER}." in result.stdout
+        assert "FELL THROUGH TO DRIFT WATCHDOG" not in result.stdout
+
+    @pytest.mark.parametrize(
+        ("holder", "label"),
+        [
+            ("discogs-etl-seed", "discogs-etl-seed"),
+            ("discogs-etl-dedup", "discogs-etl-dedup"),
+            ("", "an unnamed session"),
+            ("psql", "psql"),
+            (ERROR, "unknown"),
+        ],
+    )
+    def test_a_non_rebuild_holder_is_waited_out_then_the_rebuild_runs(
+        self, tmp_path: Path, holder: str, label: str
+    ) -> None:
+        result = _run_harness([75, 75, 0], tmp_path, holders=[holder], wait_minutes=180)
+        assert result.returncode == 0, result.stdout + result.stderr
+        out = result.stdout.splitlines()
+        assert out.count("SLEEP 300") == 2
+        assert result.stdout.count("PIPELINE attempt") == 3
+        hourglass = [line for line in out if line.startswith("NOTIFY :hourglass_flowing_sand:")]
+        assert len(hourglass) == 1, "the wait is announced once, not once per retry"
+        assert "354001" in hourglass[0]
+        assert label in hourglass[0]
+        assert re.search(r"retrying every 5 min until \w{3} \d\d:\d\d P[SD]T", hourglass[0])
+        assert "NOTIFY :warning:" not in result.stdout
+        assert "NOTIFY :no_entry:" not in result.stdout
+        assert "FELL THROUGH TO DRIFT WATCHDOG" in result.stdout
+
+    def test_a_non_rebuild_holder_past_the_deadline_bows_out_naming_it(
+        self, tmp_path: Path
+    ) -> None:
+        result = _run_harness([75], tmp_path, holders=["discogs-etl-seed"], wait_minutes=10)
+        assert result.returncode == 0, result.stdout
+        assert result.stdout.count("PIPELINE attempt") == 3  # t=0, t=5, t=10 min
+        assert result.stdout.count("SLEEP 300") == 2
+        final = next(ln for ln in result.stdout.splitlines() if ln.startswith("NOTIFY :no_entry:"))
+        assert "discogs-etl-seed" in final
+        assert "for the whole 10-minute wait" in final
+        outcome = next(
+            ln for ln in result.stdout.splitlines() if ln.startswith("OUTCOME bowed_out")
+        )
+        assert "discogs-etl-seed" in outcome
+        assert "FELL THROUGH TO DRIFT WATCHDOG" not in result.stdout
+
+    def test_the_holder_becoming_a_peer_rebuild_mid_wait_bows_out_then(
+        self, tmp_path: Path
+    ) -> None:
+        result = _run_harness([75, 75, 75], tmp_path, holders=["discogs-etl-dedup", REBUILD_HOLDER])
+        assert result.stdout.count("PIPELINE attempt") == 2
+        assert result.stdout.count("SLEEP 300") == 1
+        assert "NOTIFY :no_entry:" in result.stdout
+        assert "FELL THROUGH TO DRIFT WATCHDOG" not in result.stdout
+
+    def test_a_lock_released_between_attempt_and_lookup_is_retried_at_once(
+        self, tmp_path: Path
+    ) -> None:
+        result = _run_harness([75, 0], tmp_path, holders=[FREE])
+        assert result.stdout.count("PIPELINE attempt") == 2
+        assert "SLEEP" not in result.stdout
+        assert "hourglass" not in result.stdout
+        assert "FELL THROUGH TO DRIFT WATCHDOG" in result.stdout
+
+    def test_a_crash_while_waiting_still_fails_loudly(self, tmp_path: Path) -> None:
+        result = _run_harness([75, 1], tmp_path, holders=["discogs-etl-seed"])
+        assert result.returncode == 1
+        assert "NOTIFY :warning:" in result.stdout
+        assert "FELL THROUGH TO DRIFT WATCHDOG" not in result.stdout
+
+    def test_zero_minutes_restores_the_immediate_bow_out(self, tmp_path: Path) -> None:
+        result = _run_harness([75], tmp_path, holders=["discogs-etl-seed"], wait_minutes=0)
+        assert result.returncode == 0
+        assert result.stdout.count("PIPELINE attempt") == 1
+        assert "SLEEP" not in result.stdout
+        assert "hourglass" not in result.stdout
+        assert "Holder:" not in result.stdout, "no lookup is made when the wait is off"
+        assert "NOTIFY :no_entry:" in result.stdout
+
 
 WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "rebuild-cache.yml"
+DEPLOY_WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "deploy-ephemeral-rebuild.yml"
+
+
+class TestLockWaitConstants:
+    """The shell's literals for the wait (#465), pinned to the Python side."""
+
+    def test_rebuild_holder_name_matches_python(self, script_text: str) -> None:
+        code = "\n".join(_non_comment_lines(script_text.splitlines()))
+        expected = _python_constant("REBUILD_LOCK_HOLDER_REBUILD")
+        assert re.search(rf'REBUILD_LOCK_REBUILD_HOLDER="{re.escape(expected)}"', code)
+
+    def test_free_exit_code_matches_python(self, script_text: str) -> None:
+        code = "\n".join(_non_comment_lines(script_text.splitlines()))
+        expected = _python_free_exit_code()
+        assert re.search(rf"REBUILD_LOCK_HOLDER_FREE_EXIT_CODE={expected}\b", code)
+
+    def test_wait_fits_inside_the_instance_lifetime(self, script_text: str) -> None:
+        """The wait, about 30 min of setup and a 90-minute rebuild must finish
+        before the sweeper's earliest kill (exactly MaxInstanceAgeHours), with
+        an hour to spare for a rebuild that runs long. The deployed limit is
+        the workflow's: SAM keeps a parameter's previous value unless it is
+        passed, so the template default alone does not reach the stack."""
+        default = re.search(r"REBUILD_LOCK_WAIT_MINUTES:-(\d+)", script_text)
+        assert default is not None, "REBUILD_LOCK_WAIT_MINUTES needs a literal default"
+        age = re.search(r"MaxInstanceAgeHours=(\d+)", DEPLOY_WORKFLOW_PATH.read_text())
+        assert age is not None, f"no MaxInstanceAgeHours= override in {DEPLOY_WORKFLOW_PATH}"
+        wait, max_age_minutes = int(default.group(1)), 60 * int(age.group(1))
+        assert wait + 120 <= max_age_minutes - 60, (
+            f"a {wait}-minute lock wait + 120 minutes of setup and rebuild must fit in the "
+            f"{max_age_minutes}-minute instance limit with an hour of margin"
+        )
 
 
 def test_workflow_bow_out_literal_matches_python_sentinel() -> None:
