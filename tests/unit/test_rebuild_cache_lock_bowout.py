@@ -441,7 +441,7 @@ class TestBowOutBranchActuallyExecutes:
         assert result.stdout.count("SLEEP 300") == 2
         final = next(ln for ln in result.stdout.splitlines() if ln.startswith("NOTIFY :no_entry:"))
         assert "discogs-etl-seed" in final
-        assert "for the whole 10-minute wait" in final
+        assert "could not take the lock in the whole 10-minute wait" in final
         outcome = next(
             ln for ln in result.stdout.splitlines() if ln.startswith("OUTCOME bowed_out")
         )
@@ -488,7 +488,7 @@ class TestBowOutBranchActuallyExecutes:
         assert result.stdout.count("PIPELINE attempt") == 4  # once at once, then t=0, 5, 10
         assert result.stdout.count("SLEEP 300") == 2
         final = next(ln for ln in result.stdout.splitlines() if ln.startswith("NOTIFY :no_entry:"))
-        assert "for the whole 10-minute wait" in final
+        assert "could not take the lock in the whole 10-minute wait" in final
         assert "FELL THROUGH TO DRIFT WATCHDOG" not in result.stdout
 
     def test_a_quote_or_backslash_in_the_holder_name_keeps_the_slack_json_valid(
@@ -515,7 +515,7 @@ class TestBowOutBranchActuallyExecutes:
             "SLEEP 300",
             "SLEEP 120",
         ]
-        assert "for the whole 7-minute wait" in result.stdout
+        assert "could not take the lock in the whole 7-minute wait" in result.stdout
 
     def test_time_spent_in_attempts_counts_against_the_wait(self, tmp_path: Path) -> None:
         """Slow attempts (connect retries) must not stretch the wait past its
@@ -545,7 +545,7 @@ class TestBowOutBranchActuallyExecutes:
     def test_a_leading_zero_is_read_as_decimal(self, tmp_path: Path) -> None:
         result = _run_harness([75], tmp_path, holders=["discogs-etl-seed"], wait_minutes="08")
         assert result.returncode == 0, result.stdout + result.stderr
-        assert "for the whole 8-minute wait" in result.stdout
+        assert "could not take the lock in the whole 8-minute wait" in result.stdout
 
     def test_a_date_that_cannot_format_the_deadline_still_waits(self, tmp_path: Path) -> None:
         """The deadline is display-only; it must not fail the run."""

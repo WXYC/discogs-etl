@@ -216,7 +216,7 @@ running on the same host: it posts a `:lock:` Slack message distinguishing
 this same-host bow-out from the destination-database advisory-lock bow-out
 (`:no_entry:`), then exits 0 (not a failure).
 
-When the destination-database lock `354001` is held by something other than a peer rebuild (a dedup, a seed, an operator session), the script does not bow out at once: it posts `:hourglass_flowing_sand:` naming the holder and re-runs `run_pipeline.py` every 5 minutes for up to `REBUILD_LOCK_WAIT_MINUTES` (default 180; `0` restores the immediate bow-out). A failed holder lookup bows out at once, like a peer rebuild. The wait counts against the instance's `MaxInstanceAgeHours`. See `docs/automation.md` failure item 5.
+When the destination-database lock `354001` is held by something other than a peer rebuild (a dedup, a seed, an operator session), the script does not bow out at once: it posts `:hourglass_flowing_sand:` naming the holder and re-runs `run_pipeline.py` every 5 minutes for up to `REBUILD_LOCK_WAIT_MINUTES` (default 180). `scripts/rebuild-cache-bootstrap.sh` does not pass `REBUILD_LOCK_WAIT_MINUTES` through, so an ephemeral instance always waits the default; `0`, which restores the immediate bow-out, takes effect only where the variable reaches `rebuild-cache.sh`, such as the legacy host's `/etc/discogs-rebuild.env`. A failed holder lookup bows out at once, like a peer rebuild. The wait counts against the instance's `MaxInstanceAgeHours`. See `docs/automation.md` failure item 5.
 
 ### Smoke mode
 
