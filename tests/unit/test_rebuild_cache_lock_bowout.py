@@ -252,6 +252,7 @@ def _build_harness(
     free_exit_code: int,
     real_notify: bool = False,
     stubs: tuple[str, ...] = (),
+    pipeline_cost: int = 0,
 ) -> str:
     source = SCRIPT_PATH.read_text()
     lines = source.splitlines()
@@ -268,6 +269,9 @@ def _build_harness(
             f"PIPELINE_RCS=({rcs})",
             f"HOLDER_REPLIES=({replies})",
             "ATTEMPT=0",
+            # Seconds each stubbed pipeline attempt takes, by advancing bash's
+            # own SECONDS clock.
+            f"PIPELINE_COST={pipeline_cost}",
             # Stand-in for the real notify_slack (which curls a webhook);
             # everything else below is the script's own code, verbatim. With
             # real_notify the script's own notify_slack runs and only curl is
@@ -299,6 +303,7 @@ def _build_harness(
             "        *scripts/run_pipeline.py*)",
             "            ATTEMPT=$((ATTEMPT + 1)); n=$ATTEMPT",
             '            echo "PIPELINE attempt $n"',
+            "            SECONDS=$((SECONDS + PIPELINE_COST))",
             "            [ $n -gt ${#PIPELINE_RCS[@]} ] && n=${#PIPELINE_RCS[@]}",
             '            return "${PIPELINE_RCS[$((n - 1))]}" ;;',
             "        *'-m lib.rebuild_lock --describe-holder'*)",
@@ -326,6 +331,7 @@ def _run_harness(
     wait_minutes: int | str | None = None,
     real_notify: bool = False,
     stubs: tuple[str, ...] = (),
+    pipeline_cost: int = 0,
 ) -> subprocess.CompletedProcess[str]:
     bash = shutil.which("bash")
     assert bash is not None, "bash is required to execute this region"
@@ -339,6 +345,7 @@ def _run_harness(
             _python_free_exit_code(),
             real_notify,
             stubs,
+            pipeline_cost,
         )
     )
     return subprocess.run(
@@ -499,7 +506,7 @@ class TestBowOutBranchActuallyExecutes:
         assert len(payloads) == 2  # the hourglass post and the bow-out
         texts = [json.loads(p)["text"] for p in payloads]
         assert ":hourglass_flowing_sand:" in texts[0]
-        assert "Holder: ops ddl x, which held the lock" in texts[1]
+        assert "Holder at the deadline: ops ddl x;" in texts[1]
 
     def test_the_last_sleep_stops_at_the_deadline(self, tmp_path: Path) -> None:
         result = _run_harness([75], tmp_path, holders=["discogs-etl-seed"], wait_minutes=7)
@@ -509,6 +516,17 @@ class TestBowOutBranchActuallyExecutes:
             "SLEEP 120",
         ]
         assert "for the whole 7-minute wait" in result.stdout
+
+    def test_time_spent_in_attempts_counts_against_the_wait(self, tmp_path: Path) -> None:
+        """Slow attempts (connect retries) must not stretch the wait past its
+        budget, which the instance-lifetime test relies on."""
+        result = _run_harness(
+            [75], tmp_path, holders=["discogs-etl-seed"], wait_minutes=10, pipeline_cost=400
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert result.stdout.count("PIPELINE attempt") == 2
+        assert [ln for ln in result.stdout.splitlines() if ln.startswith("SLEEP")] == ["SLEEP 200"]
+        assert "NOTIFY :no_entry:" in result.stdout
 
     @pytest.mark.parametrize("wait_minutes", ["90m", "3h", " 5"])
     def test_a_wait_that_is_not_whole_minutes_falls_back_to_the_default(
