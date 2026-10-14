@@ -1562,11 +1562,11 @@ class TestArtistStubOneRowPerId:
     def test_existing_row_keeps_its_name(self, tmp_path, tombstoned) -> None:
         """An id already in ``artist`` keeps its name, profile and fetch stamp.
 
-        The conflict branch only clears an LML#510 tombstone, and only a
-        tombstoned row is rewritten at all (its row version changes; a live
-        row's does not). Here the dump credits the id under two spellings
-        that both differ from the stored name, so a branch that rewrote
-        ``name`` would show.
+        The conflict branch rewrites only a tombstone or a row named ``''``
+        (its row version changes; a live, named row's does not), and it fills
+        only an empty name (``TestImportClearsTombstones``). Here the stored
+        name is real and the dump credits the id under two spellings that both
+        differ from it, so a branch that overwrote ``name`` would show.
         """
         row_sql = (
             "SELECT name, profile, fetched_at = '2026-09-01T00:00:00Z', not_found, xmin::text "
