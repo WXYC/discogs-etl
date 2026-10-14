@@ -205,7 +205,15 @@ def stage_snapshot_from(source_url: str, target_url: str) -> int:
                 if not _exists(s, table):
                     continue
                 target_cols = set(_columns(t, table))
-                cols = ", ".join(c for c in _columns(s, table) if c in target_cols)
+                source_cols = _columns(s, table)
+                dropped = [c for c in source_cols if c not in target_cols]
+                if dropped:
+                    logger.warning(
+                        "%s: not restoring export columns missing from --target: %s",
+                        table,
+                        ", ".join(dropped),
+                    )
+                cols = ", ".join(c for c in source_cols if c in target_cols)
                 t.execute(f"CREATE TABLE {_snap(table)} AS SELECT {cols} FROM {table} WHERE false")
                 select = f"SELECT {cols} FROM {table} WHERE {_key(table)} {_API_FETCH_IDS}"
                 with s.copy(f"COPY ({select}) TO STDOUT") as out:
@@ -318,6 +326,29 @@ def restore_api_fetch_releases(db_url: str) -> PreservationSummary | None:
         raise ApiFetchRestoreError(str(exc)) from exc
     logger.info(summary.format())
     return summary
+
+
+def restore_input_problem(source_url: str, target_url: str) -> str | None:
+    """Say why *source_url* / *target_url* are not an export and a cache, or return None (#462).
+
+    The export must hold ``api_fetch`` releases and the cache every snapshot
+    table. Anything else is the wrong database, which a restore would report as
+    a successful no-op or fail on mid-run. Both are only read.
+    """
+    with psycopg.connect(source_url) as conn:
+        conn.read_only = True
+        with conn.cursor() as cur:
+            for table in ("release", "cache_metadata"):
+                if not _exists(cur, table):
+                    return f"--source has no {table} table"
+            cur.execute(f"SELECT count(*) FROM release WHERE id {_API_FETCH_IDS}")
+            if cur.fetchone()[0] == 0:
+                return "--source holds no api_fetch releases"
+    with psycopg.connect(target_url) as conn, conn.cursor() as cur:
+        for table in SNAPSHOT_TABLES:
+            if not _exists(cur, table):
+                return f"--target has no {table} table"
+    return None
 
 
 def plan_restore_from(source_url: str, target_url: str) -> PreservationSummary:
