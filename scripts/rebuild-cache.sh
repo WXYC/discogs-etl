@@ -516,7 +516,8 @@ fi
 # refused attempt costs seconds. The call keeps the ERR-trap-safe shape above
 # inside the loop; only exit 75 is retried, so any other exit still reaches
 # on_error below. The wait adds up the sleeps plus the time each attempt and
-# lookup took (bash SECONDS), so the tests can stub `sleep` and advance SECONDS. It must stay inside the instance's lifetime: see
+# lookup took (bash SECONDS), so the tests can stub `sleep` and advance
+# SECONDS. It must stay inside the instance's lifetime: see
 # test_wait_fits_inside_the_instance_lifetime.
 REBUILD_LOCK_BOWED_OUT_EXIT_CODE=75
 REBUILD_LOCK_HOLDER_FREE_EXIT_CODE=3
@@ -581,6 +582,8 @@ while :; do
     fi
 
     if [ "$LOCK_ACTION" = "retry_now" ]; then
+        # Skip the sleep, not the clock.
+        REBUILD_LOCK_WAITED_SECONDS=$((REBUILD_LOCK_WAITED_SECONDS + SECONDS - LOCK_ATTEMPT_STARTED))
         continue
     elif [ "$LOCK_ACTION" = "bow_out" ]; then
         LOCK_BOWOUT_NOTE=" Holder: ${LOCK_HOLDER_LABEL}."

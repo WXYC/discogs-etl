@@ -517,6 +517,25 @@ class TestBowOutBranchActuallyExecutes:
         ]
         assert "could not take the lock in the whole 7-minute wait" in result.stdout
 
+    def test_time_spent_before_an_immediate_retry_counts_against_the_wait(
+        self, tmp_path: Path
+    ) -> None:
+        """The free-lock retry skips the sleep, not the clock: the attempt and
+        lookup before it still count, so a slow 75-then-free cycle cannot
+        stretch the wait past its budget."""
+        result = _run_harness(
+            [75],
+            tmp_path,
+            holders=[FREE, "discogs-etl-seed"],
+            wait_minutes=10,
+            pipeline_cost=400,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        # 400 s before the immediate retry plus 400 s for the second attempt
+        # already passes the 600 s budget, so nothing is left to sleep.
+        assert [ln for ln in result.stdout.splitlines() if ln.startswith("SLEEP")] == ["SLEEP 0"]
+        assert "NOTIFY :no_entry:" in result.stdout
+
     def test_time_spent_in_attempts_counts_against_the_wait(self, tmp_path: Path) -> None:
         """Slow attempts (connect retries) must not stretch the wait past its
         budget, which the instance-lifetime test relies on."""
