@@ -149,7 +149,7 @@ def test_trap_on_exit_registered_before_imds_calls(script_lines: list[str]) -> N
 
     If IMDS is flaky or a metadata-network blip makes ``imds_token`` exit
     non-zero, ``set -e`` kills the script. Without the trap registered,
-    no S3 upload, no ``shutdown -h now`` — instance sits idle until the 3h
+    no S3 upload, no ``shutdown -h now`` — instance sits idle until the 6h
     sweeper.
     """
     trap_line = first_line_index(script_lines, "trap on_exit EXIT")
@@ -530,7 +530,7 @@ def test_empty_result_fail_open_message_unchanged(script_lines: list[str]) -> No
     """#355 must not touch the genuinely-empty-result fail-open kept from #311.
 
     ``DescribeInstances`` really is eventually consistent, the launcher
-    precheck already ran, and the >3h sweeper is a backstop -- a *successful*
+    precheck already ran, and the >6h sweeper is a backstop -- a *successful*
     query that legitimately finds zero peers must still proceed with its
     original message unchanged.
     """

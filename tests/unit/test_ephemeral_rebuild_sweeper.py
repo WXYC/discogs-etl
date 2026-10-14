@@ -168,7 +168,7 @@ def test_list_active_rebuild_instances_ignores_age(handler_module):
 
 
 def test_max_age_hours_env_override(handler_module, monkeypatch):
-    """A 1h override should sweep instances that a 3h default leaves alone."""
+    """A 1h override should sweep instances that a 6h default leaves alone."""
     monkeypatch.setenv("MAX_INSTANCE_AGE_HOURS", "1")
     ec2 = _make_ec2(
         reservations=[

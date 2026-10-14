@@ -265,7 +265,7 @@ normally.
 
 An **empty** peer result is a different, benign line (`WARN: peer check found no active rebuild
 instances (self not yet visible?); proceeding`) and does not abort: `DescribeInstances` is
-eventually consistent, the launcher precheck already ran, and the >3h sweeper is the backstop. The
+eventually consistent, the launcher precheck already ran, and the >6h sweeper is the backstop. The
 two messages are deliberately distinct so they grep apart.
 
 ### Slack alerts but no log file in `/var/log/discogs-rebuild/`

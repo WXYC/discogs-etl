@@ -2,8 +2,9 @@
 
 Why the workflow reports its deploy outcome, and why
 ``--no-fail-on-empty-changeset`` stays, is in ``scripts/sam_deploy_summary.py``'s
-module docstring. This file pins only the plumbing that makes the report
-possible, all of which is silently breakable:
+module docstring. This file pins the plumbing that makes the report
+possible, and the ``--parameter-overrides`` contract (#481), all of which is
+silently breakable:
 
 1. **SAM's own exit status must survive the pipe.** ``sam deploy | tee`` makes
    ``$?`` ``tee``'s status, which is 0 essentially always. Reading ``$?`` here
@@ -19,6 +20,10 @@ possible, all of which is silently breakable:
 4. **The renderer must be importable without a ``pip install``.** The deploy
    job installs nothing; a renderer that imported a third-party package would
    traceback in the step whose job is to explain other failures.
+5. **``MaxInstanceAgeHours`` is passed, as the template default.** SAM keeps the
+   deployed value for an absent parameter, so the workflow's copy is the live
+   one; it must equal the template's, as a whole token. ``ScheduleState`` must
+   stay absent in every spelling.
 
 These are static-structural assertions, which per #397 may pin presence and
 ordering but cannot make reachability claims. All five outcomes -- and the
@@ -31,6 +36,8 @@ than in a third private copy of the harness #397 exists to consolidate.
 from __future__ import annotations
 
 import ast
+import itertools
+import shlex
 import sys
 from pathlib import Path
 from typing import Any
@@ -40,9 +47,11 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
 
+from tests.cfn_yaml import load_cfn  # noqa: E402
 from tests.workflow_yaml import load_workflow, step_named, steps, working_directory  # noqa: E402
 
 WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "deploy-ephemeral-rebuild.yml"
+TEMPLATE_PATH = REPO_ROOT / "infra" / "ephemeral-rebuild" / "template.yaml"
 RENDERER = "sam_deploy_summary.py"
 RENDERER_PATH = REPO_ROOT / "scripts" / RENDERER
 
@@ -71,15 +80,6 @@ class TestTheDeployStepCapturesItsOutcome:
         a red run on ``main``; it is safe only because the outcome is now
         reported, and these two facts belong in the same test file."""
         assert "--no-fail-on-empty-changeset" in _step("deploy", DEPLOY_STEP_NAME)["run"]
-
-    def test_max_instance_age_is_overridden_explicitly(self) -> None:
-        """SAM sends UsePreviousValue=true for absent parameters, so a changed
-        template default alone would never reach the deployed stack (#464)."""
-        assert "MaxInstanceAgeHours=6" in _step("deploy", DEPLOY_STEP_NAME)["run"]
-
-    def test_schedule_state_is_still_not_overridden(self) -> None:
-        run = _step("deploy", DEPLOY_STEP_NAME)["run"]
-        assert "ScheduleState=" not in run
 
     def test_sam_output_is_captured_to_a_file(self) -> None:
         run = _step("deploy", DEPLOY_STEP_NAME)["run"]
@@ -128,6 +128,31 @@ class TestTheDeployStepCapturesItsOutcome:
         run = _step("deploy", DEPLOY_STEP_NAME)["run"]
         assert run.index("set +e") < run.index("${PIPESTATUS[0]}")
         assert run.index("${PIPESTATUS[0]}") < run.rindex("set -e")
+
+
+class TestTheParameterOverrides:
+    """CI pins ``MaxInstanceAgeHours`` to the template default (#481), and
+    leaves ``ScheduleState`` to SAM's keep-previous-value behaviour."""
+
+    def _override_tokens(self) -> list[str]:
+        """Shell words after ``--parameter-overrides`` up to the next flag."""
+        run = _step("deploy", DEPLOY_STEP_NAME)["run"].replace("\\\n", " ")
+        words = shlex.split(run, comments=True)
+        rest = words[words.index("--parameter-overrides") + 1 :]
+        return list(itertools.takewhile(lambda w: not w.startswith("--"), rest))
+
+    def test_max_instance_age_is_exactly_the_template_default(self) -> None:
+        """SAM sends UsePreviousValue=true for absent parameters, so the
+        workflow's value is the one the stack gets; a token match, not a
+        substring, so ``=60`` cannot pass for ``=6``."""
+        template = load_cfn(TEMPLATE_PATH)
+        default = template["Parameters"]["MaxInstanceAgeHours"]["Default"]
+        assert f"MaxInstanceAgeHours={default}" in self._override_tokens()
+
+    def test_schedule_state_is_not_overridden(self) -> None:
+        run = _step("deploy", DEPLOY_STEP_NAME)["run"]
+        assert not any("ScheduleState" in t for t in self._override_tokens())
+        assert "ParameterKey=ScheduleState" not in run
 
 
 class TestTheReportStep:

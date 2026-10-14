@@ -130,7 +130,7 @@ def lambda_handler(event, context, ec2_client=None, cloudwatch_client=None):
     # raise trips LauncherErrorAlarm and EventBridge's async retries would
     # relaunch the very instance we're trying to suppress. Instead log, emit
     # the LaunchCollisionAborted metric, and return. Instance state is the
-    # lease; the >3h sweeper is its TTL, so a crashed instance can't wedge
+    # lease; the >6h sweeper is its TTL, so a crashed instance can't wedge
     # future rebuilds. Checked before rendering user-data so it's a cheap
     # fail-fast. (TOCTOU note: DescribeInstances isn't atomic, so two launches
     # inside the pending/propagation window can still both proceed — this is a
