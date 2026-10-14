@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import logging
 import sqlite3
 import sys
 from pathlib import Path
@@ -241,14 +242,17 @@ class TestDumpClassificationEndToEnd:
         assert counts["total_release_rows"] == 7
 
 
-# A pinned release with a ``release`` row but no ``extra = 0`` credit. A pin the
-# dump no longer carries looks like this after the import: the prune exemption
-# keeps its ``release`` row (#424) and the child TRUNCATE empties its
-# ``release_artist`` rows. load_discogs_releases joins ``extra = 0`` credits, so
-# the classification never sees it, yet it is present and must stay kept.
+# A pinned release with a ``release`` row but no ``extra = 0`` credit. After the
+# default (upsert) import, a pin the dump no longer carries looks like this: the
+# prune exemption keeps its ``release`` row (#424) and the child TRUNCATE empties
+# its ``release_artist`` rows. (Under --truncate-existing or --direct-pg the same
+# pin has no ``release`` row at all, the ABSENT_PINNED_ID shape.)
+# load_discogs_releases joins ``extra = 0`` credits, so the classification never
+# sees it, yet it is present and must stay kept.
 CREDITLESS_PINNED_ID = 7
 # A pinned id with no ``release`` row at all: the 2026-10-13 shape (#446).
 ABSENT_PINNED_ID = 99_999
+ABSENT_PINNED_PHRASE = "pinned release_id override(s) have no release row"
 
 
 class TestPinsWithoutAReleaseRow:
@@ -273,15 +277,92 @@ class TestPinsWithoutAReleaseRow:
                 (CREDITLESS_PINNED_ID, "Hollow Pin", "CD"),
             )
 
-        out_dir = _run_dump(
-            tmp_path,
-            fresh_db_url,
-            monkeypatch,
-            pins=[PINNED_ID, CREDITLESS_PINNED_ID, ABSENT_PINNED_ID],
-        )
+        with caplog.at_level(logging.WARNING, logger=_vc.logger.name):
+            out_dir = _run_dump(
+                tmp_path,
+                fresh_db_url,
+                monkeypatch,
+                pins=[PINNED_ID, CREDITLESS_PINNED_ID, ABSENT_PINNED_ID],
+            )
 
         assert _read_ids(out_dir / "override_ids.txt") == {PINNED_ID, CREDITLESS_PINNED_ID}
         keep = _read_ids(out_dir / "keep_ids.txt")
         assert CREDITLESS_PINNED_ID in keep
         assert ABSENT_PINNED_ID not in keep
+        assert ABSENT_PINNED_PHRASE in caplog.text
+        assert f"[{ABSENT_PINNED_ID}]" in caplog.text
+
+
+# One more prune id than the inline-DELETE limit in async_main, so --prune takes
+# the copy-swap branch, where the copy-count guard aborted the 2026-10-13 run.
+COPY_SWAP_JUNK_START = 200_000
+COPY_SWAP_JUNK_COUNT = 10_001
+
+
+class TestProductionPruneWithPins:
+    """The same pins through the call run_pipeline.py makes: ``--prune
+    --keep-release-ids`` with no ``--dump-classification`` (it is opt-in and
+    off on the monthly rebuild), on a cache big enough for the copy-swap prune.
+
+    TestPinsWithoutAReleaseRow reads the dump files, so it cannot see a fix that
+    only reaches the dump path, or a prune branch handed the unfiltered pins.
+    Either one lets the absent pin into the copy-swap prune, and its count
+    guard raises CopySwapShortfallError, the #446 abort.
+    """
+
+    def test_prune_keeps_present_pins_and_completes_past_an_absent_one(
+        self, tmp_path, fresh_db_url, monkeypatch, caplog
+    ):
+        _seed_cache(fresh_db_url)
+        last = COPY_SWAP_JUNK_START + COPY_SWAP_JUNK_COUNT - 1
+        with psycopg.connect(fresh_db_url, autocommit=True) as conn:
+            conn.execute(
+                "INSERT INTO release (id, title, format) VALUES (%s, %s, %s)",
+                (CREDITLESS_PINNED_ID, "Hollow Pin", "CD"),
+            )
+            # One junk artist: a single classification group, so this stays cheap.
+            conn.execute(
+                "INSERT INTO release (id, title, format) "
+                "SELECT g, 'Nowhere ' || g, 'CD' FROM generate_series(%s, %s) g",
+                (COPY_SWAP_JUNK_START, last),
+            )
+            conn.execute(
+                "INSERT INTO release_artist (release_id, artist_name, extra) "
+                "SELECT g, 'Foobar Nonexist', 0 FROM generate_series(%s, %s) g",
+                (COPY_SWAP_JUNK_START, last),
+            )
+        library_db = tmp_path / "library.db"
+        _build_library(library_db)
+        keep_file = tmp_path / "keep_release_ids.txt"
+        keep_file.write_text(f"{PINNED_ID}\n{CREDITLESS_PINNED_ID}\n{ABSENT_PINNED_ID}\n")
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "verify_cache.py",
+                "--prune",
+                str(library_db),
+                fresh_db_url,
+                "--keep-release-ids",
+                str(keep_file),
+            ],
+        )
+        copy_swap_calls: list[set[int]] = []
+        real_copy_swap = _vc.prune_releases_copy_swap
+
+        def _spy(db_url, keep_ids, review_ids):
+            copy_swap_calls.append(set(keep_ids) | set(review_ids))
+            return real_copy_swap(db_url, keep_ids, review_ids)
+
+        monkeypatch.setattr(_vc, "prune_releases_copy_swap", _spy)
+
+        with caplog.at_level(logging.WARNING, logger=_vc.logger.name):
+            asyncio.run(_vc.async_main())
+
+        kept = {1, 2, 3, PINNED_ID, MULTI_ARTIST_KEEP_ID, CREDITLESS_PINNED_ID}
+        assert copy_swap_calls == [kept]
+        with psycopg.connect(fresh_db_url) as conn:
+            survivors = {row[0] for row in conn.execute("SELECT id FROM release")}
+        assert survivors == kept
+        assert ABSENT_PINNED_PHRASE in caplog.text
         assert f"[{ABSENT_PINNED_ID}]" in caplog.text

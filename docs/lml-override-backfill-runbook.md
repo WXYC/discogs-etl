@@ -85,7 +85,7 @@ Exits 0 only when every override source has `missing_from_cache == 0`. Non-zero 
 
 ### 7. Confirm the keep-release-ids exemption protects the backfill
 
-This is exercised automatically the next time `run_pipeline.py` runs a rebuild: `write_keep_release_ids` reads the *entire* `library_release_override` table fresh at the start of every run (not just the previously-missing subset), so the backfilled ids are covered by construction — `apply_release_overrides` unconditionally unions every id in that allowlist into `keep_ids` regardless of fuzzy-match result. Nothing to do here for the pipeline path.
+This is exercised automatically the next time `run_pipeline.py` runs a rebuild: `write_keep_release_ids` reads the *entire* `library_release_override` table fresh at the start of every run (not just the previously-missing subset), so the backfilled ids are covered by construction — `apply_release_overrides` unions every allowlisted id that has a `release` row into `keep_ids` regardless of fuzzy-match result (since [#447](https://github.com/WXYC/discogs-etl/pull/447), `drop_absent_overrides` first logs and drops any pin with no `release` row, which cannot be copied). Nothing to do here for the pipeline path.
 
 To check ahead of the next scheduled rebuild (e.g. same day as the backfill), generate a fresh allowlist directly (`run_pipeline.py` has no standalone flag for just this step — `write_keep_release_ids` only runs as part of a full pipeline invocation) and run `verify_cache.py` in its default dry-run mode (no `--prune`, no `--copy-to`):
 
