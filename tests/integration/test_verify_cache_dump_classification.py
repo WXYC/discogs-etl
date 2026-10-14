@@ -128,23 +128,23 @@ def _read_ids(path: Path) -> set[int]:
     return {int(line) for line in text.splitlines() if line}
 
 
-@pytest.fixture()
-def dump_dir(tmp_path, fresh_db_url, monkeypatch):
-    """Seed cache + library, run async_main --dump-classification, return the dump dir."""
-    _seed_cache(fresh_db_url)
+def _run_dump(tmp_path: Path, db_url: str, monkeypatch, pins: list[int]) -> Path:
+    """Build the library, pin *pins*, run async_main --dump-classification, return the dump dir.
 
+    The cache must already be seeded.
+    """
     library_db = tmp_path / "library.db"
     _build_library(library_db)
 
     keep_file = tmp_path / "keep_release_ids.txt"
-    keep_file.write_text(f"{PINNED_ID}\n")
+    keep_file.write_text("".join(f"{pin}\n" for pin in pins))
 
     out_dir = tmp_path / "prune-audit"
 
     argv = [
         "verify_cache.py",
         str(library_db),
-        fresh_db_url,
+        db_url,
         "--dump-classification",
         str(out_dir),
         "--keep-release-ids",
@@ -155,6 +155,13 @@ def dump_dir(tmp_path, fresh_db_url, monkeypatch):
     # the cache is never mutated.
     asyncio.run(_vc.async_main())
     return out_dir
+
+
+@pytest.fixture()
+def dump_dir(tmp_path, fresh_db_url, monkeypatch):
+    """Seed cache + library, run async_main --dump-classification, return the dump dir."""
+    _seed_cache(fresh_db_url)
+    return _run_dump(tmp_path, fresh_db_url, monkeypatch, pins=[PINNED_ID])
 
 
 class TestDumpClassificationEndToEnd:
@@ -196,7 +203,8 @@ class TestDumpClassificationEndToEnd:
         assert MULTI_ARTIST_KEEP_ID not in prune
 
     def test_override_ids_file_reflects_keep_release_ids(self, dump_dir):
-        """(ii) override_ids.txt is exactly the passed --keep-release-ids set."""
+        """(ii) override_ids.txt is the passed --keep-release-ids set (every pin here
+        has a release row; TestPinsWithoutAReleaseRow covers the ones that don't)."""
         assert _read_ids(dump_dir / "override_ids.txt") == {PINNED_ID}
 
     def test_no_anv_superset_and_diff_is_alias_release(self, dump_dir):
@@ -231,3 +239,49 @@ class TestDumpClassificationEndToEnd:
         # total_release_rows is the fan-out row count (id=6 has two credits), so
         # it exceeds the six distinct release ids.
         assert counts["total_release_rows"] == 7
+
+
+# A pinned release with a ``release`` row but no ``extra = 0`` credit. A pin the
+# dump no longer carries looks like this after the import: the prune exemption
+# keeps its ``release`` row (#424) and the child TRUNCATE empties its
+# ``release_artist`` rows. load_discogs_releases joins ``extra = 0`` credits, so
+# the classification never sees it, yet it is present and must stay kept.
+CREDITLESS_PINNED_ID = 7
+# A pinned id with no ``release`` row at all: the 2026-10-13 shape (#446).
+ABSENT_PINNED_ID = 99_999
+
+
+class TestPinsWithoutAReleaseRow:
+    """async_main applies only the pins that have a ``release`` row (#446, #447).
+
+    Runs the real wiring in async_main, not the helpers on their own. Each
+    assertion fails for one way of getting it wrong: the presence filter left
+    out (the absent pin lands in override_ids and keep_ids), applied after
+    apply_release_overrides (the absent pin lands in keep_ids), or checked
+    against the classification list instead of the ``release`` table (the
+    creditless pin is dropped). The absent pin in keep_ids is what made the
+    copy-swap count guard abort the 2026-10-13 prune.
+    """
+
+    def test_only_pins_with_a_release_row_are_applied(
+        self, tmp_path, fresh_db_url, monkeypatch, caplog
+    ):
+        _seed_cache(fresh_db_url)
+        with psycopg.connect(fresh_db_url, autocommit=True) as conn:
+            conn.execute(
+                "INSERT INTO release (id, title, format) VALUES (%s, %s, %s)",
+                (CREDITLESS_PINNED_ID, "Hollow Pin", "CD"),
+            )
+
+        out_dir = _run_dump(
+            tmp_path,
+            fresh_db_url,
+            monkeypatch,
+            pins=[PINNED_ID, CREDITLESS_PINNED_ID, ABSENT_PINNED_ID],
+        )
+
+        assert _read_ids(out_dir / "override_ids.txt") == {PINNED_ID, CREDITLESS_PINNED_ID}
+        keep = _read_ids(out_dir / "keep_ids.txt")
+        assert CREDITLESS_PINNED_ID in keep
+        assert ABSENT_PINNED_ID not in keep
+        assert f"[{ABSENT_PINNED_ID}]" in caplog.text

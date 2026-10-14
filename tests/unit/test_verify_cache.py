@@ -1107,10 +1107,22 @@ class TestDropAbsentOverrides:
             drop_absent_overrides({101}, {101})
         assert "no release row" not in caplog.text
 
-    def test_present_keep_id_missing_from_copy_still_trips_the_guard_count(self):
-        """The fix narrows the expected set; it must not loosen the guard. A
-        present pin stays in keep_ids, so the copy-count guard still expects it."""
-        report = TestApplyReleaseOverrides()._make_report(keep_ids=set(), prune_ids={101})
+    def test_present_pin_stays_in_the_set_the_count_guard_expects(self):
+        """The filter narrows the expected set only: a present pin still reaches
+        keep_ids, which is what the copy-count guard compares the copy against.
+
+        This checks the set the guard is given, not the guard. That a present id
+        which fails to copy still raises CopySwapShortfallError is covered by
+        TestPruneCopySwapCountGuard in tests/integration/test_copy_swap_preserves_not_null.py.
+        """
+        report = ClassificationReport(
+            keep_ids=set(),
+            prune_ids={101},
+            review_ids=set(),
+            review_by_artist={},
+            artist_originals={},
+            total_releases=1,
+        )
         apply_release_overrides(report, drop_absent_overrides({101, 999}, {101}))
         assert report.keep_ids | report.review_ids == {101}
 
