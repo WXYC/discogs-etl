@@ -1327,18 +1327,18 @@ class TestImportClearsTombstones:
         "not_found",
         [
             pytest.param(True, id="tombstone"),
-            pytest.param(False, id="tombstone-an-earlier-rebuild-cleared-without-a-name"),
+            pytest.param(False, id="live-row-an-earlier-rebuild-left-unnamed"),
         ],
     )
     def test_rebuild_clears_artist_tombstone(self, tmp_path, not_found) -> None:
-        """A tombstoned artist gets ``not_found`` reset, and a name, when the
-        fresh dump's release_artist re-stubs its id.
+        """An artist row named ``''`` gets a name, and any tombstone cleared,
+        when the fresh dump's release_artist re-stubs its id.
 
         LML#510 writes ``name = ''`` when it tombstones an id it never cached.
-        ``''`` is only the tombstone's sentinel, so clearing the tombstone must
-        also replace it with the dump's spelling. Otherwise LML serves a live
+        ``''`` is never a real name, so clearing the tombstone must also
+        replace it with the dump's spelling. Otherwise LML serves a live
         artist named ``''`` for good: its cache-hit test is ``fetched_at IS NOT
-        NULL``, and a tombstone row has ``fetched_at``. Rebuilds before this
+        NULL``, and every artist row has ``fetched_at``. Rebuilds before this
         fix cleared the tombstone and kept the ``''``, so a live row named
         ``''`` must be named the same way. A real name is never replaced
         (``TestArtistStubOneRowPerId.test_existing_row_keeps_its_name``).
@@ -1590,6 +1590,51 @@ class TestArtistStubOneRowPerId:
             rows = cur.fetchall()
         assert [row[:-1] for row in rows] == [("Stereolab", "Anglo-French group", True, False)]
         assert (rows[0][-1] != version_before) is tombstoned
+
+    @pytest.mark.parametrize(
+        "tombstoned",
+        [pytest.param(True, id="tombstone"), pytest.param(False, id="live-row")],
+    )
+    def test_empty_name_takes_the_chosen_spelling(self, tmp_path, tombstoned) -> None:
+        """A row named ``''`` that the dump credits takes the #408 spelling.
+
+        The conflict branch fills the name from ``EXCLUDED``, which is the one
+        row DISTINCT ON kept, so an id credited under several spellings gets
+        the spelling with the most main credits, not whichever came first.
+        """
+        with psycopg.connect(self.db_url) as conn, conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO artist (id, name, not_found) VALUES (%s, '', %s)",
+                (DIRT_NATION_ID, tombstoned),
+            )
+        self._credit(DIRT_NATION_ID, [(1, "Dirt nation", 1), (2, "Dirt Nation", 0)])
+
+        self._stub(tmp_path)
+
+        assert self._artist_rows(DIRT_NATION_ID) == [("Dirt Nation", False)]
+
+    @pytest.mark.parametrize(
+        "tombstoned",
+        [pytest.param(True, id="tombstone"), pytest.param(False, id="live-row")],
+    )
+    def test_uncredited_empty_name_is_left_alone(self, tmp_path, tombstoned) -> None:
+        """The heal reaches only ids this dump credits.
+
+        The stub INSERT reads ``release_artist``, so a row named ``''`` whose
+        id no credit names never conflicts: it keeps its ``''`` and its
+        tombstone. This pins the limit of the fix, which the docs state.
+        """
+        with psycopg.connect(self.db_url) as conn, conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO artist (id, name, not_found) VALUES (%s, '', %s)",
+                (NILUFER_YANYA_ID, tombstoned),
+            )
+        self._credit(STEREOLAB_ID, [(1, "Stereolab", 0)])
+
+        self._stub(tmp_path)
+
+        assert self._artist_rows(NILUFER_YANYA_ID) == [("", tombstoned)]
+        assert self._artist_rows(STEREOLAB_ID) == [("Stereolab", False)]
 
     def test_single_spelling_ids_stub_exactly_the_pre_408_rows(self, tmp_path) -> None:
         """An id credited under one spelling stubs exactly as it did before #408.

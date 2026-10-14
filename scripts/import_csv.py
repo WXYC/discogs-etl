@@ -1028,7 +1028,6 @@ def import_release_via_upsert(conn, csv_dir: Path, keep_release_ids: set[int] | 
         # COALESCE(EXCLUDED.x, release.x) would be smaller but collapses the
         # two cases the column list keeps apart — an emptied `notes` could
         # then never be cleared, pinning a note Discogs has since removed.
-        # Same shape as the narrowing WHERE on the artist stub upsert below.
         carried = present_optional_columns(
             read_csv_header(csv_path), release_config.get("optional_csv_columns")
         )
@@ -1404,13 +1403,19 @@ def import_artist_details(conn, csv_dir: Path) -> int:
     # Without this branch a tombstoned id would survive every rebuild. The
     # WHERE narrows the rewrite to tombstones and empty names, so every other
     # existing row is left alone. An id already in `artist` keeps a non-empty
-    # name. An empty name is only the sentinel LML writes when it tombstones an
-    # id it never cached (`VALUES ($1, '', ...)`), so it takes the dump's
-    # spelling. Keeping it would leave a live artist named '' that LML serves
-    # as a cache hit for good, because the tombstone row has `fetched_at`.
-    # Rebuilds before this fix left such rows behind with `not_found = FALSE`,
-    # so `artist.name = ''` matches them too. (The release upsert above
-    # writes the dump's title over a tombstone's '' title the same way.)
+    # name. '' is never a real artist name: it is the sentinel LML writes when
+    # it tombstones an id it never cached (`VALUES ($1, '', ...)`), and the
+    # default LML's 200 path falls back to when Discogs omits a name. So an
+    # empty name takes the dump's spelling. Keeping it would leave a live
+    # artist named '' that LML serves as a cache hit for good: LML's hit test
+    # is `fetched_at IS NOT NULL`, and every artist row has `fetched_at`
+    # (#469). Rebuilds before this fix left such rows behind with
+    # `not_found = FALSE`, so `artist.name = ''` matches them too.
+    #
+    # The heal reaches only ids this dump's release_artist credits, because
+    # only those conflict. A '' row no dump credit names (for example one
+    # credited only by an api_fetch release, whose credits are restored after
+    # this step) keeps its '' and its tombstone.
     #
     # One row per artist_id, because the conflict target is `id` (#408). The
     # dump's `<name>` is stored per credit, so a rename or a case fix reaches
