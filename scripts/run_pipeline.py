@@ -1352,8 +1352,9 @@ def main() -> None:
     lock_conn = try_acquire_rebuild_lock(args.database_url)
     if lock_conn is None:
         logger.warning(
-            "Another rebuild already holds the discogs-cache advisory lock "
-            "(key %d); bowing out without touching the cache. See discogs-etl#354.",
+            "The discogs-cache rebuild lock (key %d) is held by another session "
+            "(a rebuild, a dedup, or a seed); bowing out without touching the cache. "
+            "See discogs-etl#354.",
             REBUILD_LOCK_KEY,
         )
         # NOT sys.exit -- see exit_bowed_out's docstring (#180): a swallowed

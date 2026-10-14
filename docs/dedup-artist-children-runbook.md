@@ -148,7 +148,7 @@ If an `--execute` run aborted part-way, the per-table transaction rolled back an
 
 | Symptom | Meaning |
 |---|---|
-| exit `75` | A rebuild (or another operator session) holds advisory lock `354001`. Wait; do not force it. |
+| exit `75` | A rebuild, a real `seed_cache_from_clone.py` run, or another operator session holds advisory lock `354001`. Wait; do not force it. |
 | exit `1`, "expected to delete N rows … but deleted M" | The DELETE and its count disagreed, or duplicates survived. That table rolled back. Re-run the dry-run; if the surplus has moved far from the table above, something else is writing. |
 | `SQLSTATE 40001 … retrying` warnings | Normal under live LML traffic. Five attempts per table; exhausting them exits non-zero with nothing committed. |
 | `VACUUM FULL` never gets its lock | A long LML read is holding the table. The 5 s timeout retries with backoff; if it keeps failing, run step 3 in a quieter window. |
