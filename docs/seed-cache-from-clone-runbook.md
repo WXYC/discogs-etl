@@ -29,7 +29,7 @@ Do not run while a bulk job is hammering LML on the shared Discogs token — thi
 | `--target` | yes | Target discogs-cache DSN. For prod, the Railway `Postgres` service `DATABASE_PUBLIC_URL` (reading prod requires explicit approval; writing is heavier — gate on a green dry-run first). Must differ from `--source`; the script refuses an identical `--source`/`--target` pair (a transposed pair would otherwise silently no-op). |
 | `--ids-file` | yes | Release_ids (or, with `--seed-artists`, artist_ids) to seed, one per line (blank lines and `#` comments ignored). Selected upstream via LML's `lower(f_unaccent(artist_name)) % $artist` trigram predicate over the tail artists — artist-scoped (keep all releases by a tail artist), not album-scoped. |
 | `--seed-artists` | no | Seed the `artist` family (see "Artist seeding" below) from `--ids-file` instead of the default `release` family. |
-| `--preserve-provenance` | no | Release family only. For each newly seeded release, copy `cache_metadata.source` and `cached_at` from `--source` when the source row exists and both are non-NULL; otherwise fall back to the default fresh `bulk_import` row. Use when `--source` is a prod export whose provenance is reliable (e.g. restoring `api_fetch` rows); leave off for a clone, whose freshness rows are unreliable. Still additive (`ON CONFLICT DO NOTHING`); `--dry-run` logs how many rows would preserve vs fall back. |
+| `--preserve-provenance` | no | Release family only. For each newly seeded release, copy `cache_metadata.source` and `cached_at` from `--source` when the source row exists and both are non-NULL; otherwise fall back to the default fresh `bulk_import` row. Use when `--source` is a prod export whose provenance is reliable; leave off for a clone, whose freshness rows are unreliable. Do not use it to restore an export's `api_fetch` releases: use `scripts/restore_api_fetch_from_export.py` (see [Relation to the monthly rebuild](#relation-to-the-monthly-rebuild)), which also rehydrates hollow pins and restores the full `cache_metadata` row. Still additive (`ON CONFLICT DO NOTHING`); `--dry-run` logs how many rows would preserve vs fall back. |
 | `--dry-run` | no | Report per-table row-set sizes without writing. **Always run first.** |
 
 The script depends only on `psycopg` and `lib.observability` (installable via `pip install -e .`), imports `COPY_TABLE_SPEC` from `verify_cache`, and imports `parse_keep_release_ids` from `lib.keep_release_ids` for `--ids-file` parsing.
@@ -82,13 +82,13 @@ python scripts/restore_api_fetch_from_export.py \
   --dry-run
 ```
 
-`--dry-run` reads both databases, writes nothing and takes no lock; it logs `snapshotted=N preserved=N rehydrated=N superseded_by_dump=N` for the export against the cache as it stands. Drop it to restore. A real run:
+`--dry-run` reads both databases, writes nothing and takes no lock; it logs `snapshotted=N preserved=N rehydrated=N superseded_by_dump=N` for the export against the cache as it stands. Drop it to restore. Both modes exit `2` without writing when `--source` holds no `api_fetch` releases (or has no `release` / `cache_metadata` table) or `--target` lacks one of the nine cache tables: that is the wrong database, and the log names the problem. A real run:
 
 - takes the rebuild lock `354001` on `--target` for its whole run and exits `75` without writing if another session holds it (a rebuild, `dedup_artist_children.py`, a seed, or an operator session); retry once that session is done;
 - only reads `--source` (`SELECT` / `COPY ... TO STDOUT`, in a read-only transaction);
-- restores a snapshot already on `--target` (a run that died before its restore) first, then stages the export, so it never merges into an existing snapshot;
+- restores a snapshot already on `--target` (a run that died before its restore) first, then stages the export, so it never merges into an existing snapshot. If that run is one you mean to `run_pipeline.py --resume`, resume it first: the resume reuses that snapshot, and this script would consume it;
 - stages before it locks `release`, so the bounded `release` lock is held only for the restore's own transaction;
-- on a failed restore, rolls the restore back and keeps the staged `*_api_fetch_snap` tables (exit `1`). The next rebuild's left-behind recovery restores them, which is safe because the restore lets the dump win. Fix the cause and rerun, or leave it for the next rebuild.
+- on a failed restore, rolls the restore back and keeps the `*_api_fetch_snap` tables it could not restore (exit `1`). The log says which: the staged export, or a snapshot already on `--target` whose restore failed before the export was staged. Fix the cause, then rerun. Do not leave it for the next rebuild: that rebuild's left-behind recovery runs the same restore, so while the cause persists it fails the same way and aborts that rebuild, and after a failure before staging it would not apply the export at all.
 
 A hollow pin needs no restore to be correct: the import NULLs `release.artwork_checked_at` on a retained pin, so LML re-fetches it on its next read and rewrites its children. The restore only saves those rate-limited fetches.
 

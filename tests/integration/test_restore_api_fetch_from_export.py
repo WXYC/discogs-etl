@@ -17,6 +17,7 @@ from pathlib import Path
 
 import psycopg
 import pytest
+from psycopg import sql
 
 from lib.api_fetch_preservation import (
     SNAPSHOT_SUFFIX,
@@ -26,7 +27,7 @@ from lib.api_fetch_preservation import (
     stage_snapshot_from,
 )
 from lib.scratch_namespace import scratch_name
-from tests.conftest import _ephemeral_database
+from tests.conftest import ADMIN_URL, _ephemeral_database
 
 pytestmark = pytest.mark.pg
 
@@ -101,6 +102,61 @@ def _apply_schema(db_url: str) -> None:
     with psycopg.connect(db_url, autocommit=True) as conn, conn.cursor() as cur:
         cur.execute(SCHEMA_DIR.joinpath("create_functions.sql").read_text())
         cur.execute(SCHEMA_DIR.joinpath("create_database.sql").read_text())
+
+
+def _execute(db_url: str, *statements: str) -> None:
+    with psycopg.connect(db_url, autocommit=True) as conn, conn.cursor() as cur:
+        for statement in statements:
+            cur.execute(statement)
+
+
+def _make_restore_fail(target: str) -> None:
+    """Give ``release`` a NOT NULL column the export lacks, so restoring an absent id fails."""
+    _execute(
+        target,
+        "ALTER TABLE release ADD COLUMN extra_col text NOT NULL DEFAULT 'x'",
+        "ALTER TABLE release ALTER COLUMN extra_col DROP DEFAULT",
+    )
+
+
+def _set_default_read_only(db_url: str, on: bool) -> None:
+    name = sql.Identifier(db_url.rsplit("/", 1)[-1])
+    if on:
+        stmt = sql.SQL("ALTER DATABASE {} SET default_transaction_read_only = on").format(name)
+    else:
+        stmt = sql.SQL("ALTER DATABASE {} RESET default_transaction_read_only").format(name)
+    with psycopg.connect(ADMIN_URL, autocommit=True) as conn:
+        conn.execute(stmt)
+
+
+def _rebuild_lock_is_free(db_url: str) -> bool:
+    with psycopg.connect(db_url, autocommit=True) as conn, conn.cursor() as cur:
+        cur.execute("SELECT pg_try_advisory_lock(%s)", (REBUILD_LOCK_KEY,))
+        return cur.fetchone()[0]  # closing the probe's session frees its own lock
+
+
+@pytest.fixture()
+def lock_conns(monkeypatch):
+    """Keep a live reference to every rebuild-lock connection the CLI opens.
+
+    Without it the CLI's lock connection is a local that CPython finalizes when
+    ``main`` returns, which frees the lock even if the explicit release were
+    missing; holding a reference makes "the lock is free afterwards" prove the
+    release ran.
+    """
+    kept: list[psycopg.Connection] = []
+    real = _cli.try_acquire_rebuild_lock
+
+    def spy(url: str) -> psycopg.Connection | None:
+        conn = real(url)
+        if conn is not None:
+            kept.append(conn)
+        return conn
+
+    monkeypatch.setattr(_cli, "try_acquire_rebuild_lock", spy)
+    yield kept
+    for conn in kept:
+        conn.close()
 
 
 @pytest.fixture()
@@ -244,6 +300,80 @@ class TestRestoreFromExport:
             (1,)
         ]
 
+    def test_a_source_column_the_target_lacks_is_left_out_with_a_warning(
+        self, export_and_cache, caplog
+    ) -> None:
+        """An export taken before the cache dropped a column: only shared columns are copied."""
+        source, target = export_and_cache
+        _execute(source, "ALTER TABLE release ADD COLUMN retired_col text DEFAULT 'old'")
+
+        assert _run(source, target) == 0
+
+        assert _rows(target, f"SELECT title FROM release WHERE id = {ABSENT_ID}") == [("Doga",)]
+        assert "release: not restoring export columns missing from --target: retired_col" in (
+            caplog.text
+        )
+
+
+class TestSourceIsOnlyRead:
+    def test_restores_from_a_source_held_read_only(self, export_and_cache) -> None:
+        """A read-only role or a hot standby works as --source: nothing is written there."""
+        source, target = export_and_cache
+        _set_default_read_only(source, True)
+        try:
+            assert _run(source, target) == 0
+        finally:
+            _set_default_read_only(source, False)
+
+        assert _rows(target, f"SELECT title FROM release WHERE id = {ABSENT_ID}") == [("Doga",)]
+
+    def test_reads_the_export_in_a_read_only_transaction(self, export_and_cache) -> None:
+        """The export's cache_metadata raises when it is read from a read-write transaction."""
+        source, target = export_and_cache
+        _execute(
+            source,
+            "ALTER TABLE cache_metadata RENAME TO cache_metadata_rows",
+            "CREATE FUNCTION assert_read_only() RETURNS boolean LANGUAGE plpgsql AS $$ BEGIN "
+            "IF NOT current_setting('transaction_read_only')::boolean THEN "
+            "RAISE EXCEPTION 'the export was read in a read-write transaction'; END IF; "
+            "RETURN true; END $$",
+            "CREATE VIEW cache_metadata AS "
+            "SELECT * FROM cache_metadata_rows WHERE assert_read_only()",
+        )
+
+        assert _run(source, target) == 0
+
+        assert _rows(target, f"SELECT title FROM release WHERE id = {ABSENT_ID}") == [("Doga",)]
+
+
+class TestWrongDatabase:
+    @pytest.mark.parametrize("mode", [(), ("--dry-run",)], ids=["real", "dry-run"])
+    @pytest.mark.parametrize(
+        ("side", "breakage", "reason"),
+        [
+            ("source", "DROP TABLE cache_metadata", "--source has no cache_metadata table"),
+            (
+                "source",
+                "UPDATE cache_metadata SET source = 'bulk_import'",
+                "--source holds no api_fetch releases",
+            ),
+            ("target", "DROP TABLE release_video", "--target has no release_video table"),
+        ],
+        ids=["source-without-cache_metadata", "source-without-api_fetch", "target-missing-table"],
+    )
+    def test_exits_2_and_writes_nothing(
+        self, export_and_cache, caplog, side, breakage, reason, mode
+    ) -> None:
+        """Nothing to restore, or nowhere to restore it, is the wrong database, not a no-op."""
+        source, target = export_and_cache
+        _execute(source if side == "source" else target, breakage)
+
+        assert _run(source, target, *mode) == 2
+
+        assert reason in caplog.text
+        assert _rows(target, f"SELECT to_regclass('{_scratch('release')}')") == [(None,)]
+        assert _rows(target, f"SELECT 1 FROM release WHERE id = {ABSENT_ID}") == []
+
 
 class TestStageSnapshotFrom:
     def test_stages_the_api_fetch_family_and_counts_releases(self, export_and_cache) -> None:
@@ -276,9 +406,7 @@ class TestStageSnapshotFrom:
 
     def test_failed_restore_keeps_the_staged_tables(self, export_and_cache) -> None:
         source, target = export_and_cache
-        with psycopg.connect(target, autocommit=True) as conn, conn.cursor() as cur:
-            cur.execute("ALTER TABLE release ADD COLUMN extra_col text NOT NULL DEFAULT 'x'")
-            cur.execute("ALTER TABLE release ALTER COLUMN extra_col DROP DEFAULT")
+        _make_restore_fail(target)
         stage_snapshot_from(source, target)
 
         with pytest.raises(ApiFetchRestoreError):
@@ -302,12 +430,46 @@ class TestContention:
         assert _rows(target, f"SELECT to_regclass('{_scratch('release')}')") == [(None,)]
         assert _rows(target, f"SELECT 1 FROM release WHERE id = {ABSENT_ID}") == []
 
-    def test_releases_354001_when_done(self, export_and_cache) -> None:
+    def test_releases_354001_when_done(self, export_and_cache, lock_conns) -> None:
         source, target = export_and_cache
+
         assert _run(source, target) == 0
-        with psycopg.connect(target, autocommit=True) as conn, conn.cursor() as cur:
-            cur.execute("SELECT pg_try_advisory_lock(%s)", (REBUILD_LOCK_KEY,))
-            assert cur.fetchone() == (True,)
+
+        assert len(lock_conns) == 1
+        assert _rebuild_lock_is_free(target)
+
+    def test_a_failed_restore_exits_1_keeps_the_staged_tables_and_releases_354001(
+        self, export_and_cache, lock_conns
+    ) -> None:
+        source, target = export_and_cache
+        _make_restore_fail(target)
+
+        assert _run(source, target) == 1
+
+        assert _rows(target, f"SELECT count(*) FROM {_scratch('release')}") == [(3,)]
+        assert _rows(target, f"SELECT 1 FROM release WHERE id = {ABSENT_ID}") == []
+        assert len(lock_conns) == 1
+        assert _rebuild_lock_is_free(target)
+
+    def test_a_failed_left_behind_restore_exits_1_and_says_the_export_was_not_staged(
+        self, export_and_cache, lock_conns, caplog
+    ) -> None:
+        source, target = export_and_cache
+        _execute(target, "INSERT INTO release (id, title) VALUES (999, 'Back, Baby')")
+        _execute(
+            target, "INSERT INTO cache_metadata (release_id, source) VALUES (999, 'api_fetch')"
+        )
+        assert snapshot_api_fetch_releases(target) == 1
+        _execute(target, "DELETE FROM cache_metadata WHERE release_id = 999")
+        _execute(target, "DELETE FROM release WHERE id = 999")
+        _make_restore_fail(target)
+
+        assert _run(source, target) == 1
+
+        # Only the earlier snapshot is retained; the export was never staged.
+        assert _rows(target, f"SELECT id FROM {_scratch('release')}") == [(999,)]
+        assert "the export was not staged" in caplog.text
+        assert _rebuild_lock_is_free(target)
 
 
 class TestDryRun:

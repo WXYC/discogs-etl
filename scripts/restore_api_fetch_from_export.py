@@ -11,10 +11,12 @@ export taken before it. The export's ``api_fetch`` release family is staged on
 rule set: the dump wins, hollow pins (#424) are rehydrated, the full
 ``cache_metadata`` row comes back, and the ``release`` lock is bounded.
 
-``--source`` is only read. A real run holds the rebuild lock (key 354001, see
-``CLAUDE.md``'s "Advisory lock keys" table) on ``--target`` throughout and exits 75
-without writing if another session has it; ``--dry-run`` takes no lock and writes
-nothing. A failed restore keeps the staged tables, which the next rebuild restores.
+``--source`` is only read. Both modes exit 2 without writing when ``--source`` holds
+no ``api_fetch`` releases or ``--target`` lacks a cache table (the wrong database). A
+real run holds the rebuild lock (key 354001, see ``CLAUDE.md``'s "Advisory lock keys"
+table) on ``--target`` throughout and exits 75 without writing if another session has
+it; ``--dry-run`` takes no lock and writes nothing. A failed restore exits 1 and keeps
+the scratch tables it could not restore; fix the cause and rerun.
 
 Usage:
     python scripts/restore_api_fetch_from_export.py \
@@ -36,6 +38,7 @@ from lib.api_fetch_preservation import (  # noqa: E402
     ApiFetchRestoreError,
     plan_restore_from,
     restore_api_fetch_releases,
+    restore_input_problem,
     stage_snapshot_from,
 )
 from lib.observability import init_logger  # noqa: E402
@@ -64,6 +67,11 @@ def main(argv: list[str] | None = None) -> int:
 
     init_logger(repo="discogs-etl", tool="discogs-etl restore_api_fetch_from_export")
 
+    problem = restore_input_problem(args.source, args.target)
+    if problem:
+        logger.error("%s; is it the right database? Nothing written.", problem)
+        return 2
+
     if args.dry_run:
         logger.info("[dry-run] %s", plan_restore_from(args.source, args.target).format())
         return 0
@@ -78,12 +86,21 @@ def main(argv: list[str] | None = None) -> int:
             REBUILD_LOCK_BOWED_OUT_EXIT_CODE,
         )
         return REBUILD_LOCK_BOWED_OUT_EXIT_CODE
+    staged = False
     try:
         stage_snapshot_from(args.source, args.target)
+        staged = True
         if restore_api_fetch_releases(args.target) is None:
             logger.warning("Nothing was restored: --target has no snapshot or no release table")
     except ApiFetchRestoreError:
-        # Already logged by the restore; the staged tables stay for the next rebuild's recovery.
+        # The restore already logged the error; say which snapshot its retained tables hold.
+        if staged:
+            logger.warning("The export is staged on --target; fix the cause and rerun")
+        else:
+            logger.warning(
+                "Restoring the snapshot already on --target failed, so the export was not "
+                "staged; fix the cause and rerun"
+            )
         return 1
     finally:
         release_rebuild_lock(lock_conn)
