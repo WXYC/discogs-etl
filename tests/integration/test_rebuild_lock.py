@@ -37,6 +37,7 @@ from lib.rebuild_lock import (
     REBUILD_LOCK_HOLDER_DEDUP,
     REBUILD_LOCK_HOLDER_FREE_EXIT_CODE,
     REBUILD_LOCK_HOLDER_REBUILD,
+    REBUILD_LOCK_HOLDER_RESTORE_API_FETCH,
     REBUILD_LOCK_HOLDER_SEED,
     REBUILD_LOCK_KEY,
     describe_rebuild_lock_holder,
@@ -223,7 +224,12 @@ def _hold_lock_by_hand(
 class TestHolderApplicationName:
     @pytest.mark.parametrize(
         "holder",
-        [REBUILD_LOCK_HOLDER_REBUILD, REBUILD_LOCK_HOLDER_DEDUP, REBUILD_LOCK_HOLDER_SEED],
+        [
+            REBUILD_LOCK_HOLDER_REBUILD,
+            REBUILD_LOCK_HOLDER_DEDUP,
+            REBUILD_LOCK_HOLDER_SEED,
+            REBUILD_LOCK_HOLDER_RESTORE_API_FETCH,
+        ],
     )
     def test_lock_connection_names_itself_in_pg_stat_activity(
         self, fresh_db_url: str, holder: str
@@ -240,9 +246,14 @@ class TestHolderApplicationName:
         finally:
             release_rebuild_lock(conn)
 
-    def test_the_three_names_are_distinct_and_namespaced(self) -> None:
-        names = {REBUILD_LOCK_HOLDER_REBUILD, REBUILD_LOCK_HOLDER_DEDUP, REBUILD_LOCK_HOLDER_SEED}
-        assert len(names) == 3
+    def test_the_four_names_are_distinct_and_namespaced(self) -> None:
+        names = {
+            REBUILD_LOCK_HOLDER_REBUILD,
+            REBUILD_LOCK_HOLDER_DEDUP,
+            REBUILD_LOCK_HOLDER_SEED,
+            REBUILD_LOCK_HOLDER_RESTORE_API_FETCH,
+        }
+        assert len(names) == 4
         assert all(name.startswith("discogs-etl-") for name in names)
 
 

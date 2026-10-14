@@ -441,6 +441,24 @@ class TestContention:
         assert len(lock_conns) == 1
         assert _rebuild_lock_is_free(target)
 
+    def test_takes_354001_under_its_own_name(self, export_and_cache, monkeypatch) -> None:
+        """rebuild-cache.sh names the holder from ``application_name``; an unnamed
+        restore would read as an operator session in the Slack post."""
+        source, target = export_and_cache
+        names: list[str] = []
+        real = _cli.try_acquire_rebuild_lock
+
+        def spy(url: str, **kwargs: object) -> psycopg.Connection | None:
+            conn = real(url, **kwargs)
+            if conn is not None:
+                names.append(conn.execute("SHOW application_name").fetchone()[0])
+            return conn
+
+        monkeypatch.setattr(_cli, "try_acquire_rebuild_lock", spy)
+
+        assert _run(source, target) == 0
+        assert names == ["discogs-etl-restore-api-fetch"]
+
     def test_a_failed_restore_exits_1_keeps_the_staged_tables_and_releases_354001(
         self, export_and_cache, lock_conns
     ) -> None:

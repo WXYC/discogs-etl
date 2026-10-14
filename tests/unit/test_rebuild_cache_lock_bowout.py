@@ -39,6 +39,7 @@ tests/integration/test_rebuild_lock.py's TestRunPipelineBowsOutEndToEnd
 from __future__ import annotations
 
 import ast
+import json
 import re
 import shutil
 import subprocess
@@ -245,7 +246,11 @@ ERROR = "@error"
 
 
 def _build_harness(
-    pipeline_rcs: list[int], holders: list[str], wait_minutes: int | None, free_exit_code: int
+    pipeline_rcs: list[int],
+    holders: list[str],
+    wait_minutes: int | None,
+    free_exit_code: int,
+    real_notify: bool = False,
 ) -> str:
     source = SCRIPT_PATH.read_text()
     lines = source.splitlines()
@@ -263,8 +268,19 @@ def _build_harness(
             f"HOLDER_REPLIES=({replies})",
             "ATTEMPT=0",
             # Stand-in for the real notify_slack (which curls a webhook);
-            # everything else below is the script's own code, verbatim.
-            'notify_slack() { echo "NOTIFY $1 $2"; }',
+            # everything else below is the script's own code, verbatim. With
+            # real_notify the script's own notify_slack runs and only curl is
+            # stubbed, printing the JSON body it was handed.
+            *(
+                [
+                    'SLACK_MONITORING_WEBHOOK="https://hooks.invalid"',
+                    'curl() { while [ $# -gt 0 ]; do [ "$1" = "-d" ] && echo "PAYLOAD $2"; '
+                    "shift; done; }",
+                    _extract_function(source, "notify_slack"),
+                ]
+                if real_notify
+                else ['notify_slack() { echo "NOTIFY $1 $2"; }']
+            ),
             # Likewise for report_outcome (#424), which shells out to
             # scripts/report_rebuild_outcome.py. on_error() is extracted
             # verbatim below and calls it, so it has to exist here; the marker's
@@ -306,13 +322,16 @@ def _run_harness(
     *,
     holders: list[str] | None = None,
     wait_minutes: int | None = None,
+    real_notify: bool = False,
 ) -> subprocess.CompletedProcess[str]:
     bash = shutil.which("bash")
     assert bash is not None, "bash is required to execute this region"
     rcs = [pipeline_rcs] if isinstance(pipeline_rcs, int) else pipeline_rcs
     harness = tmp_path / "harness.sh"
     harness.write_text(
-        _build_harness(rcs, holders or [REBUILD_HOLDER], wait_minutes, _python_free_exit_code())
+        _build_harness(
+            rcs, holders or [REBUILD_HOLDER], wait_minutes, _python_free_exit_code(), real_notify
+        )
     )
     return subprocess.run(
         [bash, str(harness)], capture_output=True, text=True, timeout=30, cwd=tmp_path
@@ -379,7 +398,6 @@ class TestBowOutBranchActuallyExecutes:
             ("discogs-etl-dedup", "discogs-etl-dedup"),
             ("", "an unnamed session"),
             ("psql", "psql"),
-            (ERROR, "unknown"),
         ],
     )
     def test_a_non_rebuild_holder_is_waited_out_then_the_rebuild_runs(
@@ -432,6 +450,48 @@ class TestBowOutBranchActuallyExecutes:
         assert "SLEEP" not in result.stdout
         assert "hourglass" not in result.stdout
         assert "FELL THROUGH TO DRIFT WATCHDOG" in result.stdout
+
+    def test_a_failed_holder_lookup_bows_out_at_once(self, tmp_path: Path) -> None:
+        """An unnamed-by-failure holder may be a peer rebuild: waiting it out
+        would risk a second full rebuild the same night."""
+        result = _run_harness([75, 0], tmp_path, holders=[ERROR], wait_minutes=180)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert result.stdout.count("PIPELINE attempt") == 1
+        assert "SLEEP" not in result.stdout
+        assert "hourglass" not in result.stdout
+        final = next(ln for ln in result.stdout.splitlines() if ln.startswith("NOTIFY :no_entry:"))
+        assert "Holder: an unknown session (the holder lookup failed)." in final
+        assert "FELL THROUGH TO DRIFT WATCHDOG" not in result.stdout
+
+    def test_a_lock_that_keeps_reading_free_still_ends_at_the_deadline(
+        self, tmp_path: Path
+    ) -> None:
+        """75 then "free", over and over, must not spin: one immediate retry,
+        then each retry sleeps and counts against the wait."""
+        result = _run_harness([75], tmp_path, holders=[FREE], wait_minutes=10)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert result.stdout.count("PIPELINE attempt") == 4  # once at once, then t=0, 5, 10
+        assert result.stdout.count("SLEEP 300") == 2
+        final = next(ln for ln in result.stdout.splitlines() if ln.startswith("NOTIFY :no_entry:"))
+        assert "for the whole 10-minute wait" in final
+        assert "FELL THROUGH TO DRIFT WATCHDOG" not in result.stdout
+
+    def test_a_quote_or_backslash_in_the_holder_name_keeps_the_slack_json_valid(
+        self, tmp_path: Path
+    ) -> None:
+        result = _run_harness(
+            [75], tmp_path, holders=['ops "ddl" \\x'], wait_minutes=5, real_notify=True
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        payloads = [
+            ln.removeprefix("PAYLOAD ")
+            for ln in result.stdout.splitlines()
+            if ln.startswith("PAYLOAD ")
+        ]
+        assert len(payloads) == 2  # the hourglass post and the bow-out
+        texts = [json.loads(p)["text"] for p in payloads]
+        assert ":hourglass_flowing_sand:" in texts[0]
+        assert "Holder: ops ddl x, which held the lock" in texts[1]
 
     def test_a_crash_while_waiting_still_fails_loudly(self, tmp_path: Path) -> None:
         result = _run_harness([75, 1], tmp_path, holders=["discogs-etl-seed"])

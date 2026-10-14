@@ -265,8 +265,8 @@ def try_acquire_rebuild_lock(database_url: str, *, holder: str) -> psycopg.Conne
 def describe_rebuild_lock_holder(database_url: str) -> str | None:
     """Name the session holding the rebuild lock: its ``application_name``.
 
-    ``''`` when the holder set none (an operator's ``psql``, a caller from an
-    older checkout); ``None`` when nobody holds the lock. A single bigint key
+    ``''`` when the holder's client set none (a caller from an older checkout;
+    ``psql`` itself reports ``psql``); ``None`` when nobody holds the lock. A single bigint key
     below 2**32 shows in ``pg_locks`` as ``classid = 0``, ``objid = key``,
     ``objsubid = 1``. ``pg_stat_activity`` keeps another role's
     ``application_name`` visible to an unprivileged reader, so a holder under a
