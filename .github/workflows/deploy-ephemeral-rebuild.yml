@@ -125,6 +125,11 @@ jobs:
         # out-of-band survives redeploys instead of being silently re-armed —
         # which is the entire point of #353 having parameterized it.
         #
+        # MaxInstanceAgeHours IS overridden, for the opposite reason: for a
+        # parameter absent from the overrides SAM keeps the deployed value, so
+        # raising the template default to 6 (#464) would never reach the live
+        # stack. Passing it makes the template default and the stack agree.
+        #
         # --no-fail-on-empty-changeset stays, and it is why the next step
         # exists. It makes SAM exit 0 both when it applies a changeset and when
         # it has nothing to apply, and those two were indistinguishable in this
@@ -156,6 +161,7 @@ jobs:
             --s3-bucket "${SAM_S3_BUCKET:-aws-sam-cli-managed-default-samclisourcebucket-v0kc5deo10yi}" \
             --parameter-overrides \
               RepoBranch=main \
+              MaxInstanceAgeHours=6 \
               "${OPTIONAL_ARGS[@]}" 2>&1 | tee "$SAM_DEPLOY_LOG"
           # ${PIPESTATUS[0]} and NOT $?. Behind the `| tee`, `$?` is tee's
           # status — 0 unless the disk fills — so reading it would report every

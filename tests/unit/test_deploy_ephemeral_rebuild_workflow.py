@@ -72,6 +72,15 @@ class TestTheDeployStepCapturesItsOutcome:
         reported, and these two facts belong in the same test file."""
         assert "--no-fail-on-empty-changeset" in _step("deploy", DEPLOY_STEP_NAME)["run"]
 
+    def test_max_instance_age_is_overridden_explicitly(self) -> None:
+        """SAM sends UsePreviousValue=true for absent parameters, so a changed
+        template default alone would never reach the deployed stack (#464)."""
+        assert "MaxInstanceAgeHours=6" in _step("deploy", DEPLOY_STEP_NAME)["run"]
+
+    def test_schedule_state_is_still_not_overridden(self) -> None:
+        run = _step("deploy", DEPLOY_STEP_NAME)["run"]
+        assert "ScheduleState=" not in run
+
     def test_sam_output_is_captured_to_a_file(self) -> None:
         run = _step("deploy", DEPLOY_STEP_NAME)["run"]
         assert "tee" in run

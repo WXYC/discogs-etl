@@ -2,8 +2,8 @@
 
 Runs hourly. Lists every running instance tagged ``Project=discogs-rebuild``
 and force-terminates any that has been running longer than
-``MAX_INSTANCE_AGE_HOURS`` (default 3). A clean rebuild finishes inside
-~90 minutes; anything past 3 hours is either a wedged bootstrap or a
+``MAX_INSTANCE_AGE_HOURS`` (default 6). A clean rebuild finishes inside
+~90 minutes; anything past 6 hours is either a wedged bootstrap or a
 forgotten manual launch — either way, billing should stop.
 
 Emits the ``StaleInstanceTerminated`` CloudWatch metric (namespace
@@ -65,7 +65,7 @@ def list_stale_instances(ec2_client, max_age_hours: float):
 
 def lambda_handler(event, context, ec2_client=None, cloudwatch_client=None):
     """Entry point. Boto3 clients are injectable for unit tests."""
-    max_age_hours = float(os.environ.get("MAX_INSTANCE_AGE_HOURS", "3"))
+    max_age_hours = float(os.environ.get("MAX_INSTANCE_AGE_HOURS", "6"))
 
     if ec2_client is None or cloudwatch_client is None:
         import boto3

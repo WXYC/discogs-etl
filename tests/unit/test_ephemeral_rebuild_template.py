@@ -111,6 +111,17 @@ def test_schedule_state_parameter_is_constrained(source_template: dict[str, Any]
     assert param["Default"] == "ENABLED"
 
 
+def test_max_instance_age_default_covers_lock_wait_plus_rebuild(
+    source_template: dict[str, Any],
+) -> None:
+    """The retry may wait 180 min on lock 354001 and then run a ~90 min rebuild (#464).
+
+    Six hours leaves an hour of margin over that ~5h worst case; the hourly
+    sweeper can also fire up to an hour past the threshold.
+    """
+    assert source_template["Parameters"]["MaxInstanceAgeHours"]["Default"] == 6
+
+
 def test_monthly_rule_state_is_a_ref_not_a_literal(transformed_template: dict[str, Any]) -> None:
     """The whole point: an unresolved ``Ref`` survives the transform.
 
