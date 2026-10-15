@@ -10,6 +10,8 @@ inside the ``set +e`` / ``PY_RC`` region, not that the run behaves.
 from __future__ import annotations
 
 import os
+import shutil
+import signal
 import subprocess
 import time
 from pathlib import Path
@@ -88,6 +90,7 @@ done
 case "$STUB_PY" in
   fail_early) exit 1 ;;
   fail_late) sleep 1; exit 1 ;;
+  read_fifo) cat "$xml" > /dev/null; exit 1 ;;  # blocks in open() until a writer arrives
   bow_out) exit 75 ;;
   ok) cat "$xml" > /dev/null; exit 0 ;;
 esac
@@ -116,16 +119,23 @@ def _run_step(tmp_path: Path, curl_mode: str, py_mode: str) -> tuple[int, str, P
     # Output goes to a file, not a pipe: an orphaned curl would otherwise hold
     # the pipe open and turn a leak into a hang that hides the real assertion.
     log = tmp_path / "step.log"
+    # Own session so a timeout can kill every stub (curl, a python parked on
+    # the FIFO) instead of orphaning them.
     with log.open("w") as out:
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             ["bash", "-e", "-c", _run_script()],
             cwd=work,
             env=env,
             stdout=out,
             stderr=subprocess.STDOUT,
-            timeout=20,
-            check=False,
+            start_new_session=True,
         )
+        try:
+            proc.wait(timeout=20)
+        except subprocess.TimeoutExpired:
+            os.killpg(proc.pid, signal.SIGKILL)
+            proc.wait()
+            pytest.fail(f"step did not exit within 20s\n{log.read_text()}")
     return proc.returncode, log.read_text(), tmp_path / "curl.pid"
 
 
@@ -144,11 +154,23 @@ def _alive(pid_file: Path) -> bool:
     ("curl_mode", "py_mode", "expected_rc", "expected_text"),
     [
         ("fail", "fail_late", 1, "::error::curl exited 22 while streaming"),
+        ("fail", "read_fifo", 1, "::error::curl exited 22 while streaming"),
         ("block", "fail_early", 1, None),
         ("block", "bow_out", 75, "::warning::bowed out"),
         ("ok", "ok", 0, None),
     ],
-    ids=["curl-fails-first", "python-fails-early", "python-bows-out", "both-ok"],
+    ids=[
+        "curl-fails-first",
+        "curl-fails-reader-blocked",
+        "python-fails-early",
+        "python-bows-out",
+        "both-ok",
+    ],
+)
+@pytest.mark.skipif(
+    shutil.which("bash") is None
+    or subprocess.run(["bash", "-c", "((BASH_VERSINFO[0] >= 4))"], check=False).returncode != 0,
+    reason="step uses empty-array expansion under set -u, which needs bash >= 4",
 )
 def test_step_behavior(
     tmp_path: Path, curl_mode: str, py_mode: str, expected_rc: int, expected_text: str | None
