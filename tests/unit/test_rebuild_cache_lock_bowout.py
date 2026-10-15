@@ -255,6 +255,7 @@ def _build_harness(
     pipeline_cost: int = 0,
     lookups: list[str] | None = None,
     lookup_file: Path | None = None,
+    real_attempt_seconds: float = 0,
 ) -> str:
     source = SCRIPT_PATH.read_text()
     lines = source.splitlines()
@@ -276,9 +277,14 @@ def _build_harness(
             # a lookup retried within one attempt can be scripted.
             f"LOOKUP_REPLIES=({' '.join(repr(r) for r in (lookups or []))})",
             f'LOOKUP_FILE="{lookup_file}"',
-            # Seconds each stubbed pipeline attempt takes, by advancing bash's
-            # own SECONDS clock.
+            # Seconds each stubbed pipeline attempt takes. The script reads time
+            # through lock_wait_now, replaced here by a fake clock that only the
+            # pipeline stub and the sleep stub advance, so real seconds never leak in.
             f"PIPELINE_COST={pipeline_cost}",
+            "FAKE_NOW=0",
+            'lock_wait_now() { echo "$FAKE_NOW"; }',
+            _extract_function(source, "lock_wait_sleep_for"),
+            _extract_function(source, "lock_wait_sleep"),
             # Stand-in for the real notify_slack (which curls a webhook);
             # everything else below is the script's own code, verbatim. With
             # real_notify the script's own notify_slack runs and only curl is
@@ -298,7 +304,7 @@ def _build_harness(
             # verbatim below and calls it, so it has to exist here; the marker's
             # own behavior is pinned in test_rebuild_outcome_marker.py.
             'report_outcome() { echo "OUTCOME $1 ${2:-}"; }',
-            'sleep() { echo "SLEEP $1"; }',
+            'sleep() { echo "SLEEP $1"; FAKE_NOW=$((FAKE_NOW + $1)); }',
             *stubs,
             # One stub for both python entry points the region calls. The
             # pipeline's attempt N exits PIPELINE_RCS[N-1]; the holder CLI,
@@ -310,7 +316,8 @@ def _build_harness(
             "        *scripts/run_pipeline.py*)",
             "            ATTEMPT=$((ATTEMPT + 1)); n=$ATTEMPT",
             '            echo "PIPELINE attempt $n"',
-            "            SECONDS=$((SECONDS + PIPELINE_COST))",
+            "            FAKE_NOW=$((FAKE_NOW + PIPELINE_COST))",
+            f"            command sleep {real_attempt_seconds}",
             "            [ $n -gt ${#PIPELINE_RCS[@]} ] && n=${#PIPELINE_RCS[@]}",
             '            return "${PIPELINE_RCS[$((n - 1))]}" ;;',
             "        *'-m lib.rebuild_lock --describe-holder'*)",
@@ -347,6 +354,7 @@ def _run_harness(
     stubs: tuple[str, ...] = (),
     pipeline_cost: int = 0,
     lookups: list[str] | None = None,
+    real_attempt_seconds: float = 0,
 ) -> subprocess.CompletedProcess[str]:
     bash = shutil.which("bash")
     assert bash is not None, "bash is required to execute this region"
@@ -363,6 +371,7 @@ def _run_harness(
             pipeline_cost,
             lookups,
             tmp_path / "lookups",
+            real_attempt_seconds,
         )
     )
     return subprocess.run(
@@ -611,6 +620,22 @@ class TestBowOutBranchActuallyExecutes:
         # already passes the 600 s budget, so nothing is left to sleep.
         assert [ln for ln in result.stdout.splitlines() if ln.startswith("SLEEP")] == ["SLEEP 0"]
         assert "NOTIFY :no_entry:" in result.stdout
+
+    def test_real_time_inside_an_attempt_does_not_leak_into_the_wait(self, tmp_path: Path) -> None:
+        """The wait reads the injectable clock, not bash's SECONDS: a real second
+        spent inside a stubbed attempt must not turn SLEEP 120 into SLEEP 119."""
+        result = _run_harness(
+            [75],
+            tmp_path,
+            holders=["discogs-etl-seed"],
+            wait_minutes=7,
+            real_attempt_seconds=1.1,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert [ln for ln in result.stdout.splitlines() if ln.startswith("SLEEP")] == [
+            "SLEEP 300",
+            "SLEEP 120",
+        ]
 
     def test_time_spent_in_attempts_counts_against_the_wait(self, tmp_path: Path) -> None:
         """Slow attempts (connect retries) must not stretch the wait past its

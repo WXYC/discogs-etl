@@ -22,9 +22,16 @@
 #   PRESERVE_API_FETCH           set to 0 to stop the rebuild preserving LML's
 #                                api_fetch releases (default on; see #450)
 #   REBUILD_LOCK_WAIT_MINUTES    how long to retry (every 5 min) while a non-rebuild
-#                                session (dedup, seed, operator) holds the cache
-#                                rebuild lock, key 354001, before bowing out
+#                                session (dedup, seed, api_fetch export restore,
+#                                operator) holds the cache rebuild lock, key
+#                                354001, before bowing out
 #                                (default 180; 0 = bow out at once; see #465)
+#   REBUILD_LOCK_LOOKUP_ATTEMPTS how many times to try naming the lock holder
+#                                before bowing out because it might be a peer
+#                                rebuild (default 3; see #491)
+#   REBUILD_LOCK_LOOKUP_RETRY_SECONDS  sleep between those lookups (default 30);
+#                                the lookups and their sleeps count against
+#                                REBUILD_LOCK_WAIT_MINUTES
 #   REBUILD_SMOKE                when set to 1, exercise everything that can
 #                                fail at host setup (env, gh auth, git pulls,
 #                                cargo build, library.db download, dump URL
@@ -505,7 +512,8 @@ fi
 # `set -u` would abort on the unset variable below.
 #
 # Waiting out a non-rebuild holder (#465). The lock is also taken by dedup, a
-# real seed and operator sessions (#433, #454), each of which finishes in minutes
+# real seed, an api_fetch export restore and operator sessions (#433, #454,
+# #462), each of which finishes in minutes
 # to an hour or two, so skipping the month for one of them costs a month of
 # freshness for nothing. Only a peer rebuild -- named discogs-etl-rebuild on its
 # lock connection -- is this tick's rebuild and ends the run at once, and so does
@@ -517,9 +525,36 @@ fi
 # refused attempt costs seconds. The call keeps the ERR-trap-safe shape above
 # inside the loop; only exit 75 is retried, so any other exit still reaches
 # on_error below. The wait adds up the sleeps plus the time each attempt and
-# lookup took (bash SECONDS), so the tests can stub `sleep` and advance
-# SECONDS. It must stay inside the instance's lifetime: see
+# lookup took (read through lock_wait_now, so the tests can inject a fake
+# clock). It must stay inside the instance's lifetime: see
 # test_wait_fits_inside_the_instance_lifetime.
+# The wait's clock and its charge-and-clamp arithmetic, shared by the attempt
+# loop and the lookup-retry loop. The tests replace lock_wait_now.
+lock_wait_now() { echo "$SECONDS"; }
+# lock_wait_sleep_for <cap>: charge the time since LOCK_ATTEMPT_STARTED to the
+# wait, then set LOCK_SLEEP_SECONDS to the time left, capped. Returns 1 when
+# none is left, with LOCK_SLEEP_SECONDS floored at 0 so a negative never
+# reaches `sleep`.
+lock_wait_sleep_for() {
+    local now
+    now=$(lock_wait_now)
+    REBUILD_LOCK_WAITED_SECONDS=$((REBUILD_LOCK_WAITED_SECONDS + now - LOCK_ATTEMPT_STARTED))
+    LOCK_ATTEMPT_STARTED=$now
+    LOCK_SLEEP_SECONDS=$((REBUILD_LOCK_WAIT_SECONDS - REBUILD_LOCK_WAITED_SECONDS))
+    if [ "$LOCK_SLEEP_SECONDS" -gt "$1" ]; then
+        LOCK_SLEEP_SECONDS=$1
+    fi
+    if [ "$LOCK_SLEEP_SECONDS" -le 0 ]; then
+        LOCK_SLEEP_SECONDS=0
+        return 1
+    fi
+}
+# Sleep LOCK_SLEEP_SECONDS and charge exactly that, not the clock's reading.
+lock_wait_sleep() {
+    sleep "$LOCK_SLEEP_SECONDS"
+    REBUILD_LOCK_WAITED_SECONDS=$((REBUILD_LOCK_WAITED_SECONDS + LOCK_SLEEP_SECONDS))
+    LOCK_ATTEMPT_STARTED=$(lock_wait_now)
+}
 REBUILD_LOCK_BOWED_OUT_EXIT_CODE=75
 REBUILD_LOCK_HOLDER_FREE_EXIT_CODE=3
 REBUILD_LOCK_REBUILD_HOLDER="discogs-etl-rebuild"
@@ -548,7 +583,7 @@ REBUILD_LOCK_WAIT_ANNOUNCED=0
 REBUILD_LOCK_LAST_LOOKUP_FREE=0
 LOCK_BOWOUT_NOTE=""
 while :; do
-    LOCK_ATTEMPT_STARTED=$SECONDS
+    LOCK_ATTEMPT_STARTED=$(lock_wait_now)
     PIPELINE_EXIT_CODE=0
     python "$REPO_DIR/scripts/run_pipeline.py" \
         --xml "$WORK_DIR" $PRESERVE_API_FETCH_ARG \
@@ -573,18 +608,13 @@ while :; do
             break
         fi
         echo "[$(date -u +%H:%M:%SZ)] holder lookup ${LOCK_LOOKUPS} of ${REBUILD_LOCK_LOOKUP_ATTEMPTS} failed (exit ${HOLDER_EXIT_CODE})" >&2
-        REBUILD_LOCK_WAITED_SECONDS=$((REBUILD_LOCK_WAITED_SECONDS + SECONDS - LOCK_ATTEMPT_STARTED))
-        LOCK_ATTEMPT_STARTED=$SECONDS
-        LOCK_LOOKUP_SLEEP=$((REBUILD_LOCK_WAIT_SECONDS - REBUILD_LOCK_WAITED_SECONDS))
-        if [ "$LOCK_LOOKUPS" -ge "$REBUILD_LOCK_LOOKUP_ATTEMPTS" ] || [ "$LOCK_LOOKUP_SLEEP" -le 0 ]; then
+        # No time left, or the last lookup: stop retrying and let the holder
+        # label say the lookup failed.
+        if ! lock_wait_sleep_for "$REBUILD_LOCK_LOOKUP_RETRY_SECONDS" \
+            || [ "$LOCK_LOOKUPS" -ge "$REBUILD_LOCK_LOOKUP_ATTEMPTS" ]; then
             break
         fi
-        if [ "$LOCK_LOOKUP_SLEEP" -gt "$REBUILD_LOCK_LOOKUP_RETRY_SECONDS" ]; then
-            LOCK_LOOKUP_SLEEP=$REBUILD_LOCK_LOOKUP_RETRY_SECONDS
-        fi
-        sleep "$LOCK_LOOKUP_SLEEP"
-        REBUILD_LOCK_WAITED_SECONDS=$((REBUILD_LOCK_WAITED_SECONDS + LOCK_LOOKUP_SLEEP))
-        LOCK_ATTEMPT_STARTED=$SECONDS
+        lock_wait_sleep
     done
     # The name goes into notify_slack's hand-built JSON: drop what would break it.
     LOCK_HOLDER=$(printf '%s' "$LOCK_HOLDER" | tr -d '"\\[:cntrl:]')
@@ -617,7 +647,7 @@ while :; do
 
     if [ "$LOCK_ACTION" = "retry_now" ]; then
         # Skip the sleep, not the clock.
-        REBUILD_LOCK_WAITED_SECONDS=$((REBUILD_LOCK_WAITED_SECONDS + SECONDS - LOCK_ATTEMPT_STARTED))
+        lock_wait_sleep_for "$REBUILD_LOCK_RETRY_SECONDS" || true
         continue
     elif [ "$LOCK_ACTION" = "bow_out" ]; then
         LOCK_BOWOUT_NOTE=" Holder: ${LOCK_HOLDER_LABEL}."
@@ -642,16 +672,10 @@ while :; do
     # The attempt and the lookup count against the wait too (each can spend
     # most of a minute on connect retries), so the wait bounds real time. The
     # last sleep stops at the deadline rather than overshooting it.
-    REBUILD_LOCK_WAITED_SECONDS=$((REBUILD_LOCK_WAITED_SECONDS + SECONDS - LOCK_ATTEMPT_STARTED))
-    LOCK_SLEEP_SECONDS=$((REBUILD_LOCK_WAIT_SECONDS - REBUILD_LOCK_WAITED_SECONDS))
-    if [ "$LOCK_SLEEP_SECONDS" -gt "$REBUILD_LOCK_RETRY_SECONDS" ]; then
-        LOCK_SLEEP_SECONDS=$REBUILD_LOCK_RETRY_SECONDS
-    fi
-    if [ "$LOCK_SLEEP_SECONDS" -lt 0 ]; then
-        LOCK_SLEEP_SECONDS=0
-    fi
-    sleep "$LOCK_SLEEP_SECONDS"
-    REBUILD_LOCK_WAITED_SECONDS=$((REBUILD_LOCK_WAITED_SECONDS + LOCK_SLEEP_SECONDS))
+    # With no time left this sleeps 0 and the next pass bows out at the
+    # deadline; the lookup loop above stops instead, as it has nothing to retry.
+    lock_wait_sleep_for "$REBUILD_LOCK_RETRY_SECONDS" || true
+    lock_wait_sleep
 done
 
 if [ "$PIPELINE_EXIT_CODE" -eq "$REBUILD_LOCK_BOWED_OUT_EXIT_CODE" ]; then
