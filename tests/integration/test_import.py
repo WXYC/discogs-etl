@@ -1323,25 +1323,18 @@ class TestImportClearsTombstones:
             f"column list and the ON CONFLICT DO UPDATE SET clause."
         )
 
-    @pytest.mark.parametrize(
-        "not_found",
-        [
-            pytest.param(True, id="tombstone"),
-            pytest.param(False, id="live-row-an-earlier-rebuild-left-unnamed"),
-        ],
-    )
-    def test_rebuild_clears_artist_tombstone(self, tmp_path, not_found) -> None:
-        """An artist row named ``''`` gets a name, and any tombstone cleared,
-        when the fresh dump's release_artist re-stubs its id.
+    def test_rebuild_clears_artist_tombstone(self, tmp_path) -> None:
+        """A tombstoned artist gets ``not_found`` reset, and a name, when the
+        fresh dump's release_artist re-stubs its id.
 
         LML#510 writes ``name = ''`` when it tombstones an id it never cached.
         ``''`` is never a real name, so clearing the tombstone must also
         replace it with the dump's spelling. Otherwise LML serves a live
         artist named ``''`` for good: its cache-hit test is ``fetched_at IS NOT
-        NULL``, and every artist row has ``fetched_at``. Rebuilds before this
-        fix cleared the tombstone and kept the ``''``, so a live row named
-        ``''`` must be named the same way. A real name is never replaced
-        (``TestArtistStubOneRowPerId.test_existing_row_keeps_its_name``).
+        NULL``, and every artist row has ``fetched_at``. The live rows earlier
+        rebuilds left named ``''``, the spelling vote and the reach of the heal
+        are covered in ``TestArtistStubOneRowPerId``, which also shows that a
+        real name is never replaced (``test_existing_row_keeps_its_name``).
         """
         conn = psycopg.connect(self.db_url)
         with conn.cursor() as cur:
@@ -1352,12 +1345,8 @@ class TestImportClearsTombstones:
                 "INSERT INTO release_artist (release_id, artist_id, artist_name) "
                 "VALUES (700, 701, 'Stereolab')"
             )
-            # The row LML#510 writes for an id it never cached, before or
-            # after an earlier rebuild cleared its tombstone.
-            cur.execute(
-                "INSERT INTO artist (id, name, not_found) VALUES (701, '', %s)",
-                (not_found,),
-            )
+            # The row LML#510 writes for an id it never cached.
+            cur.execute("INSERT INTO artist (id, name, not_found) VALUES (701, '', TRUE)")
         conn.commit()
         conn.close()
 
@@ -1601,17 +1590,51 @@ class TestArtistStubOneRowPerId:
         The conflict branch fills the name from ``EXCLUDED``, which is the one
         row DISTINCT ON kept, so an id credited under several spellings gets
         the spelling with the most main credits, not whichever came first.
+        ``Nilufer Yanya`` comes first both in byte order and in insertion
+        order, so only the main-credit rule picks ``Nilüfer Yanya``.
         """
         with psycopg.connect(self.db_url) as conn, conn.cursor() as cur:
             cur.execute(
                 "INSERT INTO artist (id, name, not_found) VALUES (%s, '', %s)",
-                (DIRT_NATION_ID, tombstoned),
+                (NILUFER_YANYA_ID, tombstoned),
             )
-        self._credit(DIRT_NATION_ID, [(1, "Dirt nation", 1), (2, "Dirt Nation", 0)])
+        self._credit(NILUFER_YANYA_ID, [(1, "Nilufer Yanya", 1), (2, "Nilüfer Yanya", 0)])
 
         self._stub(tmp_path)
 
-        assert self._artist_rows(DIRT_NATION_ID) == [("Dirt Nation", False)]
+        assert self._artist_rows(NILUFER_YANYA_ID) == [("Nilüfer Yanya", False)]
+
+    @pytest.mark.parametrize(
+        "existing",
+        [
+            pytest.param(("", True), id="tombstone"),
+            pytest.param(("", False), id="live-row-named-empty"),
+            pytest.param(None, id="new-id"),
+        ],
+    )
+    def test_an_empty_credit_name_never_wins(self, tmp_path, existing) -> None:
+        """A credit whose name is ``''`` takes no part in the spelling vote.
+
+        ``''`` is never a real name, but ``release_artist`` can hold one: LML
+        writes the credits of releases it fetches with ``a.get("name", "")``,
+        and a name made only of NUL characters loads as ``''``. Tied with a
+        real spelling, ``''`` would win the byte-order tie-break, so a ``''``
+        row would be "healed" to ``''`` and a new id would be stubbed as
+        ``''``. An id credited only as ``''`` stubs no row.
+        """
+        if existing is not None:
+            with psycopg.connect(self.db_url) as conn, conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO artist (id, name, not_found) VALUES (%s, %s, %s)",
+                    (STEREOLAB_ID, *existing),
+                )
+        self._credit(STEREOLAB_ID, [(1, "Stereolab", 0), (2, "", 0)])
+        self._credit(DIRT_NATION_ID, [(3, "", 0)])
+
+        self._stub(tmp_path)
+
+        assert self._artist_rows(STEREOLAB_ID) == [("Stereolab", False)]
+        assert self._artist_rows(DIRT_NATION_ID) == []
 
     @pytest.mark.parametrize(
         "tombstoned",
