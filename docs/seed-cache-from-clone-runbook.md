@@ -8,7 +8,7 @@ Motivation: [Backend-Service#1631](https://github.com/WXYC/Backend-Service/issue
 
 When a bounded, known set of releases needs to exist in a populated cache and a full rebuild is not warranted. This is **not** the mechanism for widening the cache filter to open-ended demand (rejected as low-ROI). The target is a specific release_id list produced upstream.
 
-Avoid running a real seed across the monthly rebuild tick (06:00 UTC on the 4th = 22:00 PST / 23:00 PDT on the 3rd). The seed holds rebuild lock `354001` for its whole write (named `discogs-etl-seed` on its connection), and a rebuild that finds it held by a seed retries every 5 minutes for up to `REBUILD_LOCK_WAIT_MINUTES` (default 180) instead of skipping the month, so an overlap delays the rebuild. The real window is wider than the tick: the rebuild takes `354001` only after boot, the code refresh, alembic, the `library.db` download and the dump spool, often 30 or more minutes after 06:00 UTC. A seed that outlasts the wait still skips that month's rebuild, so schedule away from it, as the dedup runbook says for dedup. Seed releases and artists in one invocation (`--ids-file` plus `--artist-ids-file`): it takes `354001` once and holds it from the start of the release seed to the end of the artist seed, so a waiting rebuild cannot take the lock between the families. Two separate invocations (a release seed, then `--seed-artists`) each hold it only for their own write and leave a gap in which the rebuild's import TRUNCATE / prune drops the just-seeded rows and the artist seed refuses with exit 75; do not split a seed procedure across the tick. The span covers the two seed families only. The export restore (`restore_api_fetch_from_export.py`) takes `354001` itself under `discogs-etl-restore-api-fetch` and runs afterwards; a rebuild that runs in that gap preserves `api_fetch` releases itself (`--preserve-api-fetch`) and the restore lets the dump win, so the gap there is harmless.
+Avoid running a real seed across the monthly rebuild tick (06:00 UTC on the 4th = 22:00 PST / 23:00 PDT on the 3rd). The seed holds rebuild lock `354001` for its whole write (named `discogs-etl-seed` on its connection), and a rebuild that finds it held by a seed retries every 5 minutes for up to `REBUILD_LOCK_WAIT_MINUTES` (default 180) instead of skipping the month, so an overlap delays the rebuild. The real window is wider than the tick: the rebuild takes `354001` only after boot, the code refresh, alembic, the `library.db` download and the dump spool, often 30 or more minutes after 06:00 UTC. A seed that outlasts the wait still skips that month's rebuild, so schedule away from it, as the dedup runbook says for dedup. Seed releases and artists in one invocation (`--ids-file` plus `--artist-ids-file`): it takes `354001` once and holds it from the start of the release seed to the end of the artist seed, so the two families stay consistent with each other, with no rebuild between them. Two separate invocations (a release seed, then `--seed-artists`) each hold it only for their own write; a rebuild can run in the gap between them, and the artist seed then refuses with exit 75. The single invocation does **not** make a seed across the tick safe. A waiting rebuild takes `354001` right after the span ends, and its import prune and verify-prune drop seeded non-library releases recorded as `bulk_import` (see the end of this runbook), so still schedule the seed away from the tick. The span covers the two seed families only. The export restore (`restore_api_fetch_from_export.py`) takes `354001` itself under `discogs-etl-restore-api-fetch` and runs afterwards; the gap before it is harmless for `api_fetch` rows: `restore_api_fetch_releases` restores only absent or hollow ids and the dump wins, and a rebuild preserves the target's `api_fetch` releases itself (`--preserve-api-fetch`).
 
 Do not run while a bulk job is hammering LML on the shared Discogs token — this seed does not call Discogs (clone → PG copy only), but the downstream backfill it unblocks does.
 
@@ -47,13 +47,26 @@ The script depends only on `psycopg` and `lib.observability` (installable via `p
      --dry-run
    ```
 3. **Dry-run against prod** (still no writes) to see how many candidates are genuinely new vs already present.
-4. **Seed prod** (drop `--dry-run`). The write is one transaction per family; per-table inserted counts are logged.
+4. **Seed prod** (drop `--dry-run`). To seed releases and artists, use one invocation: `--ids-file` for the releases plus `--artist-ids-file` for the artists (see Artist seeding), so `354001` is held across both. The write is one transaction per family; per-table inserted counts are logged.
 5. **Verify (read-only).** Referential-integrity check over the seeded release_ids (every child has a parent `release`; no orphans; `artwork_url` populated where the clone had it), then a live coverage check: prod LML `/api/v1/lookup` on ≥5 tail albums → expect cache hit, zero `discogs.fallthrough` events. **Do not** run `verify_cache.py`.
 6. **Resume the paused backfill** from its cursor (`BACKFILL_ALBUM_AFTER_ID`) — separate go.
 
 ## Artist seeding
 
-`seed_artists_additive` (same guarantees, invoked via `--seed-artists`) copies tail `artist` rows + their `artist_name_variation` children when LML enrichment JOINs them and they are absent on the target. `artist` (id PK) uses `ON CONFLICT`; so does `artist_name_variation`, on `(artist_id, name)` — [#433](https://github.com/WXYC/discogs-etl/issues/433) gave it a UNIQUE constraint, and a clone taken before that ticket's dedupe carries ~4.8 copies of every row, which an arbiter-less insert would now fail on. It stays parent-gated as well. Only seed artists if the column-diff/enrichment step confirms they are needed.
+`seed_artists_additive` (same guarantees) copies tail `artist` rows + their `artist_name_variation` children when LML enrichment JOINs them and they are absent on the target. `artist` (id PK) uses `ON CONFLICT`; so does `artist_name_variation`, on `(artist_id, name)` — [#433](https://github.com/WXYC/discogs-etl/issues/433) gave it a UNIQUE constraint, and a clone taken before that ticket's dedupe carries ~4.8 copies of every row, which an arbiter-less insert would now fail on. It stays parent-gated as well. Only seed artists if the column-diff/enrichment step confirms they are needed.
+
+Seed releases and artists together with one invocation: `--ids-file` holds the release_ids and `--artist-ids-file` the artist_ids, one per line each. The run takes `354001` once for the release seed and the artist seed (#488).
+
+```bash
+python scripts/seed_cache_from_clone.py \
+  --source postgresql://localhost:5432/discogs \
+  --target "$DATABASE_URL_DISCOGS" \
+  --ids-file tail_release_ids.txt \
+  --artist-ids-file tail_artist_ids.txt \
+  --dry-run
+```
+
+Drop `--dry-run` to write. For the artists-only case, use `--seed-artists`, where `--ids-file` holds artist_ids in the same format:
 
 ```bash
 python scripts/seed_cache_from_clone.py \
@@ -63,8 +76,6 @@ python scripts/seed_cache_from_clone.py \
   --seed-artists \
   --dry-run
 ```
-
-Drop `--dry-run` to write. `--ids-file` here holds artist_ids, one per line, in the same format as the release-id file.
 
 ## Rollback
 
