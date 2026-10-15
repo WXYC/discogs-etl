@@ -234,10 +234,14 @@ jobs:
           mkfifo data/releases.xml.gz
           rm -f data/curl.status
           (
+            # Capture curl's exit code without errexit: this subshell inherits
+            # `set -e`, which would abort before the echo and leave
+            # curl.status unwritten on exactly the failures it exists to report.
+            rc=0
             curl -fL --retry 3 --retry-delay 30 \
               -o data/releases.xml.gz \
-              "$DUMP_URL"
-            echo "$?" > data/curl.status
+              "$DUMP_URL" || rc=$?
+            echo "$rc" > data/curl.status
           ) &
           CURL_PID=$!
 
@@ -273,6 +277,7 @@ jobs:
           # script is where a bow-out is reported properly.
           if [ "$PY_RC" -eq 75 ]; then
             echo "::warning::bowed out — the discogs-cache rebuild lock (key 354001) is held by another session (a rebuild, a dedup, a seed, an api_fetch export restore, or an operator session); no cache write. See discogs-etl#354."
+            pkill -P "$CURL_PID" 2>/dev/null || true
             kill "$CURL_PID" 2>/dev/null || true
             wait "$CURL_PID" 2>/dev/null || true
             exit "$PY_RC"
@@ -281,8 +286,11 @@ jobs:
           # Any other early failure (a connection error, the pre-conversion
           # api_fetch recovery restore) leaves curl just as parked on the FIFO
           # when curl.status is not yet written (discogs-etl#482). If curl had
-          # already failed first, fall through to its diagnosis below.
+          # already failed first (it then wrote its real exit code to
+          # curl.status), fall through to its diagnosis below. $CURL_PID is the
+          # subshell, not curl, so signal the child first or curl is orphaned.
           if [ "$PY_RC" -ne 0 ] && [ ! -e data/curl.status ]; then
+            pkill -P "$CURL_PID" 2>/dev/null || true
             kill "$CURL_PID" 2>/dev/null || true
             wait "$CURL_PID" 2>/dev/null || true
             exit "$PY_RC"

@@ -16,28 +16,17 @@ diverge from the in-tree semantics. Two pins in this file:
 
 from __future__ import annotations
 
-import shlex
 from pathlib import Path
+
+from tests.workflow_yaml import run_pipeline_tokens
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT_PATH = REPO_ROOT / "scripts" / "rebuild-cache.sh"
 
 
 def _run_pipeline_invocation_tokens() -> list[str]:
-    """Return the tokens of the ``run_pipeline.py`` invocation in rebuild-cache.sh.
-
-    Joins continuation lines (``\\``) so a multi-line invocation parses as a
-    single shell command, then tokenizes via shlex so quoted arguments and
-    bare flags are handled the same way bash would handle them.
-    """
-    source = SCRIPT_PATH.read_text()
-    # Strip backslash-continuations so the call spans one logical line.
-    joined = source.replace("\\\n", " ")
-    for line in joined.splitlines():
-        stripped = line.lstrip()
-        if "scripts/run_pipeline.py" in stripped and stripped.startswith("python"):
-            return shlex.split(stripped)
-    raise AssertionError("Could not find run_pipeline.py invocation in rebuild-cache.sh")
+    """Return the tokens of the ``run_pipeline.py`` invocation in rebuild-cache.sh."""
+    return run_pipeline_tokens(SCRIPT_PATH.read_text())
 
 
 class TestRebuildCacheFlags:

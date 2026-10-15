@@ -16,6 +16,7 @@ which is the whole problem with two copies.
 
 from __future__ import annotations
 
+import shlex
 from pathlib import Path
 from typing import Any
 
@@ -93,3 +94,17 @@ def working_directory(doc: dict[str, Any], job: str, name: str) -> str:
         if source.get("working-directory"):
             return str(source["working-directory"])
     return "."
+
+
+def run_pipeline_tokens(script_text: str) -> list[str]:
+    """Tokenize the ``python scripts/run_pipeline.py`` call in a shell script.
+
+    Joins ``\\`` continuations like bash, then tokenizes via shlex so quoted
+    arguments and bare flags are handled the way bash would.
+    """
+    joined = script_text.replace("\\\n", " ")
+    for line in joined.splitlines():
+        stripped = line.lstrip()
+        if "scripts/run_pipeline.py" in stripped and stripped.startswith("python"):
+            return shlex.split(stripped)
+    raise AssertionError("Could not find the run_pipeline.py invocation")
