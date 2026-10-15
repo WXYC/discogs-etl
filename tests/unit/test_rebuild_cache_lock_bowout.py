@@ -522,6 +522,18 @@ class TestBowOutBranchActuallyExecutes:
         assert "hourglass" not in result.stdout
         assert "FELL THROUGH TO DRIFT WATCHDOG" not in result.stdout
 
+    def test_a_lookup_failing_past_the_deadline_bows_out_without_sleeping(
+        self, tmp_path: Path
+    ) -> None:
+        """An attempt that overran the wait leaves no time for a lookup retry; a
+        negative sleep would fire the ERR trap on the instance, so none runs."""
+        result = _run_harness([75], tmp_path, lookups=[ERROR], wait_minutes=5, pipeline_cost=400)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert result.stderr.count("holder lookup") == 1
+        assert [ln for ln in result.stdout.splitlines() if ln.startswith("SLEEP")] == []
+        final = next(ln for ln in result.stdout.splitlines() if ln.startswith("NOTIFY :no_entry:"))
+        assert "the holder lookup failed" in final
+
     def test_lookup_retry_sleeps_count_against_the_wait_and_stop_at_the_deadline(
         self, tmp_path: Path
     ) -> None:
