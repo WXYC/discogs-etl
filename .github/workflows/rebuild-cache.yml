@@ -208,13 +208,19 @@ jobs:
       # invocation runs the converter against that FIFO. Kernel pipe buffer
       # backpressures curl when the converter falls behind.
       #
-      # Curl-failure handling (#219): the backgrounded curl writes its exit
-      # status to data/curl.status when it terminates. If curl exits non-zero
-      # before the pipeline opens the FIFO, the FIFO sees EOF immediately and
-      # the python script fails for a *different* reason (e.g. converter
-      # rejecting empty input), masking the real network failure. By checking
-      # the status file before propagating the python exit code, we surface
-      # the curl failure with priority over the masked downstream error.
+      # Curl-failure handling (#219, #508): the backgrounded curl writes its
+      # exit status to data/curl.status when it terminates. curl opens its -o
+      # target only when the first body byte arrives, so a connect, DNS or -f
+      # HTTP failure exits without ever opening the FIFO and a reader's open()
+      # would block forever. On failure the subshell therefore keeps opening
+      # and closing the write end (O_RDWR does not block) until the pipeline
+      # exits, so a reader that is already blocked, or arrives minutes later
+      # after the api_fetch restore, gets EOF. A one-shot open would miss the
+      # late reader; checking curl.status on the python side would need a change
+      # inside the converter's open. The python script then fails for a
+      # *different* reason (e.g. converter rejecting empty input), masking the
+      # real network failure. By checking the status file before propagating
+      # the python exit code, we surface the curl failure with priority.
       - name: Run pipeline (with streamed dump)
         env:
           DATABASE_URL_DISCOGS: ${{ secrets.DATABASE_URL_DISCOGS }}
@@ -232,7 +238,7 @@ jobs:
           set -euo pipefail
           mkdir -p data
           mkfifo data/releases.xml.gz
-          rm -f data/curl.status
+          rm -f data/curl.status data/pipeline.done
           (
             # Capture curl's exit code without errexit: this subshell inherits
             # `set -e`, which would abort before the echo and leave
@@ -242,6 +248,12 @@ jobs:
               -o data/releases.xml.gz \
               "$DUMP_URL" || rc=$?
             echo "$rc" > data/curl.status
+            if [ "$rc" -ne 0 ]; then
+              until [ -e data/pipeline.done ]; do
+                : <> data/releases.xml.gz
+                sleep 0.2
+              done
+            fi
           ) &
           CURL_PID=$!
 
@@ -259,6 +271,7 @@ jobs:
             "${PRESERVE_ARGS[@]}"
           PY_RC=$?
           set -e
+          touch data/pipeline.done
 
           # Advisory-lock bow-out (discogs-etl#354): run_pipeline.py exits 75
           # within a second or two, long before the converter ever opens the
