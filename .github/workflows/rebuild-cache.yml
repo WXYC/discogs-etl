@@ -231,8 +231,9 @@ jobs:
           # hands exception events to the Sentry SDK. Unset → Sentry stays
           # inactive, JSON logging still emits to stderr.
           SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
-          # verify_cache.py posts its copy-swap shortfall and absent-pin alerts
-          # here (discogs-etl#357, #446). Unset, they reach only this job's log.
+          # verify_cache.py posts its copy-swap shortfall alert and run_pipeline.py
+          # its pin-loss alert here (discogs-etl#357, #493). Unset, they reach
+          # only this job's log.
           SLACK_MONITORING_WEBHOOK: ${{ secrets.SLACK_MONITORING_WEBHOOK }}
         run: |
           set -euo pipefail

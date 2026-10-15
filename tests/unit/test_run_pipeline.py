@@ -49,6 +49,21 @@ def _stub_rebuild_lock():
         yield fake_conn
 
 
+@pytest.fixture(autouse=True)
+def _stub_pin_loss():
+    """Stub out #493's pin-loss record and check for every test in this file.
+
+    Both open their own connection, which the tests here either leave unpatched
+    or patch with a bare MagicMock. ``TestPinLossWiring`` and
+    ``TestReportPinLoss`` patch them again to observe them.
+    """
+    with (
+        patch.object(run_pipeline, "record_pin_start_state", return_value=None),
+        patch.object(run_pipeline, "measure_pin_loss", return_value=None),
+    ):
+        yield
+
+
 class TestRunStepStreaming:
     """run_step() streams subprocess output line-by-line."""
 
@@ -2828,6 +2843,7 @@ class TestPreserveApiFetchWiring:
                 run_pipeline, "snapshot_api_fetch_releases", side_effect=record("snapshot")
             ),
             patch.object(run_pipeline, "restore_api_fetch_releases", side_effect=record("restore")),
+            patch.object(run_pipeline, "record_pin_start_state", side_effect=record("record")),
             patch.object(run_pipeline, "_run_database_build", side_effect=record("build")),
             patch.object(
                 run_pipeline, "_run_database_build_post_import", side_effect=record("post_import")
@@ -2842,6 +2858,7 @@ class TestPreserveApiFetchWiring:
     def test_direct_pg_snapshots_before_the_truncate(self, tmp_path) -> None:
         assert self._xml(tmp_path, "--direct-pg") == [
             "snapshot",
+            "record",
             "truncate",
             "convert",
             "post_import",
@@ -2857,3 +2874,266 @@ class TestPreserveApiFetchWiring:
         ):
             run_pipeline._restore_api_fetch_releases_crash_safe("postgresql:///test")
         set_logged.assert_called_once_with("postgresql:///test")
+
+
+class TestResolveAbsentPinAlertRatio:
+    """ABSENT_PIN_ALERT_RATIO parsing: a typo can neither crash the run nor switch
+    the pin-loss alert off."""
+
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [
+            pytest.param(None, 0.05, id="unset-uses-default"),
+            pytest.param("", 0.05, id="empty-uses-default"),
+            pytest.param("0.01", 0.01, id="lowered"),
+            pytest.param("1.0", 1.0, id="disabled"),
+            pytest.param("0", 0.0, id="any-loss"),
+            pytest.param("abc", 0.05, id="typo-uses-default"),
+            pytest.param("1.5", 0.05, id="over-one-uses-default"),
+            pytest.param("-0.1", 0.05, id="negative-uses-default"),
+        ],
+    )
+    def test_parses_the_env_var(self, monkeypatch, raw, expected) -> None:
+        if raw is None:
+            monkeypatch.delenv("ABSENT_PIN_ALERT_RATIO", raising=False)
+        else:
+            monkeypatch.setenv("ABSENT_PIN_ALERT_RATIO", raw)
+        assert run_pipeline.resolve_absent_pin_alert_ratio() == expected
+
+
+class TestReportPinLoss:
+    """report_pin_loss (#493): ERROR plus one Slack post above the threshold,
+    INFO otherwise. The share counts only pins present when the run started."""
+
+    @pytest.fixture(autouse=True)
+    def slack_posts(self, monkeypatch) -> list[dict]:
+        """Record Slack posts instead of sending them, and use the default threshold."""
+        posts: list[dict] = []
+        monkeypatch.setattr(run_pipeline, "post_slack_alert", lambda **kw: posts.append(kw) or True)
+        monkeypatch.delenv("ABSENT_PIN_ALERT_RATIO", raising=False)
+        monkeypatch.delenv("MAX_PIN_SHORTFALL_RATIO", raising=False)
+        return posts
+
+    @staticmethod
+    def _loss(lost: int, at_start: int):
+        return run_pipeline.PinLoss(lost=list(range(1, lost + 1)), at_start=at_start)
+
+    @pytest.mark.parametrize(
+        ("lost", "at_start", "env", "alerts"),
+        [
+            pytest.param(0, 58_000, {}, False, id="nothing-lost"),
+            pytest.param(0, 0, {}, False, id="no-pins"),
+            pytest.param(13, 1000, {}, False, id="1.3%-under-default"),
+            pytest.param(1, 20, {}, False, id="5%-at-default"),
+            pytest.param(1, 8, {}, True, id="12.5%-over-default"),
+            # 2026-09-04 (#422) lost 47% of the pins the cache held.
+            pytest.param(2, 3, {}, True, id="66.7%-over-default"),
+            pytest.param(13, 1000, {"ABSENT_PIN_ALERT_RATIO": "0.01"}, True, id="lowered"),
+            pytest.param(1, 8, {"ABSENT_PIN_ALERT_RATIO": "0.2"}, False, id="raised"),
+            pytest.param(2, 3, {"ABSENT_PIN_ALERT_RATIO": "1.0"}, False, id="disabled"),
+            # Forcing an import through with the import's own knob must not
+            # silence this alert.
+            pytest.param(2, 3, {"MAX_PIN_SHORTFALL_RATIO": "1.0"}, True, id="import-knob-ignored"),
+        ],
+    )
+    def test_alerts_only_above_the_threshold(
+        self, caplog, monkeypatch, slack_posts, lost, at_start, env, alerts
+    ) -> None:
+        for name, value in env.items():
+            monkeypatch.setenv(name, value)
+        with caplog.at_level(logging.INFO, logger=run_pipeline.logger.name):
+            run_pipeline.report_pin_loss(self._loss(lost, at_start))
+
+        lines = [r for r in caplog.records if "present when the run started" in r.getMessage()]
+        assert [r.levelno for r in lines] == [logging.ERROR if alerts else logging.INFO]
+        assert f"{lost:,} of {at_start:,} pinned release(s)" in lines[0].getMessage()
+        if alerts:
+            assert len(slack_posts) == 1
+            assert slack_posts[0]["title"] == "Discogs cache: pinned releases lost by this rebuild"
+            assert "#422" in slack_posts[0]["message"]
+        else:
+            assert slack_posts == []
+
+    def test_no_start_state_reports_nothing(self, caplog, slack_posts) -> None:
+        with caplog.at_level(logging.INFO, logger=run_pipeline.logger.name):
+            run_pipeline.report_pin_loss(None)
+        assert slack_posts == [] and caplog.records == []
+
+    def test_alert_samples_the_lost_ids_and_names_a_fractional_threshold(
+        self, monkeypatch, slack_posts
+    ) -> None:
+        monkeypatch.setenv("ABSENT_PIN_ALERT_RATIO", "0.125")
+        run_pipeline.report_pin_loss(run_pipeline.PinLoss(lost=list(range(100, 130)), at_start=40))
+        text = slack_posts[0]["message"]
+        assert "over the 12.5% alert threshold" in text
+        assert str(list(range(100, 120))) in text and "120" not in text.split("]")[0]
+
+    def test_alert_posts_to_the_monitoring_webhook(self, monkeypatch, slack_posts) -> None:
+        monkeypatch.setenv("SLACK_MONITORING_WEBHOOK", "https://hooks.example.invalid/pins")
+        run_pipeline.report_pin_loss(self._loss(2, 3))
+        assert [p["webhook_url"] for p in slack_posts] == ["https://hooks.example.invalid/pins"]
+
+    @pytest.mark.parametrize("posted", [True, False])
+    def test_an_alert_that_does_not_reach_slack_is_logged(self, caplog, monkeypatch, posted):
+        monkeypatch.setattr(run_pipeline, "post_slack_alert", lambda **_: posted)
+        with caplog.at_level(logging.WARNING, logger=run_pipeline.logger.name):
+            run_pipeline.report_pin_loss(self._loss(2, 3))
+        undelivered = [r for r in caplog.records if "NOT posted to Slack" in r.getMessage()]
+        assert [r.levelno for r in undelivered] == ([] if posted else [logging.ERROR])
+
+    def test_a_crashed_runs_loss_is_reported_under_its_own_title(self, slack_posts) -> None:
+        with patch.object(run_pipeline, "record_pin_start_state", return_value=self._loss(2, 3)):
+            run_pipeline._record_pin_start("postgresql:///test", reuse_existing=False)
+        assert [p["title"] for p in slack_posts] == [
+            "Discogs cache: pinned releases lost by the previous (failed) rebuild"
+        ]
+
+    def test_the_check_reports_the_measured_loss(self, slack_posts) -> None:
+        with patch.object(run_pipeline, "measure_pin_loss", return_value=self._loss(2, 3)):
+            run_pipeline._check_pin_loss("postgresql:///test")
+        assert [p["title"] for p in slack_posts] == [
+            "Discogs cache: pinned releases lost by this rebuild"
+        ]
+
+
+class TestPinLossWiring:
+    """#493: the start state is recorded after the api_fetch snapshot and before
+    anything destructive; the loss is checked after the api_fetch restore."""
+
+    def _build(self, **kwargs) -> tuple[list[str], MagicMock]:
+        """Run _run_database_build with every step recorded in call order."""
+        calls: list[str] = []
+        record = MagicMock(side_effect=lambda *a, **k: calls.append("record"))
+
+        def sql_file(db_url, path, **k):
+            calls.append("drop" if "drop" in Path(path).name else "create_schema")
+
+        with (
+            patch.object(
+                run_pipeline, "run_step", side_effect=lambda name, *a, **k: calls.append(name)
+            ),
+            patch.object(run_pipeline, "wait_for_postgres"),
+            patch.object(run_pipeline, "write_keep_release_ids"),
+            patch.object(run_pipeline, "run_sql_file", side_effect=sql_file),
+            patch.object(run_pipeline, "run_sql_statements_parallel"),
+            patch.object(run_pipeline, "check_reload_invariant"),
+            patch.object(run_pipeline, "set_tables_unlogged"),
+            patch.object(
+                run_pipeline, "set_tables_logged", side_effect=lambda *a: calls.append("set_logged")
+            ),
+            patch.object(run_pipeline, "run_vacuum", side_effect=lambda *a: calls.append("vacuum")),
+            patch.object(run_pipeline, "report_sizes"),
+            patch.object(run_pipeline, "run_derive_va_release_step"),
+            patch.object(run_pipeline.psycopg, "connect"),
+            patch.object(
+                run_pipeline,
+                "snapshot_api_fetch_releases",
+                side_effect=lambda *a, **k: calls.append("snapshot"),
+            ),
+            patch.object(
+                run_pipeline,
+                "restore_api_fetch_releases",
+                side_effect=lambda *a, **k: calls.append("restore"),
+            ),
+            patch.object(run_pipeline, "record_pin_start_state", record),
+            patch.object(
+                run_pipeline, "measure_pin_loss", side_effect=lambda *a: calls.append("check")
+            ),
+        ):
+            run_pipeline._run_database_build(
+                "postgresql:///test",
+                Path("/tmp/csv"),
+                Path("/tmp/library.db"),
+                sys.executable,
+                **kwargs,
+            )
+        return calls, record
+
+    @pytest.mark.parametrize("fresh_rebuild", [False, True], ids=["upsert", "fresh-rebuild"])
+    def test_record_follows_snapshot_and_precedes_destruction(self, fresh_rebuild) -> None:
+        calls, _ = self._build(preserve_api_fetch=True, fresh_rebuild=fresh_rebuild)
+        first_destructive = "drop" if fresh_rebuild else "create_schema"
+        assert calls.index("snapshot") < calls.index("record") < calls.index(first_destructive)
+        assert calls.count("record") == 1
+
+    def test_check_follows_the_restore(self) -> None:
+        calls, _ = self._build(preserve_api_fetch=True)
+        assert (
+            calls.index("Prune to library matches")
+            < calls.index("restore")
+            < calls.index("check")
+            < calls.index("vacuum")
+        )
+        assert calls.count("check") == 1
+
+    def test_runs_without_api_fetch_preservation(self) -> None:
+        calls, _ = self._build()
+        assert calls.index("record") < calls.index("create_schema")
+        assert calls.index("Prune to library matches") < calls.index("check")
+
+    def test_copy_to_records_and_checks_nothing(self) -> None:
+        calls, _ = self._build(target_db_url="postgresql:///target")
+        assert "record" not in calls and "check" not in calls
+
+    @pytest.mark.parametrize(
+        ("has_state", "resume", "reuse"),
+        [(False, False, False), (True, False, False), (True, True, True)],
+        ids=["no-state", "fresh-csv-run", "resume"],
+    )
+    def test_only_a_resume_reuses_the_start_state(self, has_state, resume, reuse) -> None:
+        state = MagicMock(is_completed=MagicMock(return_value=False)) if has_state else None
+        _, record = self._build(state=state, resume=resume)
+        assert record.call_args.kwargs == {"reuse_existing": reuse}
+
+    def test_main_passes_resume_through(self, tmp_path) -> None:
+        args = run_pipeline.parse_args(["--csv-dir", str(tmp_path), "--resume"])
+        with (
+            patch.object(run_pipeline, "parse_args", return_value=args),
+            patch.object(run_pipeline, "_load_or_create_state"),
+            patch.object(run_pipeline, "_run_database_build") as build,
+        ):
+            run_pipeline.main()
+        assert build.call_args.kwargs["resume"] is True
+
+    def test_post_import_checks_after_the_restore_and_records_nothing(self) -> None:
+        calls: list[str] = []
+        with (
+            patch.object(run_pipeline, "write_keep_release_ids"),
+            patch.object(run_pipeline, "run_step", side_effect=lambda n, *a, **k: calls.append(n)),
+            patch.object(run_pipeline, "run_sql_statements_parallel"),
+            patch.object(run_pipeline, "run_derive_va_release_step"),
+            patch.object(run_pipeline, "run_vacuum"),
+            patch.object(
+                run_pipeline, "set_tables_logged", side_effect=lambda *a: calls.append("set_logged")
+            ),
+            patch.object(run_pipeline, "check_reload_invariant"),
+            patch.object(run_pipeline, "report_sizes"),
+            patch.object(run_pipeline.psycopg, "connect"),
+            patch.object(
+                run_pipeline,
+                "restore_api_fetch_releases",
+                side_effect=lambda *a, **k: calls.append("restore"),
+            ),
+            patch.object(
+                run_pipeline,
+                "record_pin_start_state",
+                side_effect=lambda *a, **k: calls.append("record"),
+            ),
+            patch.object(
+                run_pipeline, "measure_pin_loss", side_effect=lambda *a: calls.append("check")
+            ),
+        ):
+            run_pipeline._run_database_build_post_import(
+                "postgresql:///test",
+                Path("/tmp/csv"),
+                Path("/tmp/library.db"),
+                sys.executable,
+                preserve_api_fetch=True,
+            )
+        assert "record" not in calls
+        assert (
+            calls.index("Prune to library matches")
+            < calls.index("restore")
+            < calls.index("check")
+            < calls.index("set_logged")
+        )
