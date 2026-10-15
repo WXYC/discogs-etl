@@ -12,13 +12,20 @@ loss. The rebuild itself is simulated here by deleting and re-inserting
 from __future__ import annotations
 
 import logging
+import re
 import threading
 from contextlib import contextmanager
 
 import psycopg
 import pytest
 
-from lib.pin_loss import START_TABLE, PinLoss, measure_pin_loss, record_pin_start_state
+from lib.pin_loss import (
+    START_TABLE,
+    PinLoss,
+    drop_pin_start_state,
+    measure_pin_loss,
+    record_pin_start_state,
+)
 
 pytestmark = pytest.mark.pg
 
@@ -39,11 +46,31 @@ def _start_table_exists(db_url: str) -> bool:
         return cur.fetchone()[0] is not None
 
 
-def _record(db_url: str, **kwargs) -> list[PinLoss]:
-    """Record the start state; return what it reported for a left-behind table."""
+def _record(db_url: str, unmeasured: list | None = None, **kwargs) -> list[PinLoss]:
+    """Record the start state; return what it reported for a left-behind table.
+
+    An unmeasured leftover is appended to *unmeasured*; without that list it
+    fails the test.
+    """
     reported: list[PinLoss] = []
-    record_pin_start_state(db_url, report_previous=reported.append, **kwargs)
+
+    def report_unmeasured(renamed_to, reason) -> None:
+        assert unmeasured is not None, f"unexpected unmeasured leftover: {reason}"
+        unmeasured.append((renamed_to, reason))
+
+    record_pin_start_state(
+        db_url, report_previous=reported.append, report_unmeasured=report_unmeasured, **kwargs
+    )
     return reported
+
+
+def _columns(db_url: str, table: str) -> list[str]:
+    with psycopg.connect(db_url) as conn:
+        rows = conn.execute(
+            "SELECT column_name FROM information_schema.columns WHERE table_name = %s",
+            (table,),
+        ).fetchall()
+    return [row[0] for row in rows]
 
 
 @contextmanager
@@ -116,7 +143,9 @@ class TestMeasurePinLoss:
         _execute(cache, *during_run)
 
         assert measure_pin_loss(cache) == PinLoss(lost=lost, at_start=at_start)
-        assert not _start_table_exists(cache), "the scratch table is dropped after the check"
+        assert _start_table_exists(cache), "kept until drop_pin_start_state, after set_logged"
+        drop_pin_start_state(cache)
+        assert not _start_table_exists(cache)
 
     def test_never_cached_pin_is_never_counted(self, cache) -> None:
         """Every pin with no row at start stays out of both counts, however many."""
@@ -167,14 +196,11 @@ class TestMeasurePinLoss:
         assert measure_pin_loss(cache) is None
         assert _start_table_exists(cache)
 
-    def test_a_drop_that_cannot_get_its_lock_still_returns_the_loss(
-        self, cache, monkeypatch
-    ) -> None:
+    def test_a_drop_that_cannot_get_its_lock_keeps_the_table(self, cache, monkeypatch) -> None:
         monkeypatch.setattr("lib.pin_loss.LOCK_TIMEOUT", "100ms")
         _record(cache)
-        _execute(cache, f"DELETE FROM release WHERE id = {LOST}")
         with _start_table_locked(cache):
-            assert measure_pin_loss(cache) == PinLoss(lost=[LOST], at_start=2)
+            drop_pin_start_state(cache)  # never raises
         assert _start_table_exists(cache), "kept, so the next run reports it again"
 
     def test_any_other_error_aborts_the_record(self, cache) -> None:
@@ -209,7 +235,9 @@ class TestLeftoverStartState:
             raise KeyboardInterrupt
 
         with pytest.raises(KeyboardInterrupt):
-            record_pin_start_state(cache, report_previous=report_then_fail)
+            record_pin_start_state(
+                cache, report_previous=report_then_fail, report_unmeasured=pytest.fail
+            )
         assert reported == [PinLoss(lost=[LOST], at_start=2)]
         assert measure_pin_loss(cache) == PinLoss(lost=[LOST], at_start=2)
 
@@ -220,18 +248,31 @@ class TestLeftoverStartState:
             _record(cache)
         assert _start_table_exists(cache)
 
-    def test_a_leftover_that_cannot_be_measured_aborts_and_is_kept(self, cache) -> None:
-        """Nothing is destroyed yet, so abort rather than re-record over the evidence."""
+    def test_an_unmeasurable_leftover_is_renamed_aside_and_the_run_carries_on(self, cache):
+        """It is never dropped: renamed aside, reported, and a fresh start state recorded."""
         _record(cache)
         _execute(cache, f"ALTER TABLE {START_TABLE} RENAME release_id TO rid")
-        with pytest.raises(psycopg.errors.UndefinedColumn):
-            _record(cache)
-        with psycopg.connect(cache) as conn:
-            columns = conn.execute(
-                "SELECT column_name FROM information_schema.columns WHERE table_name = %s",
-                (START_TABLE,),
-            ).fetchall()
-        assert columns == [("rid",)]
+        unmeasured: list = []
+        assert _record(cache, unmeasured=unmeasured) == []
+
+        [(aside, reason)] = unmeasured
+        assert re.fullmatch(rf"{START_TABLE}_unmeasured_\d{{14}}", aside)
+        assert "UndefinedColumn" in reason
+        assert _columns(cache, aside) == ["rid"], "the leftover is kept as it was"
+        assert measure_pin_loss(cache) == PinLoss(lost=[], at_start=2)
+
+    def test_a_leftover_that_cannot_be_renamed_either_aborts(self, cache, monkeypatch) -> None:
+        monkeypatch.setattr("lib.pin_loss.LOCK_TIMEOUT", "100ms")
+        _record(cache)
+        _execute(cache, f"ALTER TABLE {START_TABLE} RENAME release_id TO rid")
+        unmeasured: list = []
+        with _start_table_locked(cache), pytest.raises(psycopg.errors.LockNotAvailable):
+            _record(cache, unmeasured=unmeasured)
+
+        [(renamed_to, reason)] = unmeasured
+        assert renamed_to is None
+        assert "UndefinedColumn" in reason and "LockNotAvailable" in reason
+        assert _columns(cache, START_TABLE) == ["rid"], "never dropped"
 
     def test_resume_reuses_the_original_start_state(self, cache) -> None:
         _record(cache)

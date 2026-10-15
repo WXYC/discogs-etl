@@ -54,6 +54,7 @@ def _stub_pin_loss():
     with (
         patch.object(run_pipeline, "record_pin_start_state", return_value=None),
         patch.object(run_pipeline, "measure_pin_loss", return_value=None),
+        patch.object(run_pipeline, "drop_pin_start_state"),
     ):
         yield
 

@@ -47,7 +47,12 @@ from lib.api_fetch_preservation import (  # noqa: E402
 )
 from lib.dsn import redact_dsn  # noqa: E402
 from lib.observability import init_logger  # noqa: E402
-from lib.pin_loss import PinLoss, measure_pin_loss, record_pin_start_state  # noqa: E402
+from lib.pin_loss import (  # noqa: E402
+    PinLoss,
+    drop_pin_start_state,
+    measure_pin_loss,
+    record_pin_start_state,
+)
 from lib.rebuild_lock import (  # noqa: E402
     REBUILD_LOCK_HOLDER_REBUILD,
     exit_bowed_out,
@@ -1450,6 +1455,7 @@ DEFAULT_ABSENT_PIN_ALERT_RATIO = 0.05
 ABSENT_PIN_ALERT_RATIO_ENV = "ABSENT_PIN_ALERT_RATIO"
 PIN_LOSS_TITLE = "Discogs cache: pinned releases lost by this rebuild"
 PREVIOUS_PIN_LOSS_TITLE = "Discogs cache: pinned releases lost by the previous (failed) rebuild"
+UNMEASURED_PIN_LOSS_TITLE = "Discogs cache: previous rebuild's pin loss could not be measured"
 
 
 def resolve_absent_pin_alert_ratio() -> float:
@@ -1508,11 +1514,14 @@ def report_pin_loss(loss: PinLoss | None, *, previous: bool = False) -> None:
         f"run without its Seam A allowlist). Check the import mode and the Seam A warnings "
         f"in {log}."
     )
+    _alert_pin_loss(message, PREVIOUS_PIN_LOSS_TITLE if previous else PIN_LOSS_TITLE)
+
+
+def _alert_pin_loss(message: str, title: str) -> None:
+    """Log *message* at ERROR and post it to Slack; a post that does not go out is a second ERROR."""
     logger.error(message)
     posted = post_slack_alert(
-        webhook_url=os.environ.get("SLACK_MONITORING_WEBHOOK"),
-        message=message,
-        title=PREVIOUS_PIN_LOSS_TITLE if previous else PIN_LOSS_TITLE,
+        webhook_url=os.environ.get("SLACK_MONITORING_WEBHOOK"), message=message, title=title
     )
     if not posted:
         logger.error(
@@ -1521,18 +1530,40 @@ def report_pin_loss(loss: PinLoss | None, *, previous: bool = False) -> None:
         )
 
 
+def report_unmeasured_pin_start(renamed_to: str | None, reason: str) -> None:
+    """Alert that an earlier run's start table could not be measured (#493)."""
+    outcome = (
+        f"It was renamed to {renamed_to} and kept for inspection; this run recorded a fresh "
+        "start state and carried on."
+        if renamed_to
+        else "It could not be renamed aside either, so the run aborted before touching the cache."
+    )
+    _alert_pin_loss(
+        f"The release_pin_start table an earlier rebuild left behind could not be measured "
+        f"({reason}), so the pins it lost are unknown. {outcome}",
+        UNMEASURED_PIN_LOSS_TITLE,
+    )
+
+
 def _record_pin_start(db_url: str, *, reuse_existing: bool) -> None:
     """Record the pins present at start, first reporting what a crashed earlier run lost (#493)."""
     record_pin_start_state(
         db_url,
         reuse_existing=reuse_existing,
         report_previous=lambda loss: report_pin_loss(loss, previous=True),
+        report_unmeasured=report_unmeasured_pin_start,
     )
 
 
-def _check_pin_loss(db_url: str) -> None:
-    """Report the recorded pins this run lost (#493). Never raises."""
-    report_pin_loss(measure_pin_loss(db_url))
+def _check_pin_loss(db_url: str) -> bool:
+    """Report the recorded pins this run lost (#493). Never raises.
+
+    Returns whether a loss was measured: only then does the caller drop the
+    table, after ``set_tables_logged``.
+    """
+    loss = measure_pin_loss(db_url)
+    report_pin_loss(loss)
+    return loss is not None
 
 
 def _restore_api_fetch_releases_crash_safe(db_url: str) -> None:
@@ -1699,7 +1730,7 @@ def _run_database_build_post_import(
         _restore_api_fetch_releases_crash_safe(db_url)
 
     # -- pins this run lost (#493), measured once the restore has run.
-    _check_pin_loss(db_url)
+    pins_measured = _check_pin_loss(db_url)
 
     # -- derive_va_release (#344): re-derive the VA-compilation lookup table
     # now that dedup/prune have finalized release ids. Gated like prune: on a
@@ -1716,6 +1747,8 @@ def _run_database_build_post_import(
 
     # -- set_tables_logged (restore WAL durability for consumers)
     set_tables_logged(db_url)
+    if pins_measured:  # a crash before this is reported by the next run (#493)
+        drop_pin_start_state(db_url)
 
     # -- reload-invariant gate (discogs-etl#298) — see _run_database_build.
     check_reload_invariant(db_url, raise_on_violation=True)
@@ -2063,8 +2096,7 @@ def _run_database_build(
         _restore_api_fetch_releases_crash_safe(db_url)
 
     # -- pins this run lost (#493), measured once the restore has run.
-    if not target_db_url:
-        _check_pin_loss(db_url)
+    pins_measured = not target_db_url and _check_pin_loss(db_url)
 
     # The DB consumers read: the copy-to target when set, otherwise the
     # source. Shared by derive_va_release, vacuum, and set_logged below so
@@ -2105,6 +2137,8 @@ def _run_database_build(
         if state:
             state.mark_completed("set_logged")
             _save_state()
+    if pins_measured:  # a crash before this is reported by the next run (#493)
+        drop_pin_start_state(db_url)
 
     # -- reload-invariant gate (discogs-etl#298)
     # Final check on the state consumers will read (the target DB in copy-to
