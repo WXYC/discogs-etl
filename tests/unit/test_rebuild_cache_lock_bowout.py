@@ -711,26 +711,34 @@ class TestBowOutWordingIsHolderNeutral:
         _assert_names_every_holder(templates[0] % _python_lock_key())
 
     @pytest.mark.parametrize(
-        ("relpath", "needle"),
+        "relpath",
         [
-            ("scripts/seed_cache_from_clone.py", "refusing to seed"),
-            ("scripts/restore_api_fetch_from_export.py", "Rebuild lock %d is held"),
-            ("scripts/dedup_artist_children.py", "Rebuild lock {REBUILD_LOCK_KEY} is held"),
+            "scripts/seed_cache_from_clone.py",
+            "scripts/restore_api_fetch_from_export.py",
+            "scripts/dedup_artist_children.py",
         ],
     )
-    def test_holder_scripts_name_every_holder(self, relpath: str, needle: str) -> None:
+    def test_holder_scripts_refuse_through_the_naming_helper(self, relpath: str) -> None:
+        """These CLIs name the actual holder (lib.rebuild_lock.held_rebuild_lock, #490)
+        instead of listing candidates, so no hand-written holder list can drift here."""
         tree = ast.parse((REPO_ROOT / relpath).read_text())
-        # Adjacent string literals fold into one Constant (or JoinedStr for f-strings).
-        texts = [
-            ast.unparse(node) if isinstance(node, ast.JoinedStr) else node.value
+        called = {
+            node.func.id
             for node in ast.walk(tree)
-            if (isinstance(node, ast.Constant) and isinstance(node.value, str))
-            or isinstance(node, ast.JoinedStr)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        }
+        assert "held_rebuild_lock" in called, f"{relpath} must refuse through held_rebuild_lock"
+        assert "try_acquire_rebuild_lock" not in called, (
+            f"{relpath} takes the lock by hand again; its refusal would need a holder list"
+        )
+        texts = [
+            node.value
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Constant) and isinstance(node.value, str)
         ]
-        messages = [t for t in texts if "operator session" in t or needle in t]
-        assert messages, f"no holder message found in {relpath}"
-        for message in messages:
-            _assert_names_every_phrase(message)
+        assert not [t for t in texts if "operator session" in t], (
+            f"{relpath} carries a hand-written holder list"
+        )
 
     def test_automation_doc_quotes_the_slack_text(self, tmp_path: Path) -> None:
         """docs/automation.md's failure item 5 is found by searching Slack's
