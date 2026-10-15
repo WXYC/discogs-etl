@@ -509,7 +509,8 @@ fi
 # to an hour or two, so skipping the month for one of them costs a month of
 # freshness for nothing. Only a peer rebuild -- named discogs-etl-rebuild on its
 # lock connection -- is this tick's rebuild and ends the run at once, and so does
-# a failed holder lookup, which might hide one. Any other holder, an unnamed one
+# a holder lookup that keeps failing (REBUILD_LOCK_LOOKUP_ATTEMPTS tries,
+# REBUILD_LOCK_LOOKUP_RETRY_SECONDS apart), which might hide one. Any other holder, an unnamed one
 # included, is waited out: the pipeline is re-run every
 # REBUILD_LOCK_RETRY_SECONDS until REBUILD_LOCK_WAIT_MINUTES have passed (0
 # turns the wait off). run_pipeline.py takes the lock before anything else, so a
@@ -532,6 +533,15 @@ case "${REBUILD_LOCK_WAIT_MINUTES:-}" in
 esac
 REBUILD_LOCK_WAIT_MINUTES=$((10#${REBUILD_LOCK_WAIT_MINUTES:-180}))
 REBUILD_LOCK_RETRY_SECONDS=300
+# Same guard as the wait: a non-integer would abort the arithmetic outside the trap.
+case "${REBUILD_LOCK_LOOKUP_ATTEMPTS:-}${REBUILD_LOCK_LOOKUP_RETRY_SECONDS:-}" in
+    *[!0-9]*)
+        echo "[$(date -u +%H:%M:%SZ)] warning: REBUILD_LOCK_LOOKUP_ATTEMPTS / REBUILD_LOCK_LOOKUP_RETRY_SECONDS must be whole numbers; using the defaults" >&2
+        unset REBUILD_LOCK_LOOKUP_ATTEMPTS REBUILD_LOCK_LOOKUP_RETRY_SECONDS
+        ;;
+esac
+REBUILD_LOCK_LOOKUP_ATTEMPTS=$((10#${REBUILD_LOCK_LOOKUP_ATTEMPTS:-3}))
+REBUILD_LOCK_LOOKUP_RETRY_SECONDS=$((10#${REBUILD_LOCK_LOOKUP_RETRY_SECONDS:-30}))
 REBUILD_LOCK_WAIT_SECONDS=$((REBUILD_LOCK_WAIT_MINUTES * 60))
 REBUILD_LOCK_WAITED_SECONDS=0
 REBUILD_LOCK_WAIT_ANNOUNCED=0
@@ -549,9 +559,33 @@ while :; do
         break
     fi
 
-    HOLDER_EXIT_CODE=0
-    LOCK_HOLDER=$(PYTHONPATH="$REPO_DIR" python -m lib.rebuild_lock --describe-holder) \
-        || HOLDER_EXIT_CODE=$?
+    # A failed lookup is retried on its own, never by re-running the pipeline:
+    # a holder that cannot be named might be a peer rebuild. Each lookup and
+    # each retry sleep counts against the wait, and a sleep stops at the
+    # deadline (#491).
+    LOCK_LOOKUPS=0
+    while :; do
+        HOLDER_EXIT_CODE=0
+        LOCK_HOLDER=$(PYTHONPATH="$REPO_DIR" python -m lib.rebuild_lock --describe-holder) \
+            || HOLDER_EXIT_CODE=$?
+        LOCK_LOOKUPS=$((LOCK_LOOKUPS + 1))
+        if [ "$HOLDER_EXIT_CODE" -eq 0 ] || [ "$HOLDER_EXIT_CODE" -eq "$REBUILD_LOCK_HOLDER_FREE_EXIT_CODE" ]; then
+            break
+        fi
+        echo "[$(date -u +%H:%M:%SZ)] holder lookup ${LOCK_LOOKUPS} of ${REBUILD_LOCK_LOOKUP_ATTEMPTS} failed (exit ${HOLDER_EXIT_CODE})" >&2
+        REBUILD_LOCK_WAITED_SECONDS=$((REBUILD_LOCK_WAITED_SECONDS + SECONDS - LOCK_ATTEMPT_STARTED))
+        LOCK_ATTEMPT_STARTED=$SECONDS
+        LOCK_LOOKUP_SLEEP=$((REBUILD_LOCK_WAIT_SECONDS - REBUILD_LOCK_WAITED_SECONDS))
+        if [ "$LOCK_LOOKUPS" -ge "$REBUILD_LOCK_LOOKUP_ATTEMPTS" ] || [ "$LOCK_LOOKUP_SLEEP" -le 0 ]; then
+            break
+        fi
+        if [ "$LOCK_LOOKUP_SLEEP" -gt "$REBUILD_LOCK_LOOKUP_RETRY_SECONDS" ]; then
+            LOCK_LOOKUP_SLEEP=$REBUILD_LOCK_LOOKUP_RETRY_SECONDS
+        fi
+        sleep "$LOCK_LOOKUP_SLEEP"
+        REBUILD_LOCK_WAITED_SECONDS=$((REBUILD_LOCK_WAITED_SECONDS + LOCK_LOOKUP_SLEEP))
+        LOCK_ATTEMPT_STARTED=$SECONDS
+    done
     # The name goes into notify_slack's hand-built JSON: drop what would break it.
     LOCK_HOLDER=$(printf '%s' "$LOCK_HOLDER" | tr -d '"\\[:cntrl:]')
     # Each lookup outcome sets the label and one action: retry_now, bow_out or
@@ -570,7 +604,7 @@ while :; do
             LOCK_ACTION="retry_now"
         fi
     elif [ "$HOLDER_EXIT_CODE" -ne 0 ]; then
-        LOCK_HOLDER_LABEL="an unknown session (the holder lookup failed)"
+        LOCK_HOLDER_LABEL="an unknown session (the holder lookup failed ${LOCK_LOOKUPS} time$([ "$LOCK_LOOKUPS" -eq 1 ] || echo s))"
         LOCK_ACTION="bow_out"
     elif [ "$LOCK_HOLDER" = "$REBUILD_LOCK_REBUILD_HOLDER" ]; then
         LOCK_HOLDER_LABEL="$LOCK_HOLDER"
