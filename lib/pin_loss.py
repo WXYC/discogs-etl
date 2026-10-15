@@ -4,9 +4,9 @@ A pinned override (``lml_cache.library_release_override``) with no ``release``
 row is either a pin the rebuild lost (the #422 class) or a pin that was never
 cached (#446's Draft or deleted pins, or a backlog). Only the first is an
 incident. So the rebuild records, before its first destructive statement,
-which pinned ids have a ``release`` row (a Discogs-404 tombstone, ``not_found``,
-is not a cached release: no snapshot restores it), and checks after the
-api_fetch restore which of those still-pinned ids have none.
+which pinned ids have a ``release`` row (not counting a Discogs-404 tombstone,
+``not_found``: losing one costs a 404 re-fetch, not the #422 class), and checks
+after the api_fetch restore which of those still-pinned ids have none.
 
 1. :func:`record_pin_start_state` writes that start set to the
    ``release_pin_start`` scratch table. It joins the override table against
@@ -37,8 +37,9 @@ import psycopg
 logger = logging.getLogger(__name__)
 
 START_TABLE = "release_pin_start"
-# Bounds the end-of-run DROP, which runs while every pipeline table is UNLOGGED.
-DROP_LOCK_TIMEOUT = "30s"
+# Bounds both DROPs: the start-of-run one must not stall a rebuild holding lock
+# 354001, and the end-of-run one runs while every pipeline table is UNLOGGED.
+LOCK_TIMEOUT = "30s"
 
 _ABSENT = (psycopg.errors.UndefinedTable, psycopg.errors.InvalidSchemaName)
 
@@ -86,10 +87,10 @@ def _measure(cur) -> PinLoss:
 def record_pin_start_state(
     db_url: str,
     *,
+    report_previous: Callable[[PinLoss], None],
     reuse_existing: bool = False,
-    report_previous: Callable[[PinLoss], None] | None = None,
-) -> PinLoss | None:
-    """Record the pinned ids that have a ``release`` row; return a crashed run's loss.
+) -> None:
+    """Record the pinned ids that have a ``release`` row, reporting a crashed run's loss first.
 
     A missing ``release`` table or override table/schema records an empty
     start set. Any other error propagates: nothing has been destroyed yet, so
@@ -98,12 +99,14 @@ def record_pin_start_state(
     unknown, so the check is skipped rather than measured against a cache the
     interrupted run already damaged.
 
-    Otherwise a table left behind by a run that crashed is measured and passed
-    to *report_previous* before it is replaced, in the same transaction as the
-    re-record, so a failure anywhere keeps it for the next run. A leftover
-    that cannot be measured aborts the run.
+    Otherwise a table left behind by an earlier run (one that crashed, or whose
+    end-of-run check could not drop it) is measured and passed to
+    *report_previous*, outside any transaction, before it is replaced, so a
+    failure anywhere keeps it for the next run. A leftover that cannot be
+    measured aborts the run. Lock waits are bounded by ``LOCK_TIMEOUT``.
     """
     with psycopg.connect(db_url) as conn, conn.cursor() as cur:
+        cur.execute(f"SET lock_timeout = '{LOCK_TIMEOUT}'")
         left_behind = _exists(cur, START_TABLE)
         if reuse_existing:
             if left_behind:
@@ -114,7 +117,6 @@ def record_pin_start_state(
                     "so the pin-loss check is skipped this run (#493)"
                 )
             return None
-        previous = None
         if left_behind:
             logger.warning(
                 "An earlier run left %s behind; measuring its loss first (#493)", START_TABLE
@@ -123,18 +125,19 @@ def record_pin_start_state(
                 previous = _measure(cur)
             except Exception:
                 logger.exception(
-                    "Could not measure the loss recorded in the left-behind %s; aborting "
-                    "before anything is touched. Inspect it, then drop it to proceed (#493)",
+                    "Could not measure the loss recorded in the left-behind %s (error above); "
+                    "aborting before anything is touched. Fix the cause and rerun: dropping "
+                    "the table instead discards that loss unreported (#493)",
                     START_TABLE,
                 )
                 raise
-            if report_previous is not None:
-                report_previous(previous)
+            conn.commit()  # no locks held across the Slack post
+            report_previous(previous)
         cur.execute(f"DROP TABLE IF EXISTS {START_TABLE}")
         cur.execute(f"CREATE TABLE {START_TABLE} (release_id integer PRIMARY KEY)")
         if not _exists(cur, "release"):
             logger.info("No release table yet; recording an empty pin start state (#493)")
-            return previous
+            return
         try:
             with conn.transaction():
                 cur.execute(
@@ -144,9 +147,8 @@ def record_pin_start_state(
                 )
         except _ABSENT:
             logger.info("lml_cache.library_release_override not found; no pins to record (#493)")
-            return previous
+            return
         logger.info("Recorded %d pinned releases present at start (#493)", cur.rowcount)
-    return previous
 
 
 def measure_pin_loss(db_url: str) -> PinLoss | None:
@@ -156,7 +158,7 @@ def measure_pin_loss(db_url: str) -> PinLoss | None:
     table or schema reads as no loss; a missing ``release`` table loses every
     recorded pin. Never raises: the rows are already gone, and a failed check
     must not fail the rebuild. On an unexpected error the table is kept, so the
-    next run reports it. A DROP that fails (bounded by ``DROP_LOCK_TIMEOUT``)
+    next run reports it. A DROP that fails (bounded by ``LOCK_TIMEOUT``)
     still returns the loss, and the next run reports it a second time.
     """
     try:
@@ -172,7 +174,7 @@ def measure_pin_loss(db_url: str) -> PinLoss | None:
         return None
     try:
         with psycopg.connect(db_url) as conn, conn.cursor() as cur:
-            cur.execute(f"SET LOCAL lock_timeout = '{DROP_LOCK_TIMEOUT}'")
+            cur.execute(f"SET LOCAL lock_timeout = '{LOCK_TIMEOUT}'")
             cur.execute(f"DROP TABLE {START_TABLE}")
     except Exception:
         logger.exception(

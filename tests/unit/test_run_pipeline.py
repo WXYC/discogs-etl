@@ -54,8 +54,9 @@ def _stub_pin_loss():
     """Stub out #493's pin-loss record and check for every test in this file.
 
     Both open their own connection, which the tests here either leave unpatched
-    or patch with a bare MagicMock. ``TestPinLossWiring`` and
-    ``TestReportPinLoss`` patch them again to observe them.
+    or patch with a bare MagicMock. ``TestReportPinLoss`` patches them again to
+    observe them; ``TestPinLossWiring`` spies on the reporting wrappers and
+    asserts that no call site reaches these lib functions directly.
     """
     with (
         patch.object(run_pipeline, "record_pin_start_state", return_value=None),
@@ -2848,6 +2849,7 @@ class TestPreserveApiFetchWiring:
             ),
             patch.object(run_pipeline, "restore_api_fetch_releases", side_effect=record("restore")),
             patch.object(run_pipeline, "_record_pin_start", side_effect=record_pin_start),
+            patch.object(run_pipeline, "record_pin_start_state", side_effect=record("bare")),
             patch.object(run_pipeline, "_run_database_build", side_effect=record("build")),
             patch.object(
                 run_pipeline, "_run_database_build_post_import", side_effect=record("post_import")
@@ -3007,9 +3009,15 @@ class TestReportPinLoss:
         with caplog.at_level(logging.ERROR, logger=run_pipeline.logger.name):
             run_pipeline.report_pin_loss(self._loss(2, 3), previous=True)
         text = slack_posts[0]["message"]
-        assert "an earlier rebuild that did not finish" in text
+        assert "an earlier rebuild" in text
         assert "this run" not in text and "present when the run started" not in text
         assert caplog.records[0].getMessage() == text
+
+    @pytest.mark.parametrize("reuse", [True, False])
+    def test_the_wrapper_forwards_reuse_existing(self, reuse) -> None:
+        with patch.object(run_pipeline, "record_pin_start_state") as record:
+            run_pipeline._record_pin_start("postgresql:///test", reuse_existing=reuse)
+        assert record.call_args.kwargs["reuse_existing"] is reuse
 
     def test_the_check_reports_the_measured_loss(self, slack_posts) -> None:
         with patch.object(run_pipeline, "measure_pin_loss", return_value=self._loss(2, 3)):
@@ -3064,6 +3072,8 @@ class TestPinLossWiring:
             patch.object(
                 run_pipeline, "_check_pin_loss", side_effect=lambda *a: calls.append("check")
             ),
+            patch.object(run_pipeline, "record_pin_start_state") as bare_record,
+            patch.object(run_pipeline, "measure_pin_loss") as bare_measure,
         ):
             run_pipeline._run_database_build(
                 "postgresql:///test",
@@ -3072,6 +3082,7 @@ class TestPinLossWiring:
                 sys.executable,
                 **kwargs,
             )
+        assert not bare_record.called and not bare_measure.called, "bypassed the reporting"
         return calls, record
 
     @pytest.mark.parametrize("fresh_rebuild", [False, True], ids=["upsert", "fresh-rebuild"])
@@ -3154,6 +3165,8 @@ class TestPinLossWiring:
             patch.object(
                 run_pipeline, "_check_pin_loss", side_effect=lambda *a: calls.append("check")
             ),
+            patch.object(run_pipeline, "record_pin_start_state") as bare_record,
+            patch.object(run_pipeline, "measure_pin_loss") as bare_measure,
         ):
             run_pipeline._run_database_build_post_import(
                 "postgresql:///test",
@@ -3162,9 +3175,9 @@ class TestPinLossWiring:
                 sys.executable,
                 preserve_api_fetch=preserve,
             )
+        assert not bare_record.called and not bare_measure.called, "bypassed the reporting"
         assert "record" not in calls
         assert calls.count("check") == 1
-        before_check = ["Prune to library matches"] + (["restore"] if preserve else [])
-        for step in before_check:
-            assert calls.index(step) < calls.index("check")
-        assert calls.index("check") < calls.index("set_logged")
+        chain = ["Prune to library matches", "restore", "check", "set_logged"]
+        chain = [step for step in chain if preserve or step != "restore"]
+        assert [c for c in calls if c in chain] == chain
