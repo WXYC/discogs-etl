@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import ast
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -921,3 +922,29 @@ def _assert_names_every_holder(message: str) -> None:
 def _assert_names_every_phrase(message: str) -> None:
     missing = [holder for holder in _LOCK_HOLDERS if holder not in message.lower()]
     assert not missing, f"bow-out text omits {missing}: {message!r}"
+
+
+def test_notify_slack_json_encodes_quotes_backslashes_and_control_characters() -> None:
+    """#487: the body is encoded as JSON by notify_slack itself, so a caller's
+    free text (error details, step names) round-trips exactly instead of
+    producing a body Slack rejects and `|| true` swallows."""
+    source = SCRIPT_PATH.read_text()
+    message = 'step "load" failed: C:\\tmp\nline two\ttabbed'
+    harness = "\n".join(
+        [
+            "set -euo pipefail",
+            'SLACK_MONITORING_WEBHOOK="https://hooks.invalid"',
+            'curl() { while [ $# -gt 0 ]; do [ "$1" = "-d" ] && printf "%s" "$2"; shift; done; }',
+            _extract_function(source, "notify_slack"),
+            'notify_slack ":warning:" "$MESSAGE"',
+        ]
+    )
+    result = subprocess.run(
+        ["bash", "-c", harness],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "MESSAGE": message},
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert json.loads(result.stdout)["text"] == f":warning: Discogs cache rebuild: {message}"
