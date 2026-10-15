@@ -61,6 +61,7 @@ def _stub_pin_loss():
     with (
         patch.object(run_pipeline, "record_pin_start_state", return_value=None),
         patch.object(run_pipeline, "measure_pin_loss", return_value=None),
+        patch.object(run_pipeline, "drop_pin_start_state"),
     ):
         yield
 
@@ -2996,7 +2997,7 @@ class TestReportPinLoss:
         assert [r.levelno for r in undelivered] == ([] if posted else [logging.ERROR])
 
     def test_a_crashed_runs_loss_is_reported_under_its_own_title(self, slack_posts) -> None:
-        def record(db_url, *, reuse_existing, report_previous):
+        def record(db_url, *, reuse_existing, report_previous, report_unmeasured):
             report_previous(self._loss(2, 3))
 
         with patch.object(run_pipeline, "record_pin_start_state", side_effect=record):
@@ -3012,6 +3013,32 @@ class TestReportPinLoss:
         assert "an earlier rebuild" in text
         assert "this run" not in text and "present when the run started" not in text
         assert caplog.records[0].getMessage() == text
+
+    @pytest.mark.parametrize(
+        ("renamed_to", "wording"),
+        [
+            ("release_pin_start_unmeasured_20261015061500", "renamed to"),
+            (None, "aborted before touching the cache"),
+        ],
+        ids=["renamed-aside", "rename-failed"],
+    )
+    def test_an_unmeasured_leftover_is_an_error_and_a_post(
+        self, caplog, slack_posts, renamed_to, wording
+    ) -> None:
+        def record(db_url, *, reuse_existing, report_previous, report_unmeasured):
+            report_unmeasured(renamed_to, "UndefinedColumn: column s.release_id does not exist")
+
+        with (
+            caplog.at_level(logging.ERROR, logger=run_pipeline.logger.name),
+            patch.object(run_pipeline, "record_pin_start_state", side_effect=record),
+        ):
+            run_pipeline._record_pin_start("postgresql:///test", reuse_existing=False)
+        [post] = slack_posts
+        assert post["title"] == "Discogs cache: previous rebuild's pin loss could not be measured"
+        assert wording in post["message"] and "UndefinedColumn" in post["message"]
+        if renamed_to:
+            assert renamed_to in post["message"]
+        assert [r.levelno for r in caplog.records] == [logging.ERROR]
 
     @pytest.mark.parametrize("reuse", [True, False])
     def test_the_wrapper_forwards_reuse_existing(self, reuse) -> None:
@@ -3031,9 +3058,14 @@ class TestPinLossWiring:
     """#493: the start state is recorded after the api_fetch snapshot and before
     anything destructive; the loss is checked after the api_fetch restore."""
 
-    def _build(self, **kwargs) -> tuple[list[str], MagicMock]:
+    def _build(self, measured: bool = True, **kwargs) -> tuple[list[str], MagicMock]:
         """Run _run_database_build with every step recorded in call order."""
         calls: list[str] = []
+
+        def check(*args) -> bool:
+            calls.append("check")
+            return measured
+
         record = MagicMock(side_effect=lambda *a, **k: calls.append("record"))
         # The wrappers, not the lib functions: a call site that calls a bare lib
         # function measures without ever reporting.
@@ -3069,8 +3101,11 @@ class TestPinLossWiring:
                 side_effect=lambda *a, **k: calls.append("restore"),
             ),
             patch.object(run_pipeline, "_record_pin_start", record),
+            patch.object(run_pipeline, "_check_pin_loss", side_effect=check),
             patch.object(
-                run_pipeline, "_check_pin_loss", side_effect=lambda *a: calls.append("check")
+                run_pipeline,
+                "drop_pin_start_state",
+                side_effect=lambda *a: calls.append("drop_pin_start"),
             ),
             patch.object(run_pipeline, "record_pin_start_state") as bare_record,
             patch.object(run_pipeline, "measure_pin_loss") as bare_measure,
@@ -3094,13 +3129,12 @@ class TestPinLossWiring:
 
     def test_check_follows_the_restore(self) -> None:
         calls, _ = self._build(preserve_api_fetch=True)
-        assert (
-            calls.index("Prune to library matches")
-            < calls.index("restore")
-            < calls.index("check")
-            < calls.index("vacuum")
-        )
-        assert calls.count("check") == 1
+        chain = ["Prune to library matches", "restore", "check", "vacuum", "set_logged"]
+        assert [c for c in calls if c in chain + ["drop_pin_start"]] == chain + ["drop_pin_start"]
+
+    def test_an_unmeasured_start_state_is_not_dropped(self) -> None:
+        calls, _ = self._build(measured=False)
+        assert "check" in calls and "drop_pin_start" not in calls
 
     def test_runs_without_api_fetch_preservation(self) -> None:
         calls, _ = self._build()
@@ -3109,7 +3143,7 @@ class TestPinLossWiring:
 
     def test_copy_to_records_and_checks_nothing(self) -> None:
         calls, _ = self._build(target_db_url="postgresql:///target")
-        assert "record" not in calls and "check" not in calls
+        assert not {"record", "check", "drop_pin_start"} & set(calls)
 
     @pytest.mark.parametrize(
         ("has_state", "resume", "reuse"),
@@ -3163,7 +3197,12 @@ class TestPinLossWiring:
                 side_effect=lambda *a, **k: calls.append("record"),
             ),
             patch.object(
-                run_pipeline, "_check_pin_loss", side_effect=lambda *a: calls.append("check")
+                run_pipeline, "_check_pin_loss", side_effect=lambda *a: calls.append("check") or 1
+            ),
+            patch.object(
+                run_pipeline,
+                "drop_pin_start_state",
+                side_effect=lambda *a: calls.append("drop_pin_start"),
             ),
             patch.object(run_pipeline, "record_pin_start_state") as bare_record,
             patch.object(run_pipeline, "measure_pin_loss") as bare_measure,
@@ -3178,6 +3217,6 @@ class TestPinLossWiring:
         assert not bare_record.called and not bare_measure.called, "bypassed the reporting"
         assert "record" not in calls
         assert calls.count("check") == 1
-        chain = ["Prune to library matches", "restore", "check", "set_logged"]
+        chain = ["Prune to library matches", "restore", "check", "set_logged", "drop_pin_start"]
         chain = [step for step in chain if preserve or step != "restore"]
         assert [c for c in calls if c in chain] == chain

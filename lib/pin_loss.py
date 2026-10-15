@@ -13,13 +13,16 @@ after the api_fetch restore which of those still-pinned ids have none.
    ``release`` and never reads the allowlist file: the file holds every pin,
    including the never-cached ones.
 2. :func:`measure_pin_loss` counts the start ids that are still pinned and now
-   have no ``release`` row, then drops the table.
+   have no ``release`` row.
+3. :func:`drop_pin_start_state` drops the table once every pipeline table is
+   LOGGED again, so a crash before that is still reported by the next run.
 
 The table name is fixed, not per-invocation like ``lib.scratch_namespace``'s.
 That is safe for the same reason ``*_api_fetch_snap`` is: only the rebuild
 writes it, and the rebuild holds the 354001 advisory lock. A table left
-behind by a run that crashed is measured and reported before it is replaced,
-and a failed measurement aborts instead; a ``--resume`` run reuses it. This
+behind by a run that crashed is measured and reported before it is replaced;
+one that cannot be measured is renamed aside and reported, never dropped; a
+``--resume`` run reuses it. This
 module holds only the database logic. The threshold, the log level and the
 Slack post live in ``scripts/run_pipeline.py::report_pin_loss``.
 
@@ -30,7 +33,9 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import dataclass
+from datetime import UTC, datetime
 
 import psycopg
 
@@ -88,6 +93,7 @@ def record_pin_start_state(
     db_url: str,
     *,
     report_previous: Callable[[PinLoss], None],
+    report_unmeasured: Callable[[str | None, str], None],
     reuse_existing: bool = False,
 ) -> None:
     """Record the pinned ids that have a ``release`` row, reporting a crashed run's loss first.
@@ -103,10 +109,12 @@ def record_pin_start_state(
     end-of-run check could not drop it) is measured and passed to
     *report_previous*, outside any transaction, before it is replaced, so a
     failure anywhere keeps it for the next run. A leftover that cannot be
-    measured aborts the run. Lock waits are bounded by ``LOCK_TIMEOUT``.
+    measured is renamed aside (see :func:`_set_aside_unmeasured`) and the run
+    carries on. Lock waits are bounded by ``LOCK_TIMEOUT``.
     """
     with psycopg.connect(db_url) as conn, conn.cursor() as cur:
         cur.execute(f"SET lock_timeout = '{LOCK_TIMEOUT}'")
+        conn.commit()  # session-wide, so a rollback below keeps it
         left_behind = _exists(cur, START_TABLE)
         if reuse_existing:
             if left_behind:
@@ -123,16 +131,13 @@ def record_pin_start_state(
             )
             try:
                 previous = _measure(cur)
-            except Exception:
-                logger.exception(
-                    "Could not measure the loss recorded in the left-behind %s (error above); "
-                    "aborting before anything is touched. Fix the cause and rerun: dropping "
-                    "the table instead discards that loss unreported (#493)",
-                    START_TABLE,
-                )
-                raise
-            conn.commit()  # no locks held across the Slack post
-            report_previous(previous)
+            except Exception as error:
+                with suppress(psycopg.Error):  # a broken connection fails the re-record below
+                    conn.rollback()
+                _set_aside_unmeasured(db_url, error, report_unmeasured)
+            else:
+                conn.commit()  # no locks held across the Slack post
+                report_previous(previous)
         cur.execute(f"DROP TABLE IF EXISTS {START_TABLE}")
         cur.execute(f"CREATE TABLE {START_TABLE} (release_id integer PRIMARY KEY)")
         if not _exists(cur, "release"):
@@ -151,15 +156,41 @@ def record_pin_start_state(
         logger.info("Recorded %d pinned releases present at start (#493)", cur.rowcount)
 
 
+def _set_aside_unmeasured(
+    db_url: str, error: Exception, report_unmeasured: Callable[[str | None, str], None]
+) -> None:
+    """Rename a leftover that could not be measured to a UTC-timestamped name; report it.
+
+    It is never dropped: the loss it recorded is unknown. If the rename fails
+    too, *report_unmeasured* gets ``None`` and the rename error propagates,
+    aborting the run before anything is touched.
+    """
+    reason = f"{type(error).__name__}: {error}".strip()
+    aside = f"{START_TABLE}_unmeasured_{datetime.now(UTC):%Y%m%d%H%M%S}"
+    logger.warning("Could not measure the left-behind %s (#493)", START_TABLE, exc_info=error)
+    try:
+        with psycopg.connect(db_url) as conn:
+            conn.execute(f"SET LOCAL lock_timeout = '{LOCK_TIMEOUT}'")
+            conn.execute(f"ALTER TABLE {START_TABLE} RENAME TO {aside}")
+    except Exception as rename_error:
+        report_unmeasured(
+            None,
+            f"{reason}; renaming it aside failed too: "
+            f"{type(rename_error).__name__}: {rename_error}".strip(),
+        )
+        raise
+    report_unmeasured(aside, reason)
+
+
 def measure_pin_loss(db_url: str) -> PinLoss | None:
-    """Return the recorded pins that are still pinned and have lost their row; drop the table.
+    """Return the recorded pins that are still pinned and have lost their row.
 
     Returns ``None`` when no start state was recorded. A missing override
     table or schema reads as no loss; a missing ``release`` table loses every
     recorded pin. Never raises: the rows are already gone, and a failed check
-    must not fail the rebuild. On an unexpected error the table is kept, so the
-    next run reports it. A DROP that fails (bounded by ``LOCK_TIMEOUT``)
-    still returns the loss, and the next run reports it a second time.
+    must not fail the rebuild. On an unexpected error it returns ``None``, and
+    the caller keeps the table so the next run reports it. The table is left
+    for :func:`drop_pin_start_state`.
     """
     try:
         with psycopg.connect(db_url) as conn, conn.cursor() as cur:
@@ -172,12 +203,20 @@ def measure_pin_loss(db_url: str) -> PinLoss | None:
             "The pin-loss check failed; %s is kept for the next run (#493)", START_TABLE
         )
         return None
+    return loss
+
+
+def drop_pin_start_state(db_url: str) -> None:
+    """Drop the measured start table, waiting at most ``LOCK_TIMEOUT``. Never raises.
+
+    The caller runs it after ``set_tables_logged``. A DROP that fails keeps the
+    table, and the next run reports this loss a second time.
+    """
     try:
-        with psycopg.connect(db_url) as conn, conn.cursor() as cur:
-            cur.execute(f"SET LOCAL lock_timeout = '{LOCK_TIMEOUT}'")
-            cur.execute(f"DROP TABLE {START_TABLE}")
+        with psycopg.connect(db_url) as conn:
+            conn.execute(f"SET LOCAL lock_timeout = '{LOCK_TIMEOUT}'")
+            conn.execute(f"DROP TABLE IF EXISTS {START_TABLE}")
     except Exception:
         logger.exception(
             "Could not drop %s; the next run will report this loss again (#493)", START_TABLE
         )
-    return loss
