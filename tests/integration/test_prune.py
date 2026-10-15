@@ -409,8 +409,7 @@ class TestCopySwapPruneWithAbsentPin:
 
     @pytest.fixture(autouse=True)
     def _no_slack(self, monkeypatch):
-        """Both cases reach a Slack post: the count guard's abort, and the
-        absent-pin alert (one of two pins absent is over the 5% threshold)."""
+        """The count guard's abort reaches a Slack post."""
         monkeypatch.setattr(_vc, "post_slack_alert", lambda **_: False)
 
     def _release_ids(self, db_url: str) -> set[int]:

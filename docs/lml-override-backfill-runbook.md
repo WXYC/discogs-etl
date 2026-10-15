@@ -96,7 +96,7 @@ psql "$DATABASE_URL_DISCOGS" -Atc \
 python scripts/verify_cache.py <library_db> "$DATABASE_URL_DISCOGS" --keep-release-ids /tmp/keep_release_ids.txt
 ```
 
-Confirm the printed `Releases to prune` count does not include the backfilled ids. The dry run also logs any pins that have no `release` row. If their share of all pins is above `ABSENT_PIN_ALERT_RATIO` (5% by default), it logs that at ERROR and posts the absent-pin alert to Slack when `SLACK_MONITORING_WEBHOOK` is set in your shell; unset it for a quiet check. Before the backfill that share is expected to be high; afterwards it should be near zero.
+Confirm the printed `Releases to prune` count does not include the backfilled ids. The dry run also logs, at WARNING, any pins that have no `release` row, with their share of all pins. It never alerts: the pin-loss alert runs only inside a rebuild, against the pins present when that rebuild started ([#493](https://github.com/WXYC/discogs-etl/issues/493)). Before the backfill that share is expected to be high; afterwards it should be near zero.
 
 ### 8. Confirm 0 trackless releases
 

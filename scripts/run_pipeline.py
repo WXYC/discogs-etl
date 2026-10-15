@@ -47,6 +47,7 @@ from lib.api_fetch_preservation import (  # noqa: E402
 )
 from lib.dsn import redact_dsn  # noqa: E402
 from lib.observability import init_logger  # noqa: E402
+from lib.pin_loss import PinLoss, measure_pin_loss, record_pin_start_state  # noqa: E402
 from lib.rebuild_lock import (  # noqa: E402
     REBUILD_LOCK_HOLDER_REBUILD,
     exit_bowed_out,
@@ -54,6 +55,9 @@ from lib.rebuild_lock import (  # noqa: E402
     release_rebuild_lock,
     try_acquire_rebuild_lock,
 )
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from check_cache_drift import post_slack_alert  # noqa: E402
 
 STEP_NAMES = [
     "create_schema",
@@ -1211,6 +1215,9 @@ def _run_xml_pipeline(
             # The TRUNCATE below destroys api_fetch releases; snapshot first (#450).
             if args.preserve_api_fetch:
                 snapshot_api_fetch_releases(db_url)
+            # After the snapshot (a left-behind one is restored first), before
+            # the TRUNCATE: which pins have a release row (#493).
+            _record_pin_start(db_url, reuse_existing=False)
             # create_functions.sql must run BEFORE create_database.sql:
             # create_database.sql's idx_master_title_trgm index expression
             # references f_unaccent (see #104).
@@ -1414,6 +1421,7 @@ def main() -> None:
                 truncate_existing=args.truncate_existing,
                 fresh_rebuild=args.fresh_rebuild,
                 preserve_api_fetch=args.preserve_api_fetch,
+                resume=args.resume,
             )
 
         total = time.monotonic() - pipeline_start
@@ -1428,6 +1436,90 @@ def main() -> None:
         # holding backend's connection has dropped, so a crashed run can
         # never wedge the next monthly tick.
         release_rebuild_lock(lock_conn)
+
+
+# Share of the pins present in ``release`` when the rebuild started that may
+# have no row after the api_fetch restore before report_pin_loss alerts
+# (#493). Never-cached pins are outside the ratio, so its normal value is 0:
+# the 2026-10-13 re-run lost none (its 13 absent pins were never cached), and
+# #422 lost 47%. Its own knob, not the import's MAX_PIN_SHORTFALL_RATIO, which
+# an operator sets to 1.0 to force an import through.
+DEFAULT_ABSENT_PIN_ALERT_RATIO = 0.05
+ABSENT_PIN_ALERT_RATIO_ENV = "ABSENT_PIN_ALERT_RATIO"
+PIN_LOSS_TITLE = "Discogs cache: pinned releases lost by this rebuild"
+PREVIOUS_PIN_LOSS_TITLE = "Discogs cache: pinned releases lost by the previous (failed) rebuild"
+
+
+def resolve_absent_pin_alert_ratio() -> float:
+    """Read ABSENT_PIN_ALERT_RATIO, falling back to the default.
+
+    An unparseable or out-of-range value logs a WARNING and uses the default,
+    so a typo can neither crash the run nor switch the alert off.
+    """
+    raw = os.environ.get(ABSENT_PIN_ALERT_RATIO_ENV, "")
+    if not raw:
+        return DEFAULT_ABSENT_PIN_ALERT_RATIO
+    try:
+        value = float(raw)
+    except ValueError:
+        value = -1.0
+    if not 0.0 <= value <= 1.0:
+        logger.warning(
+            "%s=%r is not a ratio in [0, 1]; using the default %.2f",
+            ABSENT_PIN_ALERT_RATIO_ENV,
+            raw,
+            DEFAULT_ABSENT_PIN_ALERT_RATIO,
+        )
+        return DEFAULT_ABSENT_PIN_ALERT_RATIO
+    return value
+
+
+def report_pin_loss(loss: PinLoss | None, *, title: str = PIN_LOSS_TITLE) -> None:
+    """Log *loss*; above ABSENT_PIN_ALERT_RATIO, at ERROR and to Slack (#493).
+
+    ERROR reaches Sentry when ``SENTRY_DSN`` is set; the post goes to
+    ``SLACK_MONITORING_WEBHOOK``, and a post that does not go out is a second
+    ERROR. Never fatal: the rows are already gone. ``None`` (no start state
+    recorded) reports nothing.
+    """
+    if loss is None:
+        return
+    message = (
+        f"{len(loss.lost):,} of {loss.at_start:,} pinned release(s) present when the run "
+        f"started ({loss.share:.1%}) have no release row after it "
+        f"(sample, max 20): {loss.lost[:20]}"
+    )
+    threshold = resolve_absent_pin_alert_ratio()
+    if loss.share <= threshold:
+        logger.info(message)
+        return
+    message += (
+        f". That is over the {threshold:.1%} alert threshold ({ABSENT_PIN_ALERT_RATIO_ENV}). "
+        "Pins were lost during the rebuild (the WXYC/discogs-etl#422 class, e.g. a converter "
+        "run without its Seam A allowlist). Check the import mode and the Seam A warnings "
+        "in this run's log."
+    )
+    logger.error(message)
+    posted = post_slack_alert(
+        webhook_url=os.environ.get("SLACK_MONITORING_WEBHOOK"), message=message, title=title
+    )
+    if not posted:
+        logger.error(
+            "The pin-loss alert above was NOT posted to Slack: SLACK_MONITORING_WEBHOOK "
+            "is unset or the post failed. This log is its only record."
+        )
+
+
+def _record_pin_start(db_url: str, *, reuse_existing: bool) -> None:
+    """Record the pins present at start; report what a crashed earlier run lost (#493)."""
+    previous = record_pin_start_state(db_url, reuse_existing=reuse_existing)
+    if previous is not None:
+        report_pin_loss(previous, title=PREVIOUS_PIN_LOSS_TITLE)
+
+
+def _check_pin_loss(db_url: str) -> None:
+    """Report the recorded pins this run lost (#493). Never raises."""
+    report_pin_loss(measure_pin_loss(db_url))
 
 
 def _restore_api_fetch_releases_crash_safe(db_url: str) -> None:
@@ -1593,6 +1685,9 @@ def _run_database_build_post_import(
     if preserve_api_fetch:
         _restore_api_fetch_releases_crash_safe(db_url)
 
+    # -- pins this run lost (#493), measured once the restore has run.
+    _check_pin_loss(db_url)
+
     # -- derive_va_release (#344): re-derive the VA-compilation lookup table
     # now that dedup/prune have finalized release ids. Gated like prune: on a
     # build without library.db nothing consumes the table, and the unpruned
@@ -1632,6 +1727,7 @@ def _run_database_build(
     truncate_existing: bool = False,
     fresh_rebuild: bool = False,
     preserve_api_fetch: bool = False,
+    resume: bool = False,
 ) -> None:
     """Database build: create_schema through vacuum.
 
@@ -1649,6 +1745,11 @@ def _run_database_build(
     When *preserve_api_fetch* is set, LML's ``api_fetch`` releases are
     snapshotted before the first destructive statement and restored after
     prune (discogs-etl#450). Not supported with *target_db_url* (deprecated).
+
+    The pins present at start are recorded before anything destructive and
+    the ones this run lost are reported after that restore (#493). *resume*
+    (``--resume``) reuses the start state the interrupted run recorded.
+    Skipped with *target_db_url*.
     """
 
     def _save_state() -> None:
@@ -1668,6 +1769,13 @@ def _run_database_build(
         snapshot_api_fetch_releases(
             db_url, reuse_existing=bool(state and state.is_completed("create_schema"))
         )
+
+    # -- record the pins present at start (#493), after a left-behind api_fetch
+    # snapshot is restored and before --fresh-rebuild's drop and create_schema.
+    if target_db_url:
+        logger.info("Pin-loss check skipped with the deprecated --target-db-url (#493)")
+    else:
+        _record_pin_start(db_url, reuse_existing=bool(state is not None and resume))
 
     # -- read WXYC library pinned overrides once, threaded into every dedup
     # and verify_cache.py invocation below (discogs-etl#327)
@@ -1940,6 +2048,10 @@ def _run_database_build(
     # already restored is a no-op.
     if preserve_api_fetch:
         _restore_api_fetch_releases_crash_safe(db_url)
+
+    # -- pins this run lost (#493), measured once the restore has run.
+    if not target_db_url:
+        _check_pin_loss(db_url)
 
     # The DB consumers read: the copy-to target when set, otherwise the
     # source. Shared by derive_va_release, vacuum, and set_logged below so
