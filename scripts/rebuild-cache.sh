@@ -57,10 +57,16 @@ notify_slack() {
     if [ -z "${SLACK_MONITORING_WEBHOOK:-}" ]; then
         return 0
     fi
+    # Encode the body as JSON here (#487) so a quote, backslash or control
+    # character in a caller's text cannot make Slack reject the post. System
+    # python3, not the venv: this runs before the venv exists.
+    local payload
+    payload=$(python3 -c 'import json,sys; print(json.dumps({"text": sys.argv[1]}))' \
+        "${emoji} Discogs cache rebuild: ${message}") || payload=""
     curl -sS -X POST "$SLACK_MONITORING_WEBHOOK" \
         -H 'Content-Type: application/json' \
-        -d "{\"text\":\"${emoji} Discogs cache rebuild: ${message}\"}" \
-        --max-time 10 || true
+        -d "$payload" \
+        --max-time 10 || echo "notify_slack: Slack post failed" >&2
 }
 
 # report_outcome <status> [detail] — file this run's terminal outcome (#424).
