@@ -1378,14 +1378,18 @@ DIRT_NATION_ID = 232248
 DIRT_NATION_RELEASE_ID = 313570
 STEREOLAB_ID = 2
 NILUFER_YANYA_ID = 5
+# Credited only under the name '' in the single-spelling test; no fixture id.
+EMPTY_NAME_ONLY_ID = 999001
 
 
 class TestArtistStubOneRowPerId:
     """``import_artist_details`` stubs exactly one ``artist`` row per linked id (#408).
 
-    A linked id is a positive ``artist_id``. An unlinked credit stubs no row:
-    id 0 in ``test_unlinked_credits_stub_no_artist``, and id 0 and NULL in
-    ``test_single_spelling_ids_stub_exactly_the_pre_408_rows``.
+    A linked id is a positive ``artist_id`` credited under a non-empty name.
+    An unlinked credit stubs no row: id 0 in
+    ``test_unlinked_credits_stub_no_artist``, id 0, NULL and a name of ``''``
+    in ``test_single_spelling_ids_stub_exactly_the_pre_408_rows``, and ``''``
+    in ``test_an_empty_credit_name_never_wins``.
 
     ``release_artist`` can credit one Discogs artist id under several literal
     spellings: the dump's ``<name>`` is stored per credit, so a rename or a
@@ -1699,12 +1703,15 @@ class TestArtistStubOneRowPerId:
         """A linked id credited under one spelling stubs exactly as it did before #408.
 
         Loads the fixture base CSVs the way the import does, adds a NULL-id
-        and an id-0 credit, and compares every stubbed row against what the
+        credit, an id-0 credit and a credit of a new id under the name ``''``,
+        and compares every stubbed row against what the
         pre-#408 ``SELECT DISTINCT artist_id, artist_name`` produced for
         linked ids. Only the expected side is limited to linked ids: before
-        #408 the stub also wrote a row for id 0, which is not an artist, so
-        the actual side stays unfiltered and a stub that admits id 0 fails
-        here (as in ``test_unlinked_credits_stub_no_artist``). A NULL id would
+        #408 the stub also wrote a row for id 0, which is not an artist, and
+        a row named ``''``, which is not a name. So the actual side stays
+        unfiltered, and a stub that admits id 0 or ``''`` fails here (as in
+        ``test_unlinked_credits_stub_no_artist`` and
+        ``test_an_empty_credit_name_never_wins``). A NULL id would
         fail on ``artist.id``'s primary key. Every fixture id has one
         spelling; some are credited on several releases and one only as an
         extra credit.
@@ -1714,20 +1721,23 @@ class TestArtistStubOneRowPerId:
             with conn.cursor() as cur:
                 cur.execute(
                     "INSERT INTO release_artist (release_id, artist_id, artist_name, extra) "
-                    "VALUES (1001, NULL, 'Unknown Artist', 0), (1001, 0, 'Some Engineer', 1)"
+                    "VALUES (1001, NULL, 'Unknown Artist', 0), (1001, 0, 'Some Engineer', 1),"
+                    "       (1001, %s, '', 1)",
+                    (EMPTY_NAME_ONLY_ID,),
                 )
                 cur.execute(
                     "SELECT count(*) FILTER (WHERE spellings = 1), count(*), max(n),"
                     "       count(*) FILTER (WHERE main = 0) FROM ("
                     "  SELECT artist_id, count(DISTINCT artist_name) AS spellings,"
                     "         count(*) AS n, count(*) FILTER (WHERE extra = 0) AS main"
-                    "  FROM release_artist WHERE artist_id > 0 GROUP BY artist_id"
+                    "  FROM release_artist WHERE artist_id > 0 AND artist_name <> ''"
+                    "  GROUP BY artist_id"
                     ") ids"
                 )
                 single_spelling_ids, ids, most_credits, extra_only_ids = cur.fetchone()
                 cur.execute(
                     "SELECT DISTINCT artist_id, artist_name, FALSE FROM release_artist "
-                    "WHERE artist_id > 0"
+                    "WHERE artist_id > 0 AND artist_name <> ''"
                 )
                 pre_408_rows = set(cur.fetchall())
         assert ids > 0 and single_spelling_ids == ids, (
