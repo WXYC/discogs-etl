@@ -2596,6 +2596,31 @@ class TestAdvisoryLockGuardBehaviour:
         generate.assert_not_called()
         release.assert_not_called()
 
+    def test_bow_out_warning_names_the_actual_holder(self, tmp_path, caplog) -> None:
+        """The warning carries the shared refusal text (#499), so the manual
+        workflow path, which does no shell-side lookup, still says who held it."""
+        args = self._xml_args(tmp_path)
+
+        class _Bowed(Exception):
+            """Stands in for exit_bowed_out()'s os._exit."""
+
+        with (
+            patch.object(run_pipeline, "parse_args", return_value=args),
+            patch.object(run_pipeline, "try_acquire_rebuild_lock", return_value=None),
+            patch(
+                "lib.rebuild_lock.describe_rebuild_lock_holder",
+                return_value="discogs-etl-seed",
+            ),
+            patch.object(run_pipeline, "exit_bowed_out", side_effect=_Bowed) as bow_out,
+            caplog.at_level("WARNING"),
+            pytest.raises(_Bowed),
+        ):
+            run_pipeline.main()
+
+        bow_out.assert_called_once_with()
+        assert "held by discogs-etl-seed" in caplog.text
+        assert "discogs-etl#354" in caplog.text
+
     def test_lock_is_acquired_before_pipeline_work_and_released_after(self, tmp_path) -> None:
         args = self._xml_args(tmp_path)
         order: list[str] = []

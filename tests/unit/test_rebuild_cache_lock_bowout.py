@@ -770,21 +770,22 @@ class TestBowOutWordingIsHolderNeutral:
         branch_idx = next(i for i, line in enumerate(lines) if f"-eq {sentinel} ]" in line)
         _assert_names_every_holder(next(ln for ln in lines[branch_idx:] if "::warning::" in ln))
 
-    def test_run_pipeline_warning_names_every_holder(self) -> None:
+    def test_run_pipeline_warning_uses_the_shared_refusal_message(self) -> None:
+        """run_pipeline can't use held_rebuild_lock (os._exit, #180) but shares
+        its message builder, so no hand-written holder list can drift there."""
         tree = ast.parse((REPO_ROOT / "scripts" / "run_pipeline.py").read_text())
-        templates = [
-            node.args[0].value
+        called = {
+            node.func.id
             for node in ast.walk(tree)
-            if isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and node.func.attr == "warning"
-            and node.args
-            and isinstance(node.args[0], ast.Constant)
-            and isinstance(node.args[0].value, str)
-            and "bowing out" in node.args[0].value
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        }
+        assert "rebuild_lock_refusal_message" in called
+        texts = [
+            node.value
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Constant) and isinstance(node.value, str)
         ]
-        assert len(templates) == 1, f"expected one bow-out warning, found {templates!r}"
-        _assert_names_every_holder(templates[0] % _python_lock_key())
+        assert not [t for t in texts if "operator session" in t]
 
     @pytest.mark.parametrize(
         "relpath",

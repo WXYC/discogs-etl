@@ -49,8 +49,8 @@ from lib.dsn import redact_dsn  # noqa: E402
 from lib.observability import init_logger  # noqa: E402
 from lib.rebuild_lock import (  # noqa: E402
     REBUILD_LOCK_HOLDER_REBUILD,
-    REBUILD_LOCK_KEY,
     exit_bowed_out,
+    rebuild_lock_refusal_message,
     release_rebuild_lock,
     try_acquire_rebuild_lock,
 )
@@ -1353,10 +1353,8 @@ def main() -> None:
     lock_conn = try_acquire_rebuild_lock(args.database_url, holder=REBUILD_LOCK_HOLDER_REBUILD)
     if lock_conn is None:
         logger.warning(
-            "The discogs-cache rebuild lock (key %d) is held by another session "
-            "(a rebuild, a dedup, a seed, an api_fetch export restore, or an operator session); bowing out without "
-            "touching the cache. See discogs-etl#354.",
-            REBUILD_LOCK_KEY,
+            "%s; bowing out without touching the cache. See discogs-etl#354.",
+            rebuild_lock_refusal_message(args.database_url),
         )
         # NOT sys.exit -- see exit_bowed_out's docstring (#180): a swallowed
         # SystemExit here would exit 0 and let rebuild-cache.sh report a
