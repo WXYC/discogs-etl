@@ -1487,7 +1487,11 @@ def report_pin_loss(loss: PinLoss | None, *, previous: bool = False) -> None:
     """
     if loss is None:
         return
-    run = "an earlier rebuild that did not finish" if previous else "the run"
+    run = (
+        "an earlier rebuild (one that did not finish, or whose check could not clear it)"
+        if previous
+        else "the run"
+    )
     message = (
         f"{len(loss.lost):,} of {loss.at_start:,} pinned release(s) present when {run} "
         f"started ({loss.share:.1%}) have no release row after it "
