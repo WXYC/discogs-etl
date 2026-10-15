@@ -663,6 +663,54 @@ class TestSeedCacheFromClone:
         assert self._seed_all()["release"] > 0
         assert names == ["discogs-etl-seed"]
 
+    def test_one_sequence_holds_the_lock_between_the_families(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """#488: --ids-file + --artist-ids-file seed both families under one 354001
+        acquisition; a second session cannot take it between them."""
+        src = psycopg.connect(self.source_url, autocommit=True)
+        src.execute("DELETE FROM artist WHERE id = 9488")
+        src.execute("INSERT INTO artist (id, name) VALUES (9488, 'Sessa')")
+        src.close()
+        rel_file = tmp_path / "releases.txt"
+        rel_file.write_text("".join(f"{rid}\n" for rid, _, _ in CLONE_RELEASES))
+        art_file = tmp_path / "artists.txt"
+        art_file.write_text("9488\n")
+
+        free_between: list[bool] = []
+        real_artists = _seed.seed_artists_additive
+
+        def probe_then_seed(*args: object, **kwargs: object) -> dict[str, int]:
+            free_between.append(_rebuild_lock_is_free(self.target_url))
+            return real_artists(*args, **kwargs)
+
+        monkeypatch.setattr(_seed, "seed_artists_additive", probe_then_seed)
+        monkeypatch.setattr(
+            _sys,
+            "argv",
+            [
+                "seed_cache_from_clone.py",
+                "--source",
+                self.source_url,
+                "--target",
+                self.target_url,
+                "--ids-file",
+                str(rel_file),
+                "--artist-ids-file",
+                str(art_file),
+            ],
+        )
+        try:
+            assert _seed.main() == 0
+        finally:
+            src = psycopg.connect(self.source_url, autocommit=True)
+            src.execute("DELETE FROM artist WHERE id = 9488")
+            src.close()
+        assert free_between == [False]
+        with psycopg.connect(self.target_url) as conn:
+            assert conn.execute("SELECT count(*) FROM artist WHERE id = 9488").fetchone()[0] == 1
+        assert _rebuild_lock_is_free(self.target_url)
+
     def test_real_seed_releases_rebuild_lock_afterwards(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
