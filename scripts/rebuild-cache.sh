@@ -62,8 +62,13 @@ notify_slack() {
     # python3, not the venv: this runs before the venv exists.
     local payload
     payload=$(python3 -c 'import json,sys; print(json.dumps({"text": sys.argv[1]}))' \
-        "${emoji} Discogs cache rebuild: ${message}") || payload=""
-    curl -sS -X POST "$SLACK_MONITORING_WEBHOOK" \
+        "${emoji} Discogs cache rebuild: ${message}") || {
+        echo "notify_slack: could not encode the payload; post skipped" >&2
+        return 0
+    }
+    # --fail turns a Slack rejection (4xx/5xx) into a nonzero exit, so it is
+    # logged like a transport error instead of passing as success.
+    curl -sS --fail -X POST "$SLACK_MONITORING_WEBHOOK" \
         -H 'Content-Type: application/json' \
         -d "$payload" \
         --max-time 10 || echo "notify_slack: Slack post failed" >&2
@@ -623,7 +628,8 @@ while :; do
         fi
         lock_wait_sleep
     done
-    # The name goes into notify_slack's hand-built JSON: drop what would break it.
+    # notify_slack JSON-encodes its payload (#487); stripping quotes, backslashes
+    # and control characters from the name is kept as defense in depth.
     LOCK_HOLDER=$(printf '%s' "$LOCK_HOLDER" | tr -d '"\\[:cntrl:]')
     # Each lookup outcome sets the label and one action: retry_now, bow_out or
     # wait. A holder the lookup could not name may be a peer rebuild, and waiting

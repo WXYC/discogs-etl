@@ -948,3 +948,41 @@ def test_notify_slack_json_encodes_quotes_backslashes_and_control_characters() -
     )
     assert result.returncode == 0, result.stdout + result.stderr
     assert json.loads(result.stdout)["text"] == f":warning: Discogs cache rebuild: {message}"
+
+
+@pytest.mark.parametrize(
+    ("shim", "curl_called"),
+    [
+        pytest.param('curl() { echo "CURL $*"; return 22; }', True, id="slack-rejects-post"),
+        pytest.param(
+            'python3() { return 1; }\ncurl() { echo "CURL $*"; }', False, id="encode-fails"
+        ),
+    ],
+)
+def test_notify_slack_failure_logs_one_line_and_is_not_fatal(shim: str, curl_called: bool) -> None:
+    """#487: a post Slack rejects (curl --fail exits 22) or a payload that cannot
+    be encoded logs exactly one stderr line, never trips the ERR trap, and never
+    ends the run. An encode failure skips the post instead of sending an empty
+    body."""
+    source = SCRIPT_PATH.read_text()
+    harness = "\n".join(
+        [
+            "set -Eeuo pipefail",
+            "trap 'echo ERRTRAP' ERR",
+            'SLACK_MONITORING_WEBHOOK="https://hooks.invalid"',
+            shim,
+            _extract_function(source, "notify_slack"),
+            'notify_slack ":x:" "step failed"',
+            "echo AFTER",
+        ]
+    )
+    result = subprocess.run(["bash", "-c", harness], capture_output=True, text=True, check=False)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "ERRTRAP" not in result.stdout
+    assert result.stdout.rstrip().endswith("AFTER")
+    notify_lines = [ln for ln in result.stderr.splitlines() if ln.startswith("notify_slack:")]
+    assert len(notify_lines) == 1, result.stderr
+    if curl_called:
+        assert "--fail" in result.stdout.split()
+    else:
+        assert "CURL" not in result.stdout
