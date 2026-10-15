@@ -169,8 +169,16 @@ def _alive(pid_file: Path) -> bool:
 )
 @pytest.mark.skipif(
     shutil.which("bash") is None
-    or subprocess.run(["bash", "-c", "((BASH_VERSINFO[0] >= 4))"], check=False).returncode != 0,
-    reason="step uses empty-array expansion under set -u, which needs bash >= 4",
+    or subprocess.run(
+        [
+            "bash",
+            "-c",
+            "((BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 4)))",
+        ],
+        check=False,
+    ).returncode
+    != 0,
+    reason="step uses empty-array expansion under set -u, which needs bash >= 4.4",
 )
 def test_step_behavior(
     tmp_path: Path, curl_mode: str, py_mode: str, expected_rc: int, expected_text: str | None
