@@ -71,6 +71,7 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+from contextlib import ExitStack
 from pathlib import Path
 
 import psycopg
@@ -86,9 +87,8 @@ from lib.observability import init_logger  # noqa: E402
 from lib.rebuild_lock import (  # noqa: E402
     REBUILD_LOCK_BOWED_OUT_EXIT_CODE,
     REBUILD_LOCK_HOLDER_SEED,
-    REBUILD_LOCK_KEY,
-    release_rebuild_lock,
-    try_acquire_rebuild_lock,
+    RebuildLockRefused,
+    held_rebuild_lock,
 )
 
 logger = logging.getLogger(__name__)
@@ -152,12 +152,8 @@ _COALESCE_NOW_COLUMNS = {("artist", "fetched_at")}
 _ADVISORY_LOCK_KEY = 330001
 
 
-class RebuildInProgressError(RuntimeError):
-    """The rebuild advisory lock (354001) is held on the target, so a real seed must not write.
-
-    Any of its holders may hold it: a rebuild, dedup_artist_children, an operator
-    session, or another real seed.
-    """
+# Kept as the seed's name for the shared refusal.
+RebuildInProgressError = RebuildLockRefused
 
 
 def _table_exists(conn: psycopg.Connection, table: str) -> bool:
@@ -422,18 +418,14 @@ def _seed_family(
     # advisory lock on key 330001 (discogs-etl PR#330, registered in CLAUDE.md's
     # "Advisory lock keys" table) spans the read -> write window as a backstop.
     target_conn = psycopg.connect(target_url)
-    rebuild_lock_conn = None
+    rebuild_lock_stack = ExitStack()
     try:
         # Exclude every 354001 holder (a rebuild and its api_fetch restore, dedup,
         # an operator session, another seed) from the whole write window; 330001
         # below is the seed-vs-seed backstop.
-        rebuild_lock_conn = try_acquire_rebuild_lock(target_url, holder=REBUILD_LOCK_HOLDER_SEED)
-        if rebuild_lock_conn is None:
-            raise RebuildInProgressError(
-                f"the rebuild lock {REBUILD_LOCK_KEY} is held on --target (a rebuild, "
-                "a dedup, a seed, an api_fetch export restore, or an operator session); "
-                "refusing to seed -- nothing written, retry later"
-            )
+        rebuild_lock_stack.enter_context(
+            held_rebuild_lock(target_url, holder=REBUILD_LOCK_HOLDER_SEED)
+        )
         with target_conn.cursor() as cur:
             cur.execute("SELECT pg_advisory_xact_lock(%s)", (_ADVISORY_LOCK_KEY,))
 
@@ -493,8 +485,7 @@ def _seed_family(
             source_conn.close()
     finally:
         target_conn.close()
-        if rebuild_lock_conn is not None:
-            release_rebuild_lock(rebuild_lock_conn)
+        rebuild_lock_stack.close()
 
     logger.info("Seed complete (%s): %s", family, {k: v for k, v in result.items() if v})
     return result

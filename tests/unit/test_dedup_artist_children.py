@@ -14,6 +14,7 @@ import contextlib
 import psycopg
 import pytest
 
+import lib.rebuild_lock as _lock
 import scripts.dedup_artist_children as dedup
 from scripts.dedup_artist_children import (
     ARTIST_CHILD_KEYS,
@@ -195,7 +196,7 @@ class TestMainBowOut:
     def test_exits_75_without_touching_the_database_when_the_lock_is_held(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setattr(dedup, "try_acquire_rebuild_lock", lambda _url, **_kw: None)
+        monkeypatch.setattr(_lock, "try_acquire_rebuild_lock", lambda _url, **_kw: None)
 
         def _explode(**_kwargs: object) -> int:
             raise AssertionError("run() must not be reached when the lock is held")
@@ -210,7 +211,7 @@ class TestMainBowOut:
         def acquire(_url: str, *, holder: str) -> None:
             holders.append(holder)
 
-        monkeypatch.setattr(dedup, "try_acquire_rebuild_lock", acquire)
+        monkeypatch.setattr(_lock, "try_acquire_rebuild_lock", acquire)
         assert main(["--database-url", "postgresql://example/discogs"]) == 75
         assert holders == ["discogs-etl-dedup"]
 
@@ -219,8 +220,8 @@ class TestMainBowOut:
     ) -> None:
         released: list[object] = []
         sentinel = object()
-        monkeypatch.setattr(dedup, "try_acquire_rebuild_lock", lambda _url, **_kw: sentinel)
-        monkeypatch.setattr(dedup, "release_rebuild_lock", released.append)
+        monkeypatch.setattr(_lock, "try_acquire_rebuild_lock", lambda _url, **_kw: sentinel)
+        monkeypatch.setattr(_lock, "release_rebuild_lock", released.append)
         monkeypatch.setattr(dedup, "run", lambda **_kwargs: 0)
         assert main(["--database-url", "postgresql://example/discogs"]) == 0
         assert released == [sentinel]

@@ -45,9 +45,8 @@ from lib.observability import init_logger  # noqa: E402
 from lib.rebuild_lock import (  # noqa: E402
     REBUILD_LOCK_BOWED_OUT_EXIT_CODE,
     REBUILD_LOCK_HOLDER_RESTORE_API_FETCH,
-    REBUILD_LOCK_KEY,
-    release_rebuild_lock,
-    try_acquire_rebuild_lock,
+    RebuildLockRefused,
+    held_rebuild_lock,
 )
 
 logger = logging.getLogger(__name__)
@@ -77,35 +76,30 @@ def main(argv: list[str] | None = None) -> int:
         logger.info("[dry-run] %s", plan_restore_from(args.source, args.target).format())
         return 0
 
-    lock_conn = try_acquire_rebuild_lock(args.target, holder=REBUILD_LOCK_HOLDER_RESTORE_API_FETCH)
-    if lock_conn is None:
-        # EX_TEMPFAIL is an expected outcome (retry later): WARNING, so it opens no Sentry event.
-        logger.warning(
-            "Rebuild lock %d is held on --target (a rebuild, a dedup, a seed, "
-            "an api_fetch export restore, or an operator session); nothing written. "
-            "Bowing out with %d.",
-            REBUILD_LOCK_KEY,
-            REBUILD_LOCK_BOWED_OUT_EXIT_CODE,
-        )
-        return REBUILD_LOCK_BOWED_OUT_EXIT_CODE
     staged = False
     try:
-        stage_snapshot_from(args.source, args.target)
-        staged = True
-        if restore_api_fetch_releases(args.target) is None:
-            logger.warning("Nothing was restored: --target has no snapshot or no release table")
-    except ApiFetchRestoreError:
-        # The restore already logged the error; say which snapshot its retained tables hold.
-        if staged:
-            logger.warning("The export is staged on --target; fix the cause and rerun")
-        else:
-            logger.warning(
-                "Restoring the snapshot already on --target failed, so the export was not "
-                "staged; fix the cause and rerun"
-            )
-        return 1
-    finally:
-        release_rebuild_lock(lock_conn)
+        with held_rebuild_lock(args.target, holder=REBUILD_LOCK_HOLDER_RESTORE_API_FETCH):
+            try:
+                stage_snapshot_from(args.source, args.target)
+                staged = True
+                if restore_api_fetch_releases(args.target) is None:
+                    logger.warning(
+                        "Nothing was restored: --target has no snapshot or no release table"
+                    )
+            except ApiFetchRestoreError:
+                # The restore already logged the error; say which snapshot its retained tables hold.
+                if staged:
+                    logger.warning("The export is staged on --target; fix the cause and rerun")
+                else:
+                    logger.warning(
+                        "Restoring the snapshot already on --target failed, so the export was "
+                        "not staged; fix the cause and rerun"
+                    )
+                return 1
+    except RebuildLockRefused as exc:
+        # EX_TEMPFAIL is an expected outcome (retry later): WARNING, so it opens no Sentry event.
+        logger.warning("%s. Bowing out with %d.", exc, REBUILD_LOCK_BOWED_OUT_EXIT_CODE)
+        return REBUILD_LOCK_BOWED_OUT_EXIT_CODE
     return 0
 
 

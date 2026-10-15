@@ -33,6 +33,8 @@ import psycopg
 import pytest
 from psycopg import sql
 
+import lib.rebuild_lock as _lock
+
 SCHEMA_DIR = Path(__file__).parent.parent.parent / "schema"
 
 ADMIN_URL = os.environ.get("DATABASE_URL_TEST", "postgresql://localhost:5433/postgres")
@@ -83,7 +85,7 @@ def _keep_rebuild_lock_conns(monkeypatch: pytest.MonkeyPatch) -> list[psycopg.Co
     a reference makes "the lock is free afterwards" prove the explicit release ran.
     """
     kept: list[psycopg.Connection] = []
-    real = _seed.try_acquire_rebuild_lock
+    real = _lock.try_acquire_rebuild_lock
 
     def spy(url: str, **kwargs: object) -> psycopg.Connection | None:
         conn = real(url, **kwargs)
@@ -91,7 +93,7 @@ def _keep_rebuild_lock_conns(monkeypatch: pytest.MonkeyPatch) -> list[psycopg.Co
             kept.append(conn)
         return conn
 
-    monkeypatch.setattr(_seed, "try_acquire_rebuild_lock", spy)
+    monkeypatch.setattr(_lock, "try_acquire_rebuild_lock", spy)
     return kept
 
 
@@ -621,6 +623,17 @@ class TestSeedCacheFromClone:
             holder.close()
         assert self._release_ids(self.target_url) == before
 
+    def test_refusal_names_the_holder(self) -> None:
+        holder = psycopg.connect(
+            self.target_url, autocommit=True, application_name="named-holder-490"
+        )
+        try:
+            holder.execute("SELECT pg_advisory_lock(%s)", (REBUILD_LOCK_KEY,))
+            with pytest.raises(RebuildInProgressError, match="held by named-holder-490"):
+                self._seed_all()
+        finally:
+            holder.close()
+
     def test_dry_run_succeeds_while_rebuild_lock_held(self) -> None:
         holder = _hold_rebuild_lock(self.target_url)
         try:
@@ -638,7 +651,7 @@ class TestSeedCacheFromClone:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         names: list[str] = []
-        real = _seed.try_acquire_rebuild_lock
+        real = _lock.try_acquire_rebuild_lock
 
         def spy(url: str, **kwargs: object) -> psycopg.Connection | None:
             conn = real(url, **kwargs)
@@ -646,7 +659,7 @@ class TestSeedCacheFromClone:
                 names.append(conn.execute("SHOW application_name").fetchone()[0])
             return conn
 
-        monkeypatch.setattr(_seed, "try_acquire_rebuild_lock", spy)
+        monkeypatch.setattr(_lock, "try_acquire_rebuild_lock", spy)
         assert self._seed_all()["release"] > 0
         assert names == ["discogs-etl-seed"]
 

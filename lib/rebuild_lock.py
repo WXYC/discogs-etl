@@ -50,6 +50,8 @@ import logging
 import os
 import sys
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import NoReturn
 
 import psycopg
@@ -380,6 +382,40 @@ def release_rebuild_lock(conn: psycopg.Connection) -> None:
         )
     finally:
         conn.close()
+
+
+class RebuildLockRefused(RuntimeError):
+    """Another session holds the rebuild lock; the message names it."""
+
+
+@contextmanager
+def held_rebuild_lock(database_url: str, *, holder: str) -> Iterator[psycopg.Connection]:
+    """Hold the rebuild lock for the block, or raise ``RebuildLockRefused``.
+
+    The refusal names the session holding the lock, read back from
+    ``pg_locks``. A failed lookup, or a lock released since the refused try,
+    is said so rather than guessed at, and never turns the refusal into a crash.
+    """
+    conn = try_acquire_rebuild_lock(database_url, holder=holder)
+    if conn is None:
+        try:
+            name = describe_rebuild_lock_holder(database_url)
+        except Exception:
+            who = "by a session that could not be looked up"
+        else:
+            if name is None:
+                who = "by a session that has since released it"
+            elif name == "":
+                who = "by a session that set no application_name"
+            else:
+                who = f"by {name}"
+        raise RebuildLockRefused(
+            f"rebuild lock {REBUILD_LOCK_KEY} is held {who}; nothing written, retry later"
+        )
+    try:
+        yield conn
+    finally:
+        release_rebuild_lock(conn)
 
 
 if __name__ == "__main__":
