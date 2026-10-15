@@ -9,6 +9,7 @@ inside the ``set +e`` / ``PY_RC`` region, not that the run behaves.
 
 from __future__ import annotations
 
+import shlex
 from pathlib import Path
 
 from tests.workflow_yaml import load_workflow, step_named, triggers
@@ -32,12 +33,33 @@ def test_step_env_carries_the_input() -> None:
     assert "inputs.preserve_api_fetch" in str(step["env"]["PRESERVE_API_FETCH"])
 
 
+def _run_pipeline_invocation_tokens() -> list[str]:
+    """Tokenize the ``run_pipeline.py`` call, joining ``\\`` continuations like bash."""
+    joined = _run_script().replace("\\\n", " ")
+    for line in joined.splitlines():
+        stripped = line.lstrip()
+        if "scripts/run_pipeline.py" in stripped and stripped.startswith("python"):
+            return shlex.split(stripped)
+    raise AssertionError("Could not find run_pipeline.py invocation in the workflow step")
+
+
 def test_flag_is_passed_unless_the_input_is_false_inside_the_set_plus_e_block() -> None:
     script = _run_script()
     assert '[ "$PRESERVE_API_FETCH" != "false" ]' in script
     assert "PRESERVE_ARGS=(--preserve-api-fetch)" in script
     region = script[script.index("set +e") : script.index("PY_RC=$?")]
-    assert '"${PRESERVE_ARGS[@]}"' in region, (
-        "the conditional flag must be expanded on the run_pipeline.py call itself, "
-        "inside the set +e / PY_RC region"
+    assert '"${PRESERVE_ARGS[@]}"' in region
+    assert "${PRESERVE_ARGS[@]}" in _run_pipeline_invocation_tokens(), (
+        "the conditional flag must be a token of the run_pipeline.py command itself, "
+        "not detached from it by a dropped continuation backslash"
     )
+
+
+def test_any_nonzero_exit_reaps_curl_before_waiting() -> None:
+    script = _run_script()
+    wait_idx = script.index('wait "$CURL_PID" || true')
+    reap_idx = script.index('[ "$PY_RC" -ne 0 ] && [ ! -e data/curl.status ]')
+    assert reap_idx < wait_idx
+    block = script[reap_idx:wait_idx]
+    assert 'kill "$CURL_PID"' in block
+    assert 'exit "$PY_RC"' in block
