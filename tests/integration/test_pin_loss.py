@@ -42,7 +42,8 @@ def cache(fresh_db_url):
     """A cache holding KEPT and LOST, with all three ids pinned."""
     _execute(
         fresh_db_url,
-        "CREATE TABLE release (id integer PRIMARY KEY, title text)",
+        "CREATE TABLE release "
+        "(id integer PRIMARY KEY, title text, not_found boolean NOT NULL DEFAULT FALSE)",
         f"INSERT INTO release VALUES ({KEPT}, 'Aluminum Tunes'), ({LOST}, 'DOGA')",
         "CREATE SCHEMA lml_cache",
         "CREATE TABLE lml_cache.library_release_override "
@@ -63,7 +64,7 @@ class TestMeasurePinLoss:
             pytest.param(
                 [
                     f"DELETE FROM release WHERE id = {LOST}",
-                    f"INSERT INTO release VALUES ({LOST}, 'DOGA')",
+                    f"INSERT INTO release (id, title) VALUES ({LOST}, 'DOGA')",
                 ],
                 [],
                 2,
@@ -80,7 +81,7 @@ class TestMeasurePinLoss:
                 id="unpinned-mid-run",
             ),
             pytest.param(
-                [f"INSERT INTO release VALUES ({NEVER_CACHED}, 'Moon Pix')"],
+                [f"INSERT INTO release (id, title) VALUES ({NEVER_CACHED}, 'Moon Pix')"],
                 [],
                 2,
                 id="cached-mid-run-not-in-start-set",
@@ -123,6 +124,37 @@ class TestMeasurePinLoss:
         _execute(cache, "DROP SCHEMA lml_cache CASCADE")
         assert measure_pin_loss(cache) == PinLoss(lost=[], at_start=0)
 
+    def test_a_release_table_gone_since_the_record_loses_every_pin(self, cache) -> None:
+        """A run that died between --fresh-rebuild's drop and create_schema lost them all."""
+        record_pin_start_state(cache)
+        _execute(cache, "DROP TABLE release")
+        assert measure_pin_loss(cache) == PinLoss(lost=[KEPT, LOST], at_start=2)
+
+    def test_a_tombstone_is_not_a_pin_present_at_start(self, cache) -> None:
+        """LML's Discogs-404 tombstone (not_found) is never snapshotted, so no restore
+        brings it back; losing it is not the #422 class."""
+        _execute(cache, f"UPDATE release SET not_found = TRUE WHERE id = {LOST}")
+        record_pin_start_state(cache)
+        _execute(cache, f"DELETE FROM release WHERE id = {LOST}")
+        assert measure_pin_loss(cache) == PinLoss(lost=[], at_start=1)
+
+    def test_a_failed_check_keeps_the_table_for_the_next_run(self, cache) -> None:
+        record_pin_start_state(cache)
+        _execute(cache, f"ALTER TABLE {START_TABLE} RENAME release_id TO rid")
+        assert measure_pin_loss(cache) is None
+        assert _start_table_exists(cache)
+
+    def test_a_drop_that_cannot_get_its_lock_still_returns_the_loss(
+        self, cache, monkeypatch
+    ) -> None:
+        monkeypatch.setattr("lib.pin_loss.DROP_LOCK_TIMEOUT", "100ms")
+        record_pin_start_state(cache)
+        _execute(cache, f"DELETE FROM release WHERE id = {LOST}")
+        with psycopg.connect(cache) as holder:
+            holder.execute(f"LOCK TABLE {START_TABLE} IN ACCESS SHARE MODE")
+            assert measure_pin_loss(cache) == PinLoss(lost=[LOST], at_start=2)
+        assert _start_table_exists(cache), "kept, so the next run reports it again"
+
     def test_any_other_error_aborts_the_record(self, cache) -> None:
         """A column typo or missing grant must not read as 'no pins'."""
         _execute(
@@ -143,6 +175,35 @@ class TestLeftoverStartState:
         # The fresh start set is the cache as it is now: LOST is no longer in it.
         _execute(cache, f"DELETE FROM release WHERE id = {KEPT}")
         assert measure_pin_loss(cache) == PinLoss(lost=[KEPT], at_start=1)
+
+    def test_the_loss_is_reported_before_the_table_is_replaced(self, cache) -> None:
+        """If the re-record fails, the crashed run's table and its loss survive."""
+        record_pin_start_state(cache)
+        _execute(cache, f"DELETE FROM release WHERE id = {LOST}")  # the run dies here
+        reported: list[PinLoss] = []
+
+        def report_then_fail(loss: PinLoss) -> None:
+            reported.append(loss)
+            assert _start_table_exists(cache), "reported while the table is still there"
+            raise KeyboardInterrupt
+
+        with pytest.raises(KeyboardInterrupt):
+            record_pin_start_state(cache, report_previous=report_then_fail)
+        assert reported == [PinLoss(lost=[LOST], at_start=2)]
+        assert measure_pin_loss(cache) == PinLoss(lost=[LOST], at_start=2)
+
+    def test_a_leftover_that_cannot_be_measured_aborts_and_is_kept(self, cache) -> None:
+        """Nothing is destroyed yet, so abort rather than re-record over the evidence."""
+        record_pin_start_state(cache)
+        _execute(cache, f"ALTER TABLE {START_TABLE} RENAME release_id TO rid")
+        with pytest.raises(psycopg.errors.UndefinedColumn):
+            record_pin_start_state(cache)
+        with psycopg.connect(cache) as conn:
+            columns = conn.execute(
+                "SELECT column_name FROM information_schema.columns WHERE table_name = %s",
+                (START_TABLE,),
+            ).fetchall()
+        assert columns == [("rid",)]
 
     def test_resume_reuses_the_original_start_state(self, cache) -> None:
         record_pin_start_state(cache)

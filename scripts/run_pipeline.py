@@ -1443,7 +1443,9 @@ def main() -> None:
 # (#493). Never-cached pins are outside the ratio, so its normal value is 0:
 # the 2026-10-13 re-run lost none (its 13 absent pins were never cached), and
 # #422 lost 47%. Its own knob, not the import's MAX_PIN_SHORTFALL_RATIO, which
-# an operator sets to 1.0 to force an import through.
+# an operator sets to 1.0 to force an import through. A forced upsert import
+# leaves the pins it strands hollow (row kept, children gone), which this check
+# does not count; only import_csv's "[#424] retained N" WARNING records them.
 DEFAULT_ABSENT_PIN_ALERT_RATIO = 0.05
 ABSENT_PIN_ALERT_RATIO_ENV = "ABSENT_PIN_ALERT_RATIO"
 PIN_LOSS_TITLE = "Discogs cache: pinned releases lost by this rebuild"
@@ -1474,18 +1476,20 @@ def resolve_absent_pin_alert_ratio() -> float:
     return value
 
 
-def report_pin_loss(loss: PinLoss | None, *, title: str = PIN_LOSS_TITLE) -> None:
+def report_pin_loss(loss: PinLoss | None, *, previous: bool = False) -> None:
     """Log *loss*; above ABSENT_PIN_ALERT_RATIO, at ERROR and to Slack (#493).
 
     ERROR reaches Sentry when ``SENTRY_DSN`` is set; the post goes to
     ``SLACK_MONITORING_WEBHOOK``, and a post that does not go out is a second
     ERROR. Never fatal: the rows are already gone. ``None`` (no start state
-    recorded) reports nothing.
+    recorded) reports nothing. *previous* reports the loss recorded by an
+    earlier run that did not finish, under its own title and wording.
     """
     if loss is None:
         return
+    run = "an earlier rebuild that did not finish" if previous else "the run"
     message = (
-        f"{len(loss.lost):,} of {loss.at_start:,} pinned release(s) present when the run "
+        f"{len(loss.lost):,} of {loss.at_start:,} pinned release(s) present when {run} "
         f"started ({loss.share:.1%}) have no release row after it "
         f"(sample, max 20): {loss.lost[:20]}"
     )
@@ -1493,15 +1497,18 @@ def report_pin_loss(loss: PinLoss | None, *, title: str = PIN_LOSS_TITLE) -> Non
     if loss.share <= threshold:
         logger.info(message)
         return
+    log = "that run's log (an earlier one)" if previous else "this run's log"
     message += (
         f". That is over the {threshold:.1%} alert threshold ({ABSENT_PIN_ALERT_RATIO_ENV}). "
         "Pins were lost during the rebuild (the WXYC/discogs-etl#422 class, e.g. a converter "
-        "run without its Seam A allowlist). Check the import mode and the Seam A warnings "
-        "in this run's log."
+        f"run without its Seam A allowlist). Check the import mode and the Seam A warnings "
+        f"in {log}."
     )
     logger.error(message)
     posted = post_slack_alert(
-        webhook_url=os.environ.get("SLACK_MONITORING_WEBHOOK"), message=message, title=title
+        webhook_url=os.environ.get("SLACK_MONITORING_WEBHOOK"),
+        message=message,
+        title=PREVIOUS_PIN_LOSS_TITLE if previous else PIN_LOSS_TITLE,
     )
     if not posted:
         logger.error(
@@ -1511,10 +1518,12 @@ def report_pin_loss(loss: PinLoss | None, *, title: str = PIN_LOSS_TITLE) -> Non
 
 
 def _record_pin_start(db_url: str, *, reuse_existing: bool) -> None:
-    """Record the pins present at start; report what a crashed earlier run lost (#493)."""
-    previous = record_pin_start_state(db_url, reuse_existing=reuse_existing)
-    if previous is not None:
-        report_pin_loss(previous, title=PREVIOUS_PIN_LOSS_TITLE)
+    """Record the pins present at start, first reporting what a crashed earlier run lost (#493)."""
+    record_pin_start_state(
+        db_url,
+        reuse_existing=reuse_existing,
+        report_previous=lambda loss: report_pin_loss(loss, previous=True),
+    )
 
 
 def _check_pin_loss(db_url: str) -> None:
