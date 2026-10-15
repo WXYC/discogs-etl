@@ -541,12 +541,13 @@ lock_wait_sleep_for() {
     REBUILD_LOCK_WAITED_SECONDS=$((REBUILD_LOCK_WAITED_SECONDS + now - LOCK_ATTEMPT_STARTED))
     LOCK_ATTEMPT_STARTED=$now
     LOCK_SLEEP_SECONDS=$((REBUILD_LOCK_WAIT_SECONDS - REBUILD_LOCK_WAITED_SECONDS))
-    if [ "$LOCK_SLEEP_SECONDS" -gt "$1" ]; then
-        LOCK_SLEEP_SECONDS=$1
-    fi
+    # Out of time is decided before the cap, so a cap of 0 means "retry at once".
     if [ "$LOCK_SLEEP_SECONDS" -le 0 ]; then
         LOCK_SLEEP_SECONDS=0
         return 1
+    fi
+    if [ "$LOCK_SLEEP_SECONDS" -gt "$1" ]; then
+        LOCK_SLEEP_SECONDS=$1
     fi
 }
 # Sleep LOCK_SLEEP_SECONDS and charge exactly that, not the clock's reading.
