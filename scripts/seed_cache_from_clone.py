@@ -502,7 +502,6 @@ def seed_releases_additive(
     *,
     dry_run: bool = False,
     preserve_provenance: bool = False,
-    lock_held: bool = False,
 ) -> dict[str, int]:
     """Additively copy the artist-scoped release row-set (``release_ids`` and its
     children) from the source clone into the target discogs-cache.
@@ -520,7 +519,6 @@ def seed_releases_additive(
         family="releases",
         dry_run=dry_run,
         preserve_provenance=preserve_provenance,
-        lock_held=lock_held,
     )
 
 
@@ -530,7 +528,6 @@ def seed_artists_additive(
     artist_ids,
     *,
     dry_run: bool = False,
-    lock_held: bool = False,
 ) -> dict[str, int]:
     """Additively copy tail ``artist`` rows + their ``artist_name_variation``
     children from the source clone into the target discogs-cache, for LML
@@ -546,7 +543,6 @@ def seed_artists_additive(
         artist_ids,
         family="artists",
         dry_run=dry_run,
-        lock_held=lock_held,
     )
 
 
@@ -586,18 +582,33 @@ def _seed_sequence(args, release_ids) -> dict[str, int]:
     with ExitStack() as stack:
         if not args.dry_run:
             stack.enter_context(held_rebuild_lock(args.target, holder=REBUILD_LOCK_HOLDER_SEED))
+        # The span already holds 354001, so the families skip their own acquisition
+        # (a second connection of this process would refuse itself). lock_held is
+        # private to _seed_family: the public seeders always take the lock.
         held = not args.dry_run
-        counts = seed_releases_additive(
+        counts = _seed_family(
             args.source,
             args.target,
+            _RELEASE_SPEC,
+            "release",
+            "id",
             release_ids,
+            family="releases",
             dry_run=args.dry_run,
             preserve_provenance=args.preserve_provenance,
             lock_held=held,
         )
         counts.update(
-            seed_artists_additive(
-                args.source, args.target, artist_ids, dry_run=args.dry_run, lock_held=held
+            _seed_family(
+                args.source,
+                args.target,
+                _ARTIST_SPEC,
+                "artist",
+                "id",
+                artist_ids,
+                family="artists",
+                dry_run=args.dry_run,
+                lock_held=held,
             )
         )
     return counts

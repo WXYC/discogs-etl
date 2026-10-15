@@ -663,28 +663,17 @@ class TestSeedCacheFromClone:
         assert self._seed_all()["release"] > 0
         assert names == ["discogs-etl-seed"]
 
-    def test_one_sequence_holds_the_lock_between_the_families(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-    ) -> None:
-        """#488: --ids-file + --artist-ids-file seed both families under one 354001
-        acquisition; a second session cannot take it between them."""
-        src = psycopg.connect(self.source_url, autocommit=True)
-        src.execute("DELETE FROM artist WHERE id = 9488")
-        src.execute("INSERT INTO artist (id, name) VALUES (9488, 'Sessa')")
-        src.close()
+    def _run_sequence(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        *extra_args: str,
+    ) -> int:
+        """Run main() with --ids-file + --artist-ids-file (clone artist 9488)."""
         rel_file = tmp_path / "releases.txt"
         rel_file.write_text("".join(f"{rid}\n" for rid, _, _ in CLONE_RELEASES))
         art_file = tmp_path / "artists.txt"
         art_file.write_text("9488\n")
-
-        free_between: list[bool] = []
-        real_artists = _seed.seed_artists_additive
-
-        def probe_then_seed(*args: object, **kwargs: object) -> dict[str, int]:
-            free_between.append(_rebuild_lock_is_free(self.target_url))
-            return real_artists(*args, **kwargs)
-
-        monkeypatch.setattr(_seed, "seed_artists_additive", probe_then_seed)
         monkeypatch.setattr(
             _sys,
             "argv",
@@ -698,18 +687,94 @@ class TestSeedCacheFromClone:
                 str(rel_file),
                 "--artist-ids-file",
                 str(art_file),
+                *extra_args,
             ],
         )
-        try:
-            assert _seed.main() == 0
-        finally:
-            src = psycopg.connect(self.source_url, autocommit=True)
-            src.execute("DELETE FROM artist WHERE id = 9488")
-            src.close()
-        assert free_between == [False]
+        return _seed.main()
+
+    @pytest.fixture
+    def _clone_artist_9488(self):
+        src = psycopg.connect(self.source_url, autocommit=True)
+        src.execute("DELETE FROM artist WHERE id = 9488")
+        src.execute("INSERT INTO artist (id, name) VALUES (9488, 'Sessa')")
+        src.close()
+        # _reset_target only truncates release; keep the target artist out too.
+        tgt = psycopg.connect(self.target_url, autocommit=True)
+        tgt.execute("DELETE FROM artist WHERE id = 9488")
+        tgt.close()
+        yield
+        src = psycopg.connect(self.source_url, autocommit=True)
+        src.execute("DELETE FROM artist WHERE id = 9488")
+        src.close()
+        tgt = psycopg.connect(self.target_url, autocommit=True)
+        tgt.execute("DELETE FROM artist WHERE id = 9488")
+        tgt.close()
+
+    def _artist_count(self) -> int:
         with psycopg.connect(self.target_url) as conn:
-            assert conn.execute("SELECT count(*) FROM artist WHERE id = 9488").fetchone()[0] == 1
-        assert _rebuild_lock_is_free(self.target_url)
+            return conn.execute("SELECT count(*) FROM artist WHERE id = 9488").fetchone()[0]
+
+    def test_one_sequence_holds_the_lock_between_the_families(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        _clone_artist_9488,
+    ) -> None:
+        """#488: --ids-file + --artist-ids-file seed both families under one 354001
+        acquisition; a second session cannot take it between them."""
+        kept = _keep_rebuild_lock_conns(monkeypatch)
+        free_between: list[bool] = []
+        real_family = _seed._seed_family
+
+        def probe_then_seed(*args: object, **kwargs: object) -> dict[str, int]:
+            if kwargs.get("family") == "artists":
+                free_between.append(_rebuild_lock_is_free(self.target_url))
+            return real_family(*args, **kwargs)
+
+        monkeypatch.setattr(_seed, "_seed_family", probe_then_seed)
+        try:
+            assert self._run_sequence(monkeypatch, tmp_path) == 0
+            assert free_between == [False]
+            assert len(kept) == 1
+            assert self._artist_count() == 1
+            assert len(self._release_ids(self.target_url)) > 1
+            assert _rebuild_lock_is_free(self.target_url)
+        finally:
+            for conn in kept:
+                conn.close()
+
+    @pytest.mark.parametrize("mode", ["refused", "dry_run"])
+    def test_sequence_refusal_and_dry_run(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        _clone_artist_9488,
+        mode: str,
+    ) -> None:
+        """#488: a sequence refused at its start exits 75 and writes nothing; a
+        --dry-run sequence takes no lock and writes nothing."""
+        releases_before = self._release_ids(self.target_url)
+        if mode == "refused":
+            holder = _hold_rebuild_lock(self.target_url)
+            try:
+                assert self._run_sequence(monkeypatch, tmp_path) == 75
+            finally:
+                holder.close()
+        else:
+            kept = _keep_rebuild_lock_conns(monkeypatch)
+            free_during: list[bool] = []
+            real_family = _seed._seed_family
+
+            def probe_then_seed(*args: object, **kwargs: object) -> dict[str, int]:
+                free_during.append(_rebuild_lock_is_free(self.target_url))
+                return real_family(*args, **kwargs)
+
+            monkeypatch.setattr(_seed, "_seed_family", probe_then_seed)
+            assert self._run_sequence(monkeypatch, tmp_path, "--dry-run") == 0
+            assert free_during == [True, True]
+            assert kept == []
+        assert self._release_ids(self.target_url) == releases_before
+        assert self._artist_count() == 0
 
     def test_real_seed_releases_rebuild_lock_afterwards(
         self, monkeypatch: pytest.MonkeyPatch
