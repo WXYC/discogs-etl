@@ -19,6 +19,7 @@ import psycopg
 import pytest
 from psycopg import sql
 
+import lib.rebuild_lock as _lock
 from lib.api_fetch_preservation import (
     SNAPSHOT_SUFFIX,
     ApiFetchRestoreError,
@@ -145,7 +146,7 @@ def lock_conns(monkeypatch):
     release ran.
     """
     kept: list[psycopg.Connection] = []
-    real = _cli.try_acquire_rebuild_lock
+    real = _lock.try_acquire_rebuild_lock
 
     def spy(url: str, *, holder: str) -> psycopg.Connection | None:
         conn = real(url, holder=holder)
@@ -153,7 +154,7 @@ def lock_conns(monkeypatch):
             kept.append(conn)
         return conn
 
-    monkeypatch.setattr(_cli, "try_acquire_rebuild_lock", spy)
+    monkeypatch.setattr(_lock, "try_acquire_rebuild_lock", spy)
     yield kept
     for conn in kept:
         conn.close()
@@ -433,6 +434,17 @@ class TestContention:
         assert _rows(target, f"SELECT to_regclass('{_scratch('release')}')") == [(None,)]
         assert _rows(target, f"SELECT 1 FROM release WHERE id = {ABSENT_ID}") == []
 
+    def test_refusal_logs_the_holder_by_name(self, export_and_cache, caplog) -> None:
+        source, target = export_and_cache
+        holder = psycopg.connect(target, autocommit=True, application_name="named-holder-490")
+        try:
+            holder.execute("SELECT pg_advisory_lock(%s)", (REBUILD_LOCK_KEY,))
+            with caplog.at_level(logging.WARNING):
+                assert _run(source, target) == 75
+        finally:
+            holder.close()
+        assert "held by named-holder-490" in caplog.text
+
     def test_releases_354001_when_done(self, export_and_cache, lock_conns) -> None:
         source, target = export_and_cache
 
@@ -446,7 +458,7 @@ class TestContention:
         restore would read as an operator session in the Slack post."""
         source, target = export_and_cache
         names: list[str] = []
-        real = _cli.try_acquire_rebuild_lock
+        real = _lock.try_acquire_rebuild_lock
 
         def spy(url: str, **kwargs: object) -> psycopg.Connection | None:
             conn = real(url, **kwargs)
@@ -454,7 +466,7 @@ class TestContention:
                 names.append(conn.execute("SHOW application_name").fetchone()[0])
             return conn
 
-        monkeypatch.setattr(_cli, "try_acquire_rebuild_lock", spy)
+        monkeypatch.setattr(_lock, "try_acquire_rebuild_lock", spy)
 
         assert _run(source, target) == 0
         assert names == ["discogs-etl-restore-api-fetch"]

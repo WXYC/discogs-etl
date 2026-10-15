@@ -160,6 +160,19 @@ class TestRebuildLock:
         for table in _CHILD_ROWS:
             assert _counts(duplicated_db, table) == (COPIES + 1, 2), table
 
+    def test_refusal_logs_the_holder_by_name(self, duplicated_db: str, caplog) -> None:
+        holder = psycopg.connect(
+            duplicated_db, autocommit=True, application_name="named-holder-490"
+        )
+        try:
+            holder.execute("SELECT pg_advisory_lock(%s)", (REBUILD_LOCK_KEY,))
+            with caplog.at_level("WARNING"):
+                exit_code = main(["--database-url", duplicated_db, "--execute"])
+        finally:
+            holder.close()
+        assert exit_code == REBUILD_LOCK_BOWED_OUT_EXIT_CODE
+        assert "held by named-holder-490" in caplog.text
+
 
 @pytest.mark.pg
 @pytest.mark.parametrize("lml_row_first", [False, True], ids=["lml-row-last", "lml-row-first"])
