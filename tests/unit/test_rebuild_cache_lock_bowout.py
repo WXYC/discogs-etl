@@ -531,6 +531,21 @@ class TestBowOutBranchActuallyExecutes:
         assert "hourglass" not in result.stdout
         assert "FELL THROUGH TO DRIFT WATCHDOG" not in result.stdout
 
+    def test_a_zero_lookup_retry_gap_still_retries_every_lookup(self, tmp_path: Path) -> None:
+        """REBUILD_LOCK_LOOKUP_RETRY_SECONDS=0 means retry at once, not give up: only an
+        exhausted wait ends the lookup retries early."""
+        result = _run_harness(
+            [75],
+            tmp_path,
+            lookups=[ERROR],
+            wait_minutes=180,
+            stubs=("REBUILD_LOCK_LOOKUP_RETRY_SECONDS=0",),
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert result.stderr.count("holder lookup") == 3
+        final = next(ln for ln in result.stdout.splitlines() if ln.startswith("NOTIFY :no_entry:"))
+        assert "the holder lookup failed 3 times" in final
+
     def test_a_lookup_failing_past_the_deadline_bows_out_without_sleeping(
         self, tmp_path: Path
     ) -> None:
