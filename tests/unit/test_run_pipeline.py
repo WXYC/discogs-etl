@@ -2820,12 +2820,16 @@ class TestPreserveApiFetchWiring:
         calls = self._build(preserve=True, target_db_url="postgresql:///target")
         assert "snapshot" not in calls and "restore" not in calls
 
-    def _xml(self, tmp_path, *extra: str) -> list[str]:
+    def _xml(self, tmp_path, *extra: str, preserve: bool = True) -> list[str]:
         """Run _run_xml_pipeline with the DB-touching steps recorded in call order."""
         xml_file = tmp_path / "releases.xml.gz"
         xml_file.touch()
-        args = run_pipeline.parse_args(["--xml", str(xml_file), "--preserve-api-fetch", *extra])
+        flags = ["--preserve-api-fetch"] if preserve else []
+        args = run_pipeline.parse_args(["--xml", str(xml_file), *flags, *extra])
         calls: list[str] = []
+
+        def record_pin_start(db_url, **kwargs):
+            calls.append(f"record(reuse_existing={kwargs['reuse_existing']})")
 
         def record(name: str, result=None):
             return lambda *a, **k: calls.append(name) or result
@@ -2843,7 +2847,7 @@ class TestPreserveApiFetchWiring:
                 run_pipeline, "snapshot_api_fetch_releases", side_effect=record("snapshot")
             ),
             patch.object(run_pipeline, "restore_api_fetch_releases", side_effect=record("restore")),
-            patch.object(run_pipeline, "record_pin_start_state", side_effect=record("record")),
+            patch.object(run_pipeline, "_record_pin_start", side_effect=record_pin_start),
             patch.object(run_pipeline, "_run_database_build", side_effect=record("build")),
             patch.object(
                 run_pipeline, "_run_database_build_post_import", side_effect=record("post_import")
@@ -2858,7 +2862,15 @@ class TestPreserveApiFetchWiring:
     def test_direct_pg_snapshots_before_the_truncate(self, tmp_path) -> None:
         assert self._xml(tmp_path, "--direct-pg") == [
             "snapshot",
-            "record",
+            "record(reuse_existing=False)",
+            "truncate",
+            "convert",
+            "post_import",
+        ]
+
+    def test_direct_pg_records_pins_without_api_fetch_preservation(self, tmp_path) -> None:
+        assert self._xml(tmp_path, "--direct-pg", preserve=False) == [
+            "record(reuse_existing=False)",
             "truncate",
             "convert",
             "post_import",
@@ -2982,11 +2994,22 @@ class TestReportPinLoss:
         assert [r.levelno for r in undelivered] == ([] if posted else [logging.ERROR])
 
     def test_a_crashed_runs_loss_is_reported_under_its_own_title(self, slack_posts) -> None:
-        with patch.object(run_pipeline, "record_pin_start_state", return_value=self._loss(2, 3)):
+        def record(db_url, *, reuse_existing, report_previous):
+            report_previous(self._loss(2, 3))
+
+        with patch.object(run_pipeline, "record_pin_start_state", side_effect=record):
             run_pipeline._record_pin_start("postgresql:///test", reuse_existing=False)
         assert [p["title"] for p in slack_posts] == [
             "Discogs cache: pinned releases lost by the previous (failed) rebuild"
         ]
+
+    def test_a_previous_runs_loss_is_not_attributed_to_this_run(self, caplog, slack_posts) -> None:
+        with caplog.at_level(logging.ERROR, logger=run_pipeline.logger.name):
+            run_pipeline.report_pin_loss(self._loss(2, 3), previous=True)
+        text = slack_posts[0]["message"]
+        assert "an earlier rebuild that did not finish" in text
+        assert "this run" not in text and "present when the run started" not in text
+        assert caplog.records[0].getMessage() == text
 
     def test_the_check_reports_the_measured_loss(self, slack_posts) -> None:
         with patch.object(run_pipeline, "measure_pin_loss", return_value=self._loss(2, 3)):
@@ -3004,6 +3027,8 @@ class TestPinLossWiring:
         """Run _run_database_build with every step recorded in call order."""
         calls: list[str] = []
         record = MagicMock(side_effect=lambda *a, **k: calls.append("record"))
+        # The wrappers, not the lib functions: a call site that calls a bare lib
+        # function measures without ever reporting.
 
         def sql_file(db_url, path, **k):
             calls.append("drop" if "drop" in Path(path).name else "create_schema")
@@ -3035,9 +3060,9 @@ class TestPinLossWiring:
                 "restore_api_fetch_releases",
                 side_effect=lambda *a, **k: calls.append("restore"),
             ),
-            patch.object(run_pipeline, "record_pin_start_state", record),
+            patch.object(run_pipeline, "_record_pin_start", record),
             patch.object(
-                run_pipeline, "measure_pin_loss", side_effect=lambda *a: calls.append("check")
+                run_pipeline, "_check_pin_loss", side_effect=lambda *a: calls.append("check")
             ),
         ):
             run_pipeline._run_database_build(
@@ -3085,6 +3110,12 @@ class TestPinLossWiring:
         _, record = self._build(state=state, resume=resume)
         assert record.call_args.kwargs == {"reuse_existing": reuse}
 
+    def test_a_resume_past_prune_still_checks(self) -> None:
+        """The check sits outside every state.is_completed gate."""
+        state = MagicMock(is_completed=MagicMock(return_value=True))
+        calls, _ = self._build(state=state, resume=True)
+        assert calls.count("check") == 1
+
     def test_main_passes_resume_through(self, tmp_path) -> None:
         args = run_pipeline.parse_args(["--csv-dir", str(tmp_path), "--resume"])
         with (
@@ -3095,7 +3126,8 @@ class TestPinLossWiring:
             run_pipeline.main()
         assert build.call_args.kwargs["resume"] is True
 
-    def test_post_import_checks_after_the_restore_and_records_nothing(self) -> None:
+    @pytest.mark.parametrize("preserve", [True, False], ids=["preserve", "no-preserve"])
+    def test_post_import_checks_after_the_restore_and_records_nothing(self, preserve) -> None:
         calls: list[str] = []
         with (
             patch.object(run_pipeline, "write_keep_release_ids"),
@@ -3116,11 +3148,11 @@ class TestPinLossWiring:
             ),
             patch.object(
                 run_pipeline,
-                "record_pin_start_state",
+                "_record_pin_start",
                 side_effect=lambda *a, **k: calls.append("record"),
             ),
             patch.object(
-                run_pipeline, "measure_pin_loss", side_effect=lambda *a: calls.append("check")
+                run_pipeline, "_check_pin_loss", side_effect=lambda *a: calls.append("check")
             ),
         ):
             run_pipeline._run_database_build_post_import(
@@ -3128,12 +3160,11 @@ class TestPinLossWiring:
                 Path("/tmp/csv"),
                 Path("/tmp/library.db"),
                 sys.executable,
-                preserve_api_fetch=True,
+                preserve_api_fetch=preserve,
             )
         assert "record" not in calls
-        assert (
-            calls.index("Prune to library matches")
-            < calls.index("restore")
-            < calls.index("check")
-            < calls.index("set_logged")
-        )
+        assert calls.count("check") == 1
+        before_check = ["Prune to library matches"] + (["restore"] if preserve else [])
+        for step in before_check:
+            assert calls.index(step) < calls.index("check")
+        assert calls.index("check") < calls.index("set_logged")

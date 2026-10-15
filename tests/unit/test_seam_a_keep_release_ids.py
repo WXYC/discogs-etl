@@ -47,6 +47,17 @@ def _stub_rebuild_lock():
         yield
 
 
+@pytest.fixture(autouse=True)
+def _stub_pin_loss():
+    """Stub out #493's pin-loss record and check, which open their own
+    connection, as tests/unit/test_run_pipeline.py does."""
+    with (
+        patch.object(run_pipeline, "record_pin_start_state", return_value=None),
+        patch.object(run_pipeline, "measure_pin_loss", return_value=None),
+    ):
+        yield
+
+
 HELP_WITH_FLAG = """Usage: discogs-xml-converter build [OPTIONS] <PATH>
 
 Options:
