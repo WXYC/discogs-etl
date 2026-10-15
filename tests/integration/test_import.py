@@ -1383,8 +1383,9 @@ NILUFER_YANYA_ID = 5
 class TestArtistStubOneRowPerId:
     """``import_artist_details`` stubs exactly one ``artist`` row per linked id (#408).
 
-    A linked id is a positive ``artist_id``. An unlinked credit (id 0 or NULL)
-    stubs no row (``test_unlinked_credits_stub_no_artist``).
+    A linked id is a positive ``artist_id``. An unlinked credit stubs no row:
+    id 0 in ``test_unlinked_credits_stub_no_artist``, and id 0 and NULL in
+    ``test_single_spelling_ids_stub_exactly_the_pre_408_rows``.
 
     ``release_artist`` can credit one Discogs artist id under several literal
     spellings: the dump's ``<name>`` is stored per credit, so a rename or a
@@ -1428,9 +1429,12 @@ class TestArtistStubOneRowPerId:
 
         tmp_path holds no artist.csv and no child CSVs. ``hash_aggregate=False``
         turns off the planner's HashAggregate, so the spellings are grouped by a
-        sorted GroupAggregate instead and reach DISTINCT ON in a different order.
+        sorted GroupAggregate instead and reach the ORDER BY sort in the column
+        collation's order. ``hash_aggregate=True`` leaves the planner free and
+        does not force a HashAggregate. ``options`` is left unset in that case
+        so libpq still reads ``PGOPTIONS``; an empty value would override it.
         """
-        options = "" if hash_aggregate else "-c enable_hashagg=off"
+        options = None if hash_aggregate else "-c enable_hashagg=off"
         conn = psycopg.connect(self.db_url, options=options)
         try:
             import_artist_details(conn, tmp_path)
@@ -1498,9 +1502,11 @@ class TestArtistStubOneRowPerId:
         on total credits, the last three on alphabetical order (``Nilufer``
         sorts before ``Nilüfer`` in byte order, glibc ``en_US.utf8`` and ICU
         root order; German phonebook order, which reads ``ü`` as ``ue``, is an
-        exception). So dropping a sort key, swapping the first two, or
+        exception). So dropping either count key, swapping the two, or
         reducing the main-credit count to a has-any-main-credit flag fails a
-        case.
+        case. No case here is a full tie, so dropping the final byte-order key
+        fails none of them; ``test_tie_breaks_on_byte_order_whatever_the_column_collation``
+        covers that key.
         """
         self._credit(artist_id, credits)
 
@@ -1527,7 +1533,7 @@ class TestArtistStubOneRowPerId:
 
     @pytest.mark.parametrize(
         "hash_aggregate",
-        [pytest.param(True, id="hash-aggregate"), pytest.param(False, id="sorted-aggregate")],
+        [pytest.param(True, id="default-plan"), pytest.param(False, id="sorted-aggregate")],
     )
     @pytest.mark.parametrize("collation", [None, "C", "und-x-icu"])
     def test_tie_breaks_on_byte_order_whatever_the_column_collation(
@@ -1542,11 +1548,19 @@ class TestArtistStubOneRowPerId:
         prod, CI and a laptop agree.
 
         Without any tie-break key, DISTINCT ON keeps whichever tied spelling
-        the plan emits first. A HashAggregate happens to emit ``Dirt Nation``
+        the ORDER BY sort leaves first. With two rows that is the order the
+        grouping step emits, because PostgreSQL sorts fewer than 7 rows with
+        a stable insertion sort; more tied rows would make it depend on the
+        quicksort's pivots. The default plan (a HashAggregate on CI and
+        locally, though nothing forces it) happens to emit ``Dirt Nation``
         first, so under that plan alone a dropped tie-break would still pass.
-        A sorted GroupAggregate emits the column collation's order, which puts
-        ``Dirt nation`` first under the default and ICU collations, so the
-        sorted-aggregate cases fail when the key is missing.
+        A sorted GroupAggregate emits the column collation's order. So without
+        the key, ``[None-sorted-aggregate]`` fails where the database's default
+        collation is linguistic (CI's ``en_US.utf8``) and
+        ``[und-x-icu-sorted-aggregate]`` fails where ICU is available; on a
+        ``C``-locale server without ICU nothing here catches it.
+        ``[C-sorted-aggregate]`` is a control: byte order is also the column
+        order there.
         """
         if collation is not None:
             with psycopg.connect(self.db_url) as conn, conn.cursor() as cur:
@@ -1685,11 +1699,13 @@ class TestArtistStubOneRowPerId:
         """A linked id credited under one spelling stubs exactly as it did before #408.
 
         Loads the fixture base CSVs the way the import does, adds a NULL-id
-        and an id-0 credit, and compares the stubs against what the pre-#408
-        ``SELECT DISTINCT artist_id, artist_name`` produced for linked ids.
-        Unlinked credits are left out of the comparison on purpose: before
-        #408 the stub also wrote a row for id 0, which is not an artist
-        (``test_unlinked_credits_stub_no_artist``). Every fixture id has one
+        and an id-0 credit, and compares every stubbed row against what the
+        pre-#408 ``SELECT DISTINCT artist_id, artist_name`` produced for
+        linked ids. Only the expected side is limited to linked ids: before
+        #408 the stub also wrote a row for id 0, which is not an artist, so
+        the actual side stays unfiltered and a stub that admits id 0 fails
+        here (as in ``test_unlinked_credits_stub_no_artist``). A NULL id would
+        fail on ``artist.id``'s primary key. Every fixture id has one
         spelling; some are credited on several releases and one only as an
         extra credit.
         """
