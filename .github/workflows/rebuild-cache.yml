@@ -254,6 +254,7 @@ jobs:
           set +e
           python scripts/run_pipeline.py \
             --xml data/releases.xml.gz \
+            --xml-type releases \
             --library-db data/library.db \
             "${PRESERVE_ARGS[@]}"
           PY_RC=$?

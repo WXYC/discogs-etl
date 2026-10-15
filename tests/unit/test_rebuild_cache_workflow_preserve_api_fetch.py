@@ -169,3 +169,12 @@ def test_step_behavior(
     finally:
         if _alive(pid_file):
             os.kill(int(pid_file.read_text().strip()), 9)
+
+
+def test_fifo_input_names_its_xml_type() -> None:
+    """#510: --xml points at a FIFO, so the converter must be told the XML type.
+    Root-element auto-detection opens and closes the FIFO, which breaks curl's
+    stream before the real scan starts."""
+    tokens = _run_pipeline_invocation_tokens()
+    assert "--xml-type" in tokens, tokens
+    assert tokens[tokens.index("--xml-type") + 1] == "releases"
