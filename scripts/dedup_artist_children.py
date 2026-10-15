@@ -259,7 +259,10 @@ def main(argv: list[str] | None = None) -> int:
     # can mistake a bow-out for success.
     lock_conn = try_acquire_rebuild_lock(database_url, holder=REBUILD_LOCK_HOLDER_DEDUP)
     if lock_conn is None:
-        held = f"Rebuild lock {REBUILD_LOCK_KEY} is held elsewhere; nothing touched."
+        held = (
+            f"Rebuild lock {REBUILD_LOCK_KEY} is held elsewhere (a rebuild, a dedup, a seed, "
+            "an api_fetch export restore, or an operator session); nothing touched."
+        )
         logger.warning(
             "%s Bowing out with %d.", held, REBUILD_LOCK_BOWED_OUT_EXIT_CODE, extra=_STEP
         )

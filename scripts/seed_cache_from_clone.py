@@ -431,7 +431,7 @@ def _seed_family(
         if rebuild_lock_conn is None:
             raise RebuildInProgressError(
                 f"the rebuild lock {REBUILD_LOCK_KEY} is held on --target (a rebuild, "
-                "dedup_artist_children, an operator session, or another seed); "
+                "a dedup, a seed, an api_fetch export restore, or an operator session); "
                 "refusing to seed -- nothing written, retry later"
             )
         with target_conn.cursor() as cur:

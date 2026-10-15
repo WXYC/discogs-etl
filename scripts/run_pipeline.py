@@ -1354,7 +1354,7 @@ def main() -> None:
     if lock_conn is None:
         logger.warning(
             "The discogs-cache rebuild lock (key %d) is held by another session "
-            "(a rebuild, a dedup, a seed, or an operator session); bowing out without "
+            "(a rebuild, a dedup, a seed, an api_fetch export restore, or an operator session); bowing out without "
             "touching the cache. See discogs-etl#354.",
             REBUILD_LOCK_KEY,
         )
