@@ -510,8 +510,8 @@ fi
 # freshness for nothing. Only a peer rebuild -- named discogs-etl-rebuild on its
 # lock connection -- is this tick's rebuild and ends the run at once, and so does
 # a holder lookup that keeps failing (REBUILD_LOCK_LOOKUP_ATTEMPTS tries,
-# REBUILD_LOCK_LOOKUP_RETRY_SECONDS apart), which might hide one. Any other holder, an unnamed one
-# included, is waited out: the pipeline is re-run every
+# REBUILD_LOCK_LOOKUP_RETRY_SECONDS apart), which might hide one. Any other
+# holder, an unnamed one included, is waited out: the pipeline is re-run every
 # REBUILD_LOCK_RETRY_SECONDS until REBUILD_LOCK_WAIT_MINUTES have passed (0
 # turns the wait off). run_pipeline.py takes the lock before anything else, so a
 # refused attempt costs seconds. The call keeps the ERR-trap-safe shape above
