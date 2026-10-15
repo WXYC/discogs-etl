@@ -1412,10 +1412,12 @@ def import_artist_details(conn, csv_dir: Path) -> int:
     # (#469). Rebuilds before this fix left such rows behind with
     # `not_found = FALSE`, so `artist.name = ''` matches them too.
     #
-    # The heal reaches only ids this dump's release_artist credits, because
-    # only those conflict. A '' row no dump credit names (for example one
-    # credited only by an api_fetch release, whose credits are restored after
-    # this step) keeps its '' and its tombstone.
+    # The heal reaches only ids that release_artist credits when this
+    # statement runs, because only those conflict: the dump's credits, plus
+    # any LML wrote after the base step's TRUNCATE. A '' row no such credit
+    # names (for example one credited only by an api_fetch release, whose
+    # credits are restored after this step) keeps its '' and, if it has one,
+    # its tombstone.
     #
     # One row per artist_id, because the conflict target is `id` (#408). The
     # dump's `<name>` is stored per credit, so a rename or a case fix reaches
@@ -1446,6 +1448,12 @@ def import_artist_details(conn, csv_dir: Path) -> int:
     # Discogs API returns for an unlinked credit. It is not an artist, and
     # with the dedup on artist_id alone every such credit would collapse
     # into one `artist` row 0 named after an arbitrary unrelated credit.
+    #
+    # `artist_name <> ''` keeps '' out of the vote. The import skips empty
+    # names, but LML writes the credits of releases it fetches with
+    # `a.get("name", "")`, and a name made only of NUL characters loads as ''.
+    # Tied with a real spelling, '' would win the byte-order tie-break and the
+    # heal above would write '' back over ''.
     logger.info("Creating stub artist rows from release_artist...")
     with conn.cursor() as cur:
         cur.execute("""
@@ -1457,7 +1465,7 @@ def import_artist_details(conn, csv_dir: Path) -> int:
                        count(*) FILTER (WHERE extra = 0) AS main_credits,
                        count(*) AS credits
                 FROM release_artist
-                WHERE artist_id > 0
+                WHERE artist_id > 0 AND artist_name <> ''
                 GROUP BY artist_id, artist_name
             ) spellings
             ORDER BY artist_id, main_credits DESC, credits DESC, artist_name COLLATE "C"
