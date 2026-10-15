@@ -81,8 +81,9 @@ def main(argv: list[str] | None = None) -> int:
     if lock_conn is None:
         # EX_TEMPFAIL is an expected outcome (retry later): WARNING, so it opens no Sentry event.
         logger.warning(
-            "Rebuild lock %d is held on --target (a rebuild, dedup_artist_children, a seed or "
-            "an operator session); nothing written. Bowing out with %d.",
+            "Rebuild lock %d is held on --target (a rebuild, a dedup, a seed, "
+            "an api_fetch export restore, or an operator session); nothing written. "
+            "Bowing out with %d.",
             REBUILD_LOCK_KEY,
             REBUILD_LOCK_BOWED_OUT_EXIT_CODE,
         )

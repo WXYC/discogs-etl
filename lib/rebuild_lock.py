@@ -65,7 +65,7 @@ logger = logging.getLogger(__name__)
 REBUILD_LOCK_KEY = 354001
 
 # Distinct process exit code for "bowed out: another session (a rebuild, a
-# dedup, a seed, or an operator session) already holds the advisory lock."
+# dedup, a seed, an api_fetch export restore, or an operator session) already holds the advisory lock."
 # Deliberately NOT 0 -- a lock-loser is not a successful rebuild, and #352
 # exists precisely because a silent no-op success (a peer guard that fails
 # open) was indistinguishable from a real one. Also deliberately not 1, the

@@ -710,6 +710,28 @@ class TestBowOutWordingIsHolderNeutral:
         assert len(templates) == 1, f"expected one bow-out warning, found {templates!r}"
         _assert_names_every_holder(templates[0] % _python_lock_key())
 
+    @pytest.mark.parametrize(
+        ("relpath", "needle"),
+        [
+            ("scripts/seed_cache_from_clone.py", "refusing to seed"),
+            ("scripts/restore_api_fetch_from_export.py", "Rebuild lock %d is held"),
+            ("scripts/dedup_artist_children.py", "Rebuild lock {REBUILD_LOCK_KEY} is held"),
+        ],
+    )
+    def test_holder_scripts_name_every_holder(self, relpath: str, needle: str) -> None:
+        tree = ast.parse((REPO_ROOT / relpath).read_text())
+        # Adjacent string literals fold into one Constant (or JoinedStr for f-strings).
+        texts = [
+            ast.unparse(node) if isinstance(node, ast.JoinedStr) else node.value
+            for node in ast.walk(tree)
+            if (isinstance(node, ast.Constant) and isinstance(node.value, str))
+            or isinstance(node, ast.JoinedStr)
+        ]
+        messages = [t for t in texts if "operator session" in t or needle in t]
+        assert messages, f"no holder message found in {relpath}"
+        for message in messages:
+            _assert_names_every_phrase(message)
+
     def test_automation_doc_quotes_the_slack_text(self, tmp_path: Path) -> None:
         """docs/automation.md's failure item 5 is found by searching Slack's
         text, so its heading must quote what the script posts today."""
@@ -720,10 +742,35 @@ class TestBowOutWordingIsHolderNeutral:
         assert f"**Slack posts `{quoted}`**" in doc
 
 
-# Every registered 354001 holder (CLAUDE.md's advisory-lock table): the rebuild,
-# dedup_artist_children.py, a real seed_cache_from_clone.py run, and an operator
-# session holding the lock by hand.
-_LOCK_HOLDERS = ("a rebuild", "a dedup", "a seed", "an operator session")
+# How each REBUILD_LOCK_HOLDER_* constant in lib/rebuild_lock.py reads in a
+# bow-out message. test_every_holder_constant_has_a_phrase keeps this complete,
+# so a new holder cannot be registered without the messages being made to name it.
+_HOLDER_PHRASES = {
+    "REBUILD_LOCK_HOLDER_REBUILD": "a rebuild",
+    "REBUILD_LOCK_HOLDER_DEDUP": "a dedup",
+    "REBUILD_LOCK_HOLDER_SEED": "a seed",
+    "REBUILD_LOCK_HOLDER_RESTORE_API_FETCH": "an api_fetch export restore",
+}
+# Every registered 354001 holder: one phrase per constant, plus an operator
+# session holding the lock by hand (which has no constant).
+_LOCK_HOLDERS = (*_HOLDER_PHRASES.values(), "an operator session")
+
+
+def _holder_constant_names() -> set[str]:
+    tree = ast.parse(LOCK_MODULE_PATH.read_text())
+    return {
+        target.id
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        and isinstance(node.value, ast.Constant)
+        and isinstance(node.value.value, str)
+        for target in node.targets
+        if isinstance(target, ast.Name) and target.id.startswith("REBUILD_LOCK_HOLDER_")
+    }
+
+
+def test_every_holder_constant_has_a_phrase() -> None:
+    assert _holder_constant_names() == set(_HOLDER_PHRASES)
 
 
 def _python_lock_key() -> int:
@@ -743,5 +790,9 @@ def _assert_names_every_holder(message: str) -> None:
     assert str(_python_lock_key()) in message, f"must name the lock key: {message!r}"
     assert "another rebuild" not in lowered, f"must not claim a peer rebuild: {message!r}"
     assert "held by another session" in lowered, message
-    missing = [holder for holder in _LOCK_HOLDERS if holder not in lowered]
+    _assert_names_every_phrase(message)
+
+
+def _assert_names_every_phrase(message: str) -> None:
+    missing = [holder for holder in _LOCK_HOLDERS if holder not in message.lower()]
     assert not missing, f"bow-out text omits {missing}: {message!r}"
