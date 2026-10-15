@@ -365,6 +365,7 @@ def _seed_family(
     family: str,
     dry_run: bool,
     preserve_provenance: bool = False,
+    lock_held: bool = False,
 ) -> dict[str, int]:
     """Generic additive, parent-gated copy of one table family (release or
     artist) from the source clone into the target. Only parent ids absent from
@@ -423,9 +424,12 @@ def _seed_family(
         # Exclude every 354001 holder (a rebuild and its api_fetch restore, dedup,
         # an operator session, another seed) from the whole write window; 330001
         # below is the seed-vs-seed backstop.
-        rebuild_lock_stack.enter_context(
-            held_rebuild_lock(target_url, holder=REBUILD_LOCK_HOLDER_SEED)
-        )
+        # A caller that holds 354001 across several families passes lock_held: a
+        # second connection of the same process would refuse itself.
+        if not lock_held:
+            rebuild_lock_stack.enter_context(
+                held_rebuild_lock(target_url, holder=REBUILD_LOCK_HOLDER_SEED)
+            )
         with target_conn.cursor() as cur:
             cur.execute("SELECT pg_advisory_xact_lock(%s)", (_ADVISORY_LOCK_KEY,))
 
@@ -498,6 +502,7 @@ def seed_releases_additive(
     *,
     dry_run: bool = False,
     preserve_provenance: bool = False,
+    lock_held: bool = False,
 ) -> dict[str, int]:
     """Additively copy the artist-scoped release row-set (``release_ids`` and its
     children) from the source clone into the target discogs-cache.
@@ -515,6 +520,7 @@ def seed_releases_additive(
         family="releases",
         dry_run=dry_run,
         preserve_provenance=preserve_provenance,
+        lock_held=lock_held,
     )
 
 
@@ -524,6 +530,7 @@ def seed_artists_additive(
     artist_ids,
     *,
     dry_run: bool = False,
+    lock_held: bool = False,
 ) -> dict[str, int]:
     """Additively copy tail ``artist`` rows + their ``artist_name_variation``
     children from the source clone into the target discogs-cache, for LML
@@ -539,6 +546,7 @@ def seed_artists_additive(
         artist_ids,
         family="artists",
         dry_run=dry_run,
+        lock_held=lock_held,
     )
 
 
@@ -572,6 +580,29 @@ def _read_ids_file(path: Path) -> list[int]:
     return sorted(parse_keep_release_ids(path))
 
 
+def _seed_sequence(args, release_ids) -> dict[str, int]:
+    """Seed releases then artists; a real run holds 354001 across both families."""
+    artist_ids = _read_ids_file(args.artist_ids_file)
+    with ExitStack() as stack:
+        if not args.dry_run:
+            stack.enter_context(held_rebuild_lock(args.target, holder=REBUILD_LOCK_HOLDER_SEED))
+        held = not args.dry_run
+        counts = seed_releases_additive(
+            args.source,
+            args.target,
+            release_ids,
+            dry_run=args.dry_run,
+            preserve_provenance=args.preserve_provenance,
+            lock_held=held,
+        )
+        counts.update(
+            seed_artists_additive(
+                args.source, args.target, artist_ids, dry_run=args.dry_run, lock_held=held
+            )
+        )
+    return counts
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", required=True, help="Source clone DSN (read-only).")
@@ -601,7 +632,15 @@ def main() -> int:
         "release when both are non-NULL (e.g. restoring a prod export); otherwise fall "
         "back to a fresh bulk_import row. Release family only.",
     )
+    parser.add_argument(
+        "--artist-ids-file",
+        type=Path,
+        help="File of artist_ids to seed after the releases in --ids-file, in the same run "
+        "under one 354001 acquisition (no gap for a waiting rebuild). Not with --seed-artists.",
+    )
     args = parser.parse_args()
+    if args.artist_ids_file and args.seed_artists:
+        parser.error("--artist-ids-file seeds artists after releases; drop --seed-artists")
 
     try:
         _validate_distinct_dsns(args.source, args.target)
@@ -617,7 +656,9 @@ def main() -> int:
     if args.preserve_provenance and args.seed_artists:
         parser.error("--preserve-provenance applies to the release family, not --seed-artists")
     try:
-        if args.seed_artists:
+        if args.artist_ids_file:
+            counts = _seed_sequence(args, ids)
+        elif args.seed_artists:
             counts = seed_artists_additive(args.source, args.target, ids, dry_run=args.dry_run)
         else:
             counts = seed_releases_additive(

@@ -225,3 +225,27 @@ def test_main_rejects_preserve_provenance_with_seed_artists(monkeypatch, tmp_pat
     with pytest.raises(SystemExit) as exc_info:
         _seed.main()
     assert exc_info.value.code == 2
+
+
+def test_main_rejects_artist_ids_file_with_seed_artists(monkeypatch, tmp_path):
+    ids_file = tmp_path / "ids.txt"
+    ids_file.write_text("500\n")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "seed_cache_from_clone.py",
+            "--source",
+            "postgresql://localhost:5432/a",
+            "--target",
+            "postgresql://localhost:5432/b",
+            "--ids-file",
+            str(ids_file),
+            "--seed-artists",
+            "--artist-ids-file",
+            str(ids_file),
+        ],
+    )
+    with pytest.raises(SystemExit) as exc_info:
+        _seed.main()
+    assert exc_info.value.code == 2
