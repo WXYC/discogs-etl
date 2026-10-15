@@ -278,6 +278,16 @@ jobs:
             exit "$PY_RC"
           fi
 
+          # Any other early failure (a connection error, the pre-conversion
+          # api_fetch recovery restore) leaves curl just as parked on the FIFO
+          # when curl.status is not yet written (discogs-etl#482). If curl had
+          # already failed first, fall through to its diagnosis below.
+          if [ "$PY_RC" -ne 0 ] && [ ! -e data/curl.status ]; then
+            kill "$CURL_PID" 2>/dev/null || true
+            wait "$CURL_PID" 2>/dev/null || true
+            exit "$PY_RC"
+          fi
+
           # Wait for curl to finish writing curl.status. `wait` returns curl's
           # own exit code; we also read the status file in case curl was killed
           # by SIGPIPE (downstream reader closed early -- python crash) which
