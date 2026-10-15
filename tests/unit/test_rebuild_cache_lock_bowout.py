@@ -253,6 +253,8 @@ def _build_harness(
     real_notify: bool = False,
     stubs: tuple[str, ...] = (),
     pipeline_cost: int = 0,
+    lookups: list[str] | None = None,
+    lookup_file: Path | None = None,
 ) -> str:
     source = SCRIPT_PATH.read_text()
     lines = source.splitlines()
@@ -269,6 +271,11 @@ def _build_harness(
             f"PIPELINE_RCS=({rcs})",
             f"HOLDER_REPLIES=({replies})",
             "ATTEMPT=0",
+            # With lookups given, holder-CLI call N answers LOOKUP_REPLIES[N-1]
+            # (repeating the last), counted apart from the pipeline attempts so
+            # a lookup retried within one attempt can be scripted.
+            f"LOOKUP_REPLIES=({' '.join(repr(r) for r in (lookups or []))})",
+            f'LOOKUP_FILE="{lookup_file}"',
             # Seconds each stubbed pipeline attempt takes, by advancing bash's
             # own SECONDS clock.
             f"PIPELINE_COST={pipeline_cost}",
@@ -307,8 +314,15 @@ def _build_harness(
             "            [ $n -gt ${#PIPELINE_RCS[@]} ] && n=${#PIPELINE_RCS[@]}",
             '            return "${PIPELINE_RCS[$((n - 1))]}" ;;',
             "        *'-m lib.rebuild_lock --describe-holder'*)",
-            "            [ $n -gt ${#HOLDER_REPLIES[@]} ] && n=${#HOLDER_REPLIES[@]}",
-            '            local reply="${HOLDER_REPLIES[$((n - 1))]}"',
+            "            local reply",
+            "            if [ ${#LOOKUP_REPLIES[@]} -gt 0 ]; then",
+            '                n=$(($(cat "$LOOKUP_FILE" 2>/dev/null || echo 0) + 1)); echo $n >"$LOOKUP_FILE"',
+            "                [ $n -gt ${#LOOKUP_REPLIES[@]} ] && n=${#LOOKUP_REPLIES[@]}",
+            '                reply="${LOOKUP_REPLIES[$((n - 1))]}"',
+            "            else",
+            "                [ $n -gt ${#HOLDER_REPLIES[@]} ] && n=${#HOLDER_REPLIES[@]}",
+            '                reply="${HOLDER_REPLIES[$((n - 1))]}"',
+            "            fi",
             f'            [ "$reply" = "{FREE}" ] && return {free_exit_code}',
             '            [ "$reply" = "' + ERROR + '" ] && return 1',
             '            echo "$reply"; return 0 ;;',
@@ -332,6 +346,7 @@ def _run_harness(
     real_notify: bool = False,
     stubs: tuple[str, ...] = (),
     pipeline_cost: int = 0,
+    lookups: list[str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     bash = shutil.which("bash")
     assert bash is not None, "bash is required to execute this region"
@@ -346,6 +361,8 @@ def _run_harness(
             real_notify,
             stubs,
             pipeline_cost,
+            lookups,
+            tmp_path / "lookups",
         )
     )
     return subprocess.run(
@@ -466,17 +483,64 @@ class TestBowOutBranchActuallyExecutes:
         assert "hourglass" not in result.stdout
         assert "FELL THROUGH TO DRIFT WATCHDOG" in result.stdout
 
-    def test_a_failed_holder_lookup_bows_out_at_once(self, tmp_path: Path) -> None:
-        """An unnamed-by-failure holder may be a peer rebuild: waiting it out
-        would risk a second full rebuild the same night."""
-        result = _run_harness([75, 0], tmp_path, holders=[ERROR], wait_minutes=180)
+    def test_a_failed_lookup_then_a_named_holder_is_waited_out(self, tmp_path: Path) -> None:
+        result = _run_harness(
+            [75, 0], tmp_path, lookups=[ERROR, "discogs-etl-seed"], wait_minutes=180
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "holder lookup 1 of 3 failed (exit 1)" in result.stderr
+        out = result.stdout.splitlines()
+        assert out.count("SLEEP 30") == 1
+        assert out.count("SLEEP 300") == 1
+        assert result.stdout.count("PIPELINE attempt") == 2
+        assert "NOTIFY :no_entry:" not in result.stdout
+        assert "FELL THROUGH TO DRIFT WATCHDOG" in result.stdout
+
+    def test_a_failed_lookup_then_a_peer_rebuild_bows_out_at_once(self, tmp_path: Path) -> None:
+        result = _run_harness([75, 0], tmp_path, lookups=[ERROR, REBUILD_HOLDER], wait_minutes=180)
         assert result.returncode == 0, result.stdout + result.stderr
         assert result.stdout.count("PIPELINE attempt") == 1
-        assert "SLEEP" not in result.stdout
-        assert "hourglass" not in result.stdout
-        final = next(ln for ln in result.stdout.splitlines() if ln.startswith("NOTIFY :no_entry:"))
-        assert "Holder: an unknown session (the holder lookup failed)." in final
+        assert f"Holder: {REBUILD_HOLDER}." in result.stdout
+        assert "SLEEP 300" not in result.stdout
         assert "FELL THROUGH TO DRIFT WATCHDOG" not in result.stdout
+
+    def test_every_lookup_failing_bows_out_after_the_configured_attempts(
+        self, tmp_path: Path
+    ) -> None:
+        """A holder that cannot be named might be a peer rebuild, so the
+        pipeline is never re-run to retry the lookup."""
+        result = _run_harness([75, 0], tmp_path, lookups=[ERROR], wait_minutes=180)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert result.stdout.count("PIPELINE attempt") == 1
+        assert result.stderr.count("holder lookup") == 3
+        assert [ln for ln in result.stdout.splitlines() if ln.startswith("SLEEP")] == [
+            "SLEEP 30",
+            "SLEEP 30",
+        ]
+        final = next(ln for ln in result.stdout.splitlines() if ln.startswith("NOTIFY :no_entry:"))
+        assert "Holder: an unknown session (the holder lookup failed 3 times)." in final
+        assert "hourglass" not in result.stdout
+        assert "FELL THROUGH TO DRIFT WATCHDOG" not in result.stdout
+
+    def test_lookup_retry_sleeps_count_against_the_wait_and_stop_at_the_deadline(
+        self, tmp_path: Path
+    ) -> None:
+        # 1 min of wait, 45 s between lookups: lookup 1 fails, sleep 45;
+        # lookup 2 fails, and the next sleep is clamped to the 15 s left.
+        result = _run_harness(
+            [75],
+            tmp_path,
+            lookups=[ERROR],
+            wait_minutes=1,
+            stubs=("REBUILD_LOCK_LOOKUP_RETRY_SECONDS=45",),
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert [ln for ln in result.stdout.splitlines() if ln.startswith("SLEEP")] == [
+            "SLEEP 45",
+            "SLEEP 15",
+        ]
+        assert result.stdout.count("PIPELINE attempt") == 1
+        assert "the holder lookup failed 3 times" in result.stdout
 
     def test_a_lock_that_keeps_reading_free_still_ends_at_the_deadline(
         self, tmp_path: Path
