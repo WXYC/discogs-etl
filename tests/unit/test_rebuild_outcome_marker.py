@@ -215,6 +215,7 @@ class TestRebuildFailedMetric:
         assert cmd[cmd.index("--namespace") + 1] == "WXYC/DiscogsRebuild"
         assert cmd[cmd.index("--metric-name") + 1] == "RebuildFailed"
         assert cmd[cmd.index("--value") + 1] == "1"
+        assert cmd[cmd.index("--unit") + 1] == "Count"
 
     def test_success_publishes_zero(self, tmp_path: Path, aws_calls: list[list[str]]) -> None:
         run(status="success", detail="", log_dir=tmp_path, run_log="")
@@ -247,6 +248,47 @@ class TestRebuildFailedMetric:
         )
         assert run(status="failed", detail="", log_dir=tmp_path, run_log="") == 0
         assert (tmp_path / OUTCOME_FILENAME).exists()
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            subprocess.CalledProcessError(
+                254,
+                ["aws"],
+                stderr=b"\nAn error occurred (AccessDenied) when calling the PutMetricData operation\n",
+            ),
+            subprocess.TimeoutExpired(
+                ["aws"],
+                60,
+                stderr=b"An error occurred (AccessDenied) when calling the PutMetricData operation",
+            ),
+        ],
+        ids=["called-process-error", "timeout"],
+    )
+    def test_publish_failure_logs_the_cli_stderr(
+        self,
+        error: Exception,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """The CLI's own error text (AccessDenied, missing region, throttling) is the
+        diagnosis; a CalledProcessError's repr carries only the code and argv."""
+
+        def boom(*_a: object, **_k: object) -> None:
+            raise error
+
+        monkeypatch.setattr(
+            "scripts.report_rebuild_outcome.subprocess",
+            types.SimpleNamespace(run=boom),
+        )
+        with caplog.at_level(logging.WARNING, logger="scripts.report_rebuild_outcome"):
+            run(status="failed", detail="", log_dir=tmp_path, run_log="")
+        warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        assert warnings[0].endswith(
+            "stderr: An error occurred (AccessDenied) when calling the PutMetricData operation"
+        )
 
 
 class TestMarkerSurvivesAnUnimportableLogger:

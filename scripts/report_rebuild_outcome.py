@@ -11,7 +11,7 @@ own Python (DISCOGS-ETL-4/-5/-6), which no alert rule watched, plus a leftover
 backwards from. The shell that owns the rebuild could not reach a person at all,
 and a successful run and an aborted one left the same artifacts behind.
 
-``rebuild-cache.sh`` calls this on every terminal path. It does two things:
+``rebuild-cache.sh`` calls this on every terminal path. It does three things:
 
 1. **Writes ``<log-dir>/99-outcome.txt``.** ``rebuild-cache-bootstrap.sh``'s
    ``trap EXIT`` syncs the whole log directory to S3, so the outcome becomes
@@ -34,6 +34,14 @@ and a successful run and an aborted one left the same artifacts behind.
    A failed or refused run logs at ERROR (so it raises a Sentry issue tagged
    ``step=rebuild_outcome``, targetable by an alert rule); a clean finish logs
    at INFO and raises nothing.
+
+3. **Publishes ``RebuildFailed`` to CloudWatch** (namespace
+   ``WXYC/DiscogsRebuild``, #515) through the AWS CLI the bootstrap installs,
+   so this script stays stdlib-only: ``1`` on ``failed`` and on a marker-write
+   failure, ``0`` on ``success`` / ``smoke_ok``, nothing on ``bowed_out`` /
+   ``running``. ``RebuildFailedAlarm`` in ``infra/ephemeral-rebuild/template.yaml``
+   pages on it. The publish is best effort; a failure is logged with the CLI's
+   stderr and never blocks the marker or the logger.
 
 Slack is deliberately *not* posted from here: ``rebuild-cache.sh`` already
 posts on each of these paths, and a second post would double every alert.
@@ -123,13 +131,27 @@ def publish_rebuild_failed(value: int) -> None:
                 "--namespace", METRIC_NAMESPACE,
                 "--metric-name", METRIC_NAME,
                 "--value", str(value),
+                "--unit", "Count",
             ],
             check=True,
             capture_output=True,
             timeout=60,
         )  # fmt: skip
     except Exception as exc:
-        logger.warning("could not publish %s=%d: %r", METRIC_NAME, value, exc)
+        # CalledProcessError's repr carries the code and argv but not the CLI's
+        # own error text (AccessDenied, missing region, throttling), which is the
+        # actual diagnosis; TimeoutExpired carries whatever stderr arrived.
+        stderr = getattr(exc, "stderr", None)
+        if isinstance(stderr, bytes):
+            stderr = stderr.decode("utf-8", errors="replace")
+        stderr = (stderr or "").strip()
+        logger.warning(
+            "could not publish %s=%d: %r%s",
+            METRIC_NAME,
+            value,
+            exc,
+            f"; stderr: {stderr}" if stderr else "",
+        )
 
 
 def init_logging_best_effort() -> bool:
