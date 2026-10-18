@@ -214,6 +214,19 @@ Resources:
               - Effect: Allow
                 Action: ec2:DescribeInstances
                 Resource: '*'
+        # report_rebuild_outcome.py publishes RebuildFailed (#515) so the
+        # RebuildFailedAlarm can page. Namespace-scoped like the launcher's
+        # and sweeper's grants.
+        - PolicyName: rebuild-outcome-metric
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: cloudwatch:PutMetricData
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    cloudwatch:namespace: WXYC/DiscogsRebuild
 
   InstanceProfile:
     Type: AWS::IAM::InstanceProfile
@@ -422,6 +435,27 @@ Resources:
       MetricName: StaleInstanceTerminated
       Statistic: Sum
       Period: 3600
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+
+  # #515: paging for the rebuild outcome moved off Sentry. The series is
+  # monthly, so missing data is not breaching; the SNS notification fires on
+  # the OK -> ALARM transition, so returning to OK later loses nothing.
+  RebuildFailedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: discogs-rebuild-failed
+      AlarmDescription: >
+        The monthly discogs-cache rebuild reported a failure (or could not write
+        its outcome marker). See the rebuild log in
+        s3://wxyc-discogs-rebuild-logs-<account>/<instance-id>/.
+      Namespace: WXYC/DiscogsRebuild
+      MetricName: RebuildFailed
+      Statistic: Maximum
+      Period: 300
       EvaluationPeriods: 1
       Threshold: 1
       ComparisonOperator: GreaterThanOrEqualToThreshold
