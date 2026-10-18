@@ -36,6 +36,8 @@ Known gap: `scripts/sync-library.sh` has three soft-fail paths that log `WARNING
 
 ## Monthly Cache Rebuild (`rebuild-cache.yml`)
 
+**Failure paging ([#515](https://github.com/WXYC/discogs-etl/issues/515)):** `scripts/report_rebuild_outcome.py` publishes `RebuildFailed` to `WXYC/DiscogsRebuild` through the AWS CLI after the marker write — `1` on `failed` and on a marker-write failure, `0` on `success` / `smoke_ok`, nothing on `bowed_out` / `running`. `RebuildFailedAlarm` (`infra/ephemeral-rebuild/template.yaml`) notifies `AlertTopic` on `>= 1`; `InstanceRole` holds the namespace-scoped `cloudwatch:PutMetricData` grant. The Sentry ERROR path is unchanged for now.
+
 **Status (2026-05-07)**: the GH Actions cron is disabled. The rebuild now runs on a one-shot ephemeral EC2 spawned monthly by the `wxyc-discogs-rebuild` SAM stack (`infra/ephemeral-rebuild/`). Setup + recurring-ops instructions in [`infra/ephemeral-rebuild/README.md`](../infra/ephemeral-rebuild/README.md). The Backend-Service EC2 cron is the legacy fallback; once two ephemeral runs land successfully, it is removed per the procedure in [`docs/ec2-rebuild-runbook.md`](ec2-rebuild-runbook.md). The GH workflow file stays in the repo as a `workflow_dispatch`-only manual escape hatch (no scheduled trigger).
 
 **Why EC2**: GH-hosted runner egress IPs are 403'd by Discogs's Cloudflare front at `data.discogs.com/?download=`; residential and EC2 IPs aren't. Plus the job's compute envelope (multi-tens-of-GB stream + 60-90 min wall) is wrong for free Actions minutes. EC2 already hosts Backend-Service, so the marginal cost of adding this cron is effectively $0.

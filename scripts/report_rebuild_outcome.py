@@ -69,6 +69,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -95,6 +96,40 @@ OUTCOME_FILENAME = "99-outcome.txt"
 # removed -- that matches only ``*.log``.
 STATUSES = ("success", "failed", "bowed_out", "smoke_ok", "running")
 FAILURE_STATUSES = ("failed",)
+
+METRIC_NAMESPACE = "WXYC/DiscogsRebuild"
+METRIC_NAME = "RebuildFailed"
+
+
+def rebuild_failed_value(status: str, *, marker_failed: bool) -> int | None:
+    """``RebuildFailed`` datapoint for a status; None means publish nothing.
+
+    A marker-write failure wins over every status, because the S3 listing is then
+    misleading. ``bowed_out`` and ``running`` are no-ops that must not touch the
+    monthly series.
+    """
+    if marker_failed or status in FAILURE_STATUSES:
+        return 1
+    return 0 if status in ("success", "smoke_ok") else None
+
+
+def publish_rebuild_failed(value: int) -> None:
+    """Publish through the AWS CLI the bootstrap installs, keeping this script
+    stdlib-only. Best effort: the marker and the logger must survive a failure here."""
+    try:
+        subprocess.run(
+            [
+                "aws", "cloudwatch", "put-metric-data",
+                "--namespace", METRIC_NAMESPACE,
+                "--metric-name", METRIC_NAME,
+                "--value", str(value),
+            ],
+            check=True,
+            capture_output=True,
+            timeout=60,
+        )  # fmt: skip
+    except Exception as exc:
+        logger.warning("could not publish %s=%d: %r", METRIC_NAME, value, exc)
 
 
 def init_logging_best_effort() -> bool:
@@ -188,6 +223,9 @@ def run(
             write_error,
             extra={"step": "rebuild_outcome", "outcome": status, "marker_write_failed": True},
         )
+    value = rebuild_failed_value(status, marker_failed=write_error is not None)
+    if value is not None:
+        publish_rebuild_failed(value)
     return 0
 
 

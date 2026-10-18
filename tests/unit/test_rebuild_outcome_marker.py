@@ -51,6 +51,7 @@ unreachable dead code. Text cannot see that; execution can.
 from __future__ import annotations
 
 import logging
+import os
 import re
 import shutil
 import subprocess
@@ -71,9 +72,27 @@ from scripts.report_rebuild_outcome import (  # noqa: E402
     OUTCOME_FILENAME,
     STATUSES,
     main,
+    rebuild_failed_value,
     render_outcome,
     run,
 )
+
+
+@pytest.fixture(autouse=True)
+def aws_calls(monkeypatch: pytest.MonkeyPatch) -> list[list[str]]:
+    """Stub the reporter's ``aws cloudwatch put-metric-data`` call for every test
+    in this file, so none can publish a real metric. Only the reporter's own
+    ``subprocess`` reference is replaced; the bash-executing tests keep the real one."""
+    calls: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(
+        "scripts.report_rebuild_outcome.subprocess", types.SimpleNamespace(run=fake_run)
+    )
+    return calls
 
 
 @pytest.fixture
@@ -159,6 +178,75 @@ class TestLogLevelByStatus:
         with caplog.at_level(logging.INFO):
             run(status=status, detail="", log_dir=tmp_path, run_log="")
         assert [r.levelno for r in caplog.records] == [logging.INFO]
+
+
+class TestRebuildFailedMetric:
+    """Paging for the rebuild outcome lives in CloudWatch (discogs-etl#515): the
+    reporter publishes ``RebuildFailed`` through the AWS CLI, 1 on ``failed``
+    and on a marker-write failure, 0 on a clean finish, nothing on a no-op
+    (``bowed_out``, ``running``) so the monthly series stays quiet."""
+
+    @pytest.mark.parametrize(
+        ("status", "marker_failed", "expected"),
+        [
+            ("failed", False, 1),
+            ("success", False, 0),
+            ("smoke_ok", False, 0),
+            ("bowed_out", False, None),
+            ("running", False, None),
+            # A marker-write failure wins over every status: the S3 listing is
+            # misleading, so it must page even when the outcome itself was benign.
+            ("success", True, 1),
+            ("bowed_out", True, 1),
+            ("running", True, 1),
+            ("failed", True, 1),
+        ],
+    )
+    def test_status_mapping(self, status: str, marker_failed: bool, expected: int | None) -> None:
+        assert rebuild_failed_value(status, marker_failed=marker_failed) == expected
+
+    def test_failed_publishes_one_to_the_rebuild_namespace(
+        self, tmp_path: Path, aws_calls: list[list[str]]
+    ) -> None:
+        run(status="failed", detail="", log_dir=tmp_path, run_log="")
+        assert len(aws_calls) == 1
+        cmd = aws_calls[0]
+        assert cmd[:3] == ["aws", "cloudwatch", "put-metric-data"]
+        assert cmd[cmd.index("--namespace") + 1] == "WXYC/DiscogsRebuild"
+        assert cmd[cmd.index("--metric-name") + 1] == "RebuildFailed"
+        assert cmd[cmd.index("--value") + 1] == "1"
+
+    def test_success_publishes_zero(self, tmp_path: Path, aws_calls: list[list[str]]) -> None:
+        run(status="success", detail="", log_dir=tmp_path, run_log="")
+        assert aws_calls[0][aws_calls[0].index("--value") + 1] == "0"
+
+    @pytest.mark.parametrize("status", ["bowed_out", "running"])
+    def test_no_op_statuses_publish_nothing(
+        self, status: str, tmp_path: Path, aws_calls: list[list[str]]
+    ) -> None:
+        run(status=status, detail="", log_dir=tmp_path, run_log="")
+        assert aws_calls == []
+
+    def test_marker_write_failure_publishes_one_even_when_bowed_out(
+        self, tmp_path: Path, aws_calls: list[list[str]]
+    ) -> None:
+        blocker = tmp_path / "not-a-dir"
+        blocker.write_text("")
+        run(status="bowed_out", detail="", log_dir=blocker, run_log="")
+        assert aws_calls[0][aws_calls[0].index("--value") + 1] == "1"
+
+    @pytest.mark.parametrize("error", [FileNotFoundError("aws"), OSError("boom")])
+    def test_publish_failure_never_breaks_the_reporter(
+        self, error: Exception, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def boom(*_a: object, **_k: object) -> None:
+            raise error
+
+        monkeypatch.setattr(
+            "scripts.report_rebuild_outcome.subprocess", types.SimpleNamespace(run=boom)
+        )
+        assert run(status="failed", detail="", log_dir=tmp_path, run_log="") == 0
+        assert (tmp_path / OUTCOME_FILENAME).exists()
 
 
 class TestMarkerSurvivesAnUnimportableLogger:
@@ -450,12 +538,20 @@ class TestReporterIsExecutableStandalone:
         sandbox.mkdir(parents=True)
         shutil.copy(REPORTER_PATH, sandbox / REPORTER_PATH.name)
         log_dir = tmp_path / "logs"
+        # A no-op ``aws`` first on PATH: the child process is not covered by the
+        # autouse stub, and a ``failed`` status must never publish a real metric.
+        fake_bin = tmp_path / "bin"
+        fake_bin.mkdir()
+        (fake_bin / "aws").write_text("#!/bin/sh\nexit 0\n")
+        (fake_bin / "aws").chmod(0o755)
+        env = {**os.environ, "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}"}
         result = subprocess.run(
             [sys.executable, str(sandbox / REPORTER_PATH.name), "--log-dir", str(log_dir), *args],
             capture_output=True,
             text=True,
             timeout=60,
             cwd=tmp_path,
+            env=env,
         )
         return result, log_dir / OUTCOME_FILENAME
 
