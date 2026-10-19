@@ -146,7 +146,7 @@ class TestWxyccatalogInstall:
     def test_wxyc_etl_pinned_alongside_wxyc_catalog_in_both_workflows(self) -> None:
         """wxyc-catalog's own dependency (wxyc-etl>=0.1.0) is unpinned, so the bare
         interpreter would take a future wxyc-etl 0.11; copy pyproject's cap."""
-        match = re.search(r'"(wxyc-etl>=[^"]+)"', (REPO_ROOT / "pyproject.toml").read_text())
+        match = re.search(r'"(wxyc-etl[^"]+)"', (REPO_ROOT / "pyproject.toml").read_text())
         assert match
         for name in ("sync-library.yml", "catalog-parity.yml"):
             text = (REPO_ROOT / ".github" / "workflows" / name).read_text()

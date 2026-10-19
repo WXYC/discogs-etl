@@ -310,6 +310,7 @@ DATABASE_URL_DISCOGS="$(ssm_param "${SSM_PREFIX}/DATABASE_URL_DISCOGS")"
 GH_TOKEN="$(ssm_param "${SSM_PREFIX}/GH_TOKEN")"
 SLACK_MONITORING_WEBHOOK="$(ssm_param "${SSM_PREFIX}/SLACK_MONITORING_WEBHOOK")"
 SENTRY_DSN="$(ssm_param "${SSM_PREFIX}/SENTRY_DSN")"
+POSTHOG_ERRORS_API_KEY="$(ssm_param "${SSM_PREFIX}/POSTHOG_ERRORS_API_KEY")"
 # Optional, default-off (discogs-etl#217 Phase 1). A missing param is the
 # steady state — ssm_param's `2>/dev/null || true` returns empty, exactly
 # like SENTRY_DSN above, so this never aborts a normal rebuild.
@@ -324,7 +325,7 @@ if [ -z "$GH_TOKEN" ]; then
     exit 2
 fi
 
-export DATABASE_URL_DISCOGS GH_TOKEN SLACK_MONITORING_WEBHOOK SENTRY_DSN
+export DATABASE_URL_DISCOGS GH_TOKEN SLACK_MONITORING_WEBHOOK SENTRY_DSN POSTHOG_ERRORS_API_KEY
 export REPO_DIR CONVERTER_DIR LOG_DIR
 
 notify_slack ":hourglass:" "starting on ${INSTANCE_ID}"

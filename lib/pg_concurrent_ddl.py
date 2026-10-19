@@ -105,27 +105,6 @@ class RetryStats:
     elapsed_seconds: float = 0.0
 
 
-def _sentry_breadcrumb(category: str, message: str, data: dict | None = None) -> None:
-    """Best-effort Sentry breadcrumb. No-op if ``sentry_sdk`` isn't importable.
-
-    Kept tiny on purpose — the helper must not pull a hard dependency on
-    Sentry just to surface the 40P01 canary. If Sentry is wired up via
-    :mod:`lib.observability`, the breadcrumb attaches to the next event;
-    otherwise it silently drops.
-    """
-    try:
-        import sentry_sdk
-
-        sentry_sdk.add_breadcrumb(
-            category=category,
-            message=message,
-            level="warning",
-            data=data or {},
-        )
-    except Exception:
-        pass
-
-
 def _extract_index_name(ddl: str) -> str | None:
     """Pull the index name out of a ``CREATE INDEX CONCURRENTLY`` statement.
 
@@ -314,8 +293,8 @@ def add_constraint_safely(
       is reached.
 
     On ``40P01`` (``deadlock_detected``):
-      retries after backoff but ALSO emits ``logger.warning`` and a Sentry
-      breadcrumb naming the offending statement. With parent-first ordering
+      retries after backoff but ALSO emits a ``logger.warning`` naming the
+      offending statement. With parent-first ordering
       enforced everywhere, ``40P01`` is structurally impossible — if it
       ever fires post-fix it means some LML write path has drifted to
       child-first acquisition, and the canary should be loud so the
@@ -365,7 +344,7 @@ def add_constraint_safely(
     start = time.monotonic()
     lock_clause = ", ".join(lock_tables)
     ddls: list[str] = [ddl] if isinstance(ddl, str) else list(ddl)
-    # Truncated rendering for log lines / Sentry breadcrumbs. The multi-stmt
+    # Truncated rendering for log lines. The multi-stmt
     # form (RENAME swap, 3 statements) would otherwise produce a huge
     # repr() in the 40P01 canary — the canary's job is to name the failure
     # site for an operator, not dump every byte of DDL.
@@ -402,8 +381,7 @@ def add_constraint_safely(
             # LOUD: parent-first ordering should make 40P01 structurally
             # impossible. Firing here means some writer has drifted to a
             # different acquisition order — almost certainly LML. Name
-            # the statement in both the log line and the Sentry breadcrumb
-            # so the regressed LML code path surfaces quickly.
+            # the statement in the log line so the regressed LML code path surfaces quickly.
             logger.warning(
                 "add_constraint_safely: 40P01 deadlock_detected on attempt "
                 "%d/%d. Parent-first LOCK TABLE ordering should make this "
@@ -415,16 +393,6 @@ def add_constraint_safely(
                 attempts,
                 lock_clause,
                 ddl_summary,
-            )
-            _sentry_breadcrumb(
-                category="pg_concurrent_ddl",
-                message="40P01 deadlock_detected in add_constraint_safely",
-                data={
-                    "attempt": stats.attempts,
-                    "attempts_total": attempts,
-                    "lock_tables": list(lock_tables),
-                    "ddl": ddl_summary,
-                },
             )
 
         if attempt < attempts - 1:

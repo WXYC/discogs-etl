@@ -28,6 +28,7 @@
 #                                                        WXYC/library-metadata-lookup
 #     <prefix>/SLACK_MONITORING_WEBHOOK     (optional) — Slack incoming webhook
 #     <prefix>/SENTRY_DSN                   (optional) — Sentry DSN
+#     <prefix>/POSTHOG_ERRORS_API_KEY       (optional) — PostHog "Services" errors key
 #
 # Optional values are skipped on empty input. The script never deletes; if you
 # need to remove an optional parameter later, run `aws ssm delete-parameter`
@@ -103,6 +104,8 @@ put_secret SLACK_MONITORING_WEBHOOK \
     "SLACK_MONITORING_WEBHOOK (or blank to skip)" optional
 put_secret SENTRY_DSN \
     "SENTRY_DSN (or blank to skip)" optional
+put_secret POSTHOG_ERRORS_API_KEY \
+    "POSTHOG_ERRORS_API_KEY (or blank to skip)" optional
 
 echo
 echo "Parameters now under ${SSM_PREFIX}/:"
