@@ -67,7 +67,7 @@ If the discogs-cache Postgres volume is ever recreated / the service reprovision
 3. Restart the service (for `shared_buffers`).
 4. Verify with the [verification query](#verification-non-destructive).
 
-**Drift check ([#432](https://github.com/WXYC/discogs-etl/issues/432)):** `scripts/cache_health_metrics.py` publishes the live `shared_buffers` daily as `WXYC/DiscogsCache` `shared_buffers_mb` (from `sync-library.yml`), and the `wxyc-discogs-rebuild` stack's `SharedBuffersStockAlarm` (`discogs-cache-shared-buffers-stock`) emails the rebuild alert topic when it reads `<= 128` — the stock default, which is what a reprovision leaves behind. When it fires, run the recovery steps above.
+**Drift check ([#432](https://github.com/WXYC/discogs-etl/issues/432)):** `scripts/cache_health_metrics.py` publishes the live `shared_buffers` daily as `WXYC/DiscogsCache` `shared_buffers_mb` (from `sync-library.yml`), and the `wxyc-discogs-rebuild` stack's `SharedBuffersStockAlarm` (`discogs-rebuild-shared-buffers-stock`; the name must start with `discogs-rebuild-`, the only alarm prefix the deploy role may write) emails the rebuild alert topic when it reads `<= 128` — the stock default, which is what a reprovision leaves behind. When it fires, run the recovery steps above.
 
 ## Why not the image (the shared-image constraint)
 

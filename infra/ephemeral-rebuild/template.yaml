@@ -525,7 +525,7 @@ Resources:
   SharedBuffersStockAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:
-      AlarmName: discogs-cache-shared-buffers-stock
+      AlarmName: discogs-rebuild-shared-buffers-stock
       AlarmDescription: >
         The discogs-cache Postgres reports shared_buffers at the 128 MB stock
         default — the ALTER SYSTEM tuning was lost, most likely to a Railway
