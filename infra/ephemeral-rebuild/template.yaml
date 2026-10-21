@@ -514,6 +514,34 @@ Resources:
       AlarmActions: [!Ref AlertTopic]
       OKActions: [!Ref AlertTopic]
 
+  # #432: the discogs-cache Postgres tuning (#313, resized by #432) lives only
+  # in postgresql.auto.conf on the Railway volume, so a volume reprovision
+  # silently reverts shared_buffers to the 128 MB stock default and reopens the
+  # LML#706 latency regression. cache_health_metrics.py publishes the live
+  # value daily as shared_buffers_mb, undimensioned. `<= 128` catches exactly
+  # the revert and does not page on a deliberate resize. Same daily-gauge
+  # shape as ReleaseCountAlarm (Minimum, one-day period, `missing`) for the
+  # same reasons; see docs/pg-tuning-runbook.md for the recovery procedure.
+  SharedBuffersStockAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: discogs-cache-shared-buffers-stock
+      AlarmDescription: >
+        The discogs-cache Postgres reports shared_buffers at the 128 MB stock
+        default — the ALTER SYSTEM tuning was lost, most likely to a Railway
+        volume reprovision. Restore it with the recovery procedure in
+        docs/pg-tuning-runbook.md (ALTER SYSTEM block, then restart).
+      Namespace: WXYC/DiscogsCache
+      MetricName: shared_buffers_mb
+      Statistic: Minimum
+      Period: 86400
+      EvaluationPeriods: 1
+      Threshold: 128
+      ComparisonOperator: LessThanOrEqualToThreshold
+      TreatMissingData: missing
+      AlarmActions: [!Ref AlertTopic]
+      OKActions: [!Ref AlertTopic]
+
 Outputs:
   LauncherFunctionArn:
     Value: !GetAtt LauncherFunction.Arn

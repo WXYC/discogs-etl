@@ -1,7 +1,8 @@
 """Unit tests for ``scripts/cache_health_metrics.py``.
 
-The cache-health watchdog publishes three counts from the ``release`` table
-to CloudWatch every time it runs:
+The cache-health watchdog publishes three counts from the ``release`` table,
+plus the server's live ``shared_buffers`` (``shared_buffers_mb``, #432), to
+CloudWatch every time it runs:
 
 * ``release_count`` — total rows.
 * ``artwork_never_asked_count`` — ``artwork_url IS NULL AND artwork_checked_at IS NULL``.
@@ -73,59 +74,102 @@ class TestCountArtworkStates:
         assert states == mod.ArtworkStates(total=0, never_asked=0, imageless=0)
 
 
-class TestBuildMetricData:
-    """Pure: ``ArtworkStates`` -> CloudWatch ``MetricData`` payload."""
+class TestReadSharedBuffersMb:
+    """``shared_buffers`` in MB, read from the server's live setting."""
 
-    def test_emits_three_metrics(self) -> None:
+    def test_returns_megabytes_from_single_query(self) -> None:
+        mock_cursor = MagicMock()
+        mock_cursor.fetchone.return_value = (1408,)
+        mock_conn = MagicMock()
+        mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+        with patch.dict(sys.modules, {"psycopg": MagicMock()}) as patched:
+            patched["psycopg"].connect.return_value.__enter__.return_value = mock_conn
+            mod = _load_module()
+            mb = mod.read_shared_buffers_mb("postgresql://fake")
+        assert mb == 1408
+        assert mock_cursor.execute.call_count == 1
+
+
+class TestBuildMetricData:
+    """Pure: ``ArtworkStates`` + ``shared_buffers`` MB -> CloudWatch ``MetricData`` payload."""
+
+    def test_emits_four_metrics(self) -> None:
         mod = _load_module()
         data = mod.build_metric_data(
-            mod.ArtworkStates(total=80000, never_asked=39000, imageless=200)
+            mod.ArtworkStates(total=80000, never_asked=39000, imageless=200),
+            shared_buffers_mb=1408,
         )
         names = sorted(d["MetricName"] for d in data)
         assert names == [
             "artwork_imageless_count",
             "artwork_never_asked_count",
             "release_count",
+            "shared_buffers_mb",
         ]
 
-    def test_metric_values_match_counts(self) -> None:
+    def test_metric_values_match_inputs(self) -> None:
         mod = _load_module()
         data = mod.build_metric_data(
-            mod.ArtworkStates(total=80000, never_asked=39000, imageless=200)
+            mod.ArtworkStates(total=80000, never_asked=39000, imageless=200),
+            shared_buffers_mb=1408,
         )
         by_name = {d["MetricName"]: d for d in data}
         assert by_name["release_count"]["Value"] == 80000
         assert by_name["artwork_never_asked_count"]["Value"] == 39000
         assert by_name["artwork_imageless_count"]["Value"] == 200
+        assert by_name["shared_buffers_mb"]["Value"] == 1408
 
-    def test_metric_unit_is_count(self) -> None:
+    @pytest.mark.parametrize(
+        ("metric_name", "unit"),
+        [
+            ("release_count", "Count"),
+            ("artwork_never_asked_count", "Count"),
+            ("artwork_imageless_count", "Count"),
+            ("shared_buffers_mb", "Megabytes"),
+        ],
+    )
+    def test_metric_units(self, metric_name: str, unit: str) -> None:
         mod = _load_module()
-        data = mod.build_metric_data(mod.ArtworkStates(total=1, never_asked=0, imageless=0))
-        for d in data:
-            assert d["Unit"] == "Count"
+        data = mod.build_metric_data(
+            mod.ArtworkStates(total=1, never_asked=0, imageless=0), shared_buffers_mb=128
+        )
+        assert {d["MetricName"]: d["Unit"] for d in data}[metric_name] == unit
+
+    def test_no_metric_carries_dimensions(self) -> None:
+        """Every series is published undimensioned so plain-form alarms can query it."""
+        mod = _load_module()
+        data = mod.build_metric_data(
+            mod.ArtworkStates(total=1, never_asked=0, imageless=0), shared_buffers_mb=128
+        )
+        assert all("Dimensions" not in d for d in data)
 
     def test_empty_state_emits_zero_values(self) -> None:
         mod = _load_module()
-        data = mod.build_metric_data(mod.ArtworkStates(total=0, never_asked=0, imageless=0))
+        data = mod.build_metric_data(
+            mod.ArtworkStates(total=0, never_asked=0, imageless=0), shared_buffers_mb=128
+        )
         assert {d["MetricName"]: d["Value"] for d in data} == {
             "release_count": 0,
             "artwork_never_asked_count": 0,
             "artwork_imageless_count": 0,
+            "shared_buffers_mb": 128,
         }
 
 
 class TestPublishMetrics:
-    """Sends one ``put_metric_data`` call carrying all three metrics together."""
+    """Sends one ``put_metric_data`` call carrying all four metrics together."""
 
     def test_publishes_to_configured_namespace(self) -> None:
         mod = _load_module()
         client = MagicMock()
         states = mod.ArtworkStates(total=80000, never_asked=39000, imageless=200)
-        mod.publish_metrics(client=client, namespace="WXYC/DiscogsCache", states=states)
+        mod.publish_metrics(
+            client=client, namespace="WXYC/DiscogsCache", states=states, shared_buffers_mb=1408
+        )
         client.put_metric_data.assert_called_once()
         kwargs = client.put_metric_data.call_args.kwargs
         assert kwargs["Namespace"] == "WXYC/DiscogsCache"
-        assert len(kwargs["MetricData"]) == 3
+        assert len(kwargs["MetricData"]) == 4
 
     def test_skips_publish_when_dry_run(self) -> None:
         mod = _load_module()
@@ -134,6 +178,7 @@ class TestPublishMetrics:
             client=client,
             namespace="WXYC/DiscogsCache",
             states=mod.ArtworkStates(total=1, never_asked=0, imageless=0),
+            shared_buffers_mb=1408,
             dry_run=True,
         )
         client.put_metric_data.assert_not_called()
@@ -145,8 +190,11 @@ class TestRun:
     def test_exits_zero_on_happy_path(self) -> None:
         mod = _load_module()
         client = MagicMock()
-        with patch.object(
-            mod, "count_artwork_states", return_value=mod.ArtworkStates(80000, 39000, 200)
+        with (
+            patch.object(
+                mod, "count_artwork_states", return_value=mod.ArtworkStates(80000, 39000, 200)
+            ),
+            patch.object(mod, "read_shared_buffers_mb", return_value=1408),
         ):
             rc = mod.run(
                 database_url="postgresql://fake",
@@ -156,12 +204,20 @@ class TestRun:
             )
         assert rc == 0
         client.put_metric_data.assert_called_once()
+        published = {
+            d["MetricName"]: d["Value"]
+            for d in client.put_metric_data.call_args.kwargs["MetricData"]
+        }
+        assert published["shared_buffers_mb"] == 1408
 
     def test_dry_run_skips_publish_but_still_returns_zero(self) -> None:
         mod = _load_module()
         client = MagicMock()
-        with patch.object(
-            mod, "count_artwork_states", return_value=mod.ArtworkStates(80000, 39000, 200)
+        with (
+            patch.object(
+                mod, "count_artwork_states", return_value=mod.ArtworkStates(80000, 39000, 200)
+            ),
+            patch.object(mod, "read_shared_buffers_mb", return_value=1408),
         ):
             rc = mod.run(
                 database_url="postgresql://fake",

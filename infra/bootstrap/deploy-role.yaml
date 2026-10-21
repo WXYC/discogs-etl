@@ -261,9 +261,10 @@ Resources:
               # Not a deploy grant. sync-library.yml assumes this same role daily
               # to run scripts/cache_health_metrics.py, which publishes
               # release_count / artwork_imageless_count / artwork_never_asked_count
-              # into WXYC/DiscogsCache. Dropping this statement silently kills the
-              # daily metrics — and the release-count floor alarm built on them
-              # (#358) decays to INSUFFICIENT_DATA rather than firing.
+              # / shared_buffers_mb into WXYC/DiscogsCache. Dropping this statement
+              # silently kills the daily metrics — and the release-count floor
+              # (#358) and shared_buffers stock (#432) alarms built on them decay
+              # to INSUFFICIENT_DATA rather than firing.
               #
               # PutMetricData cannot be resource-scoped; the namespace condition
               # is the scoping mechanism. Note that simulate-principal-policy

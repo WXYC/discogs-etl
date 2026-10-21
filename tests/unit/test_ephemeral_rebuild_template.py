@@ -243,9 +243,33 @@ def test_release_count_alarm_is_not_anomaly_detection(
     assert "ThresholdMetricId" not in alarm
 
 
+def test_shared_buffers_stock_alarm_shape(transformed_template: dict[str, Any]) -> None:
+    """Fires when the discogs-cache ``shared_buffers`` reads the 128 MB stock default.
+
+    The #313/#432 tuning lives only in ``postgresql.auto.conf`` on the Railway
+    volume, so a volume reprovision silently reverts it to stock and reopens
+    LML#706 (see ``docs/pg-tuning-runbook.md``). ``LessThanOrEqualToThreshold``
+    at 128 catches exactly that revert without paging on a deliberate resize.
+    It is a daily gauge like ``release_count``, so it shares that alarm's
+    ``Minimum`` statistic, one-day period, and ``missing`` policy, for the same
+    reasons (see ``test_release_count_alarm_treats_a_missing_datapoint_as_missing``).
+    """
+    props = _cloudwatch_alarm(transformed_template, "SharedBuffersStockAlarm")
+    assert props["Namespace"] == "WXYC/DiscogsCache"
+    assert props["MetricName"] == "shared_buffers_mb"
+    assert "Dimensions" not in props
+    assert props["Statistic"] == "Minimum"
+    assert props["Period"] == 86400
+    assert props["EvaluationPeriods"] == 1
+    assert props["Threshold"] == 128
+    assert props["ComparisonOperator"] == "LessThanOrEqualToThreshold"
+    assert props["TreatMissingData"] == "missing"
+    assert props["OKActions"] == [{"Ref": "AlertTopic"}]
+
+
 @pytest.mark.parametrize(
     "logical_id",
-    ["LauncherErrorAlarm", "StaleInstanceAlarm", "ReleaseCountAlarm"],
+    ["LauncherErrorAlarm", "StaleInstanceAlarm", "ReleaseCountAlarm", "SharedBuffersStockAlarm"],
 )
 def test_every_alarm_fans_into_the_shared_alert_topic(
     transformed_template: dict[str, Any], logical_id: str

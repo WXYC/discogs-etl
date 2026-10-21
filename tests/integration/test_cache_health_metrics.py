@@ -108,3 +108,19 @@ class TestCountArtworkStatesIntegration:
         assert states.total == 6
         assert states.never_asked == 3
         assert states.imageless == 1
+
+
+class TestReadSharedBuffersMbIntegration:
+    def test_matches_pg_settings_page_count(self, isolated_db: str) -> None:
+        """Cross-checks the MB conversion against ``pg_settings``' 8 kB page count."""
+        with psycopg.connect(isolated_db) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT setting::bigint * block_size / 1048576 "
+                    "FROM pg_settings, "
+                    "(SELECT current_setting('block_size')::bigint AS block_size) b "
+                    "WHERE name = 'shared_buffers'"
+                )
+                expected = cur.fetchone()[0]
+        mod = _load_module()
+        assert mod.read_shared_buffers_mb(isolated_db) == expected

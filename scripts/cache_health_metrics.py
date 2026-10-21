@@ -1,6 +1,6 @@
-"""Publish discogs-cache artwork-state counts to CloudWatch.
+"""Publish discogs-cache artwork-state counts and shared_buffers to CloudWatch.
 
-Emits three metrics under the ``WXYC/DiscogsCache`` namespace on every run:
+Emits four metrics under the ``WXYC/DiscogsCache`` namespace on every run:
 
 * ``release_count`` — total rows in ``release``.
 * ``artwork_never_asked_count`` — ``artwork_url IS NULL AND artwork_checked_at IS NULL``.
@@ -9,6 +9,12 @@ Emits three metrics under the ``WXYC/DiscogsCache`` namespace on every run:
 * ``artwork_imageless_count`` — ``artwork_url IS NULL AND artwork_checked_at IS NOT NULL``.
   Asked, genuinely no image — unfixable. Tracked so the alarm on
   ``never_asked`` doesn't mistake legitimate imageless rows for a regression.
+* ``shared_buffers_mb`` — the server's live ``shared_buffers``, in MB. The
+  tuned value lives only in ``postgresql.auto.conf`` on the Railway volume, so
+  a volume reprovision silently reverts it to the 128 MB stock default; the
+  ``SharedBuffersStockAlarm`` in ``infra/ephemeral-rebuild/template.yaml``
+  fires on that reading. See ``docs/pg-tuning-runbook.md`` and
+  [#432](https://github.com/WXYC/discogs-etl/issues/432).
 
 The headline "% NULL artwork_url" metric from
 [#241](https://github.com/WXYC/discogs-etl/issues/241) decomposes as
@@ -86,12 +92,31 @@ def count_artwork_states(database_url: str) -> ArtworkStates:
     )
 
 
-def build_metric_data(states: ArtworkStates) -> list[dict]:
-    """Map an ``ArtworkStates`` onto the CloudWatch ``MetricData`` payload."""
+_SHARED_BUFFERS_MB_QUERY = "SELECT pg_size_bytes(current_setting('shared_buffers')) / (1024 * 1024)"
+
+
+def read_shared_buffers_mb(database_url: str) -> int:
+    """Return the server's live ``shared_buffers`` in MB."""
+    import psycopg
+
+    with psycopg.connect(database_url) as conn:
+        with conn.cursor() as cur:
+            cur.execute(_SHARED_BUFFERS_MB_QUERY)
+            (mb,) = cur.fetchone()
+    return int(mb)
+
+
+def build_metric_data(states: ArtworkStates, *, shared_buffers_mb: int) -> list[dict]:
+    """Map the counts and ``shared_buffers`` onto the CloudWatch ``MetricData`` payload.
+
+    No metric carries ``Dimensions``, so the plain-form alarms in
+    ``infra/ephemeral-rebuild/template.yaml`` can query each series directly.
+    """
     return [
         {"MetricName": "release_count", "Value": states.total, "Unit": "Count"},
         {"MetricName": "artwork_never_asked_count", "Value": states.never_asked, "Unit": "Count"},
         {"MetricName": "artwork_imageless_count", "Value": states.imageless, "Unit": "Count"},
+        {"MetricName": "shared_buffers_mb", "Value": shared_buffers_mb, "Unit": "Megabytes"},
     ]
 
 
@@ -100,21 +125,26 @@ def publish_metrics(
     client,
     namespace: str,
     states: ArtworkStates,
+    shared_buffers_mb: int,
     dry_run: bool = False,
 ) -> None:
-    """Send one ``put_metric_data`` call carrying all three metrics.
+    """Send one ``put_metric_data`` call carrying all four metrics.
 
     Returns immediately without calling the client when ``dry_run`` is True.
     """
     if dry_run:
         logger.info(
-            "dry-run: would publish to %s: %s",
+            "dry-run: would publish to %s: %s shared_buffers_mb=%d",
             namespace,
             states,
+            shared_buffers_mb,
             extra={"step": "cache_health"},
         )
         return
-    client.put_metric_data(Namespace=namespace, MetricData=build_metric_data(states))
+    client.put_metric_data(
+        Namespace=namespace,
+        MetricData=build_metric_data(states, shared_buffers_mb=shared_buffers_mb),
+    )
 
 
 def run(
@@ -133,7 +163,15 @@ def run(
         states.imageless,
         extra={"step": "cache_health"},
     )
-    publish_metrics(client=cloudwatch_client, namespace=namespace, states=states, dry_run=dry_run)
+    shared_buffers_mb = read_shared_buffers_mb(database_url)
+    logger.info("shared_buffers_mb=%d", shared_buffers_mb, extra={"step": "cache_health"})
+    publish_metrics(
+        client=cloudwatch_client,
+        namespace=namespace,
+        states=states,
+        shared_buffers_mb=shared_buffers_mb,
+        dry_run=dry_run,
+    )
     return 0
 
 
