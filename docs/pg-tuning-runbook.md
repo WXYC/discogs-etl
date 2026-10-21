@@ -39,7 +39,7 @@ ALTER SYSTEM SET effective_io_concurrency = '200';
 `postgresql.auto.conf`:
 
 - **survives** service restarts, redeploys, and the monthly data rebuild (none of those touch it);
-- does **not** survive a **full volume recreation / fresh Postgres service reprovision** — that reverts the instance to stock (`shared_buffers=128MB`, `random_page_cost=4`, …), silently reintroducing the exact buffer-eviction / connection-pool-saturation regression #313 fixed, with no alert.
+- does **not** survive a **full volume recreation / fresh Postgres service reprovision** — that reverts the instance to stock (`shared_buffers=128MB`, `random_page_cost=4`, …), silently reintroducing the exact buffer-eviction / connection-pool-saturation regression #313 fixed, until the [drift check](#recovery-after-a-volume-reprovision) alarms (within a day).
 
 That last point is the **durability gap**. Because no clean automatic lever exists on this image (see below), the gap is closed by a **documented recovery step + a drift check**, not by baked config.
 
@@ -52,7 +52,7 @@ If the discogs-cache Postgres volume is ever recreated / the service reprovision
 3. Restart the service (for `shared_buffers`).
 4. Verify with the [verification query](#verification-non-destructive).
 
-Consider wiring a drift check (e.g. a cache-health metric that alarms when `shared_buffers` reads `128MB`) so a silent reprovision-revert surfaces instead of degrading latency unnoticed.
+**Drift check ([#432](https://github.com/WXYC/discogs-etl/issues/432)):** `scripts/cache_health_metrics.py` publishes the live `shared_buffers` daily as `WXYC/DiscogsCache` `shared_buffers_mb` (from `sync-library.yml`), and the `wxyc-discogs-rebuild` stack's `SharedBuffersStockAlarm` (`discogs-cache-shared-buffers-stock`) emails the rebuild alert topic when it reads `<= 128` — the stock default, which is what a reprovision leaves behind. When it fires, run the recovery steps above.
 
 ## Why not the image (the shared-image constraint)
 
