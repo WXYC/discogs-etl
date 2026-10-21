@@ -137,3 +137,32 @@ def test_describe_actions_are_unscoped_deliberately(statements: list[dict[str, A
             "ec2:Describe* does not support resource-level permissions; a narrower "
             "Resource silently denies the call"
         )
+
+
+def test_every_stack_alarm_name_is_inside_the_roles_alarm_scope(
+    statements: list[dict[str, Any]],
+) -> None:
+    """Each ``AlarmName`` in the ephemeral-rebuild stack must match the role's alarm ARN.
+
+    The ``Alarms`` statement scopes ``cloudwatch:PutMetricAlarm`` to
+    ``alarm:discogs-rebuild-*``. An alarm named outside that prefix passes
+    review and every template test, then fails at ``sam deploy`` with
+    ``AccessDenied`` and rolls the whole changeset back -- which is what #432's
+    first ``SharedBuffersStockAlarm`` (``discogs-cache-shared-buffers-stock``) did.
+    """
+    alarm_statement = next(s for s in statements if s.get("Sid") == "Alarms")
+    resource = alarm_statement["Resource"]
+    arn = resource["Fn::Sub"] if isinstance(resource, dict) else resource
+    _, _, pattern = arn.partition(":alarm:")
+    assert pattern.endswith("*"), f"expected a prefix wildcard, got {pattern!r}"
+    prefix = pattern[:-1]
+
+    template = load_cfn(EPHEMERAL_TEMPLATE_PATH)
+    alarm_names = {
+        logical_id: resource["Properties"]["AlarmName"]
+        for logical_id, resource in template["Resources"].items()
+        if resource.get("Type") == "AWS::CloudWatch::Alarm"
+    }
+    assert alarm_names, "the ephemeral-rebuild stack declares no alarms"
+    outside = {lid: name for lid, name in alarm_names.items() if not name.startswith(prefix)}
+    assert not outside, f"alarm names outside the deploy role's {prefix}* scope: {outside}"
