@@ -10,23 +10,35 @@ The discogs-cache Postgres service runs with these settings (stock = PG defaults
 
 | setting | stock | applied | scaling basis |
 |---|---|---|---|
-| `shared_buffers` | 128MB | **2GB** | 25% of the 8 GB instance (restart-only param) |
+| `shared_buffers` | 128MB | **1408MB** | DB size × 1.15, rounded up to 128 MB ([#432](https://github.com/WXYC/discogs-etl/issues/432); restart-only param) |
 | `effective_cache_size` | 4GB | **6GB** | ~75% of 8 GB — planner hint, no allocation |
 | `work_mem` | 4MB | **16MB** | low query concurrency on 8 vCPU |
 | `maintenance_work_mem` | 64MB | **512MB** | index/rebuild maintenance (monthly rebuild) |
 | `random_page_cost` | 4 | **1.1** | cloud SSD — size-independent, correct for any SSD instance |
 | `effective_io_concurrency` | 1 | **200** | cloud SSD — size-independent |
 
-Instance sizing this assumes: **8 GB RAM, ~935 MB on-disk DB**. The DB fits inside `shared_buffers` at 2GB, which is the point — the working set stays resident instead of churning through the buffer manager. If the instance is resized, revisit `shared_buffers` / `effective_cache_size` / `work_mem` (the top four rows scale with RAM; the bottom two do not).
+Instance sizing this assumes: **8 GB RAM ceiling, 1,209 MB database** (`pg_database_size`, measured 2026-10-21 10:20 PDT). The DB fits inside `shared_buffers` with 15% to spare, which is the point — the working set stays resident instead of churning through the buffer manager, and the headroom absorbs a year of dump growth without a monthly rebuild pushing the working set out of the pool. `effective_cache_size` / `work_mem` / `maintenance_work_mem` scale with the instance's RAM; `shared_buffers` scales with the database; the bottom two rows scale with neither.
 
-`shared_buffers` sizing is under separate cost-driven review ([#313](https://github.com/WXYC/discogs-etl/issues/313), post-BS#1631 steady-state read) — 2GB vs 1GB vs 512MB. Update this table if it changes.
+### Sizing `shared_buffers`
+
+Railway bills the memory the container actually holds, and Postgres fills the buffer pool lazily, so once a monthly rebuild's full-table scans have touched every page, the pool's full size is billed for the rest of the month (about pool + 0.4 GB for the service). The pool is therefore sized to the database, not to the instance:
+
+```
+pool = ceil_to_128MB(pg_database_size × 1.15)
+  clamp up to 1280 MB  — below that, the saving stops justifying a restart
+  above 1792 MB        — hold 2 GB instead
+```
+
+History: stock 128 MB → **2 GB** on 2026-07-15 ([#313](https://github.com/WXYC/discogs-etl/issues/313), against an ~935 MB database) → **1408 MB** on 2026-10-21 ([#432](https://github.com/WXYC/discogs-etl/issues/432): 1,209 MB × 1.15 = 1,391 → 1,408), freeing about 640 MB (≈ $6–7 per Railway billing period). Re-run the rule if `pg_database_size` passes about 1,300 MB (about 92% of the pool) or the cache hit ratio stays below 99% once warm, and record the inputs on the issue before applying. Every resize costs one restart, which hands LML a cold pool ([library-metadata-lookup#706](https://github.com/WXYC/library-metadata-lookup/issues/706)) until live traffic re-warms it; the 15% headroom is there so the rule is not re-run every month.
+
+**Post-rebuild restart: decided against.** A restart after each monthly rebuild would release the pages the rebuild's scans pulled in (worth about $11–12/month at the 2 GB pool, less at 1408 MB), but it would hand LML a cold pool every month — the exact #706 regression the tuning exists to prevent. With the pool sized to the database the saving is smaller and the monthly cold-pool cost is unchanged, so it is not adopted (#432). An opt-in implementation once existed on an unpushed branch; it was discarded.
 
 ## How the tuning is applied today
 
-The values were applied **live via `ALTER SYSTEM`** (2026-07-15), which writes `postgresql.auto.conf` on the Railway volume. To reproduce or restore:
+The values were applied **live via `ALTER SYSTEM`** (2026-07-15; `shared_buffers` resized 2026-10-21), which writes `postgresql.auto.conf` on the Railway volume. To reproduce or restore:
 
 ```sql
-ALTER SYSTEM SET shared_buffers = '2GB';
+ALTER SYSTEM SET shared_buffers = '1408MB';
 ALTER SYSTEM SET effective_cache_size = '6GB';
 ALTER SYSTEM SET work_mem = '16MB';
 ALTER SYSTEM SET maintenance_work_mem = '512MB';
@@ -34,7 +46,7 @@ ALTER SYSTEM SET random_page_cost = '1.1';
 ALTER SYSTEM SET effective_io_concurrency = '200';
 ```
 
-`shared_buffers` is a **restart-only** parameter, so after running these the service needs a restart for `shared_buffers` to take effect (the others reload with `SELECT pg_reload_conf();`). Restart via the Railway dashboard (Service → ⋯ → Restart) or `railway redeploy`.
+`shared_buffers` is a **restart-only** parameter, so after running these the service needs a restart for `shared_buffers` to take effect (the others reload with `SELECT pg_reload_conf();`). Restart via the Railway dashboard (Service → ⋯ → Restart) or `railway restart --service Postgres --environment production` (never by setting a start command — see the trap below). On 2026-10-21 the CLI kept waiting after the restart had already happened, so confirm it with `SELECT pg_postmaster_start_time(), current_setting('shared_buffers');` rather than by waiting for the command to exit. Expect a brief LML blip while Postgres is down: on 2026-10-21, about a second of failed LML cache reads, and LML's Discogs saturation breaker open for about 2.5 minutes.
 
 `postgresql.auto.conf`:
 
@@ -56,7 +68,7 @@ If the discogs-cache Postgres volume is ever recreated / the service reprovision
 
 ## Why not the image (the shared-image constraint)
 
-The instinct to bake `shared_buffers` into the Postgres image `CMD` is **wrong here**. `ghcr.io/wxyc/wxyc-postgres` is a **shared** base image: `discogs-cache`, `musicbrainz-cache`, and `wikidata-cache` all pull it, and its [runbook](https://github.com/WXYC/wxyc-etl/blob/main/docs/wxyc-postgres-image.md) defines it as a **pure overlay** — no config or behavior change beyond the `wxyc_unaccent.rules` text-search file. Baking discogs-cache's 2GB sizing (specific to its 8 GB instance / ~935 MB DB) into the shared `CMD` would mis-size the other two caches and break that invariant. (Prod discogs-cache runs `:pg17-v0.4.x`; the local compose in `docs/architecture.md` still pins `:pg16`.)
+The instinct to bake `shared_buffers` into the Postgres image `CMD` is **wrong here**. `ghcr.io/wxyc/wxyc-postgres` is a **shared** base image: `discogs-cache`, `musicbrainz-cache`, and `wikidata-cache` all pull it, and its [runbook](https://github.com/WXYC/wxyc-etl/blob/main/docs/wxyc-postgres-image.md) defines it as a **pure overlay** — no config or behavior change beyond the `wxyc_unaccent.rules` text-search file. Baking discogs-cache's 1408MB sizing (specific to its ~1.2 GB DB) into the shared `CMD` would mis-size the other two caches and break that invariant. (Prod discogs-cache runs `:pg17-v0.4.x`; the local compose in `docs/architecture.md` still pins `:pg16`.)
 
 ## The Custom Start Command trap (do NOT use)
 
@@ -98,7 +110,7 @@ psql "$DATABASE_URL_DISCOGS" -c "
 "
 ```
 
-Expect (8 kB units where noted): `shared_buffers` = `262144` (2GB), `effective_cache_size` = `786432` (6GB), `work_mem` = `16384` kB, `maintenance_work_mem` = `524288` kB, `random_page_cost` = `1.1`, `effective_io_concurrency` = `200`. `source` reads `configuration file` (they come from `postgresql.auto.conf`).
+Expect (8 kB units where noted): `shared_buffers` = `180224` (1408MB), `effective_cache_size` = `786432` (6GB), `work_mem` = `16384` kB, `maintenance_work_mem` = `524288` kB, `random_page_cost` = `1.1`, `effective_io_concurrency` = `200`. `source` reads `configuration file` (they come from `postgresql.auto.conf`).
 
 Residency sanity check (≈99% once warm; **expect it low right after a restart** — the buffer cache is cold and re-warms with live traffic):
 
@@ -111,7 +123,7 @@ psql "$DATABASE_URL_DISCOGS" -c "
 
 ## musicbrainz-cache / wikidata-cache — separate question
 
-The two SSD flags (`random_page_cost=1.1`, `effective_io_concurrency=200`) are correct for **any** cloud-SSD instance regardless of DB size, so `musicbrainz-cache` and `wikidata-cache` (same shared image, same Railway class) would plausibly benefit from at least those two via their own `ALTER SYSTEM`. That is **out of scope here** — a separate `wxyc-etl` / [Music Data Pipeline Hardening](https://github.com/orgs/WXYC/projects/19) evaluation (their memory sizing needs its own analysis, and they don't share discogs-cache's 935 MB working set). Captured so it isn't silently dropped; file separately if pursued.
+The two SSD flags (`random_page_cost=1.1`, `effective_io_concurrency=200`) are correct for **any** cloud-SSD instance regardless of DB size, so `musicbrainz-cache` and `wikidata-cache` (same shared image, same Railway class) would plausibly benefit from at least those two via their own `ALTER SYSTEM`. That is **out of scope here** — a separate `wxyc-etl` / [Music Data Pipeline Hardening](https://github.com/orgs/WXYC/projects/19) evaluation (their memory sizing needs its own analysis, and they don't share discogs-cache's ~1.2 GB working set). Captured so it isn't silently dropped; file separately if pursued.
 
 ## Related
 
