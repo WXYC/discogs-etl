@@ -17,21 +17,24 @@ The discogs-cache Postgres service runs with these settings (stock = PG defaults
 | `random_page_cost` | 4 | **1.1** | cloud SSD — size-independent, correct for any SSD instance |
 | `effective_io_concurrency` | 1 | **200** | cloud SSD — size-independent |
 
-Instance sizing this assumes: **8 GB RAM ceiling, 1,209 MB database** (`pg_database_size`, measured 2026-10-21 10:20 PDT). The DB fits inside `shared_buffers` with 15% to spare, which is the point — the working set stays resident instead of churning through the buffer manager, and the headroom absorbs a year of dump growth without a monthly rebuild pushing the working set out of the pool. `effective_cache_size` / `work_mem` / `maintenance_work_mem` scale with the instance's RAM; `shared_buffers` scales with the database; the bottom two rows scale with neither.
+Instance sizing this assumes: **8 GB RAM ceiling, 1,209 MB database** (`pg_database_size`, measured 2026-10-21 10:20 PDT, after the #433 dedup and migration `0017`). The DB fits inside `shared_buffers` with 15% to spare, which is the point — the working set stays resident instead of churning through the buffer manager. `effective_cache_size` / `work_mem` / `maintenance_work_mem` scale with the instance's RAM; `shared_buffers` scales with the database; the bottom two rows scale with neither.
 
 ### Sizing `shared_buffers`
 
-Railway bills the memory the container actually holds, and Postgres fills the buffer pool lazily, so once a monthly rebuild's full-table scans have touched every page, the pool's full size is billed for the rest of the month (about pool + 0.4 GB for the service). The pool is therefore sized to the database, not to the instance:
+**Why the pool is sized to the database.** Railway bills the memory the container holds. Postgres reserves `shared_buffers` at startup, but a buffer page only counts against the container once Postgres first uses it, so billed memory grows as the pool fills. Bulk work does not fill it: large sequential scans, `COPY` and index builds go through small ring buffers. Ordinary traffic does — LML's index lookups pull pages into the pool one at a time. On this service the pool filled and stayed full: from 2026-08-04 to 2026-09-25 the service never held less than 2.287 GB, a flat line just above the 2 GB pool (OS page cache would have kept growing toward the 8 GB ceiling instead). So the pool's full size is what is billed, and a pool larger than the database buys nothing. The saving from a smaller pool is a prediction until a full month of Railway memory confirms it.
+
+**The rule.** Measure `pg_database_size(current_database())` after each monthly rebuild, and after any dedup or prune that changes the database's size (for example the [#433 dedup](dedup-artist-children-runbook.md)). Record it on [#432](https://github.com/WXYC/discogs-etl/issues/432). Then:
 
 ```
-pool = ceil_to_128MB(pg_database_size × 1.15)
-  clamp up to 1280 MB  — below that, the saving stops justifying a restart
-  above 1792 MB        — hold 2 GB instead
+target = ceil_to_128MB(pg_database_size × 1.15)
+resize only if |target − current shared_buffers| ≥ 256 MB
 ```
 
-History: stock 128 MB → **2 GB** on 2026-07-15 ([#313](https://github.com/WXYC/discogs-etl/issues/313), against an ~935 MB database) → **1408 MB** on 2026-10-21 ([#432](https://github.com/WXYC/discogs-etl/issues/432): 1,209 MB × 1.15 = 1,391 → 1,408), freeing about 640 MB (≈ $6–7 per Railway billing period). Re-run the rule if `pg_database_size` passes about 1,300 MB (about 92% of the pool) or the cache hit ratio stays below 99% once warm, and record the inputs on the issue before applying. Every resize costs one restart, which hands LML a cold pool ([library-metadata-lookup#706](https://github.com/WXYC/library-metadata-lookup/issues/706)) until live traffic re-warms it; the 15% headroom is there so the rule is not re-run every month.
+The 15% is headroom for the database to move between measurements; it is not a growth forecast. The size moves with each rebuild and prune (1,263 MB → 1,135 MB → 1,209 MB between 2026-10-13 and 2026-10-21), and the July figure of ~935 MB was measured differently (on disk), so no growth rate can be read from the history. The 256 MB minimum exists because every resize costs a restart, and every restart hands LML a cold pool ([library-metadata-lookup#706](https://github.com/WXYC/library-metadata-lookup/issues/706)) until live traffic re-warms it. At today's 1408 MB the rule fires when the database passes about **1,336 MB** or falls below about **1,000 MB**. Also resize up, whatever the database size, if the cache hit ratio over a window (see [Verification](#verification-non-destructive)) stays below 99% once warm. When recovering from a reprovision, the restart is needed anyway, so apply the rule's target directly.
 
-**Post-rebuild restart: decided against.** A restart after each monthly rebuild would release the pages the rebuild's scans pulled in (worth about $11–12/month at the 2 GB pool, less at 1408 MB), but it would hand LML a cold pool every month — the exact #706 regression the tuning exists to prevent. With the pool sized to the database the saving is smaller and the monthly cold-pool cost is unchanged, so it is not adopted (#432). An opt-in implementation once existed on an unpushed branch; it was discarded.
+History: stock 128 MB → **2 GB** on 2026-07-15 ([#313](https://github.com/WXYC/discogs-etl/issues/313)) → **1408 MB** on 2026-10-21 (#432: 1,209 MB × 1.15 = 1,391 → 1,408). The expected saving is about 640 MB, or roughly $6–7/month.
+
+**Post-rebuild restart: decided against.** Restarting after each monthly rebuild would empty the pool and release its billed memory until traffic refilled it (worth roughly $11–12/month at the old 2 GB pool, less at 1408 MB). But it would hand LML a cold pool every month — the exact #706 regression the tuning exists to prevent — so it is not adopted (#432).
 
 ## How the tuning is applied today
 
@@ -46,7 +49,7 @@ ALTER SYSTEM SET random_page_cost = '1.1';
 ALTER SYSTEM SET effective_io_concurrency = '200';
 ```
 
-`shared_buffers` is a **restart-only** parameter, so after running these the service needs a restart for `shared_buffers` to take effect (the others reload with `SELECT pg_reload_conf();`). Restart via the Railway dashboard (Service → ⋯ → Restart) or `railway restart --service Postgres --environment production` (never by setting a start command — see the trap below). On 2026-10-21 the CLI kept waiting after the restart had already happened, so confirm it with `SELECT pg_postmaster_start_time(), current_setting('shared_buffers');` rather than by waiting for the command to exit. Expect a brief LML blip while Postgres is down: on 2026-10-21, about a second of failed LML cache reads, and LML's Discogs saturation breaker open for about 2.5 minutes.
+`shared_buffers` is a **restart-only** parameter, so after running these the service needs a restart for `shared_buffers` to take effect (the others reload with `SELECT pg_reload_conf();`). Restart via the Railway dashboard (Service → ⋯ → Restart) or `railway restart --project 0ef26538-ace6-441f-bb07-45faae3aba27 --service Postgres --environment production` (never by setting a start command — see the trap below). Pass `--project` explicitly: discogs-cache is the `Postgres` service in the Railway `request-o-matic` project, and without the flag the CLI restarts the `Postgres` service of whatever project the current directory is linked to. On 2026-10-21 the CLI kept waiting after the restart had already happened, so confirm it with `SELECT pg_postmaster_start_time(), current_setting('shared_buffers');` rather than by waiting for the command to exit. Expect a brief LML blip while Postgres is down: on 2026-10-21, about a second of failed LML cache reads, and LML's Discogs saturation breaker open for about 2.5 minutes.
 
 `postgresql.auto.conf`:
 
@@ -95,7 +98,7 @@ In the dashboard: Service → Settings → Deploy → clear the Custom Start Com
 
 Two candidate directions, **neither yet validated — do not try either on prod without an off-prod test first**:
 
-1. **Entrypoint-preserving start command** — e.g. `wrapper.sh postgres -p 5432 -c listen_addresses=* -c shared_buffers=2GB …`, so the privilege-drop/SSL entrypoint still runs and the tuning flags ride along. Unverified; depends on exactly how Railway wraps the start command, and the 2026-07-18 attempt shows the failure mode is a live outage. Test against a throwaway service before ever pointing it at prod.
+1. **Entrypoint-preserving start command** — e.g. `wrapper.sh postgres -p 5432 -c listen_addresses=* -c shared_buffers=<applied value> …` (take each value from the [Applied values](#applied-values) table), so the privilege-drop/SSL entrypoint still runs and the tuning flags ride along. Unverified; depends on exactly how Railway wraps the start command, and the 2026-07-18 attempt shows the failure mode is a live outage. Test against a throwaway service before ever pointing it at prod.
 2. **Env-var hook in the shared image (preferred long-term)** — teach `wxyc-postgres`'s `wrapper.sh` to read an env var (e.g. `WXYC_PG_EXTRA_ARGS`) and append it as `-c` flags to the postgres invocation *from inside the entrypoint*. That would be per-service (each cache sets its own env), survive reprovision (Railway env vars do), and not bypass the privilege-drop/SSL logic. This is a `wxyc-etl` image change, tracked separately — the real fix if automatic durability is wanted.
 
 ## Verification (non-destructive)
@@ -112,14 +115,18 @@ psql "$DATABASE_URL_DISCOGS" -c "
 
 Expect (8 kB units where noted): `shared_buffers` = `180224` (1408MB), `effective_cache_size` = `786432` (6GB), `work_mem` = `16384` kB, `maintenance_work_mem` = `524288` kB, `random_page_cost` = `1.1`, `effective_io_concurrency` = `200`. `source` reads `configuration file` (they come from `postgresql.auto.conf`).
 
-Residency sanity check (≈99% once warm; **expect it low right after a restart** — the buffer cache is cold and re-warms with live traffic):
+**Cache hit ratio — measure it over a window, never from the running totals.** The counters in `pg_stat_database` are cumulative. Since PG 15 they are saved at a clean shutdown and survive a restart, so a single reading can be dominated by months of history (the 2026-10-13 snapshot had 10.7 billion hits) and barely move when the pool becomes too small. A restart that is not a clean shutdown resets them instead: the 2026-10-21 `railway restart` did. Either way, take two snapshots and compare the difference:
 
 ```bash
-psql "$DATABASE_URL_DISCOGS" -c "
-  SELECT round(100.0 * sum(heap_blks_hit) / nullif(sum(heap_blks_hit)+sum(heap_blks_read),0), 2) AS cache_hit_pct
-    FROM pg_statio_user_tables;
+psql "$DATABASE_URL_DISCOGS" -Atc "
+  SELECT now(), blks_hit, blks_read, stats_reset
+    FROM pg_stat_database WHERE datname = current_database();
 "
+# ...a day or more later, run it again, then:
+# hit % over the window = 100 × Δblks_hit / (Δblks_hit + Δblks_read)
 ```
+
+If either counter went down between the two snapshots, the counters were reset (`stats_reset` does not show this: it stayed NULL through the 2026-10-21 reset). Take a new first snapshot. Expect ≥ 99% once the pool is warm. It reads lower for the first days after a resize, while live traffic re-warms the pool.
 
 ## musicbrainz-cache / wikidata-cache — separate question
 
