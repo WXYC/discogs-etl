@@ -463,11 +463,10 @@ class TestCreateTrackIndexes:
 class TestSchemaProductionOrdering:
     """Regression test for #104: schema must apply cleanly on a fresh Postgres.
 
-    ``schema/create_database.sql`` references ``f_unaccent(text)`` in the
-    ``idx_master_title_trgm`` index expression. ``f_unaccent`` is defined in
-    ``schema/create_functions.sql``. If the production code applies
-    ``create_database.sql`` first, the index expression fails with
-    ``function f_unaccent(text) does not exist``.
+    ``f_unaccent(text)`` must be callable after the schema files apply, alone
+    and in pipeline order, and the ``f_unaccent``-dependent trigram indexes in
+    ``create_indexes.sql`` must build. (``idx_master_title_trgm``, which used
+    to be the pinned object, was removed as unused in 0018.)
 
     Locally this is masked when ``template1`` already contains
     ``f_unaccent`` from a prior pipeline run; CI's ephemeral Postgres
@@ -525,10 +524,8 @@ class TestSchemaProductionOrdering:
         Reads ``scripts/run_pipeline.py`` to find every consecutive
         ``run_sql_file(... create_database.sql)`` /
         ``run_sql_file(... create_functions.sql)`` block, then replays it
-        here. If create_database.sql is applied before create_functions.sql,
-        the ``idx_master_title_trgm`` index expression in
-        create_database.sql will fail with ``function f_unaccent(text) does
-        not exist``.
+        here, then builds ``idx_release_artist_name_trgm`` from
+        create_indexes.sql, whose expression needs ``f_unaccent``.
 
         We capture failures rather than letting ``run_sql_file`` call
         ``sys.exit(1)`` so pytest produces a useful diagnostic.
@@ -556,16 +553,22 @@ class TestSchemaProductionOrdering:
             f"Schema application failed on a fresh database (no ambient f_unaccent): {captured!r}"
         )
 
-        # Sanity check: f_unaccent and idx_master_title_trgm both exist.
+        # Sanity check: f_unaccent is callable and an f_unaccent-dependent
+        # index builds in pipeline order.
+        run_pipeline.run_sql_file(
+            fresh_db_url,
+            run_pipeline.SCHEMA_DIR / "create_indexes.sql",
+            strip_concurrently=True,
+        )
         conn = psycopg.connect(fresh_db_url)
         with conn.cursor() as cur:
             cur.execute("SELECT f_unaccent('Niluefer Yanya')")
             assert cur.fetchone() is not None
             cur.execute(
                 "SELECT 1 FROM pg_indexes "
-                "WHERE schemaname = 'public' AND indexname = 'idx_master_title_trgm'"
+                "WHERE schemaname = 'public' AND indexname = 'idx_release_artist_name_trgm'"
             )
-            assert cur.fetchone() is not None, "idx_master_title_trgm missing"
+            assert cur.fetchone() is not None, "idx_release_artist_name_trgm missing"
         conn.close()
 
     def test_create_database_alone_succeeds_on_fresh_db(self, fresh_db_url) -> None:
@@ -574,11 +577,11 @@ class TestSchemaProductionOrdering:
         on its own.
 
         Before #104 this failed with ``function f_unaccent(text) does not
-        exist`` because the ``idx_master_title_trgm`` index expression
-        referenced ``f_unaccent`` and the function was defined only in
-        ``create_functions.sql``. The fix inlines the function definition
-        into ``create_database.sql`` so the file no longer has an
-        out-of-band dependency.
+        exist`` because an index expression in the file referenced
+        ``f_unaccent``, defined only in ``create_functions.sql``. The fix
+        inlined the function definition into ``create_database.sql`` so the
+        file has no out-of-band dependency; that inlining is kept even though
+        the master index was removed as unused (0018).
         """
         conn = psycopg.connect(fresh_db_url, autocommit=True)
         try:
@@ -586,12 +589,6 @@ class TestSchemaProductionOrdering:
                 cur.execute((run_pipeline.SCHEMA_DIR / "create_database.sql").read_text())
                 cur.execute("SELECT f_unaccent('Nilüfer Yanya')")
                 assert cur.fetchone()[0] == "Nilufer Yanya"
-                cur.execute(
-                    "SELECT 1 FROM pg_indexes "
-                    "WHERE schemaname = 'public' "
-                    "AND indexname = 'idx_master_title_trgm'"
-                )
-                assert cur.fetchone() is not None, "idx_master_title_trgm missing"
         finally:
             conn.close()
 

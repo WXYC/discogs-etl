@@ -35,9 +35,9 @@ depends_on: str | Sequence[str] | None = None
 # alembic/versions/0001_initial.py -> repo root is two parents up
 _SCHEMA_DIR = Path(__file__).resolve().parents[2] / "schema"
 
-# Order matches scripts/run_pipeline.py: functions must precede create_database
-# because idx_master_title_trgm references f_unaccent (see issue #104).
-# Indexes follow once the tables exist.
+# Order matches scripts/run_pipeline.py: functions precede create_database,
+# which inlines the same f_unaccent (see issue #104), and the trigram indexes
+# that follow once the tables exist need f_unaccent to exist.
 _SCHEMA_FILES: tuple[str, ...] = (
     "create_functions.sql",
     "create_database.sql",
