@@ -27,9 +27,9 @@ CREATE EXTENSION IF NOT EXISTS unaccent;
 -- (the built-in unaccent() is STABLE, depending on search_path).
 --
 -- Defined here AND in create_functions.sql so that create_database.sql is
--- self-sufficient: the idx_master_title_trgm index expression below
--- references f_unaccent and would otherwise fail with "function
--- f_unaccent(text) does not exist" on a fresh database (see #104).
+-- self-sufficient: it must be applicable to a fresh database on its own
+-- (see #104). (The master title trigram index, once the only index here
+-- that used f_unaccent, was dropped as unused in 0018.)
 --
 -- create_functions.sql remains the canonical source of this definition;
 -- later steps (create_indexes.sql, create_track_indexes.sql) also depend
@@ -325,7 +325,6 @@ CREATE INDEX IF NOT EXISTS idx_release_master_id ON release(master_id) WHERE mas
 
 -- Master indexes
 CREATE INDEX IF NOT EXISTS idx_master_artist_master_id ON master_artist(master_id);
-CREATE INDEX IF NOT EXISTS idx_master_title_trgm ON master USING GIN (lower(f_unaccent(title)) gin_trgm_ops);
 
 -- Cache metadata indexes
 CREATE INDEX IF NOT EXISTS idx_cache_metadata_cached_at ON cache_metadata(cached_at);

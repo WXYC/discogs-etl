@@ -1223,9 +1223,9 @@ def _run_xml_pipeline(
             # After the snapshot (a left-behind one is restored first), before
             # the TRUNCATE: which pins have a release row (#493).
             _record_pin_start(db_url, reuse_existing=False)
-            # create_functions.sql must run BEFORE create_database.sql:
-            # create_database.sql's idx_master_title_trgm index expression
-            # references f_unaccent (see #104).
+            # create_functions.sql runs BEFORE create_database.sql, which
+            # inlines the same f_unaccent definition (see #104); the trigram
+            # indexes applied later need f_unaccent to exist.
             run_sql_file(db_url, SCHEMA_DIR / "create_functions.sql")
             run_sql_file(db_url, SCHEMA_DIR / "create_database.sql")
 
@@ -1834,9 +1834,9 @@ def _run_database_build(
     if state and state.is_completed("create_schema"):
         logger.info("Skipping create_schema (already completed)")
     else:
-        # create_functions.sql must run BEFORE create_database.sql:
-        # create_database.sql's idx_master_title_trgm index expression
-        # references f_unaccent (see #104).
+        # create_functions.sql runs BEFORE create_database.sql, which inlines
+        # the same f_unaccent definition (see #104); the trigram indexes
+        # applied later need f_unaccent to exist.
         if fresh_rebuild:
             # --fresh-rebuild: wipe the core-table subgraph before recreate
             # (WXYC/discogs-etl#242). Without this step create_database.sql
