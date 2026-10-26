@@ -47,7 +47,7 @@ By default, `discogs-xml-converter` is expected on PATH. Use `--converter` to sp
 
 ## Pipeline
 
-All 9 steps are automated by `run_pipeline.py`. The script supports two modes: full pipeline from XML, or database build from pre-filtered CSVs.
+All 10 steps are automated by `run_pipeline.py`. The script supports two modes: full pipeline from XML, or database build from pre-filtered CSVs.
 
 | Step | Script | Description |
 |------|--------|-------------|
@@ -60,6 +60,7 @@ All 9 steps are automated by `run_pipeline.py`. The script supports two modes: f
 | 7. Prune/Copy | `scripts/verify_cache.py` | Remove non-library releases or copy matches to target DB |
 | 8. Derive va_release | `scripts/derive_va_release.py` | Re-derive the VA-compilation lookup table consumed by LML's comp matchers (#344) |
 | 9. Vacuum | `VACUUM FULL` | Reclaim disk space |
+| 10. Sweep lookup_negative | `run_sweep_lookup_negative_step` | Delete expired LML negative-cache rows, then plain `VACUUM (ANALYZE)` (#438) |
 
 ### Full Pipeline (--xml)
 

@@ -132,6 +132,17 @@ If either counter went down between the two snapshots, the counters were reset (
 
 The two SSD flags (`random_page_cost=1.1`, `effective_io_concurrency=200`) are correct for **any** cloud-SSD instance regardless of DB size, so `musicbrainz-cache` and `wikidata-cache` (same shared image, same Railway class) would plausibly benefit from at least those two via their own `ALTER SYSTEM`. That is **out of scope here** — a separate `wxyc-etl` / [Music Data Pipeline Hardening](https://github.com/orgs/WXYC/projects/19) evaluation (their memory sizing needs its own analysis, and they don't share discogs-cache's ~1.2 GB working set). Captured so it isn't silently dropped; file separately if pursued.
 
+## One-off: clear the `lookup_negative` backlog (#438)
+
+Rebuilds now sweep expired `lookup_negative` rows themselves (plain `VACUUM`, which reuses space but does not shrink the file). The backlog that built up before the sweep existed (121,517 of 124,248 rows expired on 2026-09-25) is cleared once, by hand:
+
+1. Read-only first: `SELECT count(*) FROM lookup_negative WHERE now() >= attempted_at + (ttl_seconds * interval '1 second')`, and `count(*)` overall. A count wildly different from the last recorded figure means stop and look.
+2. `DELETE` with the identical predicate. The row count must match step 1 within the few rows that expire in between.
+3. `VACUUM (FULL, ANALYZE) lookup_negative` under `SET lock_timeout = '5s'`. `FULL` is right for the one-off, because the sizing review reads `pg_database_size` and plain `VACUUM` does not shrink the file. The table is small after the delete, so the lock is brief, and LML's negative-cache read fails open.
+4. Record `pg_total_relation_size('lookup_negative')` before and after.
+
+There is no rollback and none is needed: every deleted row is one the reader already treats as absent.
+
 ## Related
 
 - [#313](https://github.com/WXYC/discogs-etl/issues/313) — applied + verified the tuning live via `ALTER SYSTEM`.

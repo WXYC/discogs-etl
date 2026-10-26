@@ -2266,6 +2266,129 @@ class TestDeriveVaReleaseStep:
         assert not state.is_completed("derive_va_release")
 
 
+class TestSweepLookupNegativeStep:
+    """The lookup_negative TTL sweep (#438) runs at the tail of both build
+    paths, after set_tables_logged and the reload-invariant gate and before
+    report_sizes, on the database consumers read (the copy-to target when
+    set), and never raises."""
+
+    def _invoke(self, *, path, target_db_url=None, gate_ok=True, sweep=None):
+        import psycopg
+
+        order: list[str] = []
+        sweep_mock = sweep or MagicMock(side_effect=lambda *a: order.append("sweep") or True)
+        mock_check = MagicMock()
+
+        def fake_gate(*a, **k):
+            order.append("gate")
+            if not gate_ok:
+                raise RuntimeError("reload invariant violated")
+            return run_pipeline.ReloadInvariantResult(
+                ok=True, release_count=1, artist_coverage=1.0, track_coverage=1.0
+            )
+
+        mock_check.side_effect = fake_gate
+        conn = TestDeriveVaReleaseStep()._mock_conn()
+        with (
+            patch.object(run_pipeline, "run_step"),
+            patch.object(run_pipeline, "wait_for_postgres"),
+            patch.object(run_pipeline, "run_sql_file"),
+            patch.object(run_pipeline, "run_sql_statements_parallel"),
+            patch.object(run_pipeline, "set_tables_unlogged"),
+            patch.object(
+                run_pipeline, "set_tables_logged", side_effect=lambda *a: order.append("logged")
+            ),
+            patch.object(run_pipeline, "run_vacuum"),
+            patch.object(
+                run_pipeline, "report_sizes", side_effect=lambda *a: order.append("report")
+            ),
+            patch.object(run_pipeline, "check_reload_invariant", mock_check),
+            patch.object(run_pipeline, "run_sweep_lookup_negative_step", sweep_mock),
+            patch.object(run_pipeline, "write_keep_release_ids", return_value=0),
+            patch.object(psycopg, "connect", return_value=conn),
+        ):
+            if path == "post_import":
+                run_pipeline._run_database_build_post_import(
+                    "postgresql:///test", Path("/tmp/csv"), Path("/tmp/library.db"), sys.executable
+                )
+            else:
+                run_pipeline._run_database_build(
+                    "postgresql:///test",
+                    Path("/tmp/csv"),
+                    Path("/tmp/library.db"),
+                    sys.executable,
+                    target_db_url=target_db_url,
+                )
+        return sweep_mock, order
+
+    @pytest.mark.parametrize("path", ["post_import", "build"])
+    def test_runs_after_logged_and_gate_before_report(self, path) -> None:
+        sweep, order = self._invoke(path=path)
+        sweep.assert_called_once_with("postgresql:///test")
+        last_gate = len(order) - 1 - order[::-1].index("gate")  # the build path also gates earlier
+        assert order.index("logged") < last_gate < order.index("sweep") < order.index("report")
+
+    def test_copy_to_mode_sweeps_target(self) -> None:
+        sweep, _ = self._invoke(path="build", target_db_url="postgresql:///target")
+        sweep.assert_called_once_with("postgresql:///target")
+
+    @pytest.mark.parametrize("path", ["post_import", "build"])
+    def test_failed_gate_means_no_sweep(self, path) -> None:
+        sweep = MagicMock(return_value=True)
+        with pytest.raises(RuntimeError):
+            self._invoke(path=path, gate_ok=False, sweep=sweep)
+        sweep.assert_not_called()
+
+    def test_lookup_negative_not_a_pipeline_table_or_step(self) -> None:
+        assert "lookup_negative" not in run_pipeline.PIPELINE_TABLES
+        assert not any("sweep" in n for n in run_pipeline.STEP_NAMES)
+
+    def test_sql_is_inverse_of_readers_predicate(self) -> None:
+        sql = run_pipeline.SWEEP_LOOKUP_NEGATIVE_SQL
+        assert "DELETE FROM lookup_negative" in sql
+        assert "now() >= attempted_at + (ttl_seconds * interval '1 second')" in sql
+
+    def test_deletes_logs_count_then_vacuums_plain(self, caplog) -> None:
+        import psycopg
+
+        conn = MagicMock()
+        conn.execute.return_value.rowcount = 7
+        with (
+            patch.object(psycopg, "connect", return_value=conn) as connect,
+            patch.object(run_pipeline, "run_sql_statements_parallel") as par,
+            caplog.at_level(logging.INFO, logger=run_pipeline.logger.name),
+        ):
+            assert run_pipeline.run_sweep_lookup_negative_step("postgresql:///t") is True
+        assert connect.call_args.kwargs["autocommit"] is True
+        conn.execute.assert_called_once_with(run_pipeline.SWEEP_LOOKUP_NEGATIVE_SQL)
+        assert par.call_args.args[:2] == ("postgresql:///t", ["VACUUM (ANALYZE) lookup_negative"])
+        assert any("7" in r.getMessage() for r in caplog.records)
+
+    @pytest.mark.parametrize("failing", ["connect", "vacuum"])
+    def test_failure_is_soft(self, failing, caplog) -> None:
+        import psycopg
+
+        conn = MagicMock()
+        conn.execute.return_value.rowcount = 0
+        with (
+            patch.object(
+                psycopg,
+                "connect",
+                side_effect=RuntimeError("boom") if failing == "connect" else None,
+                return_value=conn,
+            ),
+            patch.object(
+                run_pipeline,
+                "run_sql_statements_parallel",
+                side_effect=RuntimeError("boom") if failing == "vacuum" else None,
+            ),
+            caplog.at_level(logging.WARNING, logger=run_pipeline.logger.name),
+        ):
+            assert run_pipeline.run_sweep_lookup_negative_step("postgresql://u:pw@h/db") is False
+        assert any(r.levelno == logging.WARNING for r in caplog.records)
+        assert all("pw" not in r.getMessage() for r in caplog.records)
+
+
 class TestRunStepSafe:
     """run_step_safe() wraps run_step(), keeping a credentialed argv out of
     any exception that escapes a failed step (#361).

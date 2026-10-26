@@ -613,6 +613,41 @@ def run_derive_va_release_step(db_url: str, python: str) -> bool:
     return True
 
 
+# Inverse of LML's ``lookup_negative_hit`` reader (``now() < attempted_at +
+# ttl_seconds * interval '1 second'``): removes exactly the rows it already ignores.
+SWEEP_LOOKUP_NEGATIVE_SQL = (
+    "DELETE FROM lookup_negative WHERE now() >= attempted_at + (ttl_seconds * interval '1 second')"
+)
+
+
+def run_sweep_lookup_negative_step(db_url: str) -> bool:
+    """Best-effort TTL sweep of LML's ``lookup_negative`` cache (#438).
+
+    Deletes expired rows, then plain ``VACUUM (ANALYZE)`` (not FULL: LML reads
+    the table on every Discogs miss) so freed space is reused. Called by both
+    build paths after set_tables_logged and the reload-invariant gate: an
+    exception earlier would strand the pipeline tables UNLOGGED, so this
+    never raises. ``lookup_negative`` is deliberately not in PIPELINE_TABLES
+    (that list drives set_tables_unlogged) nor a STEP_NAMES entry; the sweep
+    is idempotent and runs at the end of every build. Returns True on success.
+    """
+    try:
+        conn = psycopg.connect(db_url, autocommit=True)
+        try:
+            deleted = conn.execute(SWEEP_LOOKUP_NEGATIVE_SQL).rowcount
+        finally:
+            conn.close()
+        logger.info("lookup_negative sweep: deleted %d expired rows", deleted)
+        run_sql_statements_parallel(
+            db_url, ["VACUUM (ANALYZE) lookup_negative"], description="VACUUM lookup_negative"
+        )
+    except Exception as exc:
+        # Class name only: str(exc) can embed the credentialed connection string.
+        logger.warning("lookup_negative sweep failed (%s); continuing", type(exc).__name__)
+        return False
+    return True
+
+
 def run_vacuum(db_url: str) -> None:
     """Run VACUUM FULL on all pipeline tables in parallel.
 
@@ -1753,6 +1788,9 @@ def _run_database_build_post_import(
     # -- reload-invariant gate (discogs-etl#298) — see _run_database_build.
     check_reload_invariant(db_url, raise_on_violation=True)
 
+    # -- lookup_negative TTL sweep (#438); after the gate, so a failed build isn't swept
+    run_sweep_lookup_negative_step(db_url)
+
     # -- report
     report_sizes(db_url)
 
@@ -2148,6 +2186,9 @@ def _run_database_build(
     # reporting success with an empty track/artist index. Always runs (even on
     # a fully-resumed build) as a last sanity gate.
     check_reload_invariant(vacuum_db, raise_on_violation=True)
+
+    # -- lookup_negative TTL sweep (#438) on the database consumers read
+    run_sweep_lookup_negative_step(vacuum_db)
 
     # -- report
     report_sizes(vacuum_db)
